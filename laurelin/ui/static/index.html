@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laurelin</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="wordmark">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M12 21v-8" stroke="var(--gold)" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+        <path d="M12 13 C 6 13 4 8 5 4 C 10 5 12 8 12 13 C 12 8 14 5 19 4 C 20 8 18 13 12 13 Z"
+              fill="var(--gold)" opacity="0.9"/>
+        <circle cx="12" cy="21" r="1.2" fill="var(--gold)"/>
+      </svg>
+      <span class="wordmark-text">Laurelin</span>
+    </div>
+    <div class="wordmark-sub">ontology data platform</div>
+    <nav class="nav" id="nav">
+      <a href="#/datasets"  data-view="datasets">Datasets</a>
+      <a href="#/pipeline"  data-view="pipeline">Pipeline</a>
+      <a href="#/ontology"  data-view="ontology">Ontology</a>
+      <a href="#/audit"     data-view="audit">Audit</a>
+    </nav>
+    <div class="sidebar-foot" id="workspace-info"></div>
+  </aside>
+  <main class="main" id="main"></main>
+</body>
+</html>
