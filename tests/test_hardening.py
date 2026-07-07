@@ -148,7 +148,19 @@ def test_null_join_keys_do_not_link(ws, catalog, store):
 def client(ws, catalog):
     catalog.write("parents", pa.table({"pid": ["p1"], "key": ["k"]}))
     (ws.ontology_dir / "o.yml").write_text(ONTOLOGY_YML)
-    return TestClient(create_app(ws))
+    return TestClient(create_app(ws, no_auth=True))
+
+
+@pytest.fixture()
+def auth_setup(ws, catalog):
+    """Auth-enabled app with one admin ('root'/'trustno1!') and an API token."""
+    catalog.write("parents", pa.table({"pid": ["p1"], "key": ["k"]}))
+    app = create_app(ws)
+    client = TestClient(app)
+    client.post("/api/v1/auth/setup", json={"username": "root", "password": "trustno1!"})
+    client.post("/api/v1/auth/login", json={"username": "root", "password": "trustno1!"})
+    token = client.post("/api/v1/tokens", json={"name": "hardening"}).json()["token"]
+    return TestClient(app), token
 
 
 def test_empty_targets_rejected(client):
@@ -173,11 +185,12 @@ def test_unknown_filter_property_is_400(client):
     assert resp.status_code == 400
 
 
-def test_auth_preflight_and_scheme(client, monkeypatch):
-    monkeypatch.setenv("LAURELIN_TOKEN", "s3cret")
-    assert client.get("/api/v1/datasets").status_code == 401
-    # CORS preflight must not require the token
-    resp = client.options(
+def test_auth_preflight_and_scheme(auth_setup):
+    client, token = auth_setup
+    anonymous = TestClient(client.app)
+    assert anonymous.get("/api/v1/datasets").status_code == 401
+    # CORS preflight must not require credentials
+    resp = anonymous.options(
         "/api/v1/datasets",
         headers={
             "Origin": "http://example.com",
@@ -187,17 +200,22 @@ def test_auth_preflight_and_scheme(client, monkeypatch):
     assert resp.status_code == 200
     assert resp.headers.get("access-control-allow-origin") == "*"
     # scheme is case-insensitive per RFC 7235
-    ok = client.get(
-        "/api/v1/datasets", headers={"Authorization": "bearer s3cret"}
+    ok = anonymous.get(
+        "/api/v1/datasets", headers={"Authorization": f"bearer {token}"}
     )
     assert ok.status_code == 200
     # API docs are gated too
-    assert client.get("/openapi.json").status_code == 401
-    assert client.get("/docs").status_code == 401
+    assert anonymous.get("/openapi.json").status_code == 401
+    assert anonymous.get("/docs").status_code == 401
+    docs = anonymous.get(
+        "/openapi.json", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert docs.status_code == 200
 
 
-def test_401_responses_carry_cors_headers(client, monkeypatch):
-    monkeypatch.setenv("LAURELIN_TOKEN", "s3cret")
-    resp = client.get("/api/v1/datasets", headers={"Origin": "http://example.com"})
+def test_401_responses_carry_cors_headers(auth_setup):
+    client, _ = auth_setup
+    anonymous = TestClient(client.app)
+    resp = anonymous.get("/api/v1/datasets", headers={"Origin": "http://example.com"})
     assert resp.status_code == 401
     assert resp.headers.get("access-control-allow-origin") == "*"

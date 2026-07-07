@@ -8,6 +8,7 @@
   <script src="app.js" defer></script>
 </head>
 <body>
+  <div class="auth-screen" id="auth-screen" hidden></div>
   <aside class="sidebar">
     <div class="wordmark">
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
@@ -24,8 +25,10 @@
       <a href="#/pipeline"  data-view="pipeline">Pipeline</a>
       <a href="#/ontology"  data-view="ontology">Ontology</a>
       <a href="#/audit"     data-view="audit">Audit</a>
+      <a href="#/admin"     data-view="admin" hidden>Admin</a>
     </nav>
     <div class="sidebar-foot" id="workspace-info"></div>
+    <div class="sidebar-user" id="user-info"></div>
   </aside>
   <main class="main" id="main"></main>
 </body>

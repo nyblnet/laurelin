@@ -25,6 +25,8 @@ from laurelin.core.models import (
     EditKind,
     LineageEdge,
     ObjectEdit,
+    Role,
+    User,
     utcnow_iso,
 )
 
@@ -88,6 +90,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action TEXT NOT NULL,
     details_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE COLLATE NOCASE,
+    password_hash TEXT,
+    role TEXT CHECK(role IN ('viewer','editor','admin')),
+    created_at TEXT,
+    disabled INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT,
+    created_at TEXT,
+    expires_at TEXT
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    token_hash TEXT UNIQUE,
+    user_id TEXT,
+    created_at TEXT,
+    last_used_at TEXT
+);
 """
 
 
@@ -119,15 +143,14 @@ class MetadataStore:
 
     def upsert_dataset(self, name: str, description: str = "") -> DatasetInfo:
         with self._conn() as c:
-            row = c.execute("SELECT * FROM datasets WHERE name = ?", (name,)).fetchone()
-            if row is None:
-                created = utcnow_iso()
-                c.execute(
-                    "INSERT INTO datasets (name, description, created_at) VALUES (?, ?, ?)",
-                    (name, description, created),
-                )
-            elif description and description != row["description"]:
-                c.execute("UPDATE datasets SET description = ? WHERE name = ?", (description, name))
+            # Single atomic statement: concurrent writers must not race a
+            # check-then-insert. Description only overwrites when non-empty.
+            c.execute(
+                """INSERT INTO datasets (name, description, created_at) VALUES (?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET description = excluded.description
+                   WHERE excluded.description != '' AND excluded.description != description""",
+                (name, description, utcnow_iso()),
+            )
         return self.get_dataset(name)  # type: ignore[return-value]
 
     def get_dataset(self, name: str) -> Optional[DatasetInfo]:
@@ -396,3 +419,216 @@ class MetadataStore:
             )
             for r in rows
         ]
+
+    # -- users -----------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_user(row: sqlite3.Row) -> User:
+        return User(
+            id=row["id"],
+            username=row["username"],
+            role=Role(row["role"]),
+            created_at=row["created_at"],
+            disabled=bool(row["disabled"]),
+        )
+
+    def create_user(self, user: User, password_hash: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO users (id, username, password_hash, role, created_at, disabled)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    user.id,
+                    user.username,
+                    password_hash,
+                    user.role.value,
+                    user.created_at,
+                    int(user.disabled),
+                ),
+            )
+
+    def create_user_if_none_exist(self, user: User, password_hash: str) -> bool:
+        """Atomically create the first user. Returns False (without inserting) if
+        any user already exists, so concurrent first-run setups can't both win.
+        BEGIN IMMEDIATE takes the write lock up front, serializing racers."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] > 0:
+                return False
+            c.execute(
+                """INSERT INTO users (id, username, password_hash, role, created_at, disabled)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    user.id,
+                    user.username,
+                    password_hash,
+                    user.role.value,
+                    user.created_at,
+                    int(user.disabled),
+                ),
+            )
+            return True
+
+    def get_user(self, username: str) -> Optional[User]:
+        """Look a user up by username (case-insensitive per COLLATE NOCASE)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def get_user_by_id(self, user_id: str) -> Optional[User]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def get_password_hash(self, username: str) -> Optional[str]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT password_hash FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return row["password_hash"] if row else None
+
+    def list_users(self) -> list[User]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM users ORDER BY username").fetchall()
+        return [self._row_to_user(r) for r in rows]
+
+    def count_users(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+    def update_user(
+        self,
+        username: str,
+        *,
+        role: Optional[str] = None,
+        password_hash: Optional[str] = None,
+        disabled: Optional[bool] = None,
+    ) -> None:
+        sets, vals = [], []
+        if role is not None:
+            sets.append("role = ?")
+            vals.append(role)
+        if password_hash is not None:
+            sets.append("password_hash = ?")
+            vals.append(password_hash)
+        if disabled is not None:
+            sets.append("disabled = ?")
+            vals.append(int(disabled))
+        if not sets:
+            return
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE username = ?",
+                (*vals, username),
+            )
+
+    def delete_user(self, username: str) -> None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if row is None:
+                return
+            user_id = row["id"]
+            c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+    # -- sessions ----------------------------------------------------------------
+
+    def create_session(
+        self, token_hash: str, user_id: str, created_at: str, expires_at: str
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (token_hash, user_id, created_at, expires_at),
+            )
+
+    def get_session(self, token_hash: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM sessions WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_session(self, token_hash: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+    def purge_expired_sessions(self, now_iso: str) -> None:
+        """ISO-8601 UTC timestamps sort lexicographically, so string compare works."""
+        with self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso,))
+
+    # -- api tokens ---------------------------------------------------------------
+
+    def _token_row_to_dict(self, row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "user_id": row["user_id"],
+            "username": row["username"] if "username" in row.keys() else None,
+            "created_at": row["created_at"],
+            "last_used_at": row["last_used_at"],
+        }
+
+    _TOKEN_SELECT = (
+        "SELECT t.id, t.name, t.user_id, t.token_hash, t.created_at, "
+        "t.last_used_at, u.username FROM api_tokens t "
+        "LEFT JOIN users u ON u.id = t.user_id"
+    )
+
+    def create_api_token(
+        self, token_id: str, name: str, token_hash: str, user_id: str, created_at: str
+    ) -> dict:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO api_tokens (id, name, token_hash, user_id, created_at, last_used_at)
+                   VALUES (?, ?, ?, ?, ?, NULL)""",
+                (token_id, name, token_hash, user_id, created_at),
+            )
+        token = self.get_api_token(token_id)
+        assert token is not None
+        return token
+
+    def get_api_token(self, token_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                f"{self._TOKEN_SELECT} WHERE t.id = ?", (token_id,)
+            ).fetchone()
+        return self._token_row_to_dict(row) if row else None
+
+    def get_api_token_by_hash(self, token_hash: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                f"{self._TOKEN_SELECT} WHERE t.token_hash = ?", (token_hash,)
+            ).fetchone()
+        return self._token_row_to_dict(row) if row else None
+
+    def list_api_tokens(self, user_id: Optional[str] = None) -> list[dict]:
+        with self._conn() as c:
+            if user_id is None:
+                rows = c.execute(
+                    f"{self._TOKEN_SELECT} ORDER BY t.created_at"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    f"{self._TOKEN_SELECT} WHERE t.user_id = ? ORDER BY t.created_at",
+                    (user_id,),
+                ).fetchall()
+        return [self._token_row_to_dict(r) for r in rows]
+
+    def touch_api_token(self, token_id: str, last_used_at: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                (last_used_at, token_id),
+            )
+
+    def delete_api_token(self, token_id: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))

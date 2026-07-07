@@ -188,3 +188,37 @@ class AuditEvent(BaseModel):
     actor: str = "anonymous"
     action: str
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Authentication & authorization
+# ---------------------------------------------------------------------------
+
+class Role(str, Enum):
+    """Ordered roles: viewer < editor < admin."""
+
+    viewer = "viewer"
+    editor = "editor"
+    admin = "admin"
+
+    @property
+    def rank(self) -> int:
+        return _ROLE_ORDER[self]
+
+    def covers(self, required: "Role") -> bool:
+        """True if this role grants at least ``required``'s privileges."""
+        return self.rank >= required.rank
+
+
+_ROLE_ORDER = {Role.viewer: 0, Role.editor: 1, Role.admin: 2}
+
+
+class User(BaseModel):
+    """A Laurelin account. The password hash is intentionally NOT part of this
+    model so it can never leak through an API response."""
+
+    id: str
+    username: str
+    role: Role = Role.viewer
+    created_at: str = Field(default_factory=utcnow_iso)
+    disabled: bool = False

@@ -51,8 +51,8 @@ laurelin demo demo-workspace
 # Run the pipeline (executes the transform DAG, records lineage)
 laurelin build --workspace demo-workspace
 
-# Serve the API + web UI
-laurelin serve --workspace demo-workspace
+# Serve the API + web UI (--no-auth: skip login for local development)
+laurelin serve --workspace demo-workspace --no-auth
 # UI:      http://127.0.0.1:8787
 # OpenAPI: http://127.0.0.1:8787/docs
 ```
@@ -138,9 +138,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module-level detail.
 
 ## Security
 
-Local-first and open by default. Set `LAURELIN_TOKEN` to require
-`Authorization: Bearer <token>` on all `/api/` routes when exposing a server
-beyond localhost.
+Authentication is on by default. On first launch the server is in *setup
+mode*: visit the UI (or `POST /api/v1/auth/setup`) to create the first admin
+account, then sign in. Users, roles (`viewer` < `editor` < `admin`), and API
+tokens are managed in the UI, via `/api/v1/users` + `/api/v1/tokens`, or with
+the `laurelin users ...` / `laurelin tokens ...` CLI commands. API clients
+authenticate with `Authorization: Bearer <token>`; browsers use an httpOnly
+session cookie. For local development, `laurelin serve --no-auth` (or
+`LAURELIN_NO_AUTH=1`) disables auth entirely.
 
 ## Status
 

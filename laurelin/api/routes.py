@@ -16,7 +16,6 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
-    Header,
     HTTPException,
     Query,
     Request,
@@ -24,14 +23,19 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
+from laurelin.api.auth_routes import require_editor, require_user, require_viewer
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import DatasetVersionInfo
+from laurelin.core.models import DatasetVersionInfo, User
 from laurelin.ontology import OntologyService, load_ontology
 from laurelin.transforms import Builder, TransformRegistry, collect_transforms
 
 router = APIRouter()
+
+# RBAC guards (see docs/ARCHITECTURE.md): reads need viewer, mutations editor.
+VIEWER = Depends(require_viewer)
+EDITOR = Depends(require_editor)
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +67,10 @@ def get_ontology_service(
     return OntologyService(workspace, catalog, store, ontology)
 
 
-def get_actor(x_laurelin_user: Annotated[Optional[str], Header()] = None) -> str:
-    return x_laurelin_user or "anonymous"
+def get_actor(user: Annotated[User, Depends(require_user)]) -> str:
+    """Audit/edit attribution: the authenticated username. In --no-auth mode
+    the implicit admin's username honors the X-Laurelin-User header."""
+    return user.username
 
 
 WorkspaceDep = Annotated[Workspace, Depends(get_workspace)]
@@ -114,7 +120,7 @@ class ActionApplyRequest(BaseModel):
 # Workspace
 # ---------------------------------------------------------------------------
 
-@router.get("/workspace")
+@router.get("/workspace", dependencies=[VIEWER])
 def get_workspace_info(workspace: WorkspaceDep) -> dict:
     return {
         "name": workspace.name,
@@ -127,12 +133,12 @@ def get_workspace_info(workspace: WorkspaceDep) -> dict:
 # Datasets
 # ---------------------------------------------------------------------------
 
-@router.get("/datasets")
+@router.get("/datasets", dependencies=[VIEWER])
 def list_datasets(store: StoreDep) -> list[dict]:
     return [_dump(d) for d in store.list_datasets()]
 
 
-@router.post("/datasets")
+@router.post("/datasets", dependencies=[EDITOR])
 def create_dataset(
     body: DatasetCreateRequest, catalog: CatalogDep, store: StoreDep, actor: ActorDep
 ) -> dict:
@@ -141,7 +147,7 @@ def create_dataset(
     return _dump(info)
 
 
-@router.get("/datasets/{name}")
+@router.get("/datasets/{name}", dependencies=[VIEWER])
 def get_dataset(name: str, store: StoreDep) -> dict:
     info = store.get_dataset(name)
     if info is None:
@@ -151,7 +157,7 @@ def get_dataset(name: str, store: StoreDep) -> dict:
     return result
 
 
-@router.get("/datasets/{name}/schema")
+@router.get("/datasets/{name}/schema", dependencies=[VIEWER])
 def get_dataset_schema(
     name: str, store: StoreDep, version: Optional[int] = None
 ) -> list[dict]:
@@ -159,7 +165,7 @@ def get_dataset_schema(
     return [c.model_dump() for c in info.schema_]
 
 
-@router.get("/datasets/{name}/rows")
+@router.get("/datasets/{name}/rows", dependencies=[VIEWER])
 def get_dataset_rows(
     name: str,
     catalog: CatalogDep,
@@ -173,7 +179,7 @@ def get_dataset_rows(
     return {"rows": rows, "row_count": info.row_count}
 
 
-@router.post("/datasets/{name}/upload")
+@router.post("/datasets/{name}/upload", dependencies=[EDITOR])
 def upload_dataset_file(
     name: str,
     catalog: CatalogDep,
@@ -218,7 +224,7 @@ def upload_dataset_file(
 # Transforms, builds, lineage
 # ---------------------------------------------------------------------------
 
-@router.get("/transforms")
+@router.get("/transforms", dependencies=[VIEWER])
 def list_transforms(registry: RegistryDep) -> list[dict]:
     return [
         {
@@ -231,7 +237,7 @@ def list_transforms(registry: RegistryDep) -> list[dict]:
     ]
 
 
-@router.post("/builds")
+@router.post("/builds", dependencies=[EDITOR])
 def run_build(
     workspace: WorkspaceDep,
     catalog: CatalogDep,
@@ -252,12 +258,12 @@ def run_build(
     return _dump(build)
 
 
-@router.get("/builds")
+@router.get("/builds", dependencies=[VIEWER])
 def list_builds(store: StoreDep) -> list[dict]:
     return [_dump(b) for b in store.list_builds()]
 
 
-@router.get("/builds/{build_id}")
+@router.get("/builds/{build_id}", dependencies=[VIEWER])
 def get_build(build_id: str, store: StoreDep) -> dict:
     build = store.get_build(build_id)
     if build is None:
@@ -265,7 +271,7 @@ def get_build(build_id: str, store: StoreDep) -> dict:
     return _dump(build)
 
 
-@router.get("/lineage")
+@router.get("/lineage", dependencies=[VIEWER])
 def get_lineage(store: StoreDep) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -297,12 +303,12 @@ def get_lineage(store: StoreDep) -> dict:
 # Ontology
 # ---------------------------------------------------------------------------
 
-@router.get("/ontology/object-types")
+@router.get("/ontology/object-types", dependencies=[VIEWER])
 def list_object_types(service: OntologyDep) -> list[dict]:
     return [_dump(ot) for ot in service.list_object_types()]
 
 
-@router.get("/ontology/object-types/{name}")
+@router.get("/ontology/object-types/{name}", dependencies=[VIEWER])
 def get_object_type(name: str, service: OntologyDep) -> dict:
     ot = service.ontology.object_type(name)
     if ot is None:
@@ -321,7 +327,7 @@ def get_object_type(name: str, service: OntologyDep) -> dict:
     return result
 
 
-@router.get("/ontology/objects/{type_name}")
+@router.get("/ontology/objects/{type_name}", dependencies=[VIEWER])
 def query_objects(
     type_name: str,
     request: Request,
@@ -340,7 +346,7 @@ def query_objects(
     )
 
 
-@router.get("/ontology/objects/{type_name}/{pk}")
+@router.get("/ontology/objects/{type_name}/{pk}", dependencies=[VIEWER])
 def get_object(type_name: str, pk: str, service: OntologyDep) -> dict:
     obj = service.get(type_name, pk)
     if obj is None:
@@ -348,19 +354,19 @@ def get_object(type_name: str, pk: str, service: OntologyDep) -> dict:
     return obj
 
 
-@router.get("/ontology/objects/{type_name}/{pk}/links/{link_name}")
+@router.get("/ontology/objects/{type_name}/{pk}/links/{link_name}", dependencies=[VIEWER])
 def get_linked_objects(
     type_name: str, pk: str, link_name: str, service: OntologyDep
 ) -> dict:
     return {"objects": service.linked(type_name, pk, link_name)}
 
 
-@router.get("/ontology/actions")
+@router.get("/ontology/actions", dependencies=[VIEWER])
 def list_actions(service: OntologyDep) -> list[dict]:
     return [_dump(a) for a in service.ontology.actions]
 
 
-@router.post("/ontology/actions/{name}/apply")
+@router.post("/ontology/actions/{name}/apply", dependencies=[EDITOR])
 def apply_action(
     name: str, body: ActionApplyRequest, service: OntologyDep, actor: ActorDep
 ) -> dict:
@@ -372,6 +378,6 @@ def apply_action(
 # Audit
 # ---------------------------------------------------------------------------
 
-@router.get("/audit")
+@router.get("/audit", dependencies=[VIEWER])
 def list_audit(store: StoreDep, limit: int = Query(100, ge=0, le=10_000)) -> list[dict]:
     return [_dump(e) for e in store.list_audit(limit)]

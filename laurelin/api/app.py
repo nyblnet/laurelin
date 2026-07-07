@@ -3,12 +3,16 @@
 Catalog and metadata store are constructed once per app; pipelines and
 ontology are re-read per request (see routes.py dependencies). The static UI
 is mounted at ``/`` after the API routes so ``/api`` and ``/health`` win.
+
+Auth is ON by default (see docs/ARCHITECTURE.md): API routes resolve
+credentials through FastAPI dependencies (auth_routes.py); this module only
+adds the middleware that gates /docs, /redoc and /openapi.json — those are
+plain Starlette routes with no dependency hooks.
 """
 
 from __future__ import annotations
 
 import os
-import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -18,8 +22,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import laurelin
+from laurelin.api.auth_routes import (
+    auth_router,
+    resolve_credential,
+    tokens_router,
+    users_router,
+)
 from laurelin.api.routes import router
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 
@@ -32,7 +43,10 @@ def _exc_message(exc: BaseException) -> str:
     return str(exc)
 
 
-def create_app(workspace: Workspace) -> FastAPI:
+def create_app(
+    workspace: Workspace, *, no_auth: bool = False, secure_cookies: bool = False
+) -> FastAPI:
+    no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     store = MetadataStore(workspace.metadata_path)
     catalog = DatasetCatalog(workspace, store)
 
@@ -45,33 +59,32 @@ def create_app(workspace: Workspace) -> FastAPI:
     app.state.workspace = workspace
     app.state.store = store
     app.state.catalog = catalog
+    app.state.no_auth = no_auth
+    app.state.secure_cookies = secure_cookies
+    app.state.auth = AuthService(store)
 
     @app.middleware("http")
-    async def require_token(request: Request, call_next):
-        """If LAURELIN_TOKEN is set, /api/ paths (and the API docs, which list
-        the route surface) require a matching bearer token. OPTIONS is exempt
-        so CORS preflights — which never carry Authorization — can succeed."""
-        token = os.environ.get("LAURELIN_TOKEN")
+    async def guard_api_docs(request: Request, call_next):
+        """The API docs list the whole route surface, so they are gated behind
+        the same credentials as /api/ routes. OPTIONS is exempt so CORS
+        preflights — which never carry credentials — can succeed."""
         path = request.url.path
-        protected = (
-            path.startswith("/api/")
-            or path == "/openapi.json"
+        gated = (
+            path == "/openapi.json"
             or path.startswith("/docs")
             or path.startswith("/redoc")
         )
-        if token and protected and request.method != "OPTIONS":
-            scheme, _, credentials = request.headers.get("authorization", "").partition(" ")
-            if scheme.lower() != "bearer" or not secrets.compare_digest(
-                credentials.strip(), token
-            ):
+        if gated and not app.state.no_auth and request.method != "OPTIONS":
+            if store.count_users() == 0:
+                return JSONResponse(status_code=401, content={"detail": "setup required"})
+            if resolve_credential(request) is None:
                 return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Missing or invalid bearer token"},
+                    status_code=401, content={"detail": "Not authenticated"}
                 )
         return await call_next(request)
 
-    # Registered after the auth middleware so CORS is the outermost layer and
-    # its headers are applied to 401 responses too.
+    # Registered after the docs guard so CORS is the outermost layer and its
+    # headers are applied to 401/403 responses too.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -99,6 +112,9 @@ def create_app(workspace: Workspace) -> FastAPI:
     def health() -> dict:
         return {"status": "ok", "version": laurelin.__version__}
 
+    app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(users_router, prefix="/api/v1")
+    app.include_router(tokens_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

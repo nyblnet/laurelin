@@ -115,7 +115,8 @@ def workspace(tmp_path) -> Workspace:
 
 @pytest.fixture
 def client(workspace) -> TestClient:
-    return TestClient(create_app(workspace))
+    # These tests exercise the data plane; auth has its own suite (test_auth.py).
+    return TestClient(create_app(workspace, no_auth=True))
 
 
 # ---------------------------------------------------------------------------
@@ -464,26 +465,51 @@ def test_audit_listing_and_limit(client):
 # Auth
 # ---------------------------------------------------------------------------
 
-def test_token_auth(client, monkeypatch):
-    monkeypatch.setenv("LAURELIN_TOKEN", "s3cret")
+def test_auth_on_by_default_requires_setup(workspace):
+    auth_client = TestClient(create_app(workspace))
 
-    r = client.get("/api/v1/datasets")
+    r = auth_client.get("/api/v1/datasets")
     assert r.status_code == 401
-    assert "detail" in r.json()
+    assert r.json() == {"detail": "setup required"}
 
-    r = client.get("/api/v1/datasets", headers={"Authorization": "Bearer wrong"})
-    assert r.status_code == 401
+    # Health and auth status stay open.
+    assert auth_client.get("/health").status_code == 200
+    status = auth_client.get("/api/v1/auth/status")
+    assert status.status_code == 200
+    assert status.json() == {
+        "auth_required": True,
+        "setup_required": True,
+        "user": None,
+    }
 
-    r = client.get("/api/v1/datasets", headers={"Authorization": "Bearer s3cret"})
+
+def test_auth_setup_login_and_bearer(workspace):
+    auth_client = TestClient(create_app(workspace))
+    r = auth_client.post(
+        "/api/v1/auth/setup", json={"username": "root", "password": "trustno1!"}
+    )
     assert r.status_code == 200
 
-    # Health stays open.
-    assert client.get("/health").status_code == 200
+    r = auth_client.get("/api/v1/datasets", headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+
+    r = auth_client.post(
+        "/api/v1/auth/login", json={"username": "root", "password": "trustno1!"}
+    )
+    assert r.status_code == 200
+    assert auth_client.get("/api/v1/datasets").status_code == 200
+
+    token = auth_client.post("/api/v1/tokens", json={"name": "e2e"}).json()["token"]
+    fresh = TestClient(create_app(workspace))
+    r = fresh.get("/api/v1/datasets", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
 
 
-def test_no_token_means_open(client, monkeypatch):
-    monkeypatch.delenv("LAURELIN_TOKEN", raising=False)
-    assert client.get("/api/v1/datasets").status_code == 200
+def test_no_auth_env_var_opens_everything(workspace, monkeypatch):
+    monkeypatch.setenv("LAURELIN_NO_AUTH", "1")
+    open_client = TestClient(create_app(workspace))
+    assert open_client.get("/api/v1/datasets").status_code == 200
+    assert open_client.get("/api/v1/auth/status").json()["auth_required"] is False
 
 
 # ---------------------------------------------------------------------------
