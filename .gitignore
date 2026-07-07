@@ -9,6 +9,8 @@ build/
 .coverage
 htmlcov/
 
+.claude/
+
 # Laurelin workspaces created during local development
 /demo-workspace/
 /workspace/

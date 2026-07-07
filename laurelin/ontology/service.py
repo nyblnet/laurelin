@@ -56,6 +56,12 @@ def _coerce_parameter(name: str, value: Any, type_name: str) -> Any:
         if type_name == "integer":
             if isinstance(value, bool):
                 raise ValueError
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError  # don't silently truncate 1.5 -> 1
+            if isinstance(value, str) and "." in value:
+                value = float(value)
+                if not value.is_integer():
+                    raise ValueError
             return int(value)
         if type_name == "float":
             if isinstance(value, bool):
@@ -183,10 +189,21 @@ class OntologyService:
                 )
             ]
         if filters:
+            declared = set(ot.properties) | {ot.primary_key}
             for prop, value in filters.items():
-                objects = [o for o in objects if str(o.get(prop)) == str(value)]
+                if prop not in declared:
+                    raise ValueError(
+                        f"Unknown filter property {prop!r} for object type {type_name!r}"
+                    )
+                objects = [
+                    o
+                    for o in objects
+                    if o.get(prop) is not None and str(o.get(prop)) == str(value)
+                ]
 
         total = len(objects)
+        offset = max(0, offset)
+        limit = max(0, limit)
         return {"objects": objects[offset : offset + limit], "total": total}
 
     def get(self, type_name: str, pk: str) -> Optional[dict]:
@@ -222,8 +239,15 @@ class OntologyService:
         if obj is None:
             return []
         other = self._require_object_type(other_type_name)
-        key = str(obj.get(my_prop))
-        return [o for o in self._materialize(other) if str(o.get(other_prop)) == key]
+        my_value = obj.get(my_prop)
+        if my_value is None:
+            return []  # a null join key links to nothing, not to other nulls
+        key = str(my_value)
+        return [
+            o
+            for o in self._materialize(other)
+            if o.get(other_prop) is not None and str(o.get(other_prop)) == key
+        ]
 
     def edits(self, type_name: str) -> list[ObjectEdit]:
         return self.store.list_object_edits(type_name)

@@ -354,7 +354,9 @@ class MetadataStore:
     def list_object_edits(self, object_type: str) -> list[ObjectEdit]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM object_edits WHERE object_type = ? ORDER BY created_at, id",
+                # rowid = insertion order; created_at has second-level collisions
+                # and id is a random uuid, so neither gives a stable replay order.
+                "SELECT * FROM object_edits WHERE object_type = ? ORDER BY rowid",
                 (object_type,),
             ).fetchall()
         return [

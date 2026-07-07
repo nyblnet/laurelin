@@ -7,11 +7,21 @@ transform registry and ontology are rebuilt per request so edits to
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, File, Header, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from pydantic import BaseModel, Field
 
 from laurelin.catalog import DatasetCatalog
@@ -154,8 +164,8 @@ def get_dataset_rows(
     name: str,
     catalog: CatalogDep,
     store: StoreDep,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(100, ge=0, le=10_000),
+    offset: int = Query(0, ge=0),
     version: Optional[int] = None,
 ) -> dict:
     info = _version_info(store, name, version)
@@ -172,9 +182,21 @@ def upload_dataset_file(
     file: UploadFile = File(...),
 ) -> dict:
     suffix = Path(file.filename or "").suffix
+    max_bytes = int(os.environ.get("LAURELIN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
+    written = 0
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file.file.read())
         tmp_path = Path(tmp.name)
+        while chunk := file.file.read(1 << 20):
+            written += len(chunk)
+            if written > max_bytes:
+                tmp.close()
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload exceeds {max_bytes // (1024 * 1024)} MB limit "
+                    "(set LAURELIN_MAX_UPLOAD_MB to raise it)",
+                )
+            tmp.write(chunk)
     try:
         info = catalog.upload_file(name, tmp_path)
     finally:
@@ -219,9 +241,14 @@ def run_build(
     body: Optional[BuildRequest] = None,
 ) -> dict:
     targets = body.targets if body else None
+    if targets is not None and len(targets) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="targets must be non-empty when provided; omit it to build everything",
+        )
     store.log_audit("build_requested", {"targets": targets or []}, actor=actor)
     builder = Builder(workspace, catalog, store, registry)
-    build = builder.build(targets or None)
+    build = builder.build(targets)
     return _dump(build)
 
 
@@ -300,8 +327,8 @@ def query_objects(
     request: Request,
     service: OntologyDep,
     search: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(100, ge=0, le=10_000),
+    offset: int = Query(0, ge=0),
 ) -> dict:
     filters = {
         key[len("filter."):]: value
@@ -346,5 +373,5 @@ def apply_action(
 # ---------------------------------------------------------------------------
 
 @router.get("/audit")
-def list_audit(store: StoreDep, limit: int = 100) -> list[dict]:
+def list_audit(store: StoreDep, limit: int = Query(100, ge=0, le=10_000)) -> list[dict]:
     return [_dump(e) for e in store.list_audit(limit)]

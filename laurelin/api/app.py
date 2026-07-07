@@ -8,9 +8,11 @@ is mounted at ``/`` after the API routes so ``/api`` and ``/health`` win.
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +46,32 @@ def create_app(workspace: Workspace) -> FastAPI:
     app.state.store = store
     app.state.catalog = catalog
 
+    @app.middleware("http")
+    async def require_token(request: Request, call_next):
+        """If LAURELIN_TOKEN is set, /api/ paths (and the API docs, which list
+        the route surface) require a matching bearer token. OPTIONS is exempt
+        so CORS preflights — which never carry Authorization — can succeed."""
+        token = os.environ.get("LAURELIN_TOKEN")
+        path = request.url.path
+        protected = (
+            path.startswith("/api/")
+            or path == "/openapi.json"
+            or path.startswith("/docs")
+            or path.startswith("/redoc")
+        )
+        if token and protected and request.method != "OPTIONS":
+            scheme, _, credentials = request.headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not secrets.compare_digest(
+                credentials.strip(), token
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Missing or invalid bearer token"},
+                )
+        return await call_next(request)
+
+    # Registered after the auth middleware so CORS is the outermost layer and
+    # its headers are applied to 401 responses too.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -51,18 +79,13 @@ def create_app(workspace: Workspace) -> FastAPI:
         allow_headers=["*"],
     )
 
-    @app.middleware("http")
-    async def require_token(request: Request, call_next):
-        """If LAURELIN_TOKEN is set, /api/ paths require a matching bearer token."""
-        token = os.environ.get("LAURELIN_TOKEN")
-        if token and request.url.path.startswith("/api/"):
-            auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {token}":
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Missing or invalid bearer token"},
-                )
-        return await call_next(request)
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        msgs = "; ".join(
+            f"{'.'.join(str(loc) for loc in e.get('loc', []))}: {e.get('msg', 'invalid')}"
+            for e in exc.errors()
+        )
+        return JSONResponse(status_code=400, content={"detail": msgs or "Invalid request"})
 
     @app.exception_handler(KeyError)
     async def key_error_handler(request: Request, exc: KeyError):

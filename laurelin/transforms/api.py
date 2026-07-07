@@ -8,6 +8,7 @@ an *active registry* installed so the decorators register into it.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -71,24 +72,28 @@ class TransformRegistry:
 # Active registry: decorators register into whichever registry is active.
 # ---------------------------------------------------------------------------
 
-_active_registry: Optional[TransformRegistry] = None
+# ContextVar rather than a module global: the API server collects transforms
+# per request from a threadpool, and concurrent collections must not see each
+# other's registries.
+_active_registry: ContextVar[Optional[TransformRegistry]] = ContextVar(
+    "laurelin_active_registry", default=None
+)
 
 
 @contextmanager
 def use_registry(registry: TransformRegistry) -> Iterator[TransformRegistry]:
     """Make `registry` the active target for @transform / @sql_transform."""
-    global _active_registry
-    previous = _active_registry
-    _active_registry = registry
+    token = _active_registry.set(registry)
     try:
         yield registry
     finally:
-        _active_registry = previous
+        _active_registry.reset(token)
 
 
 def _register(spec: TransformSpec) -> None:
-    if _active_registry is not None:
-        _active_registry.register(spec)
+    registry = _active_registry.get()
+    if registry is not None:
+        registry.register(spec)
 
 
 def transform(output: Output, **inputs: Input) -> Callable[[Callable], Callable]:

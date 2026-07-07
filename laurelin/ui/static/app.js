@@ -550,7 +550,10 @@ function renderObjectBrowser(host, type) {
   const props = Object.keys(type.properties || {});
   const shown = props.slice(0, 6);
 
+  let loadSeq = 0;
+
   async function loadObjects() {
+    const seq = ++loadSeq;
     tableHost.replaceChildren(loading());
     let data;
     try {
@@ -558,9 +561,10 @@ function renderObjectBrowser(host, type) {
       if (state.search) q.set("search", state.search);
       data = await api(API + "/ontology/objects/" + encodeURIComponent(type.api_name) + "?" + q);
     } catch (err) {
-      tableHost.replaceChildren(errorBox(err));
+      if (seq === loadSeq) tableHost.replaceChildren(errorBox(err));
       return;
     }
+    if (seq !== loadSeq) return; // a newer search superseded this response
     const objects = data.objects || [];
     const total = data.total != null ? data.total : objects.length;
     if (!objects.length) {

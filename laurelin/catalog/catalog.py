@@ -91,21 +91,27 @@ class DatasetCatalog:
         _validate_name(name)
         self.store.upsert_dataset(name, description)
 
-        version = self.store.next_version(name)
         dataset_dir = self.workspace.data_dir / name
         dataset_dir.mkdir(parents=True, exist_ok=True)
-        final_dir = dataset_dir / f"v{version:04d}"
-        if final_dir.exists():
-            raise ValueError(
-                f"Version directory already exists: {final_dir} (versions are immutable)"
-            )
 
         tmp_dir = Path(
-            tempfile.mkdtemp(prefix=f".tmp-{name}-v{version:04d}-", dir=self.workspace.data_dir)
+            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
         )
+        version = self.store.next_version(name)
         try:
             pq.write_table(table, tmp_dir / "data.parquet")
-            os.rename(tmp_dir, final_dir)
+            # The rename is the allocation mutex: os.rename onto an existing
+            # non-empty directory fails, so concurrent writers that picked the
+            # same version collide here and the loser retries with the next one.
+            while True:
+                final_dir = dataset_dir / f"v{version:04d}"
+                if not final_dir.exists():
+                    try:
+                        os.rename(tmp_dir, final_dir)
+                        break
+                    except OSError:
+                        pass  # lost the race for this version; try the next
+                version += 1
         except Exception:
             for f in tmp_dir.glob("*") if tmp_dir.exists() else []:
                 f.unlink()
