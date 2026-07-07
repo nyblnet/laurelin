@@ -306,14 +306,14 @@ contributors; phases overlap in practice.
 
 ### Phase 1 — Trustworthy core (v0.2, ~2-3 months)
 The "you can put this on a server without embarrassment" release.
-- WS7: local auth (users, sessions, RBAC, API tokens, first-run setup, login UI) — *in progress*
-- WS7: OIDC SSO + group→role mapping
-- WS8: projects with per-project roles; audit v2 (structured, exportable)
-- WS9: Postgres metadata backend, Docker image + compose, metrics, migrations
-- WS3: scheduler (cron + on-upstream-update) with Postgres queue + workers
-- WS5: React shell replacing the vanilla SPA at feature parity + login/setup,
-  SQL workbench (first new surface)
-- WS1: S3/fsspec storage backend
+- ✅ WS7: local auth (users, sessions, RBAC, API tokens, first-run setup, login UI) — **done**
+- ✅ WS5: React + TS shell replacing the vanilla SPA at feature parity + login/setup,
+  SQL workbench (first new surface) — **done**
+- [ ] WS7: OIDC SSO + group→role mapping
+- [ ] WS8: projects with per-project roles; audit v2 (structured, exportable)
+- [ ] WS9: Postgres metadata backend, Docker image + compose, metrics, migrations
+- [ ] WS3: scheduler (cron + on-upstream-update) with Postgres queue + workers
+- [ ] WS1: S3/fsspec storage backend
 
 ### Phase 2 — Pipeline platform (v0.3, ~3 months)
 Competes with "Foundry for pipelines" + basic BI.
