@@ -133,6 +133,9 @@ Key bets, and why:
       registers a repo+ref, checks out/builds from it, PR-preview builds against
       a data branch. CI helper (`laurelin ci check`) validates DAG + expectations
       offline.
+- ✅ **In-browser transform authoring** — a code editor over `pipelines/*.py`
+      (Python + `@sql_transform`), "save query as transform" from the workbench;
+      editor-gated, disableable with `--lock-pipelines`. **done**
 - [ ] **Visual pipeline builder** (later phase): node/edge canvas that emits the
       same Python/SQL files — the visual layer is a *view over code*, never a
       proprietary format.
@@ -248,9 +251,11 @@ Enterprise:
 - [ ] **Projects (spaces)**: datasets/pipelines/ontology/dashboards live in
       projects; per-project role grants (user/group → owner/editor/viewer);
       cross-project references need explicit import grants.
-- [ ] **Fine-grained policies**: row-level security (predicate per
-      group, pushed into every query path incl. SQL workbench) and column
-      masking (hash/redact/null for unauthorized viewers).
+- ◑ **Fine-grained policies**: ✅ per-object-type ontology access (view/edit
+      grants to user/role/group/everyone, with groups) is **done**; still to do:
+      row-level security (predicate per group, pushed into every query path incl.
+      SQL workbench) and column masking, plus dataset-level ACLs so grants confer
+      real data confidentiality (today they gate the ontology layer only).
 - [ ] **Markings (mandatory access control)**: classification labels
       (e.g. PII, CONFIDENTIAL) that *propagate through lineage* — a derived
       dataset inherits input markings; access requires clearance regardless of
