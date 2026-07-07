@@ -107,6 +107,11 @@ export interface PropertyDef {
   description: string;
 }
 
+export interface ObjectTypePermission {
+  can_view: boolean;
+  can_edit: boolean;
+}
+
 export interface ObjectTypeDef {
   api_name: string;
   display_name: string | null;
@@ -115,6 +120,9 @@ export interface ObjectTypeDef {
   primary_key: string;
   title_property: string | null;
   properties: Record<string, PropertyDef>;
+  // Present on responses that are permission-aware (object-types list/detail):
+  // the current user's effective access to this type.
+  permissions?: ObjectTypePermission;
 }
 
 export type Cardinality = "one_to_one" | "one_to_many" | "many_to_many";
@@ -175,4 +183,46 @@ export interface ApiToken {
   username: string | null;
   created_at: string;
   last_used_at: string | null;
+}
+
+// -- Pipeline (transform) authoring -----------------------------------------
+
+export interface PipelineFileInfo {
+  name: string;
+  transforms: string[];
+  error: string | null;
+  bytes: number;
+}
+
+export interface PipelineFileContent {
+  name: string;
+  content: string;
+}
+
+export interface PipelineWriteResult {
+  name: string;
+  transforms: string[];
+  collect_error: string | null;
+}
+
+// -- Groups & ontology permissions ------------------------------------------
+
+export type SubjectKind = "everyone" | "role" | "group" | "user";
+
+export interface Grant {
+  subject_kind: SubjectKind;
+  subject: string;
+  can_view: boolean;
+  can_edit: boolean;
+}
+
+export interface ObjectTypeGrants {
+  object_type: string;
+  grants: Grant[];
+}
+
+export interface Group {
+  name: string;
+  members: string[];
+  created_at?: string;
 }

@@ -345,3 +345,81 @@ def revoke_token(token_id: str, request: Request, user: AuthenticatedUser) -> di
         raise HTTPException(status_code=403, detail="You can only revoke your own tokens")
     auth.revoke_api_token(token_id, actor=user.username)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# /groups (admin) — named groups of users, usable as ontology-permission subjects
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+from laurelin.core.models import utcnow_iso
+
+groups_router = APIRouter(prefix="/groups", tags=["groups"])
+
+_GROUP_RE = _re.compile(r"^[a-z0-9][a-z0-9_.-]{1,31}$")
+
+
+class GroupCreateRequest(BaseModel):
+    name: str
+
+
+class GroupMembersRequest(BaseModel):
+    members: list[str]
+
+
+@groups_router.get("")
+def list_groups(request: Request, admin: Annotated[User, Depends(require_admin)]) -> list[dict]:
+    return request.app.state.store.list_groups()
+
+
+@groups_router.post("")
+def create_group(
+    body: GroupCreateRequest, request: Request, admin: Annotated[User, Depends(require_admin)]
+) -> dict:
+    store: MetadataStore = request.app.state.store
+    name = body.name.strip().lower()
+    if not _GROUP_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid group name: 2-32 chars, lowercase letters/digits/._-",
+        )
+    if store.group_exists(name):
+        raise HTTPException(status_code=409, detail=f"Group already exists: {name!r}")
+    store.create_group(name, utcnow_iso())
+    store.log_audit("group_created", {"name": name}, actor=admin.username)
+    return {"name": name, "members": []}
+
+
+@groups_router.put("/{name}/members")
+def set_group_members(
+    name: str,
+    body: GroupMembersRequest,
+    request: Request,
+    admin: Annotated[User, Depends(require_admin)],
+) -> dict:
+    store: MetadataStore = request.app.state.store
+    if not store.group_exists(name):
+        raise HTTPException(status_code=404, detail=f"Group not found: {name!r}")
+    members = []
+    for u in body.members:
+        if store.get_user(u) is None:
+            raise HTTPException(status_code=400, detail=f"Unknown user: {u!r}")
+        members.append(u.lower())
+    store.set_group_members(name, members)
+    store.log_audit(
+        "group_members_set", {"name": name, "count": len(members)}, actor=admin.username
+    )
+    return {"name": name, "members": sorted(set(members))}
+
+
+@groups_router.delete("/{name}")
+def delete_group(
+    name: str, request: Request, admin: Annotated[User, Depends(require_admin)]
+) -> dict:
+    store: MetadataStore = request.app.state.store
+    if not store.group_exists(name):
+        raise HTTPException(status_code=404, detail=f"Group not found: {name!r}")
+    store.delete_group(name)
+    store.log_audit("group_deleted", {"name": name}, actor=admin.username)
+    return {"ok": True}

@@ -33,6 +33,7 @@ export function ObjectDetail({
   if (!obj) return null;
 
   const propEntries = Object.entries(detail.properties);
+  const canEdit = detail.permissions?.can_edit ?? false;
 
   return (
     <div>
@@ -60,6 +61,7 @@ export function ObjectDetail({
               action={action}
               type={type}
               selectedPk={pk}
+              canEdit={canEdit}
             />
           ))}
         </>

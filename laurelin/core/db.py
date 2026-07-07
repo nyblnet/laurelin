@@ -112,6 +112,25 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at TEXT,
     last_used_at TEXT
 );
+CREATE TABLE IF NOT EXISTS groups (
+    name TEXT PRIMARY KEY COLLATE NOCASE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_name TEXT NOT NULL COLLATE NOCASE,
+    username TEXT NOT NULL COLLATE NOCASE,
+    PRIMARY KEY (group_name, username)
+);
+CREATE TABLE IF NOT EXISTS ontology_grants (
+    id TEXT PRIMARY KEY,
+    object_type TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    can_view INTEGER NOT NULL DEFAULT 0,
+    can_edit INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grants_type ON ontology_grants (object_type);
 """
 
 
@@ -534,6 +553,7 @@ class MetadataStore:
             user_id = row["id"]
             c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             c.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM group_members WHERE username = ?", (username,))
             c.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
     # -- sessions ----------------------------------------------------------------
@@ -632,3 +652,109 @@ class MetadataStore:
     def delete_api_token(self, token_id: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+
+    # -- groups -------------------------------------------------------------------
+
+    def create_group(self, name: str, created_at: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, created_at)
+            )
+
+    def group_exists(self, name: str) -> bool:
+        with self._conn() as c:
+            return (
+                c.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone()
+                is not None
+            )
+
+    def list_groups(self) -> list[dict]:
+        with self._conn() as c:
+            groups = c.execute(
+                "SELECT name, created_at FROM groups ORDER BY name"
+            ).fetchall()
+            out = []
+            for g in groups:
+                members = [
+                    r["username"]
+                    for r in c.execute(
+                        "SELECT username FROM group_members WHERE group_name = ? ORDER BY username",
+                        (g["name"],),
+                    )
+                ]
+                out.append(
+                    {"name": g["name"], "created_at": g["created_at"], "members": members}
+                )
+        return out
+
+    def delete_group(self, name: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
+            c.execute("DELETE FROM groups WHERE name = ?", (name,))
+
+    def set_group_members(self, name: str, usernames: list[str]) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
+            c.executemany(
+                "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?)",
+                [(name, u) for u in usernames],
+            )
+
+    def groups_for_user(self, username: str) -> set[str]:
+        with self._conn() as c:
+            return {
+                r["group_name"]
+                for r in c.execute(
+                    "SELECT group_name FROM group_members WHERE username = ?", (username,)
+                )
+            }
+
+    # -- ontology grants ----------------------------------------------------------
+
+    def list_grants(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM ontology_grants ORDER BY object_type, subject_kind, subject"
+            ).fetchall()
+        return [self._grant_row(r) for r in rows]
+
+    def grants_for_type(self, object_type: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM ontology_grants WHERE object_type = ?", (object_type,)
+            ).fetchall()
+        return [self._grant_row(r) for r in rows]
+
+    @staticmethod
+    def _grant_row(row: sqlite3.Row) -> dict:
+        return {
+            "object_type": row["object_type"],
+            "subject_kind": row["subject_kind"],
+            "subject": row["subject"],
+            "can_view": bool(row["can_view"]),
+            "can_edit": bool(row["can_edit"]),
+        }
+
+    def set_grants_for_type(self, object_type: str, grants: list[dict]) -> None:
+        """Replace all grants for an object type atomically."""
+        import uuid as _uuid
+
+        with self._conn() as c:
+            c.execute("DELETE FROM ontology_grants WHERE object_type = ?", (object_type,))
+            c.executemany(
+                """INSERT INTO ontology_grants
+                   (id, object_type, subject_kind, subject, can_view, can_edit, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        _uuid.uuid4().hex,
+                        object_type,
+                        g["subject_kind"],
+                        g.get("subject", ""),
+                        int(g.get("can_view", False)),
+                        int(g.get("can_edit", False)),
+                        utcnow_iso(),
+                    )
+                    for g in grants
+                ],
+            )

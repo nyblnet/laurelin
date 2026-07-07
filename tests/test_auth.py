@@ -481,14 +481,13 @@ def test_rbac_viewer_cannot_mutate(role_clients):
             files={"file": ("a.csv", b"a\n1\n", "text/csv")},
         ),
         viewer.post("/api/v1/builds", json={}),
-        viewer.post(
-            "/api/v1/ontology/actions/nope/apply", json={"parameters": {}}
-        ),
         viewer.post("/api/v1/tokens", json={"name": "nope"}),
     ]
     for r in checks:
         assert r.status_code == 403, r.request.url
         assert "detail" in r.json()
+    # Viewer denial on ontology action apply (a real action -> 403) is covered
+    # in tests/test_permissions.py; an unknown action here would be 404, not 403.
 
 
 def test_rbac_editor_can_mutate_data_but_not_admin(role_clients):

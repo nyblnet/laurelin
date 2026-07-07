@@ -147,6 +147,22 @@ authenticate with `Authorization: Bearer <token>`; browsers use an httpOnly
 session cookie. For local development, `laurelin serve --no-auth` (or
 `LAURELIN_NO_AUTH=1`) disables auth entirely.
 
+**Fine-grained ontology access.** Beyond the global roles, admins can grant
+per-object-type view/edit access to specific users, groups, roles, or everyone
+(Admin → Ontology access). A type with no grants is open (viewers view, editors
+edit); adding any grant turns it into an allowlist. Admins always have access.
+Note: these grants gate the *ontology layer only* — they are not data
+confidentiality. A user denied an object type can still read the same rows via
+the SQL workbench or the dataset row API. Dataset-level access control is
+future work (see [docs/ROADMAP.md](docs/ROADMAP.md), WS8).
+
+**Transform authoring is code execution.** Writing a pipeline file through the
+UI (the Transforms tab) or API is equivalent to running Python on the server —
+it is `exec`'d on every build. It requires the `editor` role and can be
+disabled entirely with `laurelin serve --lock-pipelines` (or
+`LAURELIN_LOCK_PIPELINES=1`) for untrusted multi-user deployments. The executed
+transform code is not yet sandboxed.
+
 ## Status
 
 Early alpha. The core loop — upload → transform → build → ontology → act — works

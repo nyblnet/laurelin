@@ -9,12 +9,14 @@ from laurelin.transforms.api import (
     transform,
     use_registry,
 )
+from laurelin.transforms.authoring import PipelineFiles
 from laurelin.transforms.builder import Builder
 
 __all__ = [
     "Input",
     "Output",
     "PipelineError",
+    "PipelineFiles",
     "TransformRegistry",
     "TransformSpec",
     "Builder",

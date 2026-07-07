@@ -2,7 +2,6 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { ActionDef } from "../../types";
-import { useAuth } from "../../auth";
 import { ErrorBox } from "../../ui";
 
 /** Coerce a raw form value to the JSON type the parameter expects. */
@@ -30,14 +29,15 @@ export function ActionForm({
   action,
   type,
   selectedPk,
+  canEdit,
 }: {
   action: ActionDef;
   type: string;
   selectedPk: string | null;
+  canEdit: boolean;
 }) {
-  const auth = useAuth();
   const qc = useQueryClient();
-  const canApply = auth.can("editor");
+  const canApply = canEdit;
   const params = Object.entries(action.parameters);
 
   // Raw form state keyed by parameter name. Strings for text/number inputs,
@@ -149,7 +149,9 @@ export function ActionForm({
             {mutation.isPending ? "Applying…" : "Apply"}
           </button>
         ) : (
-          <div className="hint">Applying actions requires the editor role.</div>
+          <div className="hint">
+            Applying actions requires edit access to this object type.
+          </div>
         )}
       </form>
     </div>

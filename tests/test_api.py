@@ -437,11 +437,11 @@ def test_action_validation_errors(client):
     )
     assert r.status_code == 400
 
-    # Unknown action.
+    # Unknown action -> 404 (an unknown resource, like an unknown dataset/type).
     r = client.post(
         "/api/v1/ontology/actions/nope/apply", json={"parameters": {}}
     )
-    assert r.status_code == 400
+    assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------

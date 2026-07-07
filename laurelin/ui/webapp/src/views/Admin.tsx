@@ -21,6 +21,8 @@ import {
   fmtTime,
   type Column,
 } from "../ui";
+import { GroupsSection } from "./admin/GroupsSection";
+import { OntologyAccessSection } from "./admin/OntologyAccessSection";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
 
@@ -450,6 +452,8 @@ export function AdminView() {
         <>
           <UsersSection me={me} />
           <TokensSection />
+          <GroupsSection />
+          <OntologyAccessSection />
         </>
       )}
     </div>

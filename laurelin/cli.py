@@ -87,6 +87,13 @@ def serve(
         "--secure-cookies",
         help="Set the Secure flag on session cookies (use behind HTTPS).",
     ),
+    lock_pipelines: bool = typer.Option(
+        False,
+        "--lock-pipelines",
+        help="Disable in-browser transform authoring (pipeline files can only be "
+        "edited on disk). Recommended for untrusted multi-user deployments, since "
+        "writing a pipeline file is code-execution-equivalent.",
+    ),
 ) -> None:
     """Run the Laurelin API + UI server."""
     ws = _find_workspace(workspace)
@@ -98,7 +105,12 @@ def serve(
         typer.echo("Warning: --no-auth disables authentication; every request is an admin.")
     typer.echo(f"Serving workspace '{ws.name}' ({ws.root}) on http://{host}:{port}")
     uvicorn.run(
-        create_app(ws, no_auth=no_auth, secure_cookies=secure_cookies),
+        create_app(
+            ws,
+            no_auth=no_auth,
+            secure_cookies=secure_cookies,
+            lock_pipelines=lock_pipelines,
+        ),
         host=host,
         port=port,
     )

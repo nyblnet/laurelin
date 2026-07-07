@@ -156,7 +156,10 @@ def collect_transforms(pipelines_dir: Path) -> TransformRegistry:
     if not pipelines_dir.is_dir():
         return registry
     with use_registry(registry):
-        for index, path in enumerate(sorted(pipelines_dir.glob("*.py"))):
+        # Skip dotfiles so a leaked ".<name>-*.py.tmp" style temp from an
+        # interrupted write is never compiled/exec'd.
+        paths = [p for p in sorted(pipelines_dir.glob("*.py")) if not p.name.startswith(".")]
+        for index, path in enumerate(paths):
             namespace = {
                 "__name__": f"laurelin_pipelines.{index}_{path.stem}",
                 "__file__": str(path),

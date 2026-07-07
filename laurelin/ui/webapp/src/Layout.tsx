@@ -12,6 +12,7 @@ import { Badge } from "./ui";
 const NAV = [
   { to: "/datasets", label: "Datasets" },
   { to: "/pipeline", label: "Pipeline" },
+  { to: "/transforms", label: "Transforms" },
   { to: "/ontology", label: "Ontology" },
   { to: "/workbench", label: "SQL" },
   { to: "/audit", label: "Audit" },

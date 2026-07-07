@@ -222,3 +222,45 @@ class User(BaseModel):
     role: Role = Role.viewer
     created_at: str = Field(default_factory=utcnow_iso)
     disabled: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Groups & fine-grained ontology permissions
+# ---------------------------------------------------------------------------
+
+class GroupInfo(BaseModel):
+    name: str
+    members: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utcnow_iso)
+
+
+class SubjectKind(str, Enum):
+    everyone = "everyone"  # any authenticated user
+    role = "role"          # a global role name (viewer/editor/admin)
+    group = "group"        # a named group
+    user = "user"          # a specific username
+
+
+class Grant(BaseModel):
+    """A single access grant on an object type. ``subject`` is empty for
+    ``everyone``, else the role name / group name / username."""
+
+    subject_kind: SubjectKind
+    subject: str = ""
+    can_view: bool = False
+    can_edit: bool = False  # edit implies view
+
+    def normalized_subject(self) -> str:
+        return self.subject.strip().lower() if self.subject_kind != SubjectKind.everyone else ""
+
+
+class ObjectTypeGrants(BaseModel):
+    object_type: str
+    grants: list[Grant] = Field(default_factory=list)
+
+
+class ObjectTypePermission(BaseModel):
+    """The effective permission a specific user has on an object type."""
+
+    can_view: bool
+    can_edit: bool

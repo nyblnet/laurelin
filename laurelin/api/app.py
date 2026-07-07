@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 import laurelin
 from laurelin.api.auth_routes import (
     auth_router,
+    groups_router,
     resolve_credential,
     tokens_router,
     users_router,
@@ -44,9 +45,14 @@ def _exc_message(exc: BaseException) -> str:
 
 
 def create_app(
-    workspace: Workspace, *, no_auth: bool = False, secure_cookies: bool = False
+    workspace: Workspace,
+    *,
+    no_auth: bool = False,
+    secure_cookies: bool = False,
+    lock_pipelines: bool = False,
 ) -> FastAPI:
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
+    lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
     store = MetadataStore(workspace.metadata_path)
     catalog = DatasetCatalog(workspace, store)
 
@@ -61,6 +67,7 @@ def create_app(
     app.state.catalog = catalog
     app.state.no_auth = no_auth
     app.state.secure_cookies = secure_cookies
+    app.state.lock_pipelines = lock_pipelines
     app.state.auth = AuthService(store)
 
     @app.middleware("http")
@@ -115,6 +122,7 @@ def create_app(
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(tokens_router, prefix="/api/v1")
+    app.include_router(groups_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

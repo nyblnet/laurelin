@@ -253,16 +253,58 @@ GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset
 POST /api/v1/builds                           {targets?: [str]} -> BuildInfo (synchronous)
 GET  /api/v1/builds                           -> [BuildInfo]
 GET  /api/v1/builds/{id}                      -> BuildInfo
-GET  /api/v1/ontology/object-types            -> [ObjectTypeDef]
-GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions for it
+GET  /api/v1/ontology/object-types            -> [ObjectTypeDef]  (only viewable
+                                 types; each carries permissions:{can_view,can_edit})
+GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions +
+                                 permissions:{can_view,can_edit}  (403 if not viewable)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
-                                              -> {"objects":[...],"total":N}
+                                              -> {"objects":[...],"total":N}  (403 if not viewable)
 GET  /api/v1/ontology/objects/{type}/{pk}     -> object dict (404 if absent)
 GET  /api/v1/ontology/objects/{type}/{pk}/links/{link} -> {"objects":[...]}
-GET  /api/v1/ontology/actions                 -> [ActionDef]
-POST /api/v1/ontology/actions/{name}/apply    {pk?: str, parameters: {...}} -> ObjectEdit
+GET  /api/v1/ontology/actions                 -> [ActionDef]  (viewable types only)
+POST /api/v1/ontology/actions/{name}/apply    {pk?, parameters} -> ObjectEdit  (needs edit)
+GET  /api/v1/ontology/permissions             -> [{object_type, grants:[Grant]}]  (admin)
+PUT  /api/v1/ontology/permissions/{type}      {grants:[Grant]} -> {object_type,grants}  (admin)
+GET  /api/v1/groups                           -> [{name, members:[username]}]  (admin)
+POST /api/v1/groups                           {name} -> {name, members:[]}  (admin)
+PUT  /api/v1/groups/{name}/members            {members:[username]} -> {name,members}  (admin)
+DELETE /api/v1/groups/{name}                  -> {ok:true}  (admin)
+GET  /api/v1/pipelines                        -> [{name, transforms:[str], error, bytes}]  (viewer)
+GET  /api/v1/pipelines/{name}                 -> {name, content}  (viewer)
+PUT  /api/v1/pipelines/{name}                 {content} -> {name,transforms,collect_error}  (editor)
+DELETE /api/v1/pipelines/{name}               -> {ok:true}  (editor)
+POST /api/v1/pipelines/from-query             {sql, output, name?} -> {name,...}  (editor)
 GET  /api/v1/audit?limit=                     -> [AuditEvent]
 ```
+
+**Grant** = `{subject_kind: "everyone"|"role"|"group"|"user", subject: str,
+can_view: bool, can_edit: bool}` (`subject` empty for `everyone`).
+
+#### Fine-grained ontology permissions (`laurelin/core/permissions.py`)
+
+Each object type has a list of grants. Model: **admins bypass**; a type with
+**no grants** inherits global RBAC (any authed user views, editor+ edits — so
+existing workspaces are unchanged); a type with **any grant** becomes an
+allowlist — a user may view/edit only via a matching grant (by everyone / their
+role / a group they belong to / their username), and `can_edit` implies view.
+Grants both restrict (hide a type) and elevate (let a specific viewer edit one
+type). Enforced at the route layer: object reads need view, action apply needs
+edit, listings are filtered. Groups are named user sets, admin-managed, usable
+as a grant subject. **Scope:** grants gate the ontology layer only — they are
+not dataset confidentiality. A user denied an object type can still read the
+same rows via `/query` or `/datasets/{name}/rows`. Per-dataset ACLs are WS8.
+
+#### Pipeline (transform) authoring (`laurelin/transforms/authoring.py`)
+
+`PipelineFiles` reads/writes `pipelines/*.py`. **SECURITY:** writing a pipeline
+file is code-execution-equivalent (it is `exec`'d on every build/collection).
+Reads are viewer; writes/deletes are editor; the whole surface is disabled by
+`serve --lock-pipelines` / `LAURELIN_LOCK_PIPELINES=1`. Writes validate syntax
+(`compile`) before an atomic write and return the file's transforms plus any
+cross-file `collect_error` (e.g. a duplicate output). Module names must match
+`^[a-z][a-z0-9_]*$` (no paths/dots — no traversal). `from-query` wraps a
+workbench SQL query as a `@sql_transform`, auto-detecting input datasets by
+name. Executed transform code is **not** sandboxed (a roadmap item).
 
 ### `laurelin/ui/static` — single-page app
 
