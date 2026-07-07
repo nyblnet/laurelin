@@ -1,0 +1,411 @@
+import { useMemo, useState } from "react";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { API, api } from "../api";
+import { useAuth } from "../auth";
+import type {
+  Build,
+  BuildStatus,
+  LineageGraph,
+  LineageNode,
+  TransformSummary,
+} from "../types";
+import {
+  Badge,
+  Column,
+  DataTable,
+  EmptyState,
+  ErrorBox,
+  PageHeader,
+  Spinner,
+  fmtNum,
+  fmtTime,
+} from "../ui";
+
+// ------------------------------------------------------------------ helpers
+
+function statusTone(status: BuildStatus): "green" | "red" | "blue" {
+  if (status === "succeeded") return "green";
+  if (status === "failed") return "red";
+  return "blue"; // running | pending
+}
+
+function truncate(s: string, max = 22): string {
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function shortId(id: string): string {
+  return id.length > 12 ? id.slice(0, 12) : id;
+}
+
+// ------------------------------------------------------------- lineage graph
+
+const LAYER_W = 190;
+const ROW_H = 64;
+const MARGIN_X = 40;
+const MARGIN_Y = 32;
+const NODE_W = 140;
+const NODE_H = 40;
+
+interface Placed {
+  node: LineageNode;
+  layer: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * Assign each node a layer = longest path (in edges) from any source node.
+ * Cycle-safe: a `visiting` set turns back-edges into a 0-contribution so we
+ * never recurse infinitely. Results are memoized per node.
+ */
+function computeLayers(graph: LineageGraph): Map<string, number> {
+  const incoming = new Map<string, string[]>();
+  const ids = new Set(graph.nodes.map((n) => n.id));
+  for (const n of graph.nodes) incoming.set(n.id, []);
+  for (const e of graph.edges) {
+    if (ids.has(e.from) && ids.has(e.to)) {
+      incoming.get(e.to)!.push(e.from);
+    }
+  }
+
+  const memo = new Map<string, number>();
+  const visiting = new Set<string>();
+
+  const layerOf = (id: string): number => {
+    const cached = memo.get(id);
+    if (cached !== undefined) return cached;
+    if (visiting.has(id)) return 0; // back-edge: contribute nothing
+    visiting.add(id);
+    let best = 0;
+    for (const src of incoming.get(id) ?? []) {
+      best = Math.max(best, layerOf(src) + 1);
+    }
+    visiting.delete(id);
+    memo.set(id, best);
+    return best;
+  };
+
+  for (const n of graph.nodes) layerOf(n.id);
+  return memo;
+}
+
+function layout(graph: LineageGraph): {
+  placed: Placed[];
+  byId: Map<string, Placed>;
+  width: number;
+  height: number;
+} {
+  const layers = computeLayers(graph);
+  // Group nodes by layer, preserving input order for stable stacking.
+  const byLayer = new Map<number, LineageNode[]>();
+  let maxLayer = 0;
+  for (const n of graph.nodes) {
+    const l = layers.get(n.id) ?? 0;
+    maxLayer = Math.max(maxLayer, l);
+    if (!byLayer.has(l)) byLayer.set(l, []);
+    byLayer.get(l)!.push(n);
+  }
+
+  let maxRows = 0;
+  for (const nodes of byLayer.values()) maxRows = Math.max(maxRows, nodes.length);
+
+  const placed: Placed[] = [];
+  const byId = new Map<string, Placed>();
+  for (let l = 0; l <= maxLayer; l++) {
+    const nodes = byLayer.get(l) ?? [];
+    // Center this layer's stack vertically within the tallest layer.
+    const offset = ((maxRows - nodes.length) * ROW_H) / 2;
+    nodes.forEach((node, i) => {
+      const x = MARGIN_X + l * LAYER_W;
+      const y = MARGIN_Y + offset + i * ROW_H;
+      const p: Placed = { node, layer: l, x, y };
+      placed.push(p);
+      byId.set(node.id, p);
+    });
+  }
+
+  const width = MARGIN_X * 2 + maxLayer * LAYER_W + NODE_W;
+  const height = MARGIN_Y * 2 + Math.max(1, maxRows) * ROW_H;
+  return { placed, byId, width, height };
+}
+
+function LineageGraphView({ graph }: { graph: LineageGraph }) {
+  const { placed, byId, width, height } = useMemo(() => layout(graph), [graph]);
+
+  if (graph.nodes.length === 0) {
+    return <EmptyState>No lineage yet — run a build.</EmptyState>;
+  }
+
+  return (
+    <div className="lineage">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        width={width}
+        height={height}
+        role="img"
+        aria-label="Transform lineage graph"
+      >
+        <defs>
+          <marker
+            id="lineage-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--border-2)" />
+          </marker>
+        </defs>
+
+        {graph.edges.map((e, i) => {
+          const from = byId.get(e.from);
+          const to = byId.get(e.to);
+          if (!from || !to) return null;
+          const x1 = from.x + NODE_W;
+          const y1 = from.y + NODE_H / 2;
+          const x2 = to.x;
+          const y2 = to.y + NODE_H / 2;
+          const dx = Math.max(30, (x2 - x1) / 2);
+          const d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+          return (
+            <path
+              key={i}
+              className="edge"
+              d={d}
+              markerEnd="url(#lineage-arrow)"
+            />
+          );
+        })}
+
+        {placed.map((p) => {
+          const isTransform = p.node.type === "transform";
+          return (
+            <g key={p.node.id}>
+              <rect
+                className={isTransform ? "node-transform" : "node-dataset"}
+                x={p.x}
+                y={p.y}
+                width={NODE_W}
+                height={NODE_H}
+                rx={isTransform ? 16 : 8}
+              />
+              <text
+                className="node-label"
+                x={p.x + NODE_W / 2}
+                y={p.y + NODE_H / 2}
+                textAnchor="middle"
+                dominantBaseline="central"
+              >
+                {truncate(p.node.id, 18)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// -------------------------------------------------------------- build card
+
+function BuildCard({ build }: { build: Build }) {
+  const [open, setOpen] = useState(false);
+
+  const taskColumns: Column<Build["tasks"][number]>[] = [
+    {
+      label: "Transform",
+      className: "mono",
+      render: (t) => t.transform_name,
+    },
+    {
+      label: "Status",
+      render: (t) => <Badge tone={statusTone(t.status)}>{t.status}</Badge>,
+    },
+    {
+      label: "Rows",
+      className: "num",
+      render: (t) => fmtNum(t.rows_written),
+    },
+    {
+      label: "Version",
+      className: "mono",
+      render: (t) => (t.output_version == null ? "—" : `v${t.output_version}`),
+    },
+    {
+      label: "Error",
+      render: (t) =>
+        t.error ? <span style={{ color: "var(--red)" }}>{t.error}</span> : "",
+    },
+  ];
+
+  return (
+    <div className="card">
+      <div
+        className="clickable"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          cursor: "pointer",
+        }}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="dim" style={{ width: 12 }}>
+          {open ? "▾" : "▸"}
+        </span>
+        <span className="mono">{shortId(build.id)}</span>
+        <Badge tone={statusTone(build.status)}>{build.status}</Badge>
+        <span className="dim">{fmtTime(build.started_at)}</span>
+        <span className="dim" style={{ marginLeft: "auto" }}>
+          {build.targets.length > 0 ? build.targets.join(", ") : "all targets"}
+        </span>
+      </div>
+
+      {build.error && (
+        <div style={{ color: "var(--red)", marginTop: 8 }}>{build.error}</div>
+      )}
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {build.tasks.length === 0 ? (
+            <EmptyState>No tasks.</EmptyState>
+          ) : (
+            <DataTable
+              columns={taskColumns}
+              rows={build.tasks}
+              rowKey={(t, i) => `${t.transform_name}-${i}`}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------- view
+
+export function PipelineView() {
+  const auth = useAuth();
+  const qc = useQueryClient();
+
+  const lineageQ = useQuery({
+    queryKey: ["lineage"],
+    queryFn: () => api.get<LineageGraph>(`${API}/lineage`),
+  });
+
+  const transformsQ = useQuery({
+    queryKey: ["transforms"],
+    queryFn: () => api.get<TransformSummary[]>(`${API}/transforms`),
+  });
+
+  const buildsQ = useQuery({
+    queryKey: ["builds"],
+    queryFn: () => api.get<Build[]>(`${API}/builds`),
+    staleTime: 15_000,
+  });
+
+  const runBuild = useMutation({
+    mutationFn: () => api.post<Build>(`${API}/builds`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["builds"] });
+      qc.invalidateQueries({ queryKey: ["lineage"] });
+    },
+  });
+
+  const canEdit = auth.can("editor");
+
+  const actions = canEdit ? (
+    <button
+      className="primary"
+      disabled={runBuild.isPending}
+      onClick={() => runBuild.mutate()}
+    >
+      {runBuild.isPending ? "Building…" : "Run build"}
+    </button>
+  ) : (
+    <span className="dim">Viewer — builds are read-only.</span>
+  );
+
+  const transformColumns: Column<TransformSummary>[] = [
+    { label: "Name", className: "mono", render: (t) => t.name },
+    {
+      label: "Kind",
+      render: (t) => (
+        <Badge tone={t.kind === "sql" ? "gold" : "blue"}>{t.kind}</Badge>
+      ),
+    },
+    {
+      label: "Inputs",
+      className: "dim",
+      render: (t) => (t.inputs.length > 0 ? t.inputs.join(", ") : "—"),
+    },
+    { label: "Output", className: "mono", render: (t) => t.output },
+  ];
+
+  return (
+    <div>
+      <PageHeader
+        title="Pipeline"
+        subtitle="Transform DAG and build history."
+        actions={actions}
+      />
+
+      {runBuild.isError && <ErrorBox error={runBuild.error} />}
+
+      {/* ----------------------------------------------------- lineage */}
+      <section style={{ marginTop: 16 }}>
+        <h2>Lineage</h2>
+        {lineageQ.isLoading ? (
+          <Spinner />
+        ) : lineageQ.isError ? (
+          <ErrorBox error={lineageQ.error} />
+        ) : (
+          <LineageGraphView graph={lineageQ.data!} />
+        )}
+      </section>
+
+      {/* -------------------------------------------------- transforms */}
+      <section style={{ marginTop: 24 }}>
+        <h2>Transforms</h2>
+        {transformsQ.isLoading ? (
+          <Spinner />
+        ) : transformsQ.isError ? (
+          <ErrorBox error={transformsQ.error} />
+        ) : transformsQ.data!.length === 0 ? (
+          <EmptyState>No transforms defined.</EmptyState>
+        ) : (
+          <DataTable
+            columns={transformColumns}
+            rows={transformsQ.data!}
+            rowKey={(t) => t.name}
+          />
+        )}
+      </section>
+
+      {/* ------------------------------------------------ build history */}
+      <section style={{ marginTop: 24 }}>
+        <h2>Build history</h2>
+        {buildsQ.isLoading ? (
+          <Spinner />
+        ) : buildsQ.isError ? (
+          <ErrorBox error={buildsQ.error} />
+        ) : buildsQ.data!.length === 0 ? (
+          <EmptyState>No builds yet.</EmptyState>
+        ) : (
+          <div style={{ display: "grid", gap: 10, marginTop: 8 }}>
+            {/* The API returns builds newest-first (ORDER BY rowid DESC). */}
+            {buildsQ.data!.map((b) => (
+              <BuildCard key={b.id} build={b} />
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}

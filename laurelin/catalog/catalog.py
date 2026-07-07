@@ -177,6 +177,47 @@ class DatasetCatalog:
             {col: _json_safe(val) for col, val in zip(columns, row)} for row in data
         ]
 
+    # -- ad-hoc query ---------------------------------------------------------
+
+    def query(self, sql: str, max_rows: int = 1000) -> dict:
+        """Run a read-only SQL query with every dataset's latest version exposed
+        as a view named after the dataset. Returns
+        ``{columns, rows, row_count, truncated}`` with JSON-safe values.
+
+        The connection is read-only over parquet views, so a query can read any
+        dataset but cannot mutate stored data. ``max_rows`` caps the result;
+        ``truncated`` reports whether more rows were available.
+        """
+        con = duckdb.connect()
+        try:
+            for ds in self.store.list_datasets():
+                if ds.latest_version is None:
+                    continue
+                # Register each dataset's latest version as an in-memory Arrow
+                # table rather than a file-backed view. Combined with disabling
+                # external access below, this means arbitrary user SQL can read
+                # the workspace's datasets but cannot touch the filesystem
+                # (no read_csv('/etc/passwd'), no COPY ... TO, no path traversal).
+                con.register(ds.name, self.read(ds.name))
+            # Lock down all filesystem/network access for the untrusted query.
+            con.execute("SET enable_external_access=false")
+            cur = con.execute(sql)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            data = cur.fetchmany(max_rows + 1)
+            truncated = len(data) > max_rows
+            data = data[:max_rows]
+        finally:
+            con.close()
+        rows = [
+            {col: _json_safe(val) for col, val in zip(columns, row)} for row in data
+        ]
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
+
     # -- file uploads ---------------------------------------------------------
 
     def upload_file(self, name: str, path: Path, description: str = "") -> DatasetVersionInfo:

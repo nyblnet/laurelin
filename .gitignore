@@ -11,6 +11,11 @@ htmlcov/
 
 .claude/
 
+# Web app: track source, ignore installed deps. The built bundle lands in
+# laurelin/ui/static/index.html (committed, shipped in the package).
+node_modules/
+laurelin/ui/webapp/tsconfig.tsbuildinfo
+
 # Laurelin workspaces created during local development
 /demo-workspace/
 /workspace/

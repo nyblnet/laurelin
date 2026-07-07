@@ -116,6 +116,11 @@ class ActionApplyRequest(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
 
 
+class QueryRequest(BaseModel):
+    sql: str
+    max_rows: int = Field(default=1000, ge=1, le=100_000)
+
+
 # ---------------------------------------------------------------------------
 # Workspace
 # ---------------------------------------------------------------------------
@@ -177,6 +182,16 @@ def get_dataset_rows(
     info = _version_info(store, name, version)
     rows = catalog.rows(name, limit=limit, offset=offset, version=version)
     return {"rows": rows, "row_count": info.row_count}
+
+
+@router.post("/query", dependencies=[VIEWER])
+def run_query(body: QueryRequest, catalog: CatalogDep) -> dict:
+    """Run a read-only SQL query over the workspace's datasets (each exposed as
+    a view named after the dataset). A syntax or binder error becomes a 400."""
+    try:
+        return catalog.query(body.sql, max_rows=body.max_rows)
+    except Exception as exc:  # duckdb parser/binder/runtime errors
+        raise HTTPException(status_code=400, detail=str(exc).strip())
 
 
 @router.post("/datasets/{name}/upload", dependencies=[EDITOR])

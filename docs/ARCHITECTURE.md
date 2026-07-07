@@ -244,6 +244,8 @@ POST /api/v1/datasets                         {name, description?} -> DatasetInf
 GET  /api/v1/datasets/{name}                  -> DatasetInfo + versions: [DatasetVersionInfo]
 GET  /api/v1/datasets/{name}/schema?version=  -> [ColumnSchema]
 GET  /api/v1/datasets/{name}/rows?limit=&offset=&version= -> {"rows":[...],"row_count":N}
+POST /api/v1/query        {sql, max_rows?} -> {columns,rows,row_count,truncated}
+                                 (read-only DuckDB; each dataset is a view; viewer+)
 POST /api/v1/datasets/{name}/upload           multipart file (.csv/.parquet) -> DatasetVersionInfo
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
