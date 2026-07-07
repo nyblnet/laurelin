@@ -143,9 +143,96 @@ Construct catalog/store once; build registry + ontology **per request group**
 (cheap; re-reads pipelines/ontology so edits show up without restart — use
 FastAPI dependencies). Static UI mounted at `/` (html=True) from
 `laurelin/ui/static`; API under `/api/v1`; docs at `/docs`. CORS: allow all.
-Auth: if env `LAURELIN_TOKEN` is set, every `/api/` request requires
-`Authorization: Bearer <token>` (middleware; 401 otherwise). `actor` for
-audit/edits = `X-Laurelin-User` header or "anonymous".
+Auth: see **Authentication & authorization** below. `actor` for
+audit/edits = the authenticated username (or `X-Laurelin-User` header /
+"anonymous" only in `--no-auth` mode).
+
+#### Authentication & authorization
+
+Auth state lives in `metadata.db` (new tables, managed by `MetadataStore`):
+
+```sql
+users(id TEXT PK, username TEXT UNIQUE COLLATE NOCASE, password_hash TEXT,
+      role TEXT CHECK(role IN ('viewer','editor','admin')), created_at TEXT,
+      disabled INTEGER DEFAULT 0)
+sessions(token_hash TEXT PK, user_id TEXT, created_at TEXT, expires_at TEXT)
+api_tokens(id TEXT PK, name TEXT, token_hash TEXT UNIQUE, user_id TEXT,
+           created_at TEXT, last_used_at TEXT)
+```
+
+`laurelin/core/auth.py` provides:
+- `hash_password` / `verify_password` — stdlib `hashlib.scrypt` (n=2**14, r=8,
+  p=1, 16-byte random salt), format `scrypt$<n>$<r>$<p>$<salt_hex>$<hash_hex>`;
+  verify with `secrets.compare_digest` (via `hmac.compare_digest`).
+- `new_token() -> str` — `secrets.token_urlsafe(32)`; stored only as
+  `sha256(token).hexdigest()`.
+- `AuthService(store)` — `create_user`, `authenticate(username, password)`
+  (constant-time-ish: always run scrypt even for unknown users; in-memory
+  throttle: ≥5 consecutive failures per username → locked 30s → return
+  "throttled" sentinel), `login() -> (session_token, User)` (7-day expiry),
+  `logout(token)`, `resolve_session(token) -> User|None` (checks expiry +
+  disabled), `resolve_api_token(token) -> User|None` (updates last_used_at),
+  user/token management helpers. Expired sessions are purged opportunistically.
+
+`User` pydantic model in core/models.py: `id, username, role, created_at,
+disabled` (never expose password_hash through the API). Roles are ordered
+`viewer < editor < admin`.
+
+**Modes.** Auth is ON by default. `laurelin serve --no-auth` (or env
+`LAURELIN_NO_AUTH=1`) disables it for local development — `/api/v1/auth/status`
+then reports `{"auth_required": false}` and every request acts as an implicit
+admin. With auth on and **zero users**, the server is in *setup mode*: every
+data endpoint returns 401 `{"detail": "setup required"}`; only
+`/api/v1/auth/status` and `POST /api/v1/auth/setup` (creates the first admin,
+409 once any user exists) are reachable. The old `LAURELIN_TOKEN` env mechanism
+is REMOVED.
+
+**Credentials.** Either an httpOnly session cookie `laurelin_session`
+(SameSite=Lax, Path=/, Max-Age 7d; `Secure` when `--secure-cookies` or
+`X-Forwarded-Proto: https`) or `Authorization: Bearer <api-token>`. Static UI
+files, `/health`, and auth endpoints listed below stay reachable without
+credentials; `/docs`, `/redoc`, `/openapi.json` and all other `/api/` routes
+require auth (when enabled).
+
+**CSRF.** Mutating requests (POST/PUT/PATCH/DELETE) authenticated via session
+cookie: if an `Origin` header is present it must match the request host, else
+403. Bearer-token requests are exempt (no ambient credential).
+
+**RBAC.** viewer: all GETs. editor: viewer + POST datasets / upload / builds /
+action apply. admin: editor + user & token management. Enforced via a
+`require_role(...)` dependency; violations → 403 `{"detail": ...}`.
+
+Auth endpoints (under `/api/v1/auth`, all except status/setup/login require a
+valid credential):
+
+```
+GET  /api/v1/auth/status   -> {"auth_required": bool, "setup_required": bool,
+                               "user": User|null}          (never 401)
+POST /api/v1/auth/setup    {username, password} -> User    (only in setup mode, else 409)
+POST /api/v1/auth/login    {username, password} -> User + Set-Cookie
+                           (401 bad creds/disabled, 429 throttled)
+POST /api/v1/auth/logout   -> {"ok": true} + cookie cleared
+GET  /api/v1/auth/me       -> User
+GET  /api/v1/users                       -> [User]                       (admin)
+POST /api/v1/users         {username, password, role} -> User           (admin)
+PATCH /api/v1/users/{username}  {role?, password?, disabled?} -> User   (admin;
+                           an admin cannot disable/demote themselves)
+DELETE /api/v1/users/{username}          -> {"ok": true}                (admin, not self)
+GET  /api/v1/tokens        -> own tokens (admin: all) [{id,name,username,created_at,last_used_at}]
+POST /api/v1/tokens        {name} -> {id, name, token}   (token shown ONCE; editor+)
+DELETE /api/v1/tokens/{id} -> {"ok": true}   (own; admin: any)
+```
+
+Password rules: min 8 chars (400 otherwise). Usernames: `^[a-z0-9_.-]{2,32}$`
+case-insensitive-unique. Login failures and lockouts, user create/update/delete,
+token create/revoke are all audit-logged (never log passwords or tokens).
+
+CLI: `laurelin users create USERNAME [--role r] [--password p]` (hidden prompt
+when --password omitted; first user may also be created this way), `users list`,
+`users passwd USERNAME`, `users role USERNAME ROLE`, `users disable|enable USERNAME`,
+`users delete USERNAME`; `laurelin tokens create NAME --user USERNAME` (prints
+token once), `tokens list`, `tokens revoke ID`; `laurelin serve --no-auth
+--secure-cookies`.
 
 REST endpoints (all JSON; errors as `{"detail": str}` with 400/404):
 
