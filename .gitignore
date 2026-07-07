@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Laurelin workspaces created during local development
+/demo-workspace/
+/workspace/
+*.db-journal
+.DS_Store

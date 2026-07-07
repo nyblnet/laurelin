@@ -1,0 +1,152 @@
+# Laurelin
+
+**An open, ontology-driven data platform.** Laurelin gives you the core ideas of
+platforms like Palantir Foundry — versioned datasets, code-based transforms with
+automatic lineage, and a semantic ontology layer with objects, links, and actions —
+built entirely on open formats and open APIs, with no lock-in of any kind.
+
+> *Laurelin was the golden of the Two Trees of Valinor, whose light was gathered
+> and shared rather than hoarded.*
+
+## Why "more open"?
+
+| | Proprietary data platforms | Laurelin |
+|---|---|---|
+| License | Closed source | Apache-2.0 |
+| Data at rest | Proprietary stores | **Parquet** files on disk — readable by pandas, DuckDB, Spark, anything |
+| Metadata | Opaque services | A single **SQLite** database you can query directly |
+| Ontology definitions | GUI-managed, exported with difficulty | Plain **YAML** files in your repo, diffable and code-reviewable |
+| Pipelines | Platform-hosted code | Plain **Python** files; run them anywhere |
+| API | Partially documented | **REST + OpenAPI** (`/docs`), generated from source |
+| Deployment | SaaS / heavyweight | `pip install`, local-first, single process |
+| Exit cost | High | `cp -r` your workspace directory. That's it. |
+
+Everything Laurelin knows lives in one **workspace directory** of ordinary files.
+Delete the tool and your data, lineage, and ontology are still readable.
+
+## Concepts
+
+Laurelin maps one-to-one onto the concepts you may know from Foundry:
+
+- **Datasets** — versioned tables stored as Parquet. Every write creates an
+  immutable new version; the full history is kept.
+- **Transforms** — Python functions (or SQL) declared with `@transform`,
+  reading input datasets and producing an output dataset. Laurelin resolves the
+  DAG, executes builds, and records **lineage** automatically.
+- **Ontology** — YAML-defined *object types* (e.g. `aircraft`, `flight`) backed by
+  datasets, with typed properties, *link types* between them, and *actions* —
+  validated write-back operations recorded as an edit overlay and audit log.
+- **Builds & lineage** — every build is recorded; the lineage graph is queryable
+  via API and rendered in the UI.
+- **Audit** — mutations through the API are written to an audit log.
+
+## Quickstart
+
+```bash
+pip install -e ".[dev]"
+
+# Create a demo workspace with sample data, a pipeline, and an ontology
+laurelin demo demo-workspace
+
+# Run the pipeline (executes the transform DAG, records lineage)
+laurelin build --workspace demo-workspace
+
+# Serve the API + web UI
+laurelin serve --workspace demo-workspace
+# UI:      http://127.0.0.1:8787
+# OpenAPI: http://127.0.0.1:8787/docs
+```
+
+Or start from scratch:
+
+```bash
+laurelin init my-workspace --name "My project"
+laurelin upload my_dataset data.csv --workspace my-workspace
+```
+
+Then write a pipeline in `my-workspace/pipelines/`:
+
+```python
+from laurelin.transforms import transform, sql_transform, Input, Output
+
+@transform(output=Output("clean_orders"), orders=Input("raw_orders"))
+def clean_orders(orders):
+    # orders is a pyarrow.Table; return a pyarrow.Table
+    import pyarrow.compute as pc
+    return orders.filter(pc.is_valid(orders["order_id"]))
+
+@sql_transform(
+    output=Output("orders_by_region"),
+    inputs={"o": Input("clean_orders")},
+    query="SELECT region, count(*) AS n, sum(amount) AS total FROM o GROUP BY region",
+)
+def orders_by_region(): ...
+```
+
+And an ontology in `my-workspace/ontology/*.yml`:
+
+```yaml
+object_types:
+  - api_name: order
+    display_name: Order
+    backing_dataset: clean_orders
+    primary_key: order_id
+    title_property: order_id
+    properties:
+      order_id: { type: string }
+      region:   { type: string }
+      amount:   { type: float }
+
+actions:
+  - api_name: flag_order
+    display_name: Flag order for review
+    object_type: order
+    kind: update
+    parameters:
+      review_status: { type: string, required: true }
+```
+
+## Workspace layout
+
+```
+my-workspace/
+├── laurelin.yml      # workspace config
+├── metadata.db       # SQLite: versions, builds, lineage, edits, audit
+├── data/             # <dataset>/v<N>/data.parquet  (immutable versions)
+├── pipelines/        # your transform code (plain Python)
+└── ontology/         # object types, links, actions (plain YAML)
+```
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                     Web UI (static)                  │
+├──────────────────────────────────────────────────────┤
+│                REST API (FastAPI, /docs)             │
+├────────────┬──────────────┬──────────────────────────┤
+│  Catalog   │  Transforms  │  Ontology                │
+│  versioned │  DAG builder │  objects / links /       │
+│  datasets  │  + lineage   │  actions + edit overlay  │
+├────────────┴──────────────┴──────────────────────────┤
+│   Parquet (data)  ·  SQLite (metadata)  ·  DuckDB    │
+│                    (query engine)                    │
+└──────────────────────────────────────────────────────┘
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module-level detail.
+
+## Security
+
+Local-first and open by default. Set `LAURELIN_TOKEN` to require
+`Authorization: Bearer <token>` on all `/api/` routes when exposing a server
+beyond localhost.
+
+## Status
+
+Early alpha. The core loop — upload → transform → build → ontology → act — works
+end to end; expect rough edges and breaking changes.
+
+## License
+
+[Apache-2.0](LICENSE)
