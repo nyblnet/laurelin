@@ -248,14 +248,19 @@ Enterprise:
 
 ### WS8 — Governance & authorization (Foundry: Projects/markings/checkpoints)
 
-- [ ] **Projects (spaces)**: datasets/pipelines/ontology/dashboards live in
-      projects; per-project role grants (user/group → owner/editor/viewer);
-      cross-project references need explicit import grants.
-- ◑ **Fine-grained policies**: ✅ per-object-type ontology access (view/edit
-      grants to user/role/group/everyone, with groups) is **done**; still to do:
-      row-level security (predicate per group, pushed into every query path incl.
-      SQL workbench) and column masking, plus dataset-level ACLs so grants confer
-      real data confidentiality (today they gate the ontology layer only).
+- ✅ **Multi-workspace hosting** (`serve --root`): one server hosts many isolated
+      workspaces with global identity + per-workspace membership roles and a
+      superadmin tier. This is the tenancy/organization unit we shipped instead of
+      in-workspace "projects". **done**
+- [ ] **Projects (spaces) within a workspace**: a finer org unit *inside* a
+      workspace (datasets/pipelines/ontology grouped, per-project grants). Still
+      open — multi-workspace covers coarse-grained tenancy; projects would add
+      intra-workspace structure.
+- ◑ **Fine-grained policies**: ✅ per-object-type ontology access AND ✅
+      per-dataset ACLs (view/edit grants to user/role/group/everyone, with
+      groups) are **done** — dataset grants confer real data confidentiality
+      (enforced on rows + the SQL workbench) and compose with ontology grants.
+      Still to do: row-level security (predicate per group) and column masking.
 - [ ] **Markings (mandatory access control)**: classification labels
       (e.g. PII, CONFIDENTIAL) that *propagate through lineage* — a derived
       dataset inherits input markings; access requires clearance regardless of
