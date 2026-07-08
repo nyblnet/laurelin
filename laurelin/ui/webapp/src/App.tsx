@@ -21,6 +21,7 @@ import { OntologyView } from "./views/Ontology";
 import { WorkbenchView } from "./views/Workbench";
 import { AuditView } from "./views/Audit";
 import { AdminView } from "./views/Admin";
+import { WorkspacesView } from "./views/Workspaces";
 
 export function App() {
   const auth = useAuth();
@@ -50,25 +51,64 @@ export function App() {
   if (auth.authRequired && auth.setupRequired) return <SetupScreen />;
   if (auth.authRequired && !auth.user) return <LoginScreen />;
 
+  // Multi-workspace: a signed-in user with no workspace access gets a clear
+  // dead-end (only a superadmin can grant them membership).
+  if (auth.multi && !auth.isSuperadmin && auth.workspaces.length === 0) {
+    return <NoWorkspaceAccess />;
+  }
+
+  // Workspace-scoped views need an active workspace. A superadmin with none yet
+  // is sent to the Workspaces control panel to create one.
+  const needsWorkspace = auth.multi && !auth.activeSlug;
+  const scoped = (el: JSX.Element) =>
+    needsWorkspace ? <Navigate to="/workspaces" replace /> : el;
+
   return (
     <QueryClientProvider client={queryClient}>
       <HashRouter>
         <Layout>
           <Routes>
-            <Route path="/datasets/*" element={<DatasetsView />} />
-            <Route path="/pipeline" element={<PipelineView />} />
-            <Route path="/transforms" element={<TransformsView />} />
-            <Route path="/ontology/*" element={<OntologyView />} />
-            <Route path="/workbench" element={<WorkbenchView />} />
-            <Route path="/audit" element={<AuditView />} />
+            <Route path="/datasets/*" element={scoped(<DatasetsView />)} />
+            <Route path="/pipeline" element={scoped(<PipelineView />)} />
+            <Route path="/transforms" element={scoped(<TransformsView />)} />
+            <Route path="/ontology/*" element={scoped(<OntologyView />)} />
+            <Route path="/workbench" element={scoped(<WorkbenchView />)} />
+            <Route path="/audit" element={scoped(<AuditView />)} />
             <Route
               path="/admin"
-              element={auth.can("admin") ? <AdminView /> : <Navigate to="/datasets" replace />}
+              element={
+                auth.can("admin") ? scoped(<AdminView />) : <Navigate to="/datasets" replace />
+              }
             />
-            <Route path="*" element={<Navigate to="/datasets" replace />} />
+            <Route
+              path="/workspaces"
+              element={auth.isSuperadmin ? <WorkspacesView /> : <Navigate to="/datasets" replace />}
+            />
+            <Route
+              path="*"
+              element={<Navigate to={needsWorkspace ? "/workspaces" : "/datasets"} replace />}
+            />
           </Routes>
         </Layout>
       </HashRouter>
     </QueryClientProvider>
+  );
+}
+
+function NoWorkspaceAccess() {
+  const auth = useAuth();
+  return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <h2>No workspace access</h2>
+        <p className="dim" style={{ textAlign: "center" }}>
+          Your account isn't a member of any workspace yet. Ask a server
+          administrator to add you.
+        </p>
+        <button className="primary" style={{ width: "100%", marginTop: 12 }} onClick={() => void auth.logout()}>
+          Sign out
+        </button>
+      </div>
+    </div>
   );
 }

@@ -28,11 +28,13 @@ from laurelin.api.auth_routes import (
     resolve_credential,
     tokens_router,
     users_router,
+    workspaces_router,
 )
 from laurelin.api.routes import router
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
+from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "ui" / "static"
@@ -44,31 +46,13 @@ def _exc_message(exc: BaseException) -> str:
     return str(exc)
 
 
-def create_app(
-    workspace: Workspace,
-    *,
-    no_auth: bool = False,
-    secure_cookies: bool = False,
-    lock_pipelines: bool = False,
-) -> FastAPI:
-    no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
-    lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
-    store = MetadataStore(workspace.metadata_path)
-    catalog = DatasetCatalog(workspace, store)
+def _finalize(app: FastAPI) -> FastAPI:
+    """Add the middleware, error handlers, routers, and static mount shared by
+    both single- and multi-workspace apps."""
 
-    app = FastAPI(
-        title="Laurelin",
-        description=f"Laurelin workspace API — {workspace.name}",
-        version=laurelin.__version__,
-        docs_url="/docs",
-    )
-    app.state.workspace = workspace
-    app.state.store = store
-    app.state.catalog = catalog
-    app.state.no_auth = no_auth
-    app.state.secure_cookies = secure_cookies
-    app.state.lock_pipelines = lock_pipelines
-    app.state.auth = AuthService(store)
+    def _identity_store():
+        st = app.state
+        return st.control if st.mode == "multi" else st.store
 
     @app.middleware("http")
     async def guard_api_docs(request: Request, call_next):
@@ -82,7 +66,7 @@ def create_app(
             or path.startswith("/redoc")
         )
         if gated and not app.state.no_auth and request.method != "OPTIONS":
-            if store.count_users() == 0:
+            if _identity_store().count_users() == 0:
                 return JSONResponse(status_code=401, content={"detail": "setup required"})
             if resolve_credential(request) is None:
                 return JSONResponse(
@@ -123,9 +107,75 @@ def create_app(
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(tokens_router, prefix="/api/v1")
     app.include_router(groups_router, prefix="/api/v1")
+    app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():
         app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="ui")
 
     return app
+
+
+def create_app(
+    workspace: Workspace,
+    *,
+    no_auth: bool = False,
+    secure_cookies: bool = False,
+    lock_pipelines: bool = False,
+) -> FastAPI:
+    """Single-workspace server (``serve --workspace``). Identity lives in the
+    workspace's metadata.db; unchanged from earlier versions."""
+    no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
+    lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
+    store = MetadataStore(workspace.metadata_path)
+    catalog = DatasetCatalog(workspace, store)
+
+    app = FastAPI(
+        title="Laurelin",
+        description=f"Laurelin workspace API — {workspace.name}",
+        version=laurelin.__version__,
+        docs_url="/docs",
+    )
+    app.state.mode = "single"
+    app.state.workspace = workspace
+    app.state.store = store
+    app.state.catalog = catalog
+    app.state.no_auth = no_auth
+    app.state.secure_cookies = secure_cookies
+    app.state.lock_pipelines = lock_pipelines
+    app.state.auth = AuthService(store)
+    return _finalize(app)
+
+
+def create_server_app(
+    root: Path,
+    *,
+    no_auth: bool = False,
+    secure_cookies: bool = False,
+    lock_pipelines: bool = False,
+) -> FastAPI:
+    """Multi-workspace server (``serve --root``). Global identity + a workspace
+    registry live in ``<root>/control.db``; each workspace under ``<root>/<slug>``
+    keeps its own data and ACLs. The active workspace is selected per request via
+    the X-Laurelin-Workspace header or laurelin_workspace cookie."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
+    lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
+    control = ControlStore(root / "control.db")
+
+    app = FastAPI(
+        title="Laurelin",
+        description="Laurelin multi-workspace server",
+        version=laurelin.__version__,
+        docs_url="/docs",
+    )
+    app.state.mode = "multi"
+    app.state.root = root
+    app.state.control = control
+    app.state.control_auth = AuthService(control)
+    app.state.ws_cache = {}  # slug -> (Workspace, MetadataStore, DatasetCatalog)
+    app.state.no_auth = no_auth
+    app.state.secure_cookies = secure_cookies
+    app.state.lock_pipelines = lock_pipelines
+    return _finalize(app)

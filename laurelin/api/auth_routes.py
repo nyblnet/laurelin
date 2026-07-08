@@ -13,6 +13,13 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from laurelin.api.context import (
+    active_slug,
+    active_store,
+    identity_auth,
+    identity_store,
+    is_multi,
+)
 from laurelin.core.auth import THROTTLED, AuthService
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
@@ -27,15 +34,11 @@ _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Credential resolution
 # ---------------------------------------------------------------------------
 
-def get_auth(request: Request) -> AuthService:
-    return request.app.state.auth
-
-
 def _implicit_admin(request: Request) -> User:
     """Every request in --no-auth mode acts as this synthetic admin. The
     username honors X-Laurelin-User so audit attribution still works locally."""
     username = request.headers.get("x-laurelin-user") or "anonymous"
-    return User(id="no-auth", username=username, role=Role.admin)
+    return User(id="no-auth", username=username, role=Role.admin, superadmin=True)
 
 
 def resolve_credential(request: Request) -> Optional[User]:
@@ -47,7 +50,7 @@ def resolve_credential(request: Request) -> Optional[User]:
     request.state.credential_kind = "none"
     if request.app.state.no_auth:
         return _implicit_admin(request)
-    auth: AuthService = request.app.state.auth
+    auth: AuthService = identity_auth(request)
 
     scheme, _, credentials = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() == "bearer" and credentials.strip():
@@ -78,14 +81,15 @@ def _origin_matches_host(origin: str, request: Request) -> bool:
     return bool(origin_host) and origin_host == host
 
 
-def require_user(request: Request, user: CurrentUser) -> User:
-    """401 without a valid credential (or in setup mode); 403 on CSRF
-    origin mismatch for cookie-authenticated mutations."""
+def require_identity(request: Request, user: CurrentUser) -> User:
+    """The authenticated global identity: 401 without a valid credential (or in
+    setup mode); 403 on CSRF origin mismatch for cookie-authenticated mutations.
+    This is workspace-independent — used by control-plane routes (/auth, /users,
+    /tokens, /workspaces)."""
     if request.app.state.no_auth:
         assert user is not None
         return user
-    store: MetadataStore = request.app.state.store
-    if store.count_users() == 0:
+    if identity_store(request).count_users() == 0:
         raise HTTPException(status_code=401, detail="setup required")
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -101,7 +105,53 @@ def require_user(request: Request, user: CurrentUser) -> User:
     return user
 
 
+Identity = Annotated[User, Depends(require_identity)]
+
+
+def require_user(request: Request, identity: Identity) -> User:
+    """The authenticated user with their EFFECTIVE role for the active workspace.
+    In single mode this is just the identity. In multi mode the role comes from
+    workspace membership (or admin for a superadmin); non-members get 403. Used
+    by all workspace-scoped routes."""
+    if not is_multi(request) or request.app.state.no_auth:
+        return identity
+    if identity.superadmin:
+        # Superadmins are admin in every workspace; still require the slug so the
+        # active-workspace context is well-defined.
+        active_slug(request)
+        return identity.model_copy(update={"role": Role.admin})
+    slug = active_slug(request)
+    role = request.app.state.control.member_role(slug, identity.username)
+    if role is None:
+        raise HTTPException(
+            status_code=403, detail=f"You are not a member of workspace {slug!r}"
+        )
+    return identity.model_copy(update={"role": role})
+
+
 AuthenticatedUser = Annotated[User, Depends(require_user)]
+
+
+def require_superadmin(request: Request, identity: Identity) -> User:
+    """Server-level admin: manage workspaces + global users. In single mode this
+    is the workspace admin (there is no separate server tier)."""
+    if request.app.state.no_auth:
+        return identity
+    if not is_multi(request):
+        if not identity.role.covers(Role.admin):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Requires admin role (you are {identity.role.value})",
+            )
+        return identity
+    if not identity.superadmin:
+        raise HTTPException(
+            status_code=403, detail="Requires a server administrator (superadmin)"
+        )
+    return identity
+
+
+Superadmin = Annotated[User, Depends(require_superadmin)]
 
 
 def require_role(role: Role):
@@ -153,26 +203,44 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
     )
 
 
+def _status_user(request: Request, user: User) -> dict:
+    """User payload for /status, including their workspaces in multi mode."""
+    data = _user_json(user)
+    if is_multi(request):
+        control = request.app.state.control
+        data["workspaces"] = (
+            [w.model_dump(mode="json") | {"role": "admin"}
+             for w in control.list_workspaces()]
+            if user.superadmin
+            else control.workspaces_for_user(user.username)
+        )
+    return data
+
+
 @auth_router.get("/status")
 def auth_status(request: Request, user: CurrentUser) -> dict:
     """Never 401s — the UI probes this before deciding to show a login form."""
+    multi = is_multi(request)
     if request.app.state.no_auth:
-        return {"auth_required": False, "setup_required": False,
-                "user": _user_json(user) if user else None}
-    store: MetadataStore = request.app.state.store
-    setup_required = store.count_users() == 0
+        return {"auth_required": False, "setup_required": False, "multi": multi,
+                "user": _status_user(request, user) if user else None}
+    setup_required = identity_store(request).count_users() == 0
     return {
         "auth_required": True,
         "setup_required": setup_required,
-        "user": _user_json(user) if user else None,
+        "multi": multi,
+        "user": _status_user(request, user) if user else None,
     }
 
 
 @auth_router.post("/setup")
 def auth_setup(body: CredentialsRequest, request: Request) -> dict:
-    store: MetadataStore = request.app.state.store
-    auth: AuthService = request.app.state.auth
-    user = auth.create_first_admin(body.username, body.password, actor=body.username)
+    store = identity_store(request)
+    auth = identity_auth(request)
+    # In multi mode the first account is a server superadmin.
+    user = auth.create_first_admin(
+        body.username, body.password, superadmin=is_multi(request), actor=body.username
+    )
     if user is None:
         raise HTTPException(status_code=409, detail="Setup already completed")
     store.log_audit("setup_completed", {"username": user.username}, actor=user.username)
@@ -181,8 +249,8 @@ def auth_setup(body: CredentialsRequest, request: Request) -> dict:
 
 @auth_router.post("/login")
 def auth_login(body: CredentialsRequest, request: Request, response: Response) -> dict:
-    store: MetadataStore = request.app.state.store
-    auth: AuthService = request.app.state.auth
+    store = identity_store(request)
+    auth = identity_auth(request)
     result = auth.authenticate(body.username, body.password)
     if result is THROTTLED:
         store.log_audit("login_throttled", {"username": body.username}, actor=body.username)
@@ -196,23 +264,22 @@ def auth_login(body: CredentialsRequest, request: Request, response: Response) -
     _set_session_cookie(response, request, token)
     store.log_audit("login_succeeded", {"username": user.username}, actor=user.username)
     # The session token travels ONLY in the httpOnly cookie, never in the body.
-    return _user_json(user)
+    return _status_user(request, user)
 
 
 @auth_router.post("/logout")
-def auth_logout(request: Request, response: Response, user: AuthenticatedUser) -> dict:
+def auth_logout(request: Request, response: Response, user: Identity) -> dict:
     cookie = request.cookies.get(SESSION_COOKIE)
     if cookie:
-        auth: AuthService = request.app.state.auth
-        auth.logout(cookie)
+        identity_auth(request).logout(cookie)
     response.delete_cookie(SESSION_COOKIE, path="/")
-    request.app.state.store.log_audit("logout", {"username": user.username}, actor=user.username)
+    identity_store(request).log_audit("logout", {"username": user.username}, actor=user.username)
     return {"ok": True}
 
 
 @auth_router.get("/me")
-def auth_me(user: AuthenticatedUser) -> dict:
-    return _user_json(user)
+def auth_me(request: Request, user: Identity) -> dict:
+    return _status_user(request, user)
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +302,8 @@ class UserUpdateRequest(BaseModel):
 
 
 @users_router.get("")
-def list_users(
-    request: Request, admin: Annotated[User, Depends(require_admin)]
-) -> list[dict]:
-    auth: AuthService = request.app.state.auth
+def list_users(request: Request, admin: Superadmin) -> list[dict]:
+    auth = identity_auth(request)
     return [_user_json(u) for u in auth.list_users()]
 
 
@@ -246,9 +311,9 @@ def list_users(
 def create_user(
     body: UserCreateRequest,
     request: Request,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Superadmin,
 ) -> dict:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     user = auth.create_user(body.username, body.password, body.role, actor=admin.username)
     return _user_json(user)
 
@@ -258,9 +323,9 @@ def update_user(
     username: str,
     body: UserUpdateRequest,
     request: Request,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Superadmin,
 ) -> dict:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     target = auth.get_user(username)
     if target is None:
         raise HTTPException(status_code=404, detail=f"User not found: {username!r}")
@@ -283,9 +348,9 @@ def update_user(
 def delete_user(
     username: str,
     request: Request,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Superadmin,
 ) -> dict:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     target = auth.get_user(username)
     if target is None:
         raise HTTPException(status_code=404, detail=f"User not found: {username!r}")
@@ -318,7 +383,7 @@ def _token_json(record: dict) -> dict:
 
 @tokens_router.get("")
 def list_tokens(request: Request, user: AuthenticatedUser) -> list[dict]:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     records = auth.list_api_tokens(None if user.role == Role.admin else user)
     return [_token_json(r) for r in records]
 
@@ -329,7 +394,7 @@ def create_token(
     request: Request,
     user: Annotated[User, Depends(require_editor)],
 ) -> dict:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     token, record = auth.create_api_token(user, body.name, actor=user.username)
     # The ONLY place a plaintext API token ever appears.
     return {"id": record["id"], "name": record["name"], "token": token}
@@ -337,7 +402,7 @@ def create_token(
 
 @tokens_router.delete("/{token_id}")
 def revoke_token(token_id: str, request: Request, user: AuthenticatedUser) -> dict:
-    auth: AuthService = request.app.state.auth
+    auth = identity_auth(request)
     record = auth.get_api_token(token_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Token not found: {token_id!r}")
@@ -370,14 +435,14 @@ class GroupMembersRequest(BaseModel):
 
 @groups_router.get("")
 def list_groups(request: Request, admin: Annotated[User, Depends(require_admin)]) -> list[dict]:
-    return request.app.state.store.list_groups()
+    return active_store(request).list_groups()
 
 
 @groups_router.post("")
 def create_group(
     body: GroupCreateRequest, request: Request, admin: Annotated[User, Depends(require_admin)]
 ) -> dict:
-    store: MetadataStore = request.app.state.store
+    store = active_store(request)
     name = body.name.strip().lower()
     if not _GROUP_RE.match(name):
         raise HTTPException(
@@ -398,12 +463,13 @@ def set_group_members(
     request: Request,
     admin: Annotated[User, Depends(require_admin)],
 ) -> dict:
-    store: MetadataStore = request.app.state.store
+    store = active_store(request)
+    users = identity_store(request)  # usernames are global identity, not per-workspace
     if not store.group_exists(name):
         raise HTTPException(status_code=404, detail=f"Group not found: {name!r}")
     members = []
     for u in body.members:
-        if store.get_user(u) is None:
+        if users.get_user(u) is None:
             raise HTTPException(status_code=400, detail=f"Unknown user: {u!r}")
         members.append(u.lower())
     store.set_group_members(name, members)
@@ -417,9 +483,141 @@ def set_group_members(
 def delete_group(
     name: str, request: Request, admin: Annotated[User, Depends(require_admin)]
 ) -> dict:
-    store: MetadataStore = request.app.state.store
+    store = active_store(request)
     if not store.group_exists(name):
         raise HTTPException(status_code=404, detail=f"Group not found: {name!r}")
     store.delete_group(name)
     store.log_audit("group_deleted", {"name": name}, actor=admin.username)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# /workspaces (multi-workspace control plane, superadmin only)
+# ---------------------------------------------------------------------------
+
+from laurelin.core.config import Workspace  # noqa: E402
+from laurelin.core.control import ControlStore, validate_slug  # noqa: E402
+
+workspaces_router = APIRouter(prefix="/workspaces", tags=["workspaces"])
+
+
+class WorkspaceCreateRequest(BaseModel):
+    slug: str
+    name: str = ""
+    description: str = ""
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class MemberRequest(BaseModel):
+    username: str
+    role: Role = Role.viewer
+
+
+def _require_multi(request: Request) -> ControlStore:
+    if not is_multi(request):
+        raise HTTPException(
+            status_code=404,
+            detail="This server hosts a single workspace; workspace management "
+            "is only available in multi-workspace mode (serve --root).",
+        )
+    return request.app.state.control
+
+
+@workspaces_router.get("")
+def list_workspaces(request: Request, admin: Superadmin) -> list[dict]:
+    control = _require_multi(request)
+    return [
+        w.model_dump(mode="json") | {"members": len(control.list_members(w.slug))}
+        for w in control.list_workspaces()
+    ]
+
+
+@workspaces_router.post("")
+def create_workspace(
+    body: WorkspaceCreateRequest, request: Request, admin: Superadmin
+) -> dict:
+    control = _require_multi(request)
+    try:
+        slug = validate_slug(body.slug.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if control.get_workspace(slug) is not None:
+        raise HTTPException(status_code=409, detail=f"Workspace already exists: {slug!r}")
+    # Create the workspace directory (idempotent if files already exist on disk).
+    Workspace.init(request.app.state.root / slug, name=body.name or slug, description=body.description)
+    info = control.create_workspace(slug, body.name or slug, body.description)
+    control.log_audit("workspace_created", {"slug": slug}, actor=admin.username)
+    return info.model_dump(mode="json")
+
+
+@workspaces_router.patch("/{slug}")
+def update_workspace(
+    slug: str, body: WorkspaceUpdateRequest, request: Request, admin: Superadmin
+) -> dict:
+    control = _require_multi(request)
+    if control.get_workspace(slug) is None:
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
+    control.update_workspace(slug, name=body.name, description=body.description)
+    control.log_audit("workspace_updated", {"slug": slug}, actor=admin.username)
+    info = control.get_workspace(slug)
+    assert info is not None
+    return info.model_dump(mode="json")
+
+
+@workspaces_router.delete("/{slug}")
+def delete_workspace(slug: str, request: Request, admin: Superadmin) -> dict:
+    control = _require_multi(request)
+    if control.get_workspace(slug) is None:
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
+    control.delete_workspace(slug)
+    request.app.state.ws_cache.pop(slug, None)
+    # Files on disk are intentionally left in place; unregistering is reversible.
+    # HAZARD: re-creating the same slug later re-exposes this data — an operator
+    # reusing a slug for a *different* tenant must purge <root>/<slug>/ first.
+    control.log_audit("workspace_deleted", {"slug": slug}, actor=admin.username)
+    return {
+        "ok": True,
+        "note": f"Data files under the '{slug}' directory were left on disk. "
+        "Re-creating this slug will re-expose them; delete the directory manually "
+        "before reusing the slug for different data.",
+    }
+
+
+@workspaces_router.get("/{slug}/members")
+def list_members(slug: str, request: Request, admin: Superadmin) -> list[dict]:
+    control = _require_multi(request)
+    if control.get_workspace(slug) is None:
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
+    return control.list_members(slug)
+
+
+@workspaces_router.put("/{slug}/members")
+def set_member(slug: str, body: MemberRequest, request: Request, admin: Superadmin) -> dict:
+    control = _require_multi(request)
+    if control.get_workspace(slug) is None:
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
+    if identity_store(request).get_user(body.username) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown user: {body.username!r}")
+    control.set_member(slug, body.username.lower(), body.role)
+    control.log_audit(
+        "workspace_member_set",
+        {"slug": slug, "username": body.username, "role": body.role.value},
+        actor=admin.username,
+    )
+    return {"slug": slug, "username": body.username.lower(), "role": body.role.value}
+
+
+@workspaces_router.delete("/{slug}/members/{username}")
+def remove_member(slug: str, username: str, request: Request, admin: Superadmin) -> dict:
+    control = _require_multi(request)
+    if control.get_workspace(slug) is None:
+        raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
+    control.remove_member(slug, username)
+    control.log_audit(
+        "workspace_member_removed", {"slug": slug, "username": username}, actor=admin.username
+    )
     return {"ok": True}

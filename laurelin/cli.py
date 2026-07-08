@@ -74,6 +74,13 @@ def init(
 @app.command()
 def serve(
     workspace: Optional[Path] = WORKSPACE_OPTION,
+    root: Optional[Path] = typer.Option(
+        None,
+        "--root",
+        help="Serve MANY workspaces from this root directory (multi-workspace "
+        "mode). Mutually exclusive with --workspace. Global users + a workspace "
+        "registry live in <root>/control.db; each workspace is <root>/<slug>.",
+    ),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
     port: int = typer.Option(8787, "--port", help="Bind port."),
     no_auth: bool = typer.Option(
@@ -95,25 +102,31 @@ def serve(
         "writing a pipeline file is code-execution-equivalent.",
     ),
 ) -> None:
-    """Run the Laurelin API + UI server."""
-    ws = _find_workspace(workspace)
+    """Run the Laurelin API + UI server (single workspace, or --root for many)."""
     import uvicorn
-
-    from laurelin.api import create_app
 
     if no_auth:
         typer.echo("Warning: --no-auth disables authentication; every request is an admin.")
-    typer.echo(f"Serving workspace '{ws.name}' ({ws.root}) on http://{host}:{port}")
-    uvicorn.run(
-        create_app(
-            ws,
-            no_auth=no_auth,
-            secure_cookies=secure_cookies,
-            lock_pipelines=lock_pipelines,
-        ),
-        host=host,
-        port=port,
-    )
+
+    if root is not None:
+        if workspace is not None:
+            typer.echo("Error: pass either --workspace or --root, not both.", err=True)
+            raise typer.Exit(1)
+        from laurelin.api import create_server_app
+
+        typer.echo(f"Serving workspaces under {root} on http://{host}:{port}")
+        application = create_server_app(
+            root, no_auth=no_auth, secure_cookies=secure_cookies, lock_pipelines=lock_pipelines
+        )
+    else:
+        from laurelin.api import create_app
+
+        ws = _find_workspace(workspace)
+        typer.echo(f"Serving workspace '{ws.name}' ({ws.root}) on http://{host}:{port}")
+        application = create_app(
+            ws, no_auth=no_auth, secure_cookies=secure_cookies, lock_pipelines=lock_pipelines
+        )
+    uvicorn.run(application, host=host, port=port)
 
 
 @app.command()

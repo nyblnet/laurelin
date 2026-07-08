@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT,
     role TEXT CHECK(role IN ('viewer','editor','admin')),
     created_at TEXT,
-    disabled INTEGER DEFAULT 0
+    disabled INTEGER DEFAULT 0,
+    superadmin INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -167,6 +168,13 @@ class MetadataStore:
     def _ensure_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._migrate(c)
+
+    def _migrate(self, c: sqlite3.Connection) -> None:
+        """Additive migrations for databases created by older versions."""
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+        if "superadmin" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN superadmin INTEGER NOT NULL DEFAULT 0")
 
     # -- datasets -------------------------------------------------------------
 
@@ -453,28 +461,36 @@ class MetadataStore:
 
     @staticmethod
     def _row_to_user(row: sqlite3.Row) -> User:
+        keys = row.keys()
         return User(
             id=row["id"],
             username=row["username"],
             role=Role(row["role"]),
             created_at=row["created_at"],
             disabled=bool(row["disabled"]),
+            superadmin=bool(row["superadmin"]) if "superadmin" in keys else False,
+        )
+
+    _USER_INSERT = (
+        "INSERT INTO users (id, username, password_hash, role, created_at, "
+        "disabled, superadmin) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    @staticmethod
+    def _user_insert_params(user: User, password_hash: str) -> tuple:
+        return (
+            user.id,
+            user.username,
+            password_hash,
+            user.role.value,
+            user.created_at,
+            int(user.disabled),
+            int(user.superadmin),
         )
 
     def create_user(self, user: User, password_hash: str) -> None:
         with self._conn() as c:
-            c.execute(
-                """INSERT INTO users (id, username, password_hash, role, created_at, disabled)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    user.id,
-                    user.username,
-                    password_hash,
-                    user.role.value,
-                    user.created_at,
-                    int(user.disabled),
-                ),
-            )
+            c.execute(self._USER_INSERT, self._user_insert_params(user, password_hash))
 
     def create_user_if_none_exist(self, user: User, password_hash: str) -> bool:
         """Atomically create the first user. Returns False (without inserting) if
@@ -484,18 +500,7 @@ class MetadataStore:
             c.execute("BEGIN IMMEDIATE")
             if c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] > 0:
                 return False
-            c.execute(
-                """INSERT INTO users (id, username, password_hash, role, created_at, disabled)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    user.id,
-                    user.username,
-                    password_hash,
-                    user.role.value,
-                    user.created_at,
-                    int(user.disabled),
-                ),
-            )
+            c.execute(self._USER_INSERT, self._user_insert_params(user, password_hash))
             return True
 
     def get_user(self, username: str) -> Optional[User]:

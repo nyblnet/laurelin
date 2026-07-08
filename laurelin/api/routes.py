@@ -29,6 +29,7 @@ from laurelin.api.auth_routes import (
     require_user,
     require_viewer,
 )
+from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
@@ -55,15 +56,15 @@ ADMIN = Depends(require_admin)
 # ---------------------------------------------------------------------------
 
 def get_workspace(request: Request) -> Workspace:
-    return request.app.state.workspace
+    return active_workspace(request)
 
 
 def get_store(request: Request) -> MetadataStore:
-    return request.app.state.store
+    return active_store(request)
 
 
 def get_catalog(request: Request) -> DatasetCatalog:
-    return request.app.state.catalog
+    return active_catalog(request)
 
 
 def get_registry(workspace: Annotated[Workspace, Depends(get_workspace)]) -> TransformRegistry:

@@ -133,6 +133,7 @@ class AuthService:
         password: str,
         role: Role | str = Role.viewer,
         *,
+        superadmin: bool = False,
         actor: str = "system",
     ) -> User:
         validate_username(username)
@@ -140,25 +141,36 @@ class AuthService:
         role = Role(role)
         if self.store.get_user(username) is not None:
             raise ValueError(f"Username already exists: {username!r}")
-        user = User(id=secrets.token_hex(8), username=username, role=role)
+        user = User(
+            id=secrets.token_hex(8), username=username, role=role, superadmin=superadmin
+        )
         self.store.create_user(user, hash_password(password))
         self.store.log_audit(
-            "user_created", {"username": username, "role": role.value}, actor=actor
+            "user_created",
+            {"username": username, "role": role.value, "superadmin": superadmin},
+            actor=actor,
         )
         return user
 
     def create_first_admin(
-        self, username: str, password: str, *, actor: str = "setup"
+        self, username: str, password: str, *, superadmin: bool = False, actor: str = "setup"
     ) -> Optional[User]:
         """First-run admin creation. Returns None (creating nothing) if any user
         already exists, so two racing setups can't both plant an admin."""
         validate_username(username)
         validate_password(password)
-        user = User(id=secrets.token_hex(8), username=username, role=Role.admin)
+        user = User(
+            id=secrets.token_hex(8),
+            username=username,
+            role=Role.admin,
+            superadmin=superadmin,
+        )
         if not self.store.create_user_if_none_exist(user, hash_password(password)):
             return None
         self.store.log_audit(
-            "user_created", {"username": username, "role": Role.admin.value}, actor=actor
+            "user_created",
+            {"username": username, "role": Role.admin.value, "superadmin": superadmin},
+            actor=actor,
         )
         return user
 

@@ -156,6 +156,13 @@ confidentiality. A user denied an object type can still read the same rows via
 the SQL workbench or the dataset row API. Dataset-level access control is
 future work (see [docs/ROADMAP.md](docs/ROADMAP.md), WS8).
 
+**Multiple workspaces.** `laurelin serve --workspace X` hosts a single
+workspace. `laurelin serve --root DIR` hosts many: users are global, a
+superadmin creates workspaces and assigns each user a per-workspace role
+(viewer/editor/admin), and each workspace is fully isolated — its own datasets,
+pipelines, ontology, and ACLs under `DIR/<slug>/`. In the UI a switcher picks
+the active workspace; superadmins get a Workspaces admin panel.
+
 **Transform authoring is code execution.** Writing a pipeline file through the
 UI (the Transforms tab) or API is equivalent to running Python on the server —
 it is `exec`'d on every build. It requires the `editor` role and can be

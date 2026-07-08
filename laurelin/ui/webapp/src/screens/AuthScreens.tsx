@@ -115,7 +115,13 @@ export function SetupScreen() {
   }
 
   return (
-    <AuthShell title="First run — create the admin account">
+    <AuthShell
+      title={
+        auth.multi
+          ? "First run — create the server administrator"
+          : "First run — create the admin account"
+      }
+    >
       <form onSubmit={submit}>
         <div className="field">
           <label>Username</label>
@@ -156,11 +162,13 @@ export function SetupScreen() {
         </div>
         {error && <div className="error-box">{error}</div>}
         <button type="submit" className="primary" disabled={busy || !ready}>
-          {busy ? "Creating…" : "Create admin account"}
+          {busy ? "Creating…" : auth.multi ? "Create server administrator" : "Create admin account"}
         </button>
       </form>
       <div className="auth-note">
-        This account gets the admin role; add more users later under Admin.
+        {auth.multi
+          ? "This account manages workspaces and users, and is admin in every workspace."
+          : "This account gets the admin role; add more users later under Admin."}
       </div>
     </AuthShell>
   );

@@ -21,8 +21,10 @@ const NAV = [
 export function Layout({ children }: { children: ReactNode }) {
   const auth = useAuth();
   const { data: ws } = useQuery({
-    queryKey: ["workspace"],
+    queryKey: ["workspace", auth.activeSlug],
     queryFn: () => api.get<WorkspaceInfo>(`${API}/workspace`),
+    // In multi mode the endpoint is workspace-scoped; skip it until one is active.
+    enabled: !auth.multi || !!auth.activeSlug,
   });
 
   return (
@@ -33,6 +35,22 @@ export function Layout({ children }: { children: ReactNode }) {
           <span className="brand-name">Laurelin</span>
         </div>
         <div className="brand-tag">Ontology Data Platform</div>
+
+        {auth.multi && auth.workspaces.length > 0 && (
+          <div className="ws-switch">
+            <label>Workspace</label>
+            <select
+              value={auth.activeSlug ?? ""}
+              onChange={(e) => auth.setActiveWorkspace(e.target.value)}
+            >
+              {auth.workspaces.map((w) => (
+                <option key={w.slug} value={w.slug}>
+                  {w.name} ({w.role})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <nav className="nav">
           {NAV.map((n) => (
@@ -49,6 +67,12 @@ export function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/admin" className={({ isActive }) => (isActive ? "active" : "")}>
               <span className="nav-dot" />
               Admin
+            </NavLink>
+          )}
+          {auth.isSuperadmin && (
+            <NavLink to="/workspaces" className={({ isActive }) => (isActive ? "active" : "")}>
+              <span className="nav-dot" />
+              Workspaces
             </NavLink>
           )}
         </nav>
@@ -85,8 +109,8 @@ function UserFooter() {
     <div className="user-box">
       <div className="who">
         <div className="name">{auth.user.username}</div>
-        <Badge tone={auth.user.role === "admin" ? "gold" : "neutral"}>
-          {auth.user.role}
+        <Badge tone={auth.isSuperadmin || auth.role === "admin" ? "gold" : "neutral"}>
+          {auth.isSuperadmin ? "superadmin" : auth.role}
         </Badge>
       </div>
       <button className="small" onClick={() => void auth.logout()}>

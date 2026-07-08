@@ -122,6 +122,20 @@ h3 {
   padding: 0 6px 16px;
 }
 
+.ws-switch {
+  padding: 0 6px 14px;
+}
+.ws-switch label {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  margin-bottom: 4px;
+}
+.ws-switch select {
+  font-size: 12.5px;
+  padding: 6px 8px;
+}
+
 .nav {
   display: flex;
   flex-direction: column;

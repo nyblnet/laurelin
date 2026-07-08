@@ -178,6 +178,31 @@ api_tokens(id TEXT PK, name TEXT, token_hash TEXT UNIQUE, user_id TEXT,
 disabled` (never expose password_hash through the API). Roles are ordered
 `viewer < editor < admin`.
 
+**Single vs multi-workspace.** `serve --workspace X` (single) binds one
+workspace; identity lives in its `metadata.db` and a user's role is their
+account role — the original behavior. `serve --root R` (multi) hosts many
+workspaces: global identity + a workspace registry + per-workspace membership
+live in `<root>/control.db` (`laurelin/core/control.py`, `ControlStore`), and
+each workspace is `<root>/<slug>/` with its own data, ACLs, groups, and audit.
+The active workspace is chosen per request via the `X-Laurelin-Workspace`
+header or `laurelin_workspace` cookie; `laurelin/api/context.py` resolves it and
+builds/caches that workspace's store+catalog. A user's *effective* role is their
+membership role in the active workspace (or `admin` if they are a
+**superadmin** — a server administrator who manages workspaces + global users
+and is admin everywhere). First-run setup in multi mode creates the first
+superadmin. `require_identity` = the global user (control-plane routes);
+`require_user` = identity + effective workspace role (workspace-scoped routes);
+`require_superadmin` = server admin (workspace admin in single mode). Control-
+plane endpoints: `/api/v1/workspaces` (CRUD + `/{slug}/members`), superadmin
+only, 404 in single mode. `/api/v1/users` is superadmin (global) in multi mode.
+Auth `/status` and `/me` include the user's workspaces (+ role in each) so the
+UI can render a switcher. Isolation is enforced at the route layer: a user only
+reaches a workspace they are a member of (or a superadmin). The workspace-
+existence check is gated behind authentication so anonymous callers can't
+enumerate slugs. **Deleting** a workspace only *unregisters* it (reversible) —
+its files stay under `<root>/<slug>/`; reusing a slug re-exposes that data, so
+purge the directory before reusing a slug for a different tenant.
+
 **Modes.** Auth is ON by default. `laurelin serve --no-auth` (or env
 `LAURELIN_NO_AUTH=1`) disables it for local development — `/api/v1/auth/status`
 then reports `{"auth_required": false}` and every request acts as an implicit

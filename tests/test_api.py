@@ -479,6 +479,7 @@ def test_auth_on_by_default_requires_setup(workspace):
     assert status.json() == {
         "auth_required": True,
         "setup_required": True,
+        "multi": False,
         "user": None,
     }
 

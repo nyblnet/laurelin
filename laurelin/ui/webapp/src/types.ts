@@ -8,12 +8,37 @@ export interface User {
   role: Role;
   created_at: string;
   disabled: boolean;
+  superadmin?: boolean;
+  // Present in multi-workspace mode on /auth/status and /auth/me: the
+  // workspaces this user belongs to and their role in each.
+  workspaces?: UserWorkspace[];
+}
+
+export interface UserWorkspace {
+  slug: string;
+  name: string;
+  description?: string;
+  role: Role;
 }
 
 export interface AuthStatus {
   auth_required: boolean;
   setup_required: boolean;
+  multi?: boolean;
   user: User | null;
+}
+
+export interface WorkspaceSummary {
+  slug: string;
+  name: string;
+  description: string;
+  created_at: string;
+  members?: number;
+}
+
+export interface WorkspaceMember {
+  username: string;
+  role: Role;
 }
 
 export interface WorkspaceInfo {

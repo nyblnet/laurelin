@@ -215,13 +215,36 @@ _ROLE_ORDER = {Role.viewer: 0, Role.editor: 1, Role.admin: 2}
 
 class User(BaseModel):
     """A Laurelin account. The password hash is intentionally NOT part of this
-    model so it can never leak through an API response."""
+    model so it can never leak through an API response.
+
+    ``role`` is the account's role. In multi-workspace mode a user's *effective*
+    role is per-workspace (from membership); ``role`` there is a baseline and
+    ``superadmin`` marks a server administrator (manages workspaces + users and
+    is admin in every workspace). In single-workspace mode ``superadmin`` is
+    unused and ``role`` is the account's role directly.
+    """
 
     id: str
     username: str
     role: Role = Role.viewer
     created_at: str = Field(default_factory=utcnow_iso)
     disabled: bool = False
+    superadmin: bool = False
+
+
+class WorkspaceInfo(BaseModel):
+    """A workspace registered in the multi-workspace control plane."""
+
+    slug: str
+    name: str
+    description: str = ""
+    created_at: str = Field(default_factory=utcnow_iso)
+
+
+class WorkspaceMembership(BaseModel):
+    slug: str
+    username: str
+    role: Role = Role.viewer
 
 
 # ---------------------------------------------------------------------------
