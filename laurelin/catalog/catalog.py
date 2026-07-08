@@ -179,19 +179,28 @@ class DatasetCatalog:
 
     # -- ad-hoc query ---------------------------------------------------------
 
-    def query(self, sql: str, max_rows: int = 1000) -> dict:
-        """Run a read-only SQL query with every dataset's latest version exposed
+    def query(
+        self, sql: str, max_rows: int = 1000, allowed: Optional[set[str]] = None
+    ) -> dict:
+        """Run a read-only SQL query with each dataset's latest version exposed
         as a view named after the dataset. Returns
         ``{columns, rows, row_count, truncated}`` with JSON-safe values.
 
-        The connection is read-only over parquet views, so a query can read any
-        dataset but cannot mutate stored data. ``max_rows`` caps the result;
-        ``truncated`` reports whether more rows were available.
+        Only datasets in ``allowed`` are registered (``None`` = all). A query
+        referencing a dataset outside ``allowed`` fails as an unknown table, so
+        this is how per-dataset ACLs are enforced on the ad-hoc query surface.
+
+        The connection is read-only over in-memory tables, so a query can read
+        the registered datasets but cannot mutate stored data or touch the
+        filesystem. ``max_rows`` caps the result; ``truncated`` reports whether
+        more rows were available.
         """
         con = duckdb.connect()
         try:
             for ds in self.store.list_datasets():
                 if ds.latest_version is None:
+                    continue
+                if allowed is not None and ds.name not in allowed:
                     continue
                 # Register each dataset's latest version as an in-memory Arrow
                 # table rather than a file-backed view. Combined with disabling

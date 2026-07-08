@@ -265,6 +265,8 @@ GET  /api/v1/ontology/actions                 -> [ActionDef]  (viewable types on
 POST /api/v1/ontology/actions/{name}/apply    {pk?, parameters} -> ObjectEdit  (needs edit)
 GET  /api/v1/ontology/permissions             -> [{object_type, grants:[Grant]}]  (admin)
 PUT  /api/v1/ontology/permissions/{type}      {grants:[Grant]} -> {object_type,grants}  (admin)
+GET  /api/v1/dataset-permissions              -> [{dataset, grants:[Grant]}]  (admin)
+PUT  /api/v1/datasets/{name}/permissions      {grants:[Grant]} -> {dataset,grants}  (admin)
 GET  /api/v1/groups                           -> [{name, members:[username]}]  (admin)
 POST /api/v1/groups                           {name} -> {name, members:[]}  (admin)
 PUT  /api/v1/groups/{name}/members            {members:[username]} -> {name,members}  (admin)
@@ -290,9 +292,18 @@ role / a group they belong to / their username), and `can_edit` implies view.
 Grants both restrict (hide a type) and elevate (let a specific viewer edit one
 type). Enforced at the route layer: object reads need view, action apply needs
 edit, listings are filtered. Groups are named user sets, admin-managed, usable
-as a grant subject. **Scope:** grants gate the ontology layer only — they are
-not dataset confidentiality. A user denied an object type can still read the
-same rows via `/query` or `/datasets/{name}/rows`. Per-dataset ACLs are WS8.
+as a grant subject.
+
+**Dataset ACLs & composition.** The same grant model applies per dataset
+(`dataset_grants`, `PermissionService.dataset_permission`), enforced on **every**
+data path: `/datasets` (list filtered), `/datasets/{name}`, `/schema`, `/rows`
+(view), `/upload` (edit), and `/query` — the query registers only the datasets
+the caller can view, so a blocked dataset is simply an unknown table. Object-type
+access is now **composed**: effective view = ontology-view AND backing-dataset-
+view; effective edit = that view AND ontology-edit. So locking a dataset also
+hides its objects, and there is no longer a path (query / dataset rows) to read
+data behind a hidden object type. Builds remain editor-gated (a build runs
+trusted pipeline code); per-dataset build enforcement is future work.
 
 #### Pipeline (transform) authoring (`laurelin/transforms/authoring.py`)
 

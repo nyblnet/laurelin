@@ -23,6 +23,7 @@ import {
 } from "../ui";
 import { GroupsSection } from "./admin/GroupsSection";
 import { OntologyAccessSection } from "./admin/OntologyAccessSection";
+import { DatasetAccessSection } from "./admin/DatasetAccessSection";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
 
@@ -454,6 +455,7 @@ export function AdminView() {
           <TokensSection />
           <GroupsSection />
           <OntologyAccessSection />
+          <DatasetAccessSection />
         </>
       )}
     </div>

@@ -43,6 +43,9 @@ export interface Dataset {
   description: string;
   created_at: string;
   latest_version: number | null;
+  // Present on permission-aware responses (dataset list/detail): the current
+  // user's effective access to this dataset.
+  permissions?: ObjectTypePermission;
 }
 
 export interface DatasetDetail extends Dataset {
@@ -218,6 +221,11 @@ export interface Grant {
 
 export interface ObjectTypeGrants {
   object_type: string;
+  grants: Grant[];
+}
+
+export interface DatasetGrants {
+  dataset: string;
   grants: Grant[];
 }
 

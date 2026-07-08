@@ -55,26 +55,15 @@ class PermissionService:
             return grant.normalized_subject() in groups
         return False
 
-    def _grants(self, object_type: str) -> list[Grant]:
-        return [Grant(**g) for g in self.store.grants_for_type(object_type)]
-
-    def permission(self, user: Optional[User], object_type: str) -> tuple[bool, bool]:
-        """Return ``(can_view, can_edit)`` for ``user`` on ``object_type``.
-
-        ``user`` is None only in unusual paths; treat as no access. In no-auth
-        mode the caller passes the synthetic admin, which is handled by the
-        admin bypass below.
-        """
+    def _evaluate(self, user: Optional[User], grants: list[Grant]) -> tuple[bool, bool]:
+        """Core rule shared by ontology and dataset grants: admin bypass; no
+        grants -> global RBAC default; any grant -> allowlist."""
         if user is None:
             return (False, False)
         if user.role == Role.admin:
             return (True, True)
-
-        grants = self._grants(object_type)
         if not grants:
-            # Default: inherit global RBAC.
             return (True, user.role.covers(Role.editor))
-
         groups = self._user_groups(user.username)
         can_view = can_edit = False
         for g in grants:
@@ -87,11 +76,56 @@ class PermissionService:
                 can_view = True
         return (can_view, can_edit)
 
+    # -- object-type (ontology) permissions -----------------------------------
+
+    def _grants(self, object_type: str) -> list[Grant]:
+        return [Grant(**g) for g in self.store.grants_for_type(object_type)]
+
+    def permission(self, user: Optional[User], object_type: str) -> tuple[bool, bool]:
+        """Return ``(can_view, can_edit)`` for ``user`` on the ONTOLOGY grants of
+        ``object_type`` (not composed with the backing dataset — use
+        ``object_type_permission`` for the effective access)."""
+        return self._evaluate(user, self._grants(object_type))
+
     def can_view(self, user: Optional[User], object_type: str) -> bool:
         return self.permission(user, object_type)[0]
 
     def can_edit(self, user: Optional[User], object_type: str) -> bool:
         return self.permission(user, object_type)[1]
+
+    # -- dataset permissions --------------------------------------------------
+
+    def _dataset_grants(self, dataset: str) -> list[Grant]:
+        return [Grant(**g) for g in self.store.grants_for_dataset(dataset)]
+
+    def dataset_permission(self, user: Optional[User], dataset: str) -> tuple[bool, bool]:
+        return self._evaluate(user, self._dataset_grants(dataset))
+
+    def can_view_dataset(self, user: Optional[User], dataset: str) -> bool:
+        return self.dataset_permission(user, dataset)[0]
+
+    def can_edit_dataset(self, user: Optional[User], dataset: str) -> bool:
+        return self.dataset_permission(user, dataset)[1]
+
+    def viewable_datasets(self, user: Optional[User], names: list[str]) -> set[str]:
+        return {n for n in names if self.can_view_dataset(user, n)}
+
+    # -- composed object-type access ------------------------------------------
+
+    def object_type_permission(
+        self, user: Optional[User], object_type: str, backing_dataset: str
+    ) -> tuple[bool, bool]:
+        """Effective access to an object type = the ontology grant composed with
+        the backing dataset's access. You must be able to view the backing
+        dataset to view its objects (objects ARE the dataset rows), so this
+        closes the gap where an ontology grant alone left the data readable via
+        the dataset/query APIs. Ontology edit still needs ontology edit rights,
+        but also requires view (which requires dataset view)."""
+        dv, _ = self.dataset_permission(user, backing_dataset)
+        ov, oe = self.permission(user, object_type)
+        view = dv and ov
+        edit = view and oe
+        return (view, edit)
 
     # -- validation for the management API ------------------------------------
 

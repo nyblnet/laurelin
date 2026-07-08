@@ -115,16 +115,40 @@ PipelineFilesDep = Annotated[PipelineFiles, Depends(get_pipeline_files)]
 UserDep = Annotated[User, Depends(require_user)]
 
 
-def _require_view(perms: PermissionService, user: User, type_name: str) -> None:
-    if not perms.can_view(user, type_name):
+def _require_dataset_view(perms: PermissionService, user: User, name: str) -> None:
+    if not perms.can_view_dataset(user, name):
+        raise HTTPException(
+            status_code=403, detail=f"You do not have access to dataset {name!r}"
+        )
+
+
+def _require_dataset_edit(perms: PermissionService, user: User, name: str) -> None:
+    if not perms.can_edit_dataset(user, name):
+        raise HTTPException(
+            status_code=403, detail=f"You do not have edit access to dataset {name!r}"
+        )
+
+
+def _ot_permission(
+    perms: PermissionService, user: User, service: "OntologyService", type_name: str
+) -> tuple[bool, bool]:
+    """Effective (view, edit) for an object type = ontology grant composed with
+    the backing dataset's access."""
+    ot = service.ontology.object_type(type_name)
+    backing = ot.backing_dataset if ot is not None else ""
+    return perms.object_type_permission(user, type_name, backing)
+
+
+def _require_ot_view(perms, user, service, type_name: str) -> None:
+    if not _ot_permission(perms, user, service, type_name)[0]:
         raise HTTPException(
             status_code=403,
             detail=f"You do not have access to object type {type_name!r}",
         )
 
 
-def _require_edit(perms: PermissionService, user: User, type_name: str) -> None:
-    if not perms.can_edit(user, type_name):
+def _require_ot_edit(perms, user, service, type_name: str) -> None:
+    if not _ot_permission(perms, user, service, type_name)[1]:
         raise HTTPException(
             status_code=403,
             detail=f"You do not have edit access to object type {type_name!r}",
@@ -188,9 +212,18 @@ def get_workspace_info(workspace: WorkspaceDep) -> dict:
 # Datasets
 # ---------------------------------------------------------------------------
 
-@router.get("/datasets", dependencies=[VIEWER])
-def list_datasets(store: StoreDep) -> list[dict]:
-    return [_dump(d) for d in store.list_datasets()]
+@router.get("/datasets")
+def list_datasets(store: StoreDep, perms: PermDep, user: UserDep) -> list[dict]:
+    # Only datasets the user can view; each carries the user's effective access.
+    out = []
+    for d in store.list_datasets():
+        can_view, can_edit = perms.dataset_permission(user, d.name)
+        if not can_view:
+            continue
+        dd = _dump(d)
+        dd["permissions"] = {"can_view": can_view, "can_edit": can_edit}
+        out.append(dd)
+    return out
 
 
 @router.post("/datasets", dependencies=[EDITOR])
@@ -202,56 +235,70 @@ def create_dataset(
     return _dump(info)
 
 
-@router.get("/datasets/{name}", dependencies=[VIEWER])
-def get_dataset(name: str, store: StoreDep) -> dict:
+@router.get("/datasets/{name}")
+def get_dataset(name: str, store: StoreDep, perms: PermDep, user: UserDep) -> dict:
     info = store.get_dataset(name)
     if info is None:
         raise KeyError(f"Dataset not found: {name!r}")
+    _require_dataset_view(perms, user, name)
+    can_view, can_edit = perms.dataset_permission(user, name)
     result = _dump(info)
+    result["permissions"] = {"can_view": can_view, "can_edit": can_edit}
     result["versions"] = [_dump(v) for v in store.list_versions(name)]
     return result
 
 
-@router.get("/datasets/{name}/schema", dependencies=[VIEWER])
+@router.get("/datasets/{name}/schema")
 def get_dataset_schema(
-    name: str, store: StoreDep, version: Optional[int] = None
+    name: str, store: StoreDep, perms: PermDep, user: UserDep, version: Optional[int] = None
 ) -> list[dict]:
+    _require_dataset_view(perms, user, name)
     info = _version_info(store, name, version)
     return [c.model_dump() for c in info.schema_]
 
 
-@router.get("/datasets/{name}/rows", dependencies=[VIEWER])
+@router.get("/datasets/{name}/rows")
 def get_dataset_rows(
     name: str,
     catalog: CatalogDep,
     store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
     limit: int = Query(100, ge=0, le=10_000),
     offset: int = Query(0, ge=0),
     version: Optional[int] = None,
 ) -> dict:
+    _require_dataset_view(perms, user, name)
     info = _version_info(store, name, version)
     rows = catalog.rows(name, limit=limit, offset=offset, version=version)
     return {"rows": rows, "row_count": info.row_count}
 
 
-@router.post("/query", dependencies=[VIEWER])
-def run_query(body: QueryRequest, catalog: CatalogDep) -> dict:
-    """Run a read-only SQL query over the workspace's datasets (each exposed as
-    a view named after the dataset). A syntax or binder error becomes a 400."""
+@router.post("/query")
+def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep) -> dict:
+    """Run a read-only SQL query over the datasets the user can view (each a view
+    named after the dataset). Datasets the user cannot view are not registered,
+    so referencing one fails as an unknown table. Syntax/binder errors -> 400."""
+    allowed = perms.viewable_datasets(user, [d.name for d in store.list_datasets()])
     try:
-        return catalog.query(body.sql, max_rows=body.max_rows)
+        return catalog.query(body.sql, max_rows=body.max_rows, allowed=allowed)
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
 
 
-@router.post("/datasets/{name}/upload", dependencies=[EDITOR])
+@router.post("/datasets/{name}/upload")
 def upload_dataset_file(
     name: str,
     catalog: CatalogDep,
     store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
     actor: ActorDep,
     file: UploadFile = File(...),
 ) -> dict:
+    # Per-dataset edit. For a dataset with no grants this reduces to the old
+    # editor-role requirement; a grant can elevate a viewer for one dataset.
+    _require_dataset_edit(perms, user, name)
     suffix = Path(file.filename or "").suffix
     max_bytes = int(os.environ.get("LAURELIN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
     written = 0
@@ -373,7 +420,9 @@ def list_object_types(service: OntologyDep, perms: PermDep, user: UserDep) -> li
     # Only types the user may view; each carries the user's effective permission.
     out = []
     for ot in service.list_object_types():
-        can_view, can_edit = perms.permission(user, ot.api_name)
+        can_view, can_edit = perms.object_type_permission(
+            user, ot.api_name, ot.backing_dataset
+        )
         if not can_view:
             continue
         d = _dump(ot)
@@ -387,8 +436,8 @@ def get_object_type(name: str, service: OntologyDep, perms: PermDep, user: UserD
     ot = service.ontology.object_type(name)
     if ot is None:
         raise KeyError(f"Unknown object type: {name!r}")
-    _require_view(perms, user, name)
-    can_view, can_edit = perms.permission(user, name)
+    _require_ot_view(perms, user, service, name)
+    can_view, can_edit = perms.object_type_permission(user, name, ot.backing_dataset)
     result = _dump(ot)
     result["permissions"] = {"can_view": can_view, "can_edit": can_edit}
     result["links"] = [
@@ -415,7 +464,7 @@ def query_objects(
     limit: int = Query(100, ge=0, le=10_000),
     offset: int = Query(0, ge=0),
 ) -> dict:
-    _require_view(perms, user, type_name)
+    _require_ot_view(perms, user, service, type_name)
     filters = {
         key[len("filter."):]: value
         for key, value in request.query_params.items()
@@ -430,7 +479,7 @@ def query_objects(
 def get_object(
     type_name: str, pk: str, service: OntologyDep, perms: PermDep, user: UserDep
 ) -> dict:
-    _require_view(perms, user, type_name)
+    _require_ot_view(perms, user, service, type_name)
     obj = service.get(type_name, pk)
     if obj is None:
         raise KeyError(f"No {type_name!r} object with primary key {pk!r}")
@@ -446,12 +495,12 @@ def get_linked_objects(
     perms: PermDep,
     user: UserDep,
 ) -> dict:
-    _require_view(perms, user, type_name)
+    _require_ot_view(perms, user, service, type_name)
     # Only return links to objects on types the user may also view.
     link = service.ontology.link_type(link_name)
     if link is not None:
         other = link.to_type if link.from_type == type_name else link.from_type
-        if not perms.can_view(user, other):
+        if not _ot_permission(perms, user, service, other)[0]:
             return {"objects": []}
     return {"objects": service.linked(type_name, pk, link_name)}
 
@@ -461,7 +510,7 @@ def list_actions(service: OntologyDep, perms: PermDep, user: UserDep) -> list[di
     return [
         _dump(a)
         for a in service.ontology.actions
-        if perms.can_view(user, a.object_type)
+        if _ot_permission(perms, user, service, a.object_type)[0]
     ]
 
 
@@ -477,7 +526,7 @@ def apply_action(
     action = service.ontology.action(name)
     if action is None:
         raise KeyError(f"Unknown action: {name!r}")
-    _require_edit(perms, user, action.object_type)
+    _require_ot_edit(perms, user, service, action.object_type)
     edit = service.apply_action(name, body.pk, body.parameters, actor=actor)
     return _dump(edit)
 
@@ -525,6 +574,44 @@ def set_permissions(
         actor=actor,
     )
     return {"object_type": type_name, "grants": [g.model_dump(mode="json") for g in body.grants]}
+
+
+# ---------------------------------------------------------------------------
+# Dataset permissions (admin) — per-dataset access grants
+# ---------------------------------------------------------------------------
+
+@router.get("/dataset-permissions", dependencies=[ADMIN])
+def list_dataset_permissions(store: StoreDep) -> list[dict]:
+    """Grants for every dataset (empty list = default open per global RBAC)."""
+    by_ds: dict[str, list[dict]] = {}
+    for g in store.list_dataset_grants():
+        by_ds.setdefault(g["dataset"], []).append(
+            {k: v for k, v in g.items() if k != "dataset"}
+        )
+    return [
+        {"dataset": d.name, "grants": by_ds.get(d.name, [])}
+        for d in store.list_datasets()
+    ]
+
+
+@router.put("/datasets/{name}/permissions", dependencies=[ADMIN])
+def set_dataset_permissions(
+    name: str,
+    body: GrantsRequest,
+    store: StoreDep,
+    perms: PermDep,
+    actor: ActorDep,
+) -> dict:
+    if store.get_dataset(name) is None:
+        raise KeyError(f"Dataset not found: {name!r}")
+    perms.validate_grants(body.grants)
+    store.set_grants_for_dataset(name, [g.model_dump(mode="json") for g in body.grants])
+    store.log_audit(
+        "dataset_permissions_set",
+        {"dataset": name, "grant_count": len(body.grants)},
+        actor=actor,
+    )
+    return {"dataset": name, "grants": [g.model_dump(mode="json") for g in body.grants]}
 
 
 # ---------------------------------------------------------------------------

@@ -131,6 +131,16 @@ CREATE TABLE IF NOT EXISTS ontology_grants (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_grants_type ON ontology_grants (object_type);
+CREATE TABLE IF NOT EXISTS dataset_grants (
+    id TEXT PRIMARY KEY,
+    dataset TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    can_view INTEGER NOT NULL DEFAULT 0,
+    can_edit INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_grants ON dataset_grants (dataset);
 """
 
 
@@ -749,6 +759,56 @@ class MetadataStore:
                     (
                         _uuid.uuid4().hex,
                         object_type,
+                        g["subject_kind"],
+                        g.get("subject", ""),
+                        int(g.get("can_view", False)),
+                        int(g.get("can_edit", False)),
+                        utcnow_iso(),
+                    )
+                    for g in grants
+                ],
+            )
+
+    # -- dataset grants -----------------------------------------------------------
+
+    @staticmethod
+    def _dataset_grant_row(row: sqlite3.Row) -> dict:
+        return {
+            "dataset": row["dataset"],
+            "subject_kind": row["subject_kind"],
+            "subject": row["subject"],
+            "can_view": bool(row["can_view"]),
+            "can_edit": bool(row["can_edit"]),
+        }
+
+    def list_dataset_grants(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM dataset_grants ORDER BY dataset, subject_kind, subject"
+            ).fetchall()
+        return [self._dataset_grant_row(r) for r in rows]
+
+    def grants_for_dataset(self, dataset: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM dataset_grants WHERE dataset = ?", (dataset,)
+            ).fetchall()
+        return [self._dataset_grant_row(r) for r in rows]
+
+    def set_grants_for_dataset(self, dataset: str, grants: list[dict]) -> None:
+        """Replace all grants for a dataset atomically."""
+        import uuid as _uuid
+
+        with self._conn() as c:
+            c.execute("DELETE FROM dataset_grants WHERE dataset = ?", (dataset,))
+            c.executemany(
+                """INSERT INTO dataset_grants
+                   (id, dataset, subject_kind, subject, can_view, can_edit, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        _uuid.uuid4().hex,
+                        dataset,
                         g["subject_kind"],
                         g.get("subject", ""),
                         int(g.get("can_view", False)),
