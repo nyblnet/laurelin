@@ -88,4 +88,5 @@ there is no separate migration step to run.
 | `LAURELIN_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ROLE_MAP` | OIDC SSO |
 | `LAURELIN_SAML_IDP_METADATA` / `_SP_ENTITY_ID` / `_ROLE_MAP` | SAML SSO (needs `xmlsec1`) |
 | `LAURELIN_SCIM_TOKEN` | Enable SCIM provisioning (IdP bearer token) |
-| `LAURELIN_MAX_UPLOAD_MB` | Upload size cap (default 1024) |
+| `LAURELIN_MAX_UPLOAD_MB` | Upload size cap, also caps HTTP-connector downloads (default 1024) |
+| `LAURELIN_BUILD_WORKERS` | Async build worker threads per replica (default 2) |

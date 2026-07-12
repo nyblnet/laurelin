@@ -1,0 +1,238 @@
+"""Tests for data connectors (sources): validation, redaction, file/http sync,
+permission gating, and the streaming write path."""
+
+import http.server
+import os
+import threading
+
+import pyarrow as pa
+import pytest
+from fastapi.testclient import TestClient
+
+from laurelin.api import create_app
+from laurelin.catalog import DatasetCatalog
+from laurelin.connectors import redacted_config, validate_source
+from laurelin.core.config import Workspace
+from laurelin.core.db import MetadataStore
+
+# -- unit: validation ---------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "type_, config, msg",
+    [
+        ("bigquery", {}, "Unknown source type"),
+        ("postgres", {"url": "mysql://x"}, "postgresql:// url"),
+        ("postgres", {"url": "postgresql://h/db"}, "exactly one of"),
+        ("postgres", {"url": "postgresql://h/db", "table": "a", "query": "SELECT 1"}, "exactly one of"),
+        ("postgres", {"url": "postgresql://h/db", "table": "a; DROP TABLE x"}, "Invalid table"),
+        ("postgres", {"url": "postgresql://h/db", "table": "a", "batch_size": 0}, "batch_size"),
+        ("http", {"url": "ftp://host/f.csv"}, "http:// or https://"),
+        ("http", {"url": "https://host/export"}, "format"),
+        ("http", {"url": "https://host/f.csv", "headers": {"a": 1}}, "headers"),
+        ("file", {}, "needs a 'path'"),
+        ("file", {"path": "/data/dump.xml"}, "format"),
+    ],
+)
+def test_validate_source_rejects(type_, config, msg):
+    with pytest.raises(ValueError, match=msg):
+        validate_source(type_, config)
+
+
+def test_validate_source_accepts_good_configs():
+    validate_source("postgres", {"url": "postgresql://u:p@h/db", "table": "public.orders"})
+    validate_source("postgres", {"url": "postgres://h/db", "query": "SELECT 1"})
+    validate_source("http", {"url": "https://host/x.parquet", "headers": {"Authorization": "Bearer t"}})
+    validate_source("http", {"url": "https://host/export", "format": "csv"})
+    validate_source("file", {"path": "/land/*.csv"})
+
+
+def test_redacted_config_hides_secrets():
+    red = redacted_config(
+        {
+            "url": "postgresql://alice:hunter2@db.internal:5432/prod",
+            "api_key": "xyz",
+            "headers": {"Authorization": "Bearer tok", "Accept": "text/csv"},
+            "table": "orders",
+        }
+    )
+    assert "hunter2" not in red["url"]
+    assert "alice" in red["url"] and "db.internal" in red["url"]
+    assert red["api_key"] == "*****"
+    assert red["headers"]["Authorization"] == "*****"
+    assert red["headers"]["Accept"] == "text/csv"
+    assert red["table"] == "orders"
+
+
+# -- unit: streaming write ----------------------------------------------------
+
+def test_write_batches_streams_and_unifies_schema(tmp_path):
+    ws = Workspace.init(tmp_path / "ws", name="t")
+    cat = DatasetCatalog(ws, MetadataStore(ws.metadata_path))
+    chunks = [
+        pa.Table.from_pylist([{"id": 1, "note": None}]),   # note: null type
+        pa.Table.from_pylist([{"id": 2, "note": "hi"}]),
+    ]
+    info = cat.write_batches("streamed", iter(chunks), source="sync:test")
+    assert info.row_count == 2
+    table = cat.read("streamed")
+    assert table.column("note").to_pylist() == [None, "hi"]
+    assert str(table.schema.field("note").type) == "string"
+
+
+def test_write_batches_empty_iterator_fails(tmp_path):
+    ws = Workspace.init(tmp_path / "ws", name="t")
+    cat = DatasetCatalog(ws, MetadataStore(ws.metadata_path))
+    with pytest.raises(ValueError, match="no data"):
+        cat.write_batches("empty", iter([]))
+    assert not list((ws.data_dir).glob(".tmp-*"))  # temp dir cleaned up
+
+
+# -- API: file + http sync ----------------------------------------------------
+
+CREDS = {"username": "root", "password": "trustno1!"}
+
+
+@pytest.fixture()
+def clients(tmp_path):
+    ws = Workspace.init(tmp_path / "ws", name="conn")
+    app = create_app(ws)
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=CREDS).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=CREDS).status_code == 200
+    for username, role in (("ed", "editor"), ("vic", "viewer")):
+        admin.post(
+            "/api/v1/users",
+            json={"username": username, "password": "password123", "role": role},
+        )
+    editor, viewer = TestClient(app), TestClient(app)
+    editor.post("/api/v1/auth/login", json={"username": "ed", "password": "password123"})
+    viewer.post("/api/v1/auth/login", json={"username": "vic", "password": "password123"})
+    return admin, editor, viewer
+
+
+def test_file_source_lifecycle(clients, tmp_path):
+    admin, editor, _ = clients
+    csv = tmp_path / "cities.csv"
+    csv.write_text("city,pop\nvalmar,120\ntirion,340\n")
+
+    r = admin.put(
+        "/api/v1/sources/city_load",
+        json={"type": "file", "dataset": "cities", "config": {"path": str(csv)}},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["last_sync_status"] is None
+
+    r = editor.post("/api/v1/sources/city_load/sync")
+    assert r.status_code == 200, r.text
+    assert r.json()["row_count"] == 2
+    assert r.json()["source"] == "sync:file"
+
+    rows = admin.get("/api/v1/datasets/cities/rows").json()["rows"]
+    assert {row["city"] for row in rows} == {"valmar", "tirion"}
+
+    listed = admin.get("/api/v1/sources").json()
+    assert listed[0]["last_sync_status"] == "succeeded"
+    assert listed[0]["last_sync_rows"] == 2
+
+    r = admin.delete("/api/v1/sources/city_load")
+    assert r.status_code == 200
+    assert admin.get("/api/v1/sources/city_load").status_code == 404
+
+
+@pytest.fixture()
+def http_dir(tmp_path):
+    serve_dir = tmp_path / "www"
+    serve_dir.mkdir()
+    handler = lambda *a, **kw: http.server.SimpleHTTPRequestHandler(  # noqa: E731
+        *a, directory=str(serve_dir), **kw
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield serve_dir, f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+
+
+def test_http_source_sync_and_failure(clients, http_dir):
+    admin, _, _ = clients
+    serve_dir, base = http_dir
+    (serve_dir / "orders.csv").write_text("id,total\n1,9.5\n2,3.25\n3,7.0\n")
+
+    r = admin.put(
+        "/api/v1/sources/orders_pull",
+        json={"type": "http", "dataset": "orders", "config": {"url": f"{base}/orders.csv"}},
+    )
+    assert r.status_code == 200, r.text
+    r = admin.post("/api/v1/sources/orders_pull/sync")
+    assert r.status_code == 200, r.text
+    assert r.json()["row_count"] == 3
+
+    # A failing pull is a 502 and is recorded on the source.
+    r = admin.put(
+        "/api/v1/sources/broken",
+        json={"type": "http", "dataset": "nope", "config": {"url": f"{base}/missing.csv"}},
+    )
+    assert r.status_code == 200
+    r = admin.post("/api/v1/sources/broken/sync")
+    assert r.status_code == 502
+    src = admin.get("/api/v1/sources/broken").json()
+    assert src["last_sync_status"] == "failed"
+    assert src["last_sync_error"]
+
+
+def test_source_permissions_and_redaction(clients):
+    admin, editor, viewer = clients
+    body = {
+        "type": "postgres",
+        "dataset": "crm",
+        "config": {"url": "postgresql://svc:s3cret@db/prod", "table": "public.accounts"},
+    }
+    assert editor.put("/api/v1/sources/crm_pull", json=body).status_code == 403
+    assert admin.put("/api/v1/sources/crm_pull", json=body).status_code == 200
+
+    assert viewer.get("/api/v1/sources").status_code == 403
+    listed = editor.get("/api/v1/sources").json()
+    assert "s3cret" not in listed[0]["config"]["url"]
+
+    # Sync needs edit access on the target dataset: viewers are refused.
+    assert viewer.post("/api/v1/sources/crm_pull/sync").status_code == 403
+
+    assert editor.delete("/api/v1/sources/crm_pull").status_code == 403
+    assert admin.put(
+        "/api/v1/sources/bad", json={"type": "file", "dataset": "x", "config": {}}
+    ).status_code == 400
+
+
+# -- postgres connector (gated: needs a live database) -------------------------
+
+@pytest.mark.skipif(
+    not os.environ.get("LAURELIN_TEST_POSTGRES"),
+    reason="set LAURELIN_TEST_POSTGRES=<url> to run postgres connector tests",
+)
+def test_postgres_source_sync(clients):
+    import psycopg
+
+    pg_url = os.environ["LAURELIN_TEST_POSTGRES"]
+    admin, _, _ = clients
+    with psycopg.connect(pg_url) as conn:
+        conn.execute("DROP TABLE IF EXISTS laurelin_conn_test")
+        conn.execute("CREATE TABLE laurelin_conn_test (id int, name text)")
+        conn.execute(
+            "INSERT INTO laurelin_conn_test SELECT g, 'row-' || g FROM generate_series(1, 250) g"
+        )
+
+    r = admin.put(
+        "/api/v1/sources/pg_pull",
+        json={
+            "type": "postgres",
+            "dataset": "pg_rows",
+            "config": {"url": pg_url, "table": "laurelin_conn_test", "batch_size": 100},
+        },
+    )
+    assert r.status_code == 200, r.text
+    r = admin.post("/api/v1/sources/pg_pull/sync")
+    assert r.status_code == 200, r.text
+    assert r.json()["row_count"] == 250
+
+    rows = admin.get("/api/v1/datasets/pg_rows/rows?limit=5").json()["rows"]
+    assert rows[0]["name"].startswith("row-")

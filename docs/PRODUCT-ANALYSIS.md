@@ -96,9 +96,17 @@ audit; PostgreSQL control plane; Docker + Helm + HA-for-the-API-tier. The
 enterprise *governance and identity* gaps are effectively done — this is the
 "closer," and it's strong.
 
-**Remaining (the "opener" + scale):** connectors/ingestion; async + incremental +
-scheduled builds; a scale-honest query/ontology-index path; charts/dashboards +
-app builder; MCP + SDKs; object-storage-backed workspaces (for a fully stateless
+**Closed since (first Tier-1 pass):** first connectors — PostgreSQL (streamed),
+HTTP CSV/Parquet, server-side file drops — with redacted-secret source configs
+and one-click sync in the UI; async builds (POST /builds returns immediately,
+worker pool executes, UI polls); a scale-honest workbench query path (lazy
+Arrow scans with filter pushdown for un-policied datasets — query memory now
+scales with the result, not the dataset).
+
+**Remaining (the "opener" + scale):** more connectors + incremental cursors +
+scheduled syncs; cron/event-triggered + incremental builds and a
+multi-process worker/queue; ontology indexing; charts/dashboards + app
+builder; MCP + SDKs; object-storage-backed workspaces (for a fully stateless
 data plane and true data-plane HA); a hosted demo + benchmarks + tutorials.
 
 ## The one strategic call

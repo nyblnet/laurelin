@@ -191,6 +191,9 @@ class DatasetCreateRequest(BaseModel):
 
 class BuildRequest(BaseModel):
     targets: Optional[list[str]] = None
+    # wait=true blocks until the build finishes (small builds, tests, scripts);
+    # the default returns the pending build immediately and a worker runs it.
+    wait: bool = False
 
 
 class ActionApplyRequest(BaseModel):
@@ -299,7 +302,7 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
     try:
         return catalog.query(
             body.sql, max_rows=body.max_rows, allowed=allowed,
-            policy=perms.query_policy_fn(user),
+            policy_for=perms.per_dataset_policy_fn(user),
         )
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
@@ -370,6 +373,7 @@ def list_transforms(registry: RegistryDep) -> list[dict]:
 
 @router.post("/builds", dependencies=[EDITOR])
 def run_build(
+    request: Request,
     workspace: WorkspaceDep,
     catalog: CatalogDep,
     store: StoreDep,
@@ -385,7 +389,13 @@ def run_build(
         )
     store.log_audit("build_requested", {"targets": targets or []}, actor=actor)
     builder = Builder(workspace, catalog, store, registry)
-    build = builder.build(targets)
+    if body and body.wait:
+        return _dump(builder.build(targets))
+    # Async (default): validate the plan now so a bad target is still a 400,
+    # create the pending record, and hand execution to the build pool.
+    builder.plan(targets)  # ValueError -> 400 via handler
+    build = store.create_build(list(targets) if targets else [])
+    request.app.state.build_executor.submit(builder.execute, build.id, targets)
     return _dump(build)
 
 

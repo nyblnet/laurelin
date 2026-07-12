@@ -102,9 +102,15 @@ Key bets, and why:
 
 ### WS2 — Connectors & ingestion (Foundry: Data Connection)
 
+- [x] **First connectors (built-in)**: sources stored in metadata with secret
+      redaction; `postgres` (server-side cursor streamed to Parquet in
+      batches), `http` (CSV/Parquet fetch), `file` (server-side path/glob).
+      Admin-managed, editor-triggered syncs; results are normal dataset
+      versions (`sync:<type>`) so lineage/ACLs/markings apply. UI on the
+      Datasets page.
 - [ ] **Connector plugin SDK**: a connector is a pip-installable package
       exposing `extract() -> Arrow batches` + config schema + secret refs;
-      discovered via entry points. First-party set: Postgres, MySQL, SQL Server,
+      discovered via entry points. First-party set: MySQL, SQL Server,
       Oracle, S3/GCS/azblob file drops, SFTP, HTTP/REST (w/ pagination recipes),
       Google Sheets, Kafka (streaming v2).
 - [ ] **Syncs**: scheduled pulls with incremental cursors (updated_at / PK
@@ -120,10 +126,14 @@ Key bets, and why:
 
 ### WS3 — Pipelines & orchestration (Foundry: Code Repos / Pipeline Builder / Data Health)
 
+- [x] **Async builds (in-process)**: POST /builds returns a pending build
+      immediately; an in-process worker pool (LAURELIN_BUILD_WORKERS) executes
+      it off the request thread and the UI polls to convergence. `wait=true`
+      keeps the old blocking behavior for scripts/tests.
 - [ ] **Scheduler & workers**: cron + event triggers (upstream dataset updated),
-      Postgres-backed job queue, N worker processes, retries w/ backoff,
-      timeouts, concurrency limits, backfill runs. Embedded mode: in-process
-      scheduler thread.
+      Postgres-backed job queue, N separate worker processes, retries w/
+      backoff, timeouts, concurrency limits, backfill runs. Embedded mode:
+      in-process scheduler thread.
 - [ ] **Incremental transforms**: `@transform(incremental=True)` receiving only
       new/changed input partitions; snapshot fallback on schema change.
 - [ ] **Data expectations**: `@expect(col("x").not_null(), row_count > 0)` —

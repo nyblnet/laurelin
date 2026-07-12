@@ -250,7 +250,7 @@ def test_list_transforms(client):
 
 
 def test_build_all_and_listing(client):
-    r = client.post("/api/v1/builds", json={})
+    r = client.post("/api/v1/builds", json={"wait": True})
     assert r.status_code == 200
     build = r.json()
     assert build["status"] == "succeeded"
@@ -276,11 +276,11 @@ def test_build_all_and_listing(client):
 
 
 def test_build_missing_body_and_targets(client):
-    r = client.post("/api/v1/builds")
+    r = client.post("/api/v1/builds", json={"wait": True})
     assert r.status_code == 200
     assert r.json()["status"] == "succeeded"
 
-    r = client.post("/api/v1/builds", json={"targets": ["planes"]})
+    r = client.post("/api/v1/builds", json={"targets": ["planes"], "wait": True})
     assert r.status_code == 200
     assert [t["transform_name"] for t in r.json()["tasks"]] == ["clean_planes"]
 
@@ -288,8 +288,32 @@ def test_build_missing_body_and_targets(client):
     assert r.status_code == 400
 
 
+def test_async_build_default(client):
+    """POST /builds without wait returns a pending build immediately; a worker
+    finishes it and GET /builds/{id} converges to succeeded."""
+    import time
+
+    r = client.post("/api/v1/builds", json={})
+    assert r.status_code == 200
+    build = r.json()
+    assert build["status"] in ("pending", "running")
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        detail = client.get(f"/api/v1/builds/{build['id']}").json()
+        if detail["status"] in ("succeeded", "failed"):
+            break
+        time.sleep(0.05)
+    assert detail["status"] == "succeeded"
+    assert {t["transform_name"] for t in detail["tasks"]} == {
+        "clean_planes",
+        "count_flights",
+        "agg_plane_models",
+    }
+
+
 def test_lineage(client):
-    client.post("/api/v1/builds", json={})
+    client.post("/api/v1/builds", json={"wait": True})
     r = client.get("/api/v1/lineage")
     assert r.status_code == 200
     graph = r.json()
@@ -449,7 +473,7 @@ def test_action_validation_errors(client):
 # ---------------------------------------------------------------------------
 
 def test_audit_listing_and_limit(client):
-    client.post("/api/v1/builds", json={})
+    client.post("/api/v1/builds", json={"wait": True})
     r = client.get("/api/v1/audit")
     assert r.status_code == 200
     actions = [e["action"] for e in r.json()]

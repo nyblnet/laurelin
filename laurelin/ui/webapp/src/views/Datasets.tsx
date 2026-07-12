@@ -30,6 +30,7 @@ import {
   fmtTime,
   fmtValue,
 } from "../ui";
+import { SourcesSection } from "./Sources";
 
 const PAGE_SIZE = 50;
 
@@ -96,6 +97,7 @@ function DatasetList() {
             onRowClick={(d) => navigate(`/datasets/${d.name}`)}
           />
         ))}
+      <SourcesSection />
     </div>
   );
 }

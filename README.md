@@ -30,14 +30,19 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 
 - **Datasets** — versioned tables stored as Parquet. Every write creates an
   immutable new version; the full history is kept.
+- **Data sources** — connectors that pull external data into datasets:
+  PostgreSQL (streamed in batches), HTTP CSV/Parquet exports, and server-side
+  file drops. Synced versions flow through lineage, ACLs, and markings like
+  any other data.
 - **Transforms** — Python functions (or SQL) declared with `@transform`,
   reading input datasets and producing an output dataset. Laurelin resolves the
   DAG, executes builds, and records **lineage** automatically.
 - **Ontology** — YAML-defined *object types* (e.g. `aircraft`, `flight`) backed by
   datasets, with typed properties, *link types* between them, and *actions* —
   validated write-back operations recorded as an edit overlay and audit log.
-- **Builds & lineage** — every build is recorded; the lineage graph is queryable
-  via API and rendered in the UI.
+- **Builds & lineage** — builds run asynchronously on a worker pool and every
+  build is recorded; the lineage graph is queryable via API and rendered in
+  the UI.
 - **Audit** — mutations through the API are written to an audit log.
 
 ## Quickstart

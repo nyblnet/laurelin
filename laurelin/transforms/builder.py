@@ -87,8 +87,30 @@ class Builder:
     # -- execution ------------------------------------------------------------
 
     def build(self, targets: list[str] | None = None) -> BuildInfo:
-        specs = self.plan(targets)
+        """Plan and execute synchronously (CLI and ``wait=true`` API calls).
+        Raises ValueError for an unknown target or a cycle *before* creating
+        the build record, so a typo doesn't leave a failed-build tombstone."""
+        self.plan(targets)
         build = self.store.create_build(list(targets) if targets else [])
+        return self.execute(build.id, targets)
+
+    def execute(self, build_id: str, targets: list[str] | None = None) -> BuildInfo:
+        """Execute an already-created build record (the async path: the API
+        creates the record, returns it, and hands execution to a worker)."""
+        try:
+            specs = self.plan(targets)
+        except ValueError as exc:
+            # Normally caught at request time; guards the worker against a
+            # pipeline edit racing the queue.
+            self.store.update_build(
+                build_id, status=BuildStatus.failed,
+                started_at=utcnow_iso(), finished_at=utcnow_iso(), error=str(exc),
+            )
+            failed = self.store.get_build(build_id)
+            assert failed is not None
+            return failed
+        build = self.store.get_build(build_id)
+        assert build is not None
         self.store.update_build(
             build.id, status=BuildStatus.running, started_at=utcnow_iso()
         )

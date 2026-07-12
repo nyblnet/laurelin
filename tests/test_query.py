@@ -70,3 +70,32 @@ def test_query_requires_auth_when_enabled(ws, monkeypatch):
     client = TestClient(create_app(ws))  # auth on, no user yet -> setup mode
     resp = client.post("/api/v1/query", json={"sql": "SELECT 1"})
     assert resp.status_code == 401
+
+
+def test_lazy_scan_pushdown_and_sandbox(tmp_path):
+    """No-policy datasets are registered as lazy Arrow datasets: filters work,
+    results are correct at non-trivial size, and the SQL still cannot reach the
+    filesystem or widen its own sandbox."""
+    ws = Workspace.init(tmp_path / "ws", name="lazy")
+    catalog = DatasetCatalog(ws, MetadataStore(ws.metadata_path))
+    n = 50_000
+    catalog.write(
+        "big",
+        pa.table({"id": list(range(n)), "bucket": [i % 7 for i in range(n)]}),
+    )
+    client = TestClient(create_app(ws, no_auth=True))
+
+    r = client.post(
+        "/api/v1/query",
+        json={"sql": "SELECT count(*) AS c FROM big WHERE bucket = 3"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["rows"][0]["c"] == len([i for i in range(n) if i % 7 == 3])
+
+    # The lazy registration must not reopen filesystem access to the SQL.
+    for sql in (
+        "SELECT * FROM read_csv_auto('/etc/passwd')",
+        "COPY (SELECT 1) TO '/tmp/laurelin-escape.csv'",
+        "SET allowed_directories=['/']",
+    ):
+        assert client.post("/api/v1/query", json={"sql": sql}).status_code == 400, sql

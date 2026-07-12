@@ -308,25 +308,36 @@ export function PipelineView() {
     queryKey: ["builds"],
     queryFn: () => api.get<Build[]>(`${API}/builds`),
     staleTime: 15_000,
+    // Builds run async on the server: poll while one is in flight so the
+    // history converges without a manual refresh.
+    refetchInterval: (query) =>
+      query.state.data?.some((b) => b.status === "pending" || b.status === "running")
+        ? 2000
+        : false,
   });
 
   const runBuild = useMutation({
     mutationFn: () => api.post<Build>(`${API}/builds`, {}),
     onSuccess: () => {
+      // The POST returns a pending build immediately; polling picks it up.
       qc.invalidateQueries({ queryKey: ["builds"] });
       qc.invalidateQueries({ queryKey: ["lineage"] });
+      qc.invalidateQueries({ queryKey: ["datasets"] });
     },
   });
 
   const canEdit = auth.can("editor");
+  const buildInFlight =
+    runBuild.isPending ||
+    (buildsQ.data?.some((b) => b.status === "pending" || b.status === "running") ?? false);
 
   const actions = canEdit ? (
     <button
       className="primary"
-      disabled={runBuild.isPending}
+      disabled={buildInFlight}
       onClick={() => runBuild.mutate()}
     >
-      {runBuild.isPending ? "Building…" : "Run build"}
+      {buildInFlight ? "Building…" : "Run build"}
     </button>
   ) : (
     <span className="dim">Viewer — builds are read-only.</span>

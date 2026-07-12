@@ -46,6 +46,22 @@ class DatasetVersionInfo(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class SourceInfo(BaseModel):
+    """A configured external data source that syncs into a dataset."""
+
+    name: str
+    type: str  # "postgres" | "http" | "file"
+    dataset: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utcnow_iso)
+    created_by: str = ""
+    last_sync_at: Optional[str] = None
+    last_sync_status: Optional[str] = None  # "succeeded" | "failed"
+    last_sync_error: Optional[str] = None
+    last_sync_version: Optional[int] = None
+    last_sync_rows: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Builds & lineage
 # ---------------------------------------------------------------------------

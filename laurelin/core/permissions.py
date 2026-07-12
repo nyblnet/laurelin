@@ -216,6 +216,23 @@ class PermissionService:
             return None
         return lambda ds, t: self.apply_table_policy(user, ds, t)
 
+    def per_dataset_policy_fn(self, user: Optional[User]):
+        """A ``(dataset) -> Optional[(table)->table]`` resolver for the SQL
+        workbench: None per dataset means no filtering is needed, so the
+        catalog can register it as a lazy (out-of-core) scan instead of
+        materializing it through the policy."""
+        if user is not None and user.role == Role.admin:
+            return lambda ds: None
+
+        def for_dataset(ds: str):
+            if user is None:
+                return lambda t: t.slice(0, 0)  # fail closed
+            if not self.has_dataset_policy(ds):
+                return None
+            return lambda t: self.apply_table_policy(user, ds, t)
+
+        return for_dataset
+
     def _filter_rows(
         self, table: "pa.Table", rp: RowPolicy, user: User, groups: set[str]
     ) -> "pa.Table":

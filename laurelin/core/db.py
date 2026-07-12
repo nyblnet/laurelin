@@ -29,6 +29,7 @@ from laurelin.core.models import (
     LineageEdge,
     ObjectEdit,
     Role,
+    SourceInfo,
     User,
     utcnow_iso,
 )
@@ -49,6 +50,19 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     build_id TEXT,
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
+);
+CREATE TABLE IF NOT EXISTS sources (
+    name TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    last_sync_at TEXT,
+    last_sync_status TEXT,
+    last_sync_error TEXT,
+    last_sync_version INTEGER,
+    last_sync_rows INTEGER
 );
 CREATE TABLE IF NOT EXISTS builds (
     {{SEQ_COL}}
@@ -314,6 +328,73 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- sources ------------------------------------------------------------------
+
+    def upsert_source(self, info: "SourceInfo") -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO sources (name, type, dataset, config_json, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     type = excluded.type,
+                     dataset = excluded.dataset,
+                     config_json = excluded.config_json""",
+                (
+                    info.name,
+                    info.type,
+                    info.dataset,
+                    json.dumps(info.config),
+                    info.created_at,
+                    info.created_by,
+                ),
+            )
+
+    def _row_to_source(self, row) -> "SourceInfo":
+        return SourceInfo(
+            name=row["name"],
+            type=row["type"],
+            dataset=row["dataset"],
+            config=json.loads(row["config_json"]),
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            last_sync_at=row["last_sync_at"],
+            last_sync_status=row["last_sync_status"],
+            last_sync_error=row["last_sync_error"],
+            last_sync_version=row["last_sync_version"],
+            last_sync_rows=row["last_sync_rows"],
+        )
+
+    def get_source(self, name: str) -> Optional["SourceInfo"]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM sources WHERE name = ?", (name,)).fetchone()
+        return self._row_to_source(row) if row else None
+
+    def list_sources(self) -> list["SourceInfo"]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM sources ORDER BY name").fetchall()
+        return [self._row_to_source(r) for r in rows]
+
+    def delete_source(self, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM sources WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
+    def record_source_sync(
+        self,
+        name: str,
+        status: str,
+        error: Optional[str] = None,
+        version: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
+                   last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?
+                   WHERE name = ?""",
+                (utcnow_iso(), status, error, version, rows, name),
+            )
 
     # -- builds -----------------------------------------------------------------
 

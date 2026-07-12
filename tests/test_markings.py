@@ -134,7 +134,7 @@ def clients(ws):
 def test_http_marking_flow_and_enforcement(ws, clients):
     app, admin, viewer = clients
     # build so lineage exists, then mark the source and propagate
-    assert admin.post("/api/v1/builds", json={}).status_code == 200
+    assert admin.post("/api/v1/builds", json={"wait": True}).status_code == 200
     assert admin.post("/api/v1/markings", json={"name": "PII", "description": "personal"}).status_code == 200
     assert admin.put("/api/v1/datasets/raw/markings", json={"markings": ["pii"]}).status_code == 200
 
@@ -164,5 +164,5 @@ def test_marking_endpoints_admin_only(clients):
     assert viewer.put("/api/v1/users/vic/clearances", json={"markings": []}).status_code == 403
     assert viewer.get("/api/v1/markings").status_code == 200  # listing definitions is viewer
     # unknown marking on a dataset -> 400
-    admin.post("/api/v1/builds", json={})
+    admin.post("/api/v1/builds", json={"wait": True})
     assert admin.put("/api/v1/datasets/raw/markings", json={"markings": ["ghost"]}).status_code == 400

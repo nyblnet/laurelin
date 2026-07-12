@@ -33,6 +33,7 @@ from laurelin.api.auth_routes import (
 )
 from laurelin.api.routes import router
 from laurelin.api.scim_routes import scim_router
+from laurelin.api.source_routes import sources_router
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
@@ -51,8 +52,22 @@ def _exc_message(exc: BaseException) -> str:
 def _finalize(app: FastAPI) -> FastAPI:
     """Add the middleware, error handlers, routers, and static mount shared by
     both single- and multi-workspace apps."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from laurelin.core.oidc import OIDCConfig, OIDCProvider
     from laurelin.core.saml import SAMLConfig, SAMLProvider
+
+    # Builds run here, off the request thread (POST /builds returns a pending
+    # build immediately). Version allocation is safe under concurrency (the
+    # rename mutex in DatasetCatalog), so overlapping builds are wasteful but
+    # never corrupting.
+    app.state.build_executor = ThreadPoolExecutor(
+        max_workers=int(os.environ.get("LAURELIN_BUILD_WORKERS", "2")),
+        thread_name_prefix="laurelin-build",
+    )
+    app.router.on_shutdown.append(
+        lambda: app.state.build_executor.shutdown(wait=False)
+    )
 
     app.state.oidc_config = OIDCConfig.from_env()
     app.state.oidc_provider = OIDCProvider(app.state.oidc_config)
@@ -129,6 +144,7 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.include_router(groups_router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(scim_router, prefix="/api/v1")
+    app.include_router(sources_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

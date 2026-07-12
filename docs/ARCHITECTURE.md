@@ -84,9 +84,16 @@ class Builder:
         # upstream transforms whose outputs are inputs (recursively). Raise
         # ValueError on cycles or unknown targets.
     def build(self, targets: list[str] | None = None) -> BuildInfo
+        # Synchronous: plan (raises before creating the record), create, execute.
+    def execute(self, build_id: str, targets: list[str] | None = None) -> BuildInfo
+        # Executes an already-created record — the async path. The API validates
+        # the plan, creates the pending build, returns it, and submits
+        # execute() to app.state.build_executor (a ThreadPoolExecutor,
+        # LAURELIN_BUILD_WORKERS, default 2). POST /builds {wait:true} keeps the
+        # blocking behavior for scripts/tests.
 ```
 
-`build()` behavior: `store.create_build`, mark running with `started_at`; for each
+`execute()` behavior: mark running with `started_at`; for each
 spec in topo order: read inputs (python: `catalog.read`; sql: duckdb with each
 alias registered as a view over `parquet_glob`), execute, `catalog.write(...,
 source="transform", build_id=...)`, `store.upsert_build_task`,
@@ -325,9 +332,19 @@ POST /api/v1/datasets/{name}/upload           multipart file (.csv/.parquet) -> 
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
 GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset], kind}]
-POST /api/v1/builds                           {targets?: [str]} -> BuildInfo (synchronous)
+POST /api/v1/builds                           {targets?: [str], wait?: bool} -> BuildInfo
+                                 (default async: returns the pending build, a
+                                  worker executes it; wait=true blocks)
 GET  /api/v1/builds                           -> [BuildInfo]
 GET  /api/v1/builds/{id}                      -> BuildInfo
+GET  /api/v1/sources                          -> [SourceInfo]  (editor; secrets redacted)
+GET  /api/v1/sources/{name}                   -> SourceInfo    (editor; secrets redacted)
+PUT  /api/v1/sources/{name}                   {type, dataset, config} -> SourceInfo  (admin)
+                                 (types: postgres {url, table|query, batch_size?},
+                                  http {url, format?, headers?}, file {path, format?})
+DELETE /api/v1/sources/{name}                 -> {deleted}  (admin)
+POST /api/v1/sources/{name}/sync              -> DatasetVersionInfo  (needs edit on the
+                                 target dataset; failures recorded on the source, 502)
 GET  /api/v1/ontology/object-types            -> [ObjectTypeDef]  (only viewable
                                  types; each carries permissions:{can_view,can_edit})
 GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions +
@@ -375,7 +392,12 @@ as a grant subject.
 (`dataset_grants`, `PermissionService.dataset_permission`), enforced on **every**
 data path: `/datasets` (list filtered), `/datasets/{name}`, `/schema`, `/rows`
 (view), `/upload` (edit), and `/query` — the query registers only the datasets
-the caller can view, so a blocked dataset is simply an unknown table. Object-type
+the caller can view, so a blocked dataset is simply an unknown table. Datasets
+that need no policy for the caller are registered as **lazy Arrow datasets**
+(DuckDB streams them with projection/filter pushdown, so workbench memory
+scales with the result, not the dataset); policy'd datasets are read and
+filtered through the same choke point as the row API. External access stays
+disabled either way — the SQL can never touch the filesystem. Object-type
 access is now **composed**: effective view = ontology-view AND backing-dataset-
 view; effective edit = that view AND ontology-edit. So locking a dataset also
 hides its objects, and there is no longer a path (query / dataset rows) to read

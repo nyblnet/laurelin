@@ -96,6 +96,23 @@ export interface QueryResult {
   truncated: boolean;
 }
 
+export type SourceType = "postgres" | "http" | "file";
+
+export interface Source {
+  name: string;
+  type: SourceType;
+  dataset: string;
+  // Secret-bearing values arrive redacted ("*****") from the API.
+  config: Record<string, unknown>;
+  created_at: string;
+  created_by: string;
+  last_sync_at: string | null;
+  last_sync_status: "succeeded" | "failed" | null;
+  last_sync_error: string | null;
+  last_sync_version: number | null;
+  last_sync_rows: number | null;
+}
+
 export interface TransformSummary {
   name: string;
   output: string;
