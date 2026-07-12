@@ -231,9 +231,9 @@ Baseline (already specced in ARCHITECTURE.md, partially underway):
 
 Enterprise:
 
-- [ ] **OIDC SSO** (covers Okta, Entra ID, Google, Keycloak, Auth0): authlib
-      code-flow w/ PKCE, JIT user provisioning, group claim → role mapping,
-      IdP-initiated logout. *This is the 90% of enterprise SSO.*
+- ✅ **OIDC SSO** (Okta, Entra ID, Google, Keycloak, Auth0): authlib code-flow
+      with PKCE, JIT user provisioning, group→role mapping (+ superadmin group).
+      **done** *(the 90% of enterprise SSO)*
 - [ ] **SAML 2.0** (for the legacy 10%): SP-initiated + IdP-initiated, signed
       assertions, metadata endpoint.
 - [ ] **SCIM 2.0 provisioning**: users + groups pushed from IdP,
@@ -256,11 +256,10 @@ Enterprise:
       workspace (datasets/pipelines/ontology grouped, per-project grants). Still
       open — multi-workspace covers coarse-grained tenancy; projects would add
       intra-workspace structure.
-- ◑ **Fine-grained policies**: ✅ per-object-type ontology access AND ✅
-      per-dataset ACLs (view/edit grants to user/role/group/everyone, with
-      groups) are **done** — dataset grants confer real data confidentiality
-      (enforced on rows + the SQL workbench) and compose with ontology grants.
-      Still to do: row-level security (predicate per group) and column masking.
+- ✅ **Fine-grained policies**: per-object-type ontology access, per-dataset
+      ACLs, AND row-level security + column masking (per-subject row rules;
+      null/redact/hash masks with exemptions) — all enforced uniformly on the row
+      API, SQL workbench, and ontology objects, and composed together. **done**
 - [ ] **Markings (mandatory access control)**: classification labels
       (e.g. PII, CONFIDENTIAL) that *propagate through lineage* — a derived
       dataset inherits input markings; access requires clearance regardless of
@@ -278,7 +277,11 @@ Enterprise:
 
 - [ ] **Server mode**: config file + env, Postgres + S3 backends, `laurelin
       server` (api) / `laurelin worker` / `laurelin scheduler` processes.
-- [ ] **Packaging**: official Docker images, docker-compose for small teams,
+- ◑ **Storage backend**: ✅ metadata/control stores run on SQLite or PostgreSQL
+      via a dialect adapter; the control plane can be Postgres (`--control-db`)
+      for multi-tenant deployments. **done** (per-workspace data still SQLite dirs)
+- ◑ **Packaging**: ✅ Docker image + docker-compose (Laurelin + Postgres). **done**;
+      still to do: official Helm chart / registry-published images,
       Helm chart (api/worker/scheduler deployments, HPA-ready), single-binary
       embedded mode preserved forever.
 - [ ] **HA**: stateless API/workers, leader-elected scheduler (pg advisory
