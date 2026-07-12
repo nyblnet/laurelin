@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -250,6 +251,48 @@ def datasets_show(
                 columns,
                 [[str(r.get(c)) if r.get(c) is not None else "" for c in columns] for r in preview],
             )
+
+
+@app.command()
+def mcp(
+    url: str = typer.Option(
+        "http://127.0.0.1:8787",
+        "--url",
+        envvar="LAURELIN_URL",
+        help="Base URL of the running Laurelin server.",
+    ),
+    token: str = typer.Option(
+        "",
+        "--token",
+        envvar="LAURELIN_TOKEN",
+        help="API token (create one in the UI under your account).",
+    ),
+    workspace: str = typer.Option(
+        "",
+        "--mcp-workspace",
+        envvar="LAURELIN_MCP_WORKSPACE",
+        help="Workspace slug on a multi-workspace server.",
+    ),
+) -> None:
+    """Serve this workspace to AI agents over MCP (stdio).
+
+    Every tool call goes through the normal REST API with the given token, so
+    RBAC, ACLs, row-level security, markings, and audit all apply. Configure
+    your agent with: laurelin mcp --url http://host:8787 --token <token>
+    """
+    from laurelin.mcp import LaurelinClient, build_server
+
+    if not token and not os.environ.get("LAURELIN_NO_AUTH"):
+        typer.echo(
+            "Warning: no --token given; only works against a --no-auth server.",
+            err=True,
+        )
+    client = LaurelinClient(url, token=token, workspace=workspace)
+    try:
+        build_server(client).run()
+    except RuntimeError as exc:  # missing optional dependency
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command()

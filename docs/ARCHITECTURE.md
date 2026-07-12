@@ -337,6 +337,13 @@ POST /api/v1/builds                           {targets?: [str], wait?: bool} -> 
                                   worker executes it; wait=true blocks)
 GET  /api/v1/builds                           -> [BuildInfo]
 GET  /api/v1/builds/{id}                      -> BuildInfo
+GET  /api/v1/dashboards                       -> [DashboardInfo]  (viewer)
+GET  /api/v1/dashboards/{name}                -> DashboardInfo    (viewer)
+PUT  /api/v1/dashboards/{name}                {title?, description?, panels} -> DashboardInfo (editor)
+                                 (panels = saved SQL + chart config; the client
+                                  runs each panel through POST /query, so every
+                                  viewer sees their own filtered data)
+DELETE /api/v1/dashboards/{name}              -> {deleted}  (editor)
 GET  /api/v1/sources                          -> [SourceInfo]  (editor; secrets redacted)
 GET  /api/v1/sources/{name}                   -> SourceInfo    (editor; secrets redacted)
 PUT  /api/v1/sources/{name}                   {type, dataset, config} -> SourceInfo  (admin)

@@ -96,6 +96,28 @@ export interface QueryResult {
   truncated: boolean;
 }
 
+export type ChartKind = "table" | "bar" | "line" | "area" | "stat";
+
+export interface DashboardPanel {
+  id: string;
+  title: string;
+  sql: string;
+  chart: ChartKind;
+  x: string;
+  y: string[];
+  width: number; // 1..12 columns
+}
+
+export interface Dashboard {
+  name: string;
+  title: string;
+  description: string;
+  panels: DashboardPanel[];
+  created_at: string;
+  created_by: string;
+  updated_at: string;
+}
+
 export type SourceType = "postgres" | "http" | "file";
 
 export interface Source {

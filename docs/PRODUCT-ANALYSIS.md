@@ -103,11 +103,18 @@ worker pool executes, UI polls); a scale-honest workbench query path (lazy
 Arrow scans with filter pushdown for un-policied datasets — query memory now
 scales with the result, not the dataset).
 
+**Closed since (Tier-2 pass):** charts on workbench results + dashboards
+(saved-query grids whose panels run with the viewer's credentials — RLS/ACLs
+per user); the MCP server (`laurelin mcp`) + `LaurelinClient` Python SDK —
+agents operate datasets, SQL, the ontology, actions, and builds through the
+normal token/permission/audit path.
+
 **Remaining (the "opener" + scale):** more connectors + incremental cursors +
 scheduled syncs; cron/event-triggered + incremental builds and a
-multi-process worker/queue; ontology indexing; charts/dashboards + app
-builder; MCP + SDKs; object-storage-backed workspaces (for a fully stateless
-data plane and true data-plane HA); a hosted demo + benchmarks + tutorials.
+multi-process worker/queue; ontology indexing; dashboard v2 (cross-filtering,
+parameters) + app builder; generated typed SDKs; object-storage-backed
+workspaces (for a fully stateless data plane and true data-plane HA); a
+hosted demo + benchmarks + tutorials.
 
 ## The one strategic call
 

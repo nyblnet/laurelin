@@ -23,6 +23,8 @@ from laurelin.core.models import (
     BuildStatus,
     BuildTaskInfo,
     ColumnSchema,
+    DashboardInfo,
+    DashboardPanel,
     DatasetInfo,
     DatasetVersionInfo,
     EditKind,
@@ -63,6 +65,15 @@ CREATE TABLE IF NOT EXISTS sources (
     last_sync_error TEXT,
     last_sync_version INTEGER,
     last_sync_rows INTEGER
+);
+CREATE TABLE IF NOT EXISTS dashboards (
+    name TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    panels_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS builds (
     {{SEQ_COL}}
@@ -395,6 +406,56 @@ class MetadataStore:
                    WHERE name = ?""",
                 (utcnow_iso(), status, error, version, rows, name),
             )
+
+    # -- dashboards --------------------------------------------------------------
+
+    def upsert_dashboard(self, info: "DashboardInfo") -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO dashboards
+                     (name, title, description, panels_json, created_at, created_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     title = excluded.title,
+                     description = excluded.description,
+                     panels_json = excluded.panels_json,
+                     updated_at = excluded.updated_at""",
+                (
+                    info.name,
+                    info.title,
+                    info.description,
+                    json.dumps([p.model_dump() for p in info.panels]),
+                    info.created_at,
+                    info.created_by,
+                    info.updated_at,
+                ),
+            )
+
+    def _row_to_dashboard(self, row) -> "DashboardInfo":
+        return DashboardInfo(
+            name=row["name"],
+            title=row["title"],
+            description=row["description"],
+            panels=[DashboardPanel(**p) for p in json.loads(row["panels_json"])],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_dashboard(self, name: str) -> Optional["DashboardInfo"]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM dashboards WHERE name = ?", (name,)).fetchone()
+        return self._row_to_dashboard(row) if row else None
+
+    def list_dashboards(self) -> list["DashboardInfo"]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM dashboards ORDER BY name").fetchall()
+        return [self._row_to_dashboard(r) for r in rows]
+
+    def delete_dashboard(self, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM dashboards WHERE name = ?", (name,))
+            return cur.rowcount > 0
 
     # -- builds -----------------------------------------------------------------
 

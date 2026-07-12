@@ -43,6 +43,13 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Builds & lineage** — builds run asynchronously on a worker pool and every
   build is recorded; the lineage graph is queryable via API and rendered in
   the UI.
+- **Dashboards** — grids of saved queries rendered as charts (zero-dependency
+  SVG). Panels execute with the *viewer's* credentials, so row-level security
+  and ACLs apply per user.
+- **MCP server** — `laurelin mcp` exposes datasets, SQL, the ontology, actions,
+  and builds to AI agents over the Model Context Protocol. Agents authenticate
+  with an API token and go through the same permission and audit path as any
+  user (`pip install laurelin[mcp]`).
 - **Audit** — mutations through the API are written to an audit log.
 
 ## Quickstart

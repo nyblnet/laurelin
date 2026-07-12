@@ -63,6 +63,43 @@ class SourceInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Dashboards
+# ---------------------------------------------------------------------------
+
+class ChartKind(str, Enum):
+    table = "table"
+    bar = "bar"
+    line = "line"
+    area = "area"
+    stat = "stat"  # single big number (first cell of the result)
+
+
+class DashboardPanel(BaseModel):
+    """One saved query + presentation. Panels are executed client-side through
+    the normal /query endpoint, so each viewer sees their own ACL/RLS-filtered
+    view of the data — a dashboard adds no new read surface."""
+
+    id: str
+    title: str = ""
+    sql: str
+    chart: ChartKind = ChartKind.table
+    # Column bindings (empty = infer: first text column as x, numeric as y).
+    x: str = ""
+    y: list[str] = Field(default_factory=list)
+    width: int = Field(default=6, ge=1, le=12)  # 12-column grid
+
+
+class DashboardInfo(BaseModel):
+    name: str
+    title: str = ""
+    description: str = ""
+    panels: list[DashboardPanel] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utcnow_iso)
+    created_by: str = ""
+    updated_at: str = Field(default_factory=utcnow_iso)
+
+
+# ---------------------------------------------------------------------------
 # Builds & lineage
 # ---------------------------------------------------------------------------
 

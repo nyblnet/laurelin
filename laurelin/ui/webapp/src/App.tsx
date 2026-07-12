@@ -15,6 +15,7 @@ import { Layout } from "./Layout";
 import { LoginScreen, SetupScreen } from "./screens/AuthScreens";
 import { Spinner } from "./ui";
 import { DatasetsView } from "./views/Datasets";
+import { DashboardsView } from "./views/Dashboards";
 import { PipelineView } from "./views/Pipeline";
 import { TransformsView } from "./views/Transforms";
 import { OntologyView } from "./views/Ontology";
@@ -69,6 +70,7 @@ export function App() {
         <Layout>
           <Routes>
             <Route path="/datasets/*" element={scoped(<DatasetsView />)} />
+            <Route path="/dashboards/*" element={scoped(<DashboardsView />)} />
             <Route path="/pipeline" element={scoped(<PipelineView />)} />
             <Route path="/transforms" element={scoped(<TransformsView />)} />
             <Route path="/ontology/*" element={scoped(<OntologyView />)} />

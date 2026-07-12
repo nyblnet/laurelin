@@ -38,6 +38,8 @@ dev = ["pytest>=8"]
 postgres = ["psycopg[binary]>=3.1"]
 # SAML 2.0 SSO (needs the xmlsec1 system binary at runtime).
 saml = ["pysaml2>=7.5"]
+# MCP server: expose the workspace to AI agents (laurelin mcp).
+mcp = ["mcp>=1.0"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

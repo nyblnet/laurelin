@@ -192,11 +192,14 @@ panel"), keeping the current information-dense dark aesthetic:
 - [ ] **Analysis boards** (Contour): notebook-of-panels over datasets/objects —
       filter, join, pivot, chart panels chained together; each board
       exportable as a pipeline; stored as YAML in the workspace.
-- [ ] **Charts & dashboards** (Quiver): Vega-Lite based chart builder (bar,
-      line, area, scatter, histogram, heatmap, big-number, table, map),
-      dashboard grid w/ cross-filtering, auto-refresh, parameter controls
-      (date range, object picker); dashboards are YAML files; public/team
-      share links w/ access control; PNG/CSV export.
+- [x] **Charts & dashboards v1**: zero-dependency SVG charts (bar, line,
+      area, big-number, table) on workbench results; dashboards as grids of
+      saved queries with an inline panel editor and "Add to dashboard" from
+      the workbench. Panels execute through /query with the *viewer's*
+      credentials, so RLS/ACLs/markings apply per user.
+- [ ] **Charts & dashboards v2** (Quiver): scatter, histogram, heatmap, map;
+      cross-filtering, auto-refresh, parameter controls (date range, object
+      picker); dashboards as YAML files; share links; PNG/CSV export.
 - [ ] **Object explorer v2**: faceted search, saved object sets, bulk actions,
       link graph visualization (interactive network), object timelines
       (time series props), map view (geo props).
@@ -218,9 +221,11 @@ panel"), keeping the current information-dense dark aesthetic:
 - [ ] **Jupyter integration**: `laurelin.notebook` client (auth'd dataset
       read/write as Arrow/pandas/polars) + optional hosted JupyterLab
       (server mode, per-user kernels, workspace-mounted).
-- [ ] **MCP server**: expose datasets, ontology query, actions, lineage, and
-      builds as Model Context Protocol tools so Claude/other agents operate the
-      platform with governance (auth token = scoped user). AI-era table stakes.
+- [x] **MCP server** (`laurelin mcp`, `pip install laurelin[mcp]`): datasets,
+      SQL, ontology search/get/links, actions, lineage, builds, and source
+      syncs as MCP tools over stdio. Every call goes through the REST API
+      with an API token, so the agent is a scoped, audited user — no side
+      door. Ships with `laurelin.mcp.LaurelinClient`, a small Python SDK.
 - [ ] **VS Code extension**: workspace explorer, run/build transforms,
       dataset preview, ontology autocomplete for SDKs.
 - [ ] **API completeness**: pagination/filtering conventions, idempotency keys

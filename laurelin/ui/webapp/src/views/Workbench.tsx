@@ -10,9 +10,13 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { api, API, ApiError } from "../api";
-import type { Dataset, QueryResult, PipelineWriteResult } from "../types";
+import type { Dashboard, Dataset, QueryResult, PipelineWriteResult } from "../types";
+import type { ChartKind } from "../charts";
+import { Chart } from "../charts";
 import { PageHeader, Spinner, ErrorBox, fmtValue } from "../ui";
 import { useAuth } from "../auth";
+
+const RESULT_VIEWS: ChartKind[] = ["table", "bar", "line", "area", "stat"];
 
 const MAX_ROWS = 1000;
 const PLACEHOLDER = "-- Write SQL over your datasets. Ctrl+Enter to run.\n";
@@ -48,6 +52,45 @@ export function WorkbenchView() {
   const [fileName, setFileName] = useState("");
   const [nameErr, setNameErr] = useState<string | null>(null);
   const [saved, setSaved] = useState<PipelineWriteResult | null>(null);
+
+  // Result presentation + "Add to dashboard" state.
+  const [view, setView] = useState<ChartKind>("table");
+  const [dashOpen, setDashOpen] = useState(false);
+  const [dashName, setDashName] = useState("");
+  const [panelTitle, setPanelTitle] = useState("");
+  const [dashDone, setDashDone] = useState<string | null>(null);
+
+  const dashboardsQ = useQuery({
+    queryKey: ["dashboards"],
+    queryFn: () => api.get<Dashboard[]>(`${API}/dashboards`),
+    enabled: dashOpen,
+  });
+
+  const addToDash = useMutation({
+    mutationFn: async () => {
+      const name = dashName.trim();
+      const sqlText = viewRef.current?.state.doc.toString() ?? "";
+      const existing = (dashboardsQ.data ?? []).find((d) => d.name === name);
+      const panel = {
+        id: Math.random().toString(36).slice(2, 10),
+        title: panelTitle.trim(),
+        sql: sqlText,
+        chart: view === "table" ? ("table" as const) : view,
+        x: "",
+        y: [],
+        width: 6,
+      };
+      return api.put<Dashboard>(`${API}/dashboards/${name}`, {
+        title: existing?.title ?? name,
+        description: existing?.description ?? "",
+        panels: [...(existing?.panels ?? []), panel],
+      });
+    },
+    onSuccess: (d) => {
+      setDashOpen(false);
+      setDashDone(d.name);
+    },
+  });
 
   const saveMut = useMutation<
     PipelineWriteResult,
@@ -220,16 +263,48 @@ export function WorkbenchView() {
                   {result.row_count.toLocaleString("en-US")} rows
                   {result.truncated ? ` · truncated at ${MAX_ROWS}` : ""}
                 </span>
+                <span className="wb-viewtabs">
+                  {RESULT_VIEWS.map((k) => (
+                    <button
+                      key={k}
+                      type="button"
+                      className={`small${view === k ? " primary" : ""}`}
+                      onClick={() => setView(k)}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </span>
                 {auth.can("editor") && (
-                  <button
-                    type="button"
-                    className="button small"
-                    onClick={openSaveForm}
-                  >
-                    Save as transform
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="button small"
+                      onClick={openSaveForm}
+                    >
+                      Save as transform
+                    </button>
+                    <button
+                      type="button"
+                      className="button small"
+                      onClick={() => {
+                        setDashDone(null);
+                        addToDash.reset();
+                        setDashOpen(true);
+                      }}
+                    >
+                      Add to dashboard
+                    </button>
+                  </>
                 )}
               </div>
+
+              {dashDone && (
+                <div style={{ marginBottom: 10, fontSize: 12.5, color: "var(--green)" }}>
+                  Panel added —{" "}
+                  <Link to={`/dashboards/${dashDone}`}>open dashboard '{dashDone}'.</Link>
+                </div>
+              )}
 
               {saved && (
                 <div
@@ -258,6 +333,10 @@ export function WorkbenchView() {
                 <div className="dim" style={{ fontSize: 13, padding: "8px 0" }}>
                   No result set.
                 </div>
+              ) : view !== "table" ? (
+                <div className="card" style={{ maxWidth: 760 }}>
+                  <Chart data={result} kind={view} />
+                </div>
               ) : (
                 <div className="table-wrap">
                   <table>
@@ -284,6 +363,69 @@ export function WorkbenchView() {
                   </table>
                 </div>
               )}
+            </div>
+          )}
+
+          {dashOpen && (
+            <div
+              className="modal-backdrop"
+              onClick={() => {
+                if (!addToDash.isPending) setDashOpen(false);
+              }}
+            >
+              <div className="modal" onClick={(e) => e.stopPropagation()}>
+                <div className="card-title">Add to dashboard</div>
+                <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
+                  Saves the current query as a{" "}
+                  <span className="mono">{view === "table" ? "table" : view}</span> panel.
+                  Type a new name to create a dashboard.
+                </p>
+                <div className="field" style={{ marginTop: 12 }}>
+                  <label>Dashboard</label>
+                  <input
+                    className="mono"
+                    autoFocus
+                    list="wb-dash-list"
+                    placeholder="revenue"
+                    value={dashName}
+                    onChange={(e) => setDashName(e.target.value)}
+                  />
+                  <datalist id="wb-dash-list">
+                    {(dashboardsQ.data ?? []).map((d) => (
+                      <option key={d.name} value={d.name}>
+                        {d.title || d.name}
+                      </option>
+                    ))}
+                  </datalist>
+                  <div className="hint">Lowercase letters, digits, _ and -.</div>
+                </div>
+                <div className="field">
+                  <label>Panel title</label>
+                  <input
+                    value={panelTitle}
+                    onChange={(e) => setPanelTitle(e.target.value)}
+                    placeholder="Revenue by region"
+                  />
+                </div>
+                {addToDash.error != null && <ErrorBox error={addToDash.error} />}
+                <div className="toolbar" style={{ marginTop: 16, justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    disabled={addToDash.isPending}
+                    onClick={() => setDashOpen(false)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={addToDash.isPending || !/^[a-z][a-z0-9_-]{0,63}$/.test(dashName.trim())}
+                    onClick={() => addToDash.mutate()}
+                  >
+                    {addToDash.isPending ? "Adding…" : "Add panel"}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -422,6 +564,7 @@ export function WorkbenchView() {
           color: var(--text);
         }
         .wb-main { min-width: 0; }
+        .wb-viewtabs { display: inline-flex; gap: 4px; }
       `}</style>
     </div>
   );

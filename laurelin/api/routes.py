@@ -34,7 +34,16 @@ from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import ColumnMask, DatasetVersionInfo, Grant, RowPolicy, User
+from laurelin.core.models import (
+    ColumnMask,
+    DashboardInfo,
+    DashboardPanel,
+    DatasetVersionInfo,
+    Grant,
+    RowPolicy,
+    User,
+    utcnow_iso,
+)
 from laurelin.core.permissions import PermissionService
 from laurelin.ontology import OntologyService, load_ontology
 from laurelin.transforms import (
@@ -306,6 +315,74 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
         )
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
+
+
+# ---------------------------------------------------------------------------
+# Dashboards
+# ---------------------------------------------------------------------------
+#
+# A dashboard is saved SQL + presentation. Panels are executed by the client
+# through POST /query, so every viewer sees their own ACL/RLS/markings-filtered
+# result — storing a dashboard grants nobody any new read access.
+
+_DASHBOARD_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+
+class DashboardUpsertRequest(BaseModel):
+    title: str = ""
+    description: str = ""
+    panels: list[DashboardPanel] = Field(default_factory=list)
+
+
+@router.get("/dashboards", dependencies=[VIEWER])
+def list_dashboards(store: StoreDep) -> list[dict]:
+    return [_dump(d) for d in store.list_dashboards()]
+
+
+@router.get("/dashboards/{name}", dependencies=[VIEWER])
+def get_dashboard(name: str, store: StoreDep) -> dict:
+    dash = store.get_dashboard(name)
+    if dash is None:
+        raise HTTPException(status_code=404, detail=f"Dashboard not found: {name!r}")
+    return _dump(dash)
+
+
+@router.put("/dashboards/{name}", dependencies=[EDITOR])
+def upsert_dashboard(
+    name: str, body: DashboardUpsertRequest, store: StoreDep, actor: ActorDep
+) -> dict:
+    if not _DASHBOARD_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid dashboard name {name!r}: must match ^[a-z][a-z0-9_-]{{0,63}}$",
+        )
+    if len(body.panels) > 50:
+        raise HTTPException(status_code=400, detail="A dashboard is limited to 50 panels")
+    existing = store.get_dashboard(name)
+    info = DashboardInfo(
+        name=name,
+        title=body.title.strip(),
+        description=body.description.strip(),
+        panels=body.panels,
+        created_at=existing.created_at if existing else utcnow_iso(),
+        created_by=existing.created_by if existing else actor,
+        updated_at=utcnow_iso(),
+    )
+    store.upsert_dashboard(info)
+    store.log_audit(
+        "dashboard_updated" if existing else "dashboard_created",
+        {"dashboard": name, "panels": len(body.panels)},
+        actor=actor,
+    )
+    return _dump(info)
+
+
+@router.delete("/dashboards/{name}", dependencies=[EDITOR])
+def delete_dashboard(name: str, store: StoreDep, actor: ActorDep) -> dict:
+    if not store.delete_dashboard(name):
+        raise HTTPException(status_code=404, detail=f"Dashboard not found: {name!r}")
+    store.log_audit("dashboard_deleted", {"dashboard": name}, actor=actor)
+    return {"deleted": name}
 
 
 @router.post("/datasets/{name}/upload")
