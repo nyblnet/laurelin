@@ -14,7 +14,6 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Optional
 
-import duckdb
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
@@ -95,11 +94,16 @@ class OntologyService:
         catalog: DatasetCatalog,
         store: MetadataStore,
         ontology: OntologyDef,
+        policy=None,
     ):
         self.workspace = workspace
         self.catalog = catalog
         self.store = store
         self.ontology = ontology
+        # Optional (dataset, pa.Table) -> pa.Table row-level-security / masking
+        # transform, bound to the requesting user. Objects ARE dataset rows, so
+        # applying it here keeps RLS from being bypassed via the ontology API.
+        self.policy = policy
 
     # -- definitions ----------------------------------------------------------
 
@@ -116,23 +120,19 @@ class OntologyService:
 
     def _base_rows(self, ot: ObjectTypeDef) -> list[dict]:
         """Rows from the backing dataset's latest version, projected to the
-        declared properties (plus the primary key). Empty if the dataset does
-        not exist or has no versions yet."""
+        declared properties (plus the primary key). Row-level security / column
+        masking (``self.policy``) is applied first. Empty if the dataset does not
+        exist or has no versions yet."""
         try:
-            glob = self.catalog.parquet_glob(ot.backing_dataset)
+            table = self.catalog.read(ot.backing_dataset)
         except KeyError:
             return []
-        con = duckdb.connect()
-        try:
-            cur = con.execute("SELECT * FROM read_parquet(?)", [glob])
-            columns = [d[0] for d in cur.description]
-            data = cur.fetchall()
-        finally:
-            con.close()
+        if self.policy is not None:
+            table = self.policy(ot.backing_dataset, table)
         keep = set(ot.properties) | {ot.primary_key}
         return [
-            {col: _json_safe(val) for col, val in zip(columns, row) if col in keep}
-            for row in data
+            {k: v for k, v in row.items() if k in keep}
+            for row in self.catalog.table_to_rows(table)
         ]
 
     def _materialize(self, ot: ObjectTypeDef) -> list[dict]:

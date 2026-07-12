@@ -151,10 +151,14 @@ session cookie. For local development, `laurelin serve --no-auth` (or
 per-object-type view/edit access to specific users, groups, roles, or everyone
 (Admin → Ontology access). A type with no grants is open (viewers view, editors
 edit); adding any grant turns it into an allowlist. Admins always have access.
-Note: these grants gate the *ontology layer only* — they are not data
-confidentiality. A user denied an object type can still read the same rows via
-the SQL workbench or the dataset row API. Dataset-level access control is
-future work (see [docs/ROADMAP.md](docs/ROADMAP.md), WS8).
+Datasets have their own view/edit grants too (Admin → Dataset access), and
+ontology view composes with them — locking a dataset hides its objects.
+
+**Row-level security & column masking.** Per dataset, admins can restrict which
+*rows* a user sees (a policy column + per-subject allowed values) and *mask*
+columns (redact / null / hash) except for exempt subjects. It's enforced
+uniformly on the row API, the SQL workbench (aggregates respect it), and
+ontology objects — admins are exempt. Admin → Row & column security.
 
 **Multiple workspaces.** `laurelin serve --workspace X` hosts a single
 workspace. `laurelin serve --root DIR` hosts many: users are global, a

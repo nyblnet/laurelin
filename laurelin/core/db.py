@@ -142,6 +142,11 @@ CREATE TABLE IF NOT EXISTS dataset_grants (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_grants ON dataset_grants (dataset);
+CREATE TABLE IF NOT EXISTS dataset_policies (
+    dataset TEXT PRIMARY KEY,
+    policy_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -823,3 +828,31 @@ class MetadataStore:
                     for g in grants
                 ],
             )
+
+    # -- dataset policies (row-level security + column masking) -------------------
+
+    def get_dataset_policy(self, dataset: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT policy_json FROM dataset_policies WHERE dataset = ?", (dataset,)
+            ).fetchone()
+        return json.loads(row["policy_json"]) if row else None
+
+    def list_dataset_policies(self) -> dict[str, dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT dataset, policy_json FROM dataset_policies").fetchall()
+        return {r["dataset"]: json.loads(r["policy_json"]) for r in rows}
+
+    def set_dataset_policy(self, dataset: str, policy: Optional[dict]) -> None:
+        with self._conn() as c:
+            if policy is None:
+                c.execute("DELETE FROM dataset_policies WHERE dataset = ?", (dataset,))
+            else:
+                c.execute(
+                    """INSERT INTO dataset_policies (dataset, policy_json, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT (dataset) DO UPDATE SET
+                         policy_json = excluded.policy_json,
+                         updated_at = excluded.updated_at""",
+                    (dataset, json.dumps(policy), utcnow_iso()),
+                )

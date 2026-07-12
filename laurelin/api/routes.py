@@ -33,7 +33,7 @@ from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import DatasetVersionInfo, Grant, User
+from laurelin.core.models import ColumnMask, DatasetVersionInfo, Grant, RowPolicy, User
 from laurelin.core.permissions import PermissionService
 from laurelin.ontology import OntologyService, load_ontology
 from laurelin.transforms import (
@@ -75,9 +75,15 @@ def get_ontology_service(
     workspace: Annotated[Workspace, Depends(get_workspace)],
     catalog: Annotated[DatasetCatalog, Depends(get_catalog)],
     store: Annotated[MetadataStore, Depends(get_store)],
+    perms: Annotated[PermissionService, Depends(get_permissions)],
+    user: Annotated[User, Depends(require_user)],
 ) -> OntologyService:
     ontology = load_ontology(workspace.ontology_dir)
-    return OntologyService(workspace, catalog, store, ontology)
+    # Bind the row-level-security / masking transform to this user so objects
+    # (which are dataset rows) honor the backing dataset's policy.
+    return OntologyService(
+        workspace, catalog, store, ontology, policy=perms.query_policy_fn(user)
+    )
 
 
 def get_actor(user: Annotated[User, Depends(require_user)]) -> str:
@@ -271,18 +277,29 @@ def get_dataset_rows(
 ) -> dict:
     _require_dataset_view(perms, user, name)
     info = _version_info(store, name, version)
-    rows = catalog.rows(name, limit=limit, offset=offset, version=version)
-    return {"rows": rows, "row_count": info.row_count}
+    policy = perms.row_policy_fn(user, name)
+    if policy is None:
+        rows = catalog.rows(name, limit=limit, offset=offset, version=version)
+        return {"rows": rows, "row_count": info.row_count}
+    # Row-level security / masking: filter the full table, then page in-memory so
+    # row_count reflects only the rows this user may see.
+    table = policy(catalog.read(name, version))
+    rows = catalog.table_to_rows(table.slice(offset, limit))
+    return {"rows": rows, "row_count": table.num_rows}
 
 
 @router.post("/query")
 def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep) -> dict:
     """Run a read-only SQL query over the datasets the user can view (each a view
     named after the dataset). Datasets the user cannot view are not registered,
-    so referencing one fails as an unknown table. Syntax/binder errors -> 400."""
+    so referencing one fails as an unknown table; row-level security and column
+    masking are applied to every registered dataset. Syntax/binder errors -> 400."""
     allowed = perms.viewable_datasets(user, [d.name for d in store.list_datasets()])
     try:
-        return catalog.query(body.sql, max_rows=body.max_rows, allowed=allowed)
+        return catalog.query(
+            body.sql, max_rows=body.max_rows, allowed=allowed,
+            policy=perms.query_policy_fn(user),
+        )
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
 
@@ -613,6 +630,49 @@ def set_dataset_permissions(
         actor=actor,
     )
     return {"dataset": name, "grants": [g.model_dump(mode="json") for g in body.grants]}
+
+
+# ---------------------------------------------------------------------------
+# Dataset policies (admin) — row-level security + column masking
+# ---------------------------------------------------------------------------
+
+class DatasetPolicyRequest(BaseModel):
+    row_policy: Optional[RowPolicy] = None
+    column_masks: list[ColumnMask] = Field(default_factory=list)
+
+
+@router.get("/dataset-policies", dependencies=[ADMIN])
+def list_dataset_policies(store: StoreDep) -> list[dict]:
+    """Row-security / masking policy for every dataset (absent = no policy)."""
+    policies = store.list_dataset_policies()
+    return [
+        {"dataset": d.name, "policy": policies.get(d.name)}
+        for d in store.list_datasets()
+    ]
+
+
+@router.put("/datasets/{name}/policy", dependencies=[ADMIN])
+def set_dataset_policy(
+    name: str, body: DatasetPolicyRequest, store: StoreDep, actor: ActorDep
+) -> dict:
+    if store.get_dataset(name) is None:
+        raise KeyError(f"Dataset not found: {name!r}")
+    empty = body.row_policy is None and not body.column_masks
+    policy = None if empty else {
+        "row_policy": body.row_policy.model_dump(mode="json") if body.row_policy else None,
+        "column_masks": [m.model_dump(mode="json") for m in body.column_masks],
+    }
+    store.set_dataset_policy(name, policy)
+    store.log_audit(
+        "dataset_policy_set",
+        {
+            "dataset": name,
+            "row_policy": policy is not None and policy["row_policy"] is not None,
+            "masked_columns": [m.column for m in body.column_masks],
+        },
+        actor=actor,
+    )
+    return {"dataset": name, "policy": policy}
 
 
 # ---------------------------------------------------------------------------

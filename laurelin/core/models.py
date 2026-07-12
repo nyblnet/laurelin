@@ -282,6 +282,52 @@ class ObjectTypeGrants(BaseModel):
     grants: list[Grant] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Row-level security & column masking (per dataset)
+# ---------------------------------------------------------------------------
+
+class PolicySubject(BaseModel):
+    """A subject a row-rule or mask-exemption applies to."""
+    subject_kind: SubjectKind
+    subject: str = ""
+
+    def normalized_subject(self) -> str:
+        return self.subject.strip().lower() if self.subject_kind != SubjectKind.everyone else ""
+
+
+class RowRule(PolicySubject):
+    """Matching subjects may see rows whose policy column is in ``values``."""
+    values: list[str] = Field(default_factory=list)
+
+
+class RowPolicy(BaseModel):
+    """Row-level security on a dataset: a non-admin user sees a row only if some
+    rule matches them AND the row's ``column`` value is in that rule's values.
+    A dataset with a row policy but no matching rule for the user => no rows."""
+    column: str
+    rules: list[RowRule] = Field(default_factory=list)
+
+
+class MaskMode(str, Enum):
+    null = "null"      # replace with NULL (keeps the column's type)
+    redact = "redact"  # replace with "***"
+    hash = "hash"      # replace with a sha256 prefix (stable pseudonym)
+
+
+class ColumnMask(BaseModel):
+    """Mask ``column`` for everyone except the exempt subjects (admins always
+    see unmasked)."""
+    column: str
+    mode: MaskMode = MaskMode.redact
+    exempt: list[PolicySubject] = Field(default_factory=list)
+
+
+class DatasetPolicy(BaseModel):
+    dataset: str
+    row_policy: Optional[RowPolicy] = None
+    column_masks: list[ColumnMask] = Field(default_factory=list)
+
+
 class ObjectTypePermission(BaseModel):
     """The effective permission a specific user has on an object type."""
 

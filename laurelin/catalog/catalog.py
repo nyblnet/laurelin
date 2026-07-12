@@ -20,7 +20,7 @@ import tempfile
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import duckdb
 import pyarrow as pa
@@ -154,6 +154,19 @@ class DatasetCatalog:
         info = self._version_info(name, version)
         return str((self.workspace.root / info.path / "*.parquet").resolve())
 
+    @staticmethod
+    def table_to_rows(table: pa.Table) -> list[dict]:
+        """A pyarrow Table as a list of JSON-safe dicts (used for policy-filtered
+        pages, where paging happens in-memory rather than in duckdb)."""
+        if table.num_rows == 0:
+            return []
+        cols = table.column_names
+        columns = [c.to_pylist() for c in table.columns]
+        return [
+            {c: _json_safe(columns[j][i]) for j, c in enumerate(cols)}
+            for i in range(table.num_rows)
+        ]
+
     def rows(
         self,
         name: str,
@@ -161,7 +174,9 @@ class DatasetCatalog:
         offset: int = 0,
         version: Optional[int] = None,
     ) -> list[dict]:
-        """Page of rows as JSON-safe dicts, via duckdb."""
+        """Page of rows as JSON-safe dicts, via duckdb (no row/column policy —
+        callers that must enforce policy read+filter the table and slice it with
+        ``table_to_rows``)."""
         glob = self.parquet_glob(name, version)
         con = duckdb.connect()
         try:
@@ -180,7 +195,11 @@ class DatasetCatalog:
     # -- ad-hoc query ---------------------------------------------------------
 
     def query(
-        self, sql: str, max_rows: int = 1000, allowed: Optional[set[str]] = None
+        self,
+        sql: str,
+        max_rows: int = 1000,
+        allowed: Optional[set[str]] = None,
+        policy: Optional[Callable[[str, pa.Table], pa.Table]] = None,
     ) -> dict:
         """Run a read-only SQL query with each dataset's latest version exposed
         as a view named after the dataset. Returns
@@ -207,7 +226,12 @@ class DatasetCatalog:
                 # external access below, this means arbitrary user SQL can read
                 # the workspace's datasets but cannot touch the filesystem
                 # (no read_csv('/etc/passwd'), no COPY ... TO, no path traversal).
-                con.register(ds.name, self.read(ds.name))
+                table = self.read(ds.name)
+                if policy is not None:
+                    # Row-level security / column masking: the workbench sees the
+                    # same filtered/masked view of each dataset as the row API.
+                    table = policy(ds.name, table)
+                con.register(ds.name, table)
             # Lock down all filesystem/network access for the untrusted query.
             con.execute("SET enable_external_access=false")
             cur = con.execute(sql)

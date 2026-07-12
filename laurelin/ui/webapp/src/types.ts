@@ -254,6 +254,40 @@ export interface DatasetGrants {
   grants: Grant[];
 }
 
+// -- Row-level security & column masking ------------------------------------
+
+export interface PolicySubject {
+  subject_kind: SubjectKind;
+  subject: string;
+}
+
+export interface RowRule extends PolicySubject {
+  values: string[];
+}
+
+export interface RowPolicy {
+  column: string;
+  rules: RowRule[];
+}
+
+export type MaskMode = "null" | "redact" | "hash";
+
+export interface ColumnMask {
+  column: string;
+  mode: MaskMode;
+  exempt: PolicySubject[];
+}
+
+export interface DatasetPolicy {
+  row_policy: RowPolicy | null;
+  column_masks: ColumnMask[];
+}
+
+export interface DatasetPolicyEntry {
+  dataset: string;
+  policy: DatasetPolicy | null;
+}
+
 export interface Group {
   name: string;
   members: string[];

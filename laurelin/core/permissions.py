@@ -26,10 +26,23 @@ data-hiding) is a separate, larger piece of work (see docs/ROADMAP.md, WS8).
 
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 
+import pyarrow as pa
+import pyarrow.compute as pc
+
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import Grant, Role, SubjectKind, User
+from laurelin.core.models import (
+    ColumnMask,
+    DatasetPolicy,
+    Grant,
+    MaskMode,
+    Role,
+    RowPolicy,
+    SubjectKind,
+    User,
+)
 
 
 class PermissionService:
@@ -43,17 +56,23 @@ class PermissionService:
 
     # -- grant matching -------------------------------------------------------
 
-    def _grant_matches(self, grant: Grant, user: User, groups: set[str]) -> bool:
-        kind = grant.subject_kind
+    def _subject_matches(
+        self, kind: SubjectKind, subject_norm: str, user: User, groups: set[str]
+    ) -> bool:
         if kind == SubjectKind.everyone:
             return True
         if kind == SubjectKind.role:
-            return grant.normalized_subject() == user.role.value
+            return subject_norm == user.role.value
         if kind == SubjectKind.user:
-            return grant.normalized_subject() == user.username.lower()
+            return subject_norm == user.username.lower()
         if kind == SubjectKind.group:
-            return grant.normalized_subject() in groups
+            return subject_norm in groups
         return False
+
+    def _grant_matches(self, grant: Grant, user: User, groups: set[str]) -> bool:
+        return self._subject_matches(
+            grant.subject_kind, grant.normalized_subject(), user, groups
+        )
 
     def _evaluate(self, user: Optional[User], grants: list[Grant]) -> tuple[bool, bool]:
         """Core rule shared by ontology and dataset grants: admin bypass; no
@@ -126,6 +145,104 @@ class PermissionService:
         view = dv and ov
         edit = view and oe
         return (view, edit)
+
+    # -- row-level security & column masking ----------------------------------
+
+    def dataset_policy(self, dataset: str) -> Optional[DatasetPolicy]:
+        raw = self.store.get_dataset_policy(dataset)
+        if not raw:
+            return None
+        return DatasetPolicy(
+            dataset=dataset,
+            row_policy=raw.get("row_policy"),
+            column_masks=raw.get("column_masks", []),
+        )
+
+    def apply_table_policy(
+        self, user: Optional[User], dataset: str, table: "pa.Table"
+    ) -> "pa.Table":
+        """Filter rows and mask columns of ``table`` for ``user`` per the dataset's
+        policy. Admins (and no-policy datasets) pass through unchanged. This is the
+        single choke point applied by the row API, the SQL workbench, and ontology
+        object materialization — so RLS can't be bypassed through any read path."""
+        if user is None:
+            return table.slice(0, 0)
+        if user.role == Role.admin:
+            return table
+        policy = self.dataset_policy(dataset)
+        if policy is None:
+            return table
+        groups = self._user_groups(user.username)
+        if policy.row_policy is not None:
+            table = self._filter_rows(table, policy.row_policy, user, groups)
+        for mask in policy.column_masks:
+            table = self._mask_column(table, mask, user, groups)
+        return table
+
+    def has_dataset_policy(self, dataset: str) -> bool:
+        return self.store.get_dataset_policy(dataset) is not None
+
+    def row_policy_fn(self, user: Optional[User], dataset: str):
+        """A ``(table)->table`` filter for the row API, or None when nothing needs
+        filtering (admin, or the dataset has no policy) so the caller can fast-path."""
+        if user is None or user.role == Role.admin:
+            return None
+        if not self.has_dataset_policy(dataset):
+            return None
+        return lambda t: self.apply_table_policy(user, dataset, t)
+
+    def query_policy_fn(self, user: Optional[User]):
+        """A ``(dataset, table)->table`` filter for the SQL workbench / ontology,
+        or None for admins (no filtering)."""
+        if user is not None and user.role == Role.admin:
+            return None
+        return lambda ds, t: self.apply_table_policy(user, ds, t)
+
+    def _filter_rows(
+        self, table: "pa.Table", rp: RowPolicy, user: User, groups: set[str]
+    ) -> "pa.Table":
+        if rp.column not in table.column_names:
+            return table.slice(0, 0)  # fail closed if the policy column is missing
+        allowed: set[str] = set()
+        for rule in rp.rules:
+            if self._subject_matches(rule.subject_kind, rule.normalized_subject(), user, groups):
+                allowed.update(str(v) for v in rule.values)
+        if not allowed:
+            return table.slice(0, 0)  # policy present but no rule grants this user rows
+        col_as_str = pc.cast(table.column(rp.column), pa.string())
+        mask = pc.is_in(col_as_str, value_set=pa.array(sorted(allowed), pa.string()))
+        # NULLs in the policy column are never "in" the set -> excluded (fail closed).
+        mask = pc.fill_null(mask, False)
+        return table.filter(mask)
+
+    def _mask_column(
+        self, table: "pa.Table", mask: ColumnMask, user: User, groups: set[str]
+    ) -> "pa.Table":
+        if mask.column not in table.column_names:
+            return table
+        for ex in mask.exempt:
+            if self._subject_matches(ex.subject_kind, ex.normalized_subject(), user, groups):
+                return table  # this user is exempt -> see the real value
+        idx = table.column_names.index(mask.column)
+        col = table.column(mask.column)
+        n = len(col)
+        if mask.mode == MaskMode.null:
+            new = pa.nulls(n, type=col.type)
+            field = table.schema.field(idx)
+        elif mask.mode == MaskMode.redact:
+            new = pa.array(["***"] * n, pa.string())
+            field = pa.field(mask.column, pa.string())
+        else:  # hash
+            vals = col.to_pylist()
+            new = pa.array(
+                [
+                    None if v is None else hashlib.sha256(str(v).encode()).hexdigest()[:16]
+                    for v in vals
+                ],
+                pa.string(),
+            )
+            field = pa.field(mask.column, pa.string())
+        return table.set_column(idx, field, new)
 
     # -- validation for the management API ------------------------------------
 

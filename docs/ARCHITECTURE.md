@@ -292,6 +292,8 @@ GET  /api/v1/ontology/permissions             -> [{object_type, grants:[Grant]}]
 PUT  /api/v1/ontology/permissions/{type}      {grants:[Grant]} -> {object_type,grants}  (admin)
 GET  /api/v1/dataset-permissions              -> [{dataset, grants:[Grant]}]  (admin)
 PUT  /api/v1/datasets/{name}/permissions      {grants:[Grant]} -> {dataset,grants}  (admin)
+GET  /api/v1/dataset-policies                  -> [{dataset, policy:DatasetPolicy|null}]  (admin)
+PUT  /api/v1/datasets/{name}/policy            {row_policy?, column_masks?} -> {dataset,policy}  (admin)
 GET  /api/v1/groups                           -> [{name, members:[username]}]  (admin)
 POST /api/v1/groups                           {name} -> {name, members:[]}  (admin)
 PUT  /api/v1/groups/{name}/members            {members:[username]} -> {name,members}  (admin)
@@ -329,6 +331,21 @@ view; effective edit = that view AND ontology-edit. So locking a dataset also
 hides its objects, and there is no longer a path (query / dataset rows) to read
 data behind a hidden object type. Builds remain editor-gated (a build runs
 trusted pipeline code); per-dataset build enforcement is future work.
+
+**Row-level security & column masking** (`laurelin/core/permissions.py`,
+`dataset_policies` table). Each dataset can carry a `DatasetPolicy`:
+- *row policy* — a column plus per-subject rules; a non-admin sees a row only if
+  a rule matches them AND the row's column value is in that rule's `values`. No
+  matching rule ⇒ no rows (fail-closed; NULL column values are excluded).
+- *column masks* — per column a mode (`null`/`redact`/`hash`) and exempt
+  subjects; everyone else sees the value masked.
+Admins are exempt. Enforcement is a single choke point,
+`PermissionService.apply_table_policy(user, dataset, table)`, applied to the
+same in-memory Arrow table by **all three** read paths — the row API (filter
+then page, so counts reflect visible rows), the SQL workbench (each registered
+dataset is filtered/masked, so aggregates respect RLS), and ontology object
+materialization (objects are rows, so there is no read-around). Policy is
+managed by admins via `/dataset-policies` + `/datasets/{name}/policy`.
 
 #### Pipeline (transform) authoring (`laurelin/transforms/authoring.py`)
 
