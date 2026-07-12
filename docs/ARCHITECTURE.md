@@ -203,6 +203,20 @@ enumerate slugs. **Deleting** a workspace only *unregisters* it (reversible) —
 its files stay under `<root>/<slug>/`; reusing a slug re-exposes that data, so
 purge the directory before reusing a slug for a different tenant.
 
+**OIDC SSO** (`laurelin/core/oidc.py`). When `LAURELIN_OIDC_ISSUER` +
+`_CLIENT_ID` + `_CLIENT_SECRET` are set, an authorization-code + PKCE flow is
+enabled: `/api/v1/auth/oidc/login` stores per-flow state/nonce/verifier
+(`oidc_flows` table, single-use, ~10-min TTL) and redirects to the IdP;
+`/api/v1/auth/oidc/callback` exchanges the code, validates the id_token
+(signature via JWKS, `iss`/`aud`/`exp`/`nonce`), JIT-provisions a local identity
+(`AuthService.provision_oidc_user`), maps IdP group claims to a role
+(`LAURELIN_OIDC_ROLE_MAP`, e.g. `admins:admin,editors:editor`; optional
+`_SUPERADMIN_GROUP`), and issues the normal session cookie — so RBAC,
+workspaces, and ACLs are unchanged. `/auth/status` reports
+`oidc:{enabled, provider_name}` so the UI shows a "Sign in with <provider>"
+button. Existing users keep their local role (a local admin can override the IdP
+mapping); `disabled` still blocks SSO login.
+
 **Modes.** Auth is ON by default. `laurelin serve --no-auth` (or env
 `LAURELIN_NO_AUTH=1`) disables it for local development — `/api/v1/auth/status`
 then reports `{"auth_required": false}` and every request acts as an implicit

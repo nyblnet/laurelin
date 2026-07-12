@@ -78,6 +78,14 @@ export function LoginScreen() {
           {busy ? "Signing in…" : "Sign in"}
         </button>
       </form>
+      {auth.oidc?.enabled && (
+        <>
+          <div className="auth-divider">or</div>
+          <a className="btn sso-btn" href="/api/v1/auth/oidc/login">
+            Sign in with {auth.oidc.provider_name || "SSO"}
+          </a>
+        </>
+      )}
     </AuthShell>
   );
 }

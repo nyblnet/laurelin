@@ -7,6 +7,7 @@ guards used across the API. Only /docs gating lives in middleware (app.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from urllib.parse import urlsplit
 
@@ -223,12 +224,14 @@ def auth_status(request: Request, user: CurrentUser) -> dict:
     multi = is_multi(request)
     if request.app.state.no_auth:
         return {"auth_required": False, "setup_required": False, "multi": multi,
+                "oidc": _oidc_status(request),
                 "user": _status_user(request, user) if user else None}
     setup_required = identity_store(request).count_users() == 0
     return {
         "auth_required": True,
         "setup_required": setup_required,
         "multi": multi,
+        "oidc": _oidc_status(request),
         "user": _status_user(request, user) if user else None,
     }
 
@@ -265,6 +268,92 @@ def auth_login(body: CredentialsRequest, request: Request, response: Response) -
     store.log_audit("login_succeeded", {"username": user.username}, actor=user.username)
     # The session token travels ONLY in the httpOnly cookie, never in the body.
     return _status_user(request, user)
+
+
+def _oidc_status(request: Request) -> dict:
+    cfg = getattr(request.app.state, "oidc_config", None)
+    if cfg is None or not cfg.enabled:
+        return {"enabled": False}
+    return {"enabled": True, "provider_name": cfg.provider_name}
+
+
+def _oidc_redirect_uri(request: Request) -> str:
+    cfg = request.app.state.oidc_config
+    if cfg.redirect_url:
+        return cfg.redirect_url
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/v1/auth/oidc/callback"
+
+
+@auth_router.get("/oidc/login")
+def oidc_login(request: Request):
+    from fastapi.responses import RedirectResponse
+
+    from laurelin.core.oidc import make_pkce
+
+    cfg = getattr(request.app.state, "oidc_config", None)
+    if cfg is None or not cfg.enabled:
+        raise HTTPException(status_code=404, detail="SSO is not configured")
+    import secrets as _secrets
+
+    state = _secrets.token_urlsafe(24)
+    nonce = _secrets.token_urlsafe(16)
+    verifier, challenge = make_pkce()
+    redirect_uri = _oidc_redirect_uri(request)
+    store = identity_store(request)
+    store.purge_oidc_flows(  # opportunistic cleanup of flows older than ~10 min
+        (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    )
+    store.create_oidc_flow(state, nonce, verifier, redirect_uri)
+    url = request.app.state.oidc_provider.authorization_url(redirect_uri, state, nonce, challenge)
+    return RedirectResponse(url, status_code=302)
+
+
+@auth_router.get("/oidc/callback")
+def oidc_callback(request: Request, response: Response):
+    from fastapi.responses import RedirectResponse
+
+    from laurelin.core.oidc import OIDCError
+
+    cfg = getattr(request.app.state, "oidc_config", None)
+    if cfg is None or not cfg.enabled:
+        raise HTTPException(status_code=404, detail="SSO is not configured")
+    params = request.query_params
+    if params.get("error"):
+        raise HTTPException(status_code=400, detail=f"SSO error: {params.get('error')}")
+    code, state = params.get("code"), params.get("state")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code/state")
+    store = identity_store(request)
+    flow = store.pop_oidc_flow(state)  # single-use; unknown/replayed state -> 400
+    if flow is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired SSO state")
+    provider = request.app.state.oidc_provider
+    try:
+        tokens = provider.exchange_code(code, flow["redirect_uri"], flow["code_verifier"])
+        id_token = tokens.get("id_token")
+        if not id_token:
+            raise OIDCError("No id_token in token response")
+        claims = provider.validate_id_token(id_token, flow["nonce"])
+    except OIDCError as exc:
+        store.log_audit("oidc_login_failed", {"reason": str(exc)}, actor="oidc")
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    username = cfg.username_for(claims)
+    if not username:
+        raise HTTPException(status_code=400, detail="SSO token has no usable username claim")
+    groups = cfg.groups_of(claims)
+    auth = identity_auth(request)
+    user = auth.provision_oidc_user(
+        username, cfg.role_for(groups), cfg.is_superadmin(groups)
+    )
+    if user.disabled:
+        raise HTTPException(status_code=403, detail="Account is disabled")
+    token, user = auth.login(user)
+    resp = RedirectResponse("/", status_code=302)
+    _set_session_cookie(resp, request, token)
+    store.log_audit("login_succeeded", {"username": user.username, "via": "sso"}, actor=user.username)
+    return resp
 
 
 @auth_router.post("/logout")

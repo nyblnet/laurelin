@@ -49,6 +49,10 @@ def _exc_message(exc: BaseException) -> str:
 def _finalize(app: FastAPI) -> FastAPI:
     """Add the middleware, error handlers, routers, and static mount shared by
     both single- and multi-workspace apps."""
+    from laurelin.core.oidc import OIDCConfig, OIDCProvider
+
+    app.state.oidc_config = OIDCConfig.from_env()
+    app.state.oidc_provider = OIDCProvider(app.state.oidc_config)
 
     def _identity_store():
         st = app.state

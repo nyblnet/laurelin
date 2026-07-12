@@ -15,7 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { API, ApiError, api } from "./api";
-import type { AuthStatus, Role, User, UserWorkspace } from "./types";
+import type { AuthStatus, OidcStatus, Role, User, UserWorkspace } from "./types";
 
 interface AuthContextValue {
   loading: boolean;
@@ -31,6 +31,8 @@ interface AuthContextValue {
   workspaces: UserWorkspace[];
   activeSlug: string | null;
   setActiveWorkspace: (slug: string) => void;
+  // SSO:
+  oidc: OidcStatus | undefined;
   refresh: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<void>;
@@ -154,6 +156,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       workspaces,
       activeSlug,
       setActiveWorkspace,
+      oidc: status.oidc,
       refresh,
       login,
       setup,

@@ -147,6 +147,13 @@ CREATE TABLE IF NOT EXISTS dataset_policies (
     policy_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oidc_flows (
+    state TEXT PRIMARY KEY,
+    nonce TEXT NOT NULL,
+    code_verifier TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -842,6 +849,31 @@ class MetadataStore:
         with self._conn() as c:
             rows = c.execute("SELECT dataset, policy_json FROM dataset_policies").fetchall()
         return {r["dataset"]: json.loads(r["policy_json"]) for r in rows}
+
+    # -- OIDC transient flow state ------------------------------------------------
+
+    def create_oidc_flow(
+        self, state: str, nonce: str, code_verifier: str, redirect_uri: str
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO oidc_flows (state, nonce, code_verifier, redirect_uri, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (state, nonce, code_verifier, redirect_uri, utcnow_iso()),
+            )
+
+    def pop_oidc_flow(self, state: str) -> Optional[dict]:
+        """Atomically fetch and delete a flow by state (single-use)."""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM oidc_flows WHERE state = ?", (state,)).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM oidc_flows WHERE state = ?", (state,))
+            return dict(row)
+
+    def purge_oidc_flows(self, before_iso: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM oidc_flows WHERE created_at < ?", (before_iso,))
 
     def set_dataset_policy(self, dataset: str, policy: Optional[dict]) -> None:
         with self._conn() as c:

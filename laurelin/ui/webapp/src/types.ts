@@ -21,10 +21,16 @@ export interface UserWorkspace {
   role: Role;
 }
 
+export interface OidcStatus {
+  enabled: boolean;
+  provider_name?: string;
+}
+
 export interface AuthStatus {
   auth_required: boolean;
   setup_required: boolean;
   multi?: boolean;
+  oidc?: OidcStatus;
   user: User | null;
 }
 

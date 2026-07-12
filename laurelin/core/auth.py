@@ -174,6 +174,28 @@ class AuthService:
         )
         return user
 
+    def provision_oidc_user(
+        self, username: str, role: Role, superadmin: bool = False, *, actor: str = "oidc"
+    ) -> User:
+        """Find-or-create an SSO identity. A new user gets the IdP-mapped role and
+        an unusable random password (they sign in only via SSO). Existing users
+        keep their local role (a local admin can override the IdP mapping); their
+        ``disabled`` flag still blocks login (checked by the caller)."""
+        user = self.store.get_user(username)
+        if user is not None:
+            return user
+        validate_username(username)
+        user = User(
+            id=secrets.token_hex(8), username=username, role=role, superadmin=superadmin
+        )
+        self.store.create_user(user, hash_password(secrets.token_urlsafe(32)))
+        self.store.log_audit(
+            "oidc_user_provisioned",
+            {"username": username, "role": role.value, "superadmin": superadmin},
+            actor=actor,
+        )
+        return user
+
     def get_user(self, username: str) -> Optional[User]:
         return self.store.get_user(username)
 
