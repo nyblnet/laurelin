@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+node_modules
+laurelin/ui/webapp/node_modules
+laurelin/ui/webapp/dist
+demo-workspace
+workspace
+*.db
+*.db-journal
+*.db-wal
+.claude
+docs/img

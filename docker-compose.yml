@@ -1,0 +1,43 @@
+# Small-team multi-workspace deployment: Laurelin + PostgreSQL control plane.
+#
+#   docker compose up --build
+#   open http://localhost:8787   (first run -> create the server administrator)
+#
+# Workspace data (Parquet, per-workspace metadata) lives in the `laurelin-data`
+# volume; the shared identity/registry lives in Postgres.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: laurelin
+      POSTGRES_PASSWORD: change-me-in-production
+      POSTGRES_DB: laurelin
+    volumes:
+      - laurelin-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U laurelin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  laurelin:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LAURELIN_CONTROL_DATABASE_URL: postgresql://laurelin:change-me-in-production@db:5432/laurelin
+      # Behind TLS in production; over plain http for local compose the Secure
+      # cookie flag would block login, so disable it here:
+      # (the image's default CMD sets --secure-cookies; override it below).
+    command: >
+      laurelin serve --root /data --host 0.0.0.0 --port 8787
+    volumes:
+      - laurelin-data:/data
+    ports:
+      - "8787:8787"
+
+volumes:
+  laurelin-db:
+  laurelin-data:

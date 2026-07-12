@@ -1,19 +1,22 @@
-"""MetadataStore: SQLite-backed catalog of versions, builds, lineage, edits, audit.
+"""MetadataStore: the catalog of versions, builds, lineage, edits, audit, users,
+grants and policies.
 
-Deliberately plain SQL over a single file so users can inspect everything with
-any sqlite client. Each operation opens a short-lived connection (WAL mode),
-which keeps the store safe across threads.
+Runs on either SQLite (embedded, a single inspectable file — the default) or
+PostgreSQL (server / multi-tenant), chosen by the constructor argument: a
+filesystem path selects SQLite, a ``postgresql://`` URL selects Postgres. The
+dialect differences are handled by ``laurelin/core/backend.py`` so the SQL here
+is shared. Each operation opens a short-lived connection.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from laurelin.core.backend import Connection, make_backend
 from laurelin.core.models import (
     AuditEvent,
     BuildInfo,
@@ -48,6 +51,7 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     PRIMARY KEY (dataset, version)
 );
 CREATE TABLE IF NOT EXISTS builds (
+    {{SEQ_COL}}
     id TEXT PRIMARY KEY,
     targets_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL,
@@ -74,6 +78,7 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
     PRIMARY KEY (upstream_dataset, downstream_dataset, transform_name)
 );
 CREATE TABLE IF NOT EXISTS object_edits (
+    {{SEQ_COL}}
     id TEXT PRIMARY KEY,
     object_type TEXT NOT NULL,
     pk_value TEXT NOT NULL,
@@ -84,7 +89,7 @@ CREATE TABLE IF NOT EXISTS object_edits (
 );
 CREATE INDEX IF NOT EXISTS idx_object_edits_type ON object_edits (object_type, created_at);
 CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id {{AUTOINC_PK}},
     timestamp TEXT NOT NULL,
     actor TEXT NOT NULL DEFAULT 'anonymous',
     action TEXT NOT NULL,
@@ -92,7 +97,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
-    username TEXT UNIQUE COLLATE NOCASE,
+    username TEXT UNIQUE {{NOCASE}},
     password_hash TEXT,
     role TEXT CHECK(role IN ('viewer','editor','admin')),
     created_at TEXT,
@@ -114,12 +119,12 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     last_used_at TEXT
 );
 CREATE TABLE IF NOT EXISTS groups (
-    name TEXT PRIMARY KEY COLLATE NOCASE,
+    name TEXT PRIMARY KEY {{NOCASE}},
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS group_members (
-    group_name TEXT NOT NULL COLLATE NOCASE,
-    username TEXT NOT NULL COLLATE NOCASE,
+    group_name TEXT NOT NULL {{NOCASE}},
+    username TEXT NOT NULL {{NOCASE}},
     PRIMARY KEY (group_name, username)
 );
 CREATE TABLE IF NOT EXISTS ontology_grants (
@@ -154,20 +159,21 @@ CREATE TABLE IF NOT EXISTS oidc_flows (
     redirect_uri TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+{{EXTRA_DDL}}
 """
 
 
 class MetadataStore:
     def __init__(self, path: Path | str):
-        self.path = Path(path)
+        # ``path`` is a filesystem path (SQLite, embedded) or a postgres:// URL.
+        self.path = path
+        self.backend = make_backend(path)
+        self.dialect = self.backend.dialect
         self._ensure_schema()
 
     @contextmanager
-    def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+    def _conn(self) -> Iterator[Connection]:
+        conn = self.backend.connect()
         try:
             yield conn
             conn.commit()
@@ -179,13 +185,21 @@ class MetadataStore:
 
     def _ensure_schema(self) -> None:
         with self._conn() as c:
-            c.executescript(_SCHEMA)
+            c.executescript(self.backend.render_schema(_SCHEMA))
             self._migrate(c)
 
-    def _migrate(self, c: sqlite3.Connection) -> None:
+    def _migrate(self, c: Connection) -> None:
         """Additive migrations for databases created by older versions."""
-        cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
-        if "superadmin" not in cols:
+        if self.dialect == "postgres":
+            row = c.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'superadmin'"
+            ).fetchone()
+            has_superadmin = row is not None
+        else:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+            has_superadmin = "superadmin" in cols
+        if not has_superadmin:
             c.execute("ALTER TABLE users ADD COLUMN superadmin INTEGER NOT NULL DEFAULT 0")
 
     # -- datasets -------------------------------------------------------------
@@ -197,7 +211,8 @@ class MetadataStore:
             c.execute(
                 """INSERT INTO datasets (name, description, created_at) VALUES (?, ?, ?)
                    ON CONFLICT (name) DO UPDATE SET description = excluded.description
-                   WHERE excluded.description != '' AND excluded.description != description""",
+                   WHERE excluded.description != ''
+                     AND excluded.description != datasets.description""",
                 (name, description, utcnow_iso()),
             )
         return self.get_dataset(name)  # type: ignore[return-value]
@@ -378,7 +393,10 @@ class MetadataStore:
         with self._conn() as c:
             ids = [
                 r["id"]
-                for r in c.execute("SELECT id FROM builds ORDER BY rowid DESC LIMIT ?", (limit,))
+                for r in c.execute(
+                    f"SELECT id FROM builds ORDER BY {self.backend.order_col} DESC LIMIT ?",
+                    (limit,),
+                )
             ]
         return [b for i in ids if (b := self.get_build(i)) is not None]
 
@@ -388,7 +406,11 @@ class MetadataStore:
         with self._conn() as c:
             c.execute("DELETE FROM lineage_edges WHERE transform_name = ?", (transform_name,))
             c.executemany(
-                "INSERT OR IGNORE INTO lineage_edges VALUES (?, ?, ?)",
+                self.backend.insert_or_ignore(
+                    "lineage_edges",
+                    "upstream_dataset, downstream_dataset, transform_name",
+                    "?, ?, ?",
+                ),
                 [(e.upstream_dataset, e.downstream_dataset, e.transform_name) for e in edges],
             )
 
@@ -426,9 +448,10 @@ class MetadataStore:
     def list_object_edits(self, object_type: str) -> list[ObjectEdit]:
         with self._conn() as c:
             rows = c.execute(
-                # rowid = insertion order; created_at has second-level collisions
-                # and id is a random uuid, so neither gives a stable replay order.
-                "SELECT * FROM object_edits WHERE object_type = ? ORDER BY rowid",
+                # Insertion order (SQLite rowid / Postgres seq) — created_at has
+                # sub-second collisions and id is a random uuid, so neither gives
+                # a stable replay order.
+                f"SELECT * FROM object_edits WHERE object_type = ? ORDER BY {self.backend.order_col}",
                 (object_type,),
             ).fetchall()
         return [
@@ -507,9 +530,12 @@ class MetadataStore:
     def create_user_if_none_exist(self, user: User, password_hash: str) -> bool:
         """Atomically create the first user. Returns False (without inserting) if
         any user already exists, so concurrent first-run setups can't both win.
-        BEGIN IMMEDIATE takes the write lock up front, serializing racers."""
+        An exclusive lock up front serializes racers on both dialects."""
         with self._conn() as c:
-            c.execute("BEGIN IMMEDIATE")
+            if self.dialect == "postgres":
+                c.execute("LOCK TABLE users IN EXCLUSIVE MODE")
+            else:
+                c.execute("BEGIN IMMEDIATE")
             if c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] > 0:
                 return False
             c.execute(self._USER_INSERT, self._user_insert_params(user, password_hash))
@@ -519,7 +545,7 @@ class MetadataStore:
         """Look a user up by username (case-insensitive per COLLATE NOCASE)."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT * FROM users WHERE username = ?", (username,)
+                "SELECT * FROM users WHERE username = ?", (username.lower(),)
             ).fetchone()
         return self._row_to_user(row) if row else None
 
@@ -531,7 +557,7 @@ class MetadataStore:
     def get_password_hash(self, username: str) -> Optional[str]:
         with self._conn() as c:
             row = c.execute(
-                "SELECT password_hash FROM users WHERE username = ?", (username,)
+                "SELECT password_hash FROM users WHERE username = ?", (username.lower(),)
             ).fetchone()
         return row["password_hash"] if row else None
 
@@ -567,20 +593,20 @@ class MetadataStore:
         with self._conn() as c:
             c.execute(
                 f"UPDATE users SET {', '.join(sets)} WHERE username = ?",
-                (*vals, username),
+                (*vals, username.lower()),
             )
 
     def delete_user(self, username: str) -> None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT id FROM users WHERE username = ?", (username,)
+                "SELECT id FROM users WHERE username = ?", (username.lower(),)
             ).fetchone()
             if row is None:
                 return
             user_id = row["id"]
             c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             c.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
-            c.execute("DELETE FROM group_members WHERE username = ?", (username,))
+            c.execute("DELETE FROM group_members WHERE username = ?", (username.lower(),))
             c.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
     # -- sessions ----------------------------------------------------------------
@@ -683,15 +709,19 @@ class MetadataStore:
     # -- groups -------------------------------------------------------------------
 
     def create_group(self, name: str, created_at: str) -> None:
+        # Store identity strings lowercase; lookups compare lowercase (Postgres
+        # has no COLLATE NOCASE). Callers already lowercase, but normalize here
+        # too so the store is correct regardless of caller.
         with self._conn() as c:
             c.execute(
-                "INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, created_at)
+                "INSERT INTO groups (name, created_at) VALUES (?, ?)",
+                (name.lower(), created_at),
             )
 
     def group_exists(self, name: str) -> bool:
         with self._conn() as c:
             return (
-                c.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone()
+                c.execute("SELECT 1 FROM groups WHERE name = ?", (name.lower(),)).fetchone()
                 is not None
             )
 
@@ -715,16 +745,20 @@ class MetadataStore:
         return out
 
     def delete_group(self, name: str) -> None:
+        name = name.lower()
         with self._conn() as c:
             c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
             c.execute("DELETE FROM groups WHERE name = ?", (name,))
 
     def set_group_members(self, name: str, usernames: list[str]) -> None:
+        name = name.lower()
         with self._conn() as c:
             c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
             c.executemany(
-                "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?)",
-                [(name, u) for u in usernames],
+                self.backend.insert_or_ignore(
+                    "group_members", "group_name, username", "?, ?"
+                ),
+                [(name, u.lower()) for u in usernames],
             )
 
     def groups_for_user(self, username: str) -> set[str]:
@@ -732,7 +766,7 @@ class MetadataStore:
             return {
                 r["group_name"]
                 for r in c.execute(
-                    "SELECT group_name FROM group_members WHERE username = ?", (username,)
+                    "SELECT group_name FROM group_members WHERE username = ?", (username.lower(),)
                 )
             }
 

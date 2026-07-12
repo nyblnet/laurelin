@@ -480,6 +480,7 @@ def test_auth_on_by_default_requires_setup(workspace):
         "auth_required": True,
         "setup_required": True,
         "multi": False,
+        "oidc": {"enabled": False},
         "user": None,
     }
 

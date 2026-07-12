@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 CREATE TABLE IF NOT EXISTS workspace_members (
     slug TEXT NOT NULL,
-    username TEXT NOT NULL COLLATE NOCASE,
+    username TEXT NOT NULL {{NOCASE}},
     role TEXT NOT NULL CHECK(role IN ('viewer','editor','admin')),
     PRIMARY KEY (slug, username)
 );
@@ -50,7 +50,11 @@ class ControlStore(MetadataStore):
     def _ensure_schema(self) -> None:
         super()._ensure_schema()
         with self._conn() as c:
-            c.executescript(_CONTROL_SCHEMA)
+            # {{NOCASE}} in the control schema is substituted; {{EXTRA_DDL}} and
+            # {{AUTOINC_PK}} don't appear here, so render() just strips {{NOCASE}}.
+            c.executescript(
+                self.backend.render_schema(_CONTROL_SCHEMA).replace("{{EXTRA_DDL}}", "")
+            )
 
     # -- workspaces -----------------------------------------------------------
 
@@ -111,21 +115,21 @@ class ControlStore(MetadataStore):
             c.execute(
                 """INSERT INTO workspace_members (slug, username, role) VALUES (?, ?, ?)
                    ON CONFLICT (slug, username) DO UPDATE SET role = excluded.role""",
-                (slug, username, role.value),
+                (slug, username.lower(), role.value),
             )
 
     def remove_member(self, slug: str, username: str) -> None:
         with self._conn() as c:
             c.execute(
                 "DELETE FROM workspace_members WHERE slug = ? AND username = ?",
-                (slug, username),
+                (slug, username.lower()),
             )
 
     def member_role(self, slug: str, username: str) -> Optional[Role]:
         with self._conn() as c:
             row = c.execute(
                 "SELECT role FROM workspace_members WHERE slug = ? AND username = ?",
-                (slug, username),
+                (slug, username.lower()),
             ).fetchone()
         return Role(row["role"]) if row else None
 
@@ -144,7 +148,7 @@ class ControlStore(MetadataStore):
                 """SELECT w.slug, w.name, w.description, m.role
                    FROM workspace_members m JOIN workspaces w ON w.slug = m.slug
                    WHERE m.username = ? ORDER BY w.slug""",
-                (username,),
+                (username.lower(),),
             ).fetchall()
         return [
             {"slug": r["slug"], "name": r["name"], "description": r["description"], "role": r["role"]}
@@ -153,7 +157,7 @@ class ControlStore(MetadataStore):
 
     def remove_member_everywhere(self, username: str) -> None:
         with self._conn() as c:
-            c.execute("DELETE FROM workspace_members WHERE username = ?", (username,))
+            c.execute("DELETE FROM workspace_members WHERE username = ?", (username.lower(),))
 
     def delete_user(self, username: str) -> None:
         # Also drop the deleted user's workspace memberships (global identity).

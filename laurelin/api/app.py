@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -154,19 +155,24 @@ def create_app(
 def create_server_app(
     root: Path,
     *,
+    control_url: Optional[str] = None,
     no_auth: bool = False,
     secure_cookies: bool = False,
     lock_pipelines: bool = False,
 ) -> FastAPI:
     """Multi-workspace server (``serve --root``). Global identity + a workspace
-    registry live in ``<root>/control.db``; each workspace under ``<root>/<slug>``
-    keeps its own data and ACLs. The active workspace is selected per request via
-    the X-Laurelin-Workspace header or laurelin_workspace cookie."""
+    registry live in the control store — ``<root>/control.db`` (SQLite) by
+    default, or a PostgreSQL database when ``control_url`` /
+    ``LAURELIN_CONTROL_DATABASE_URL`` is a ``postgresql://`` URL (recommended for
+    real multi-tenant deployments). Each workspace under ``<root>/<slug>`` keeps
+    its own data and ACLs. The active workspace is selected per request via the
+    X-Laurelin-Workspace header or laurelin_workspace cookie."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
-    control = ControlStore(root / "control.db")
+    control_url = control_url or os.environ.get("LAURELIN_CONTROL_DATABASE_URL")
+    control = ControlStore(control_url) if control_url else ControlStore(root / "control.db")
 
     app = FastAPI(
         title="Laurelin",

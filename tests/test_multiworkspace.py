@@ -39,7 +39,10 @@ def _member(app, superadmin, username, slug, role, password="password123"):
 def test_setup_creates_superadmin(app):
     c = TestClient(app)
     status = c.get("/api/v1/auth/status").json()
-    assert status == {"auth_required": True, "setup_required": True, "multi": True, "user": None}
+    assert status == {
+        "auth_required": True, "setup_required": True, "multi": True,
+        "oidc": {"enabled": False}, "user": None,
+    }
     c.post("/api/v1/auth/setup", json=ROOT_CREDS)
     c.post("/api/v1/auth/login", json=ROOT_CREDS)
     me = c.get("/api/v1/auth/me").json()

@@ -81,6 +81,14 @@ def serve(
         "mode). Mutually exclusive with --workspace. Global users + a workspace "
         "registry live in <root>/control.db; each workspace is <root>/<slug>.",
     ),
+    control_db: Optional[str] = typer.Option(
+        None,
+        "--control-db",
+        help="With --root: a postgresql:// URL for the control plane (users, "
+        "workspaces, membership) instead of <root>/control.db. Recommended for "
+        "real multi-tenant deployments. Also settable via "
+        "LAURELIN_CONTROL_DATABASE_URL.",
+    ),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
     port: int = typer.Option(8787, "--port", help="Bind port."),
     no_auth: bool = typer.Option(
@@ -116,7 +124,11 @@ def serve(
 
         typer.echo(f"Serving workspaces under {root} on http://{host}:{port}")
         application = create_server_app(
-            root, no_auth=no_auth, secure_cookies=secure_cookies, lock_pipelines=lock_pipelines
+            root,
+            control_url=control_db,
+            no_auth=no_auth,
+            secure_cookies=secure_cookies,
+            lock_pipelines=lock_pipelines,
         )
     else:
         from laurelin.api import create_app

@@ -167,6 +167,21 @@ superadmin creates workspaces and assigns each user a per-workspace role
 pipelines, ontology, and ACLs under `DIR/<slug>/`. In the UI a switcher picks
 the active workspace; superadmins get a Workspaces admin panel.
 
+**Enterprise SSO (OIDC).** Point Laurelin at an OIDC issuer (Okta, Entra ID,
+Google, Keycloak, Auth0, …) with `LAURELIN_OIDC_ISSUER` / `_CLIENT_ID` /
+`_CLIENT_SECRET` and users sign in with your IdP; group claims map to roles
+(`LAURELIN_OIDC_ROLE_MAP`). Local accounts keep working alongside it.
+
+**Deployment.** Embedded mode is a single process on SQLite + local files. For
+multi-tenant deployments, run the control plane on **PostgreSQL**
+(`serve --root --control-db postgresql://…`) and use the provided **Docker**
+image + `docker-compose.yml`:
+
+```bash
+docker compose up --build      # Laurelin + Postgres
+# open http://localhost:8787 -> create the server administrator
+```
+
 **Transform authoring is code execution.** Writing a pipeline file through the
 UI (the Transforms tab) or API is equivalent to running Python on the server —
 it is `exec`'d on every build. It requires the `editor` role and can be

@@ -267,7 +267,10 @@ def test_setup_mode_blocks_everything_but_status_and_setup(app):
     assert client.get("/openapi.json").status_code == 401
     assert client.get("/health").status_code == 200
     status = client.get("/api/v1/auth/status").json()
-    assert status == {"auth_required": True, "setup_required": True, "multi": False, "user": None}
+    assert status == {
+        "auth_required": True, "setup_required": True, "multi": False,
+        "oidc": {"enabled": False}, "user": None,
+    }
 
 
 def test_setup_creates_admin_then_409(app):

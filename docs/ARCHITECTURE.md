@@ -182,8 +182,13 @@ disabled` (never expose password_hash through the API). Roles are ordered
 workspace; identity lives in its `metadata.db` and a user's role is their
 account role — the original behavior. `serve --root R` (multi) hosts many
 workspaces: global identity + a workspace registry + per-workspace membership
-live in `<root>/control.db` (`laurelin/core/control.py`, `ControlStore`), and
-each workspace is `<root>/<slug>/` with its own data, ACLs, groups, and audit.
+live in the control store — `<root>/control.db` (SQLite) by default, or
+PostgreSQL via `--control-db postgresql://…` / `LAURELIN_CONTROL_DATABASE_URL`
+(`laurelin/core/control.py`, `ControlStore`; the backend is abstracted in
+`laurelin/core/backend.py` so both stores run on either engine). Each workspace
+is `<root>/<slug>/` with its own data, ACLs, groups, and audit. Ships as a Docker
+image + `docker-compose.yml` (Laurelin + Postgres); the prebuilt UI means the
+image needs no Node toolchain.
 The active workspace is chosen per request via the `X-Laurelin-Workspace`
 header or `laurelin_workspace` cookie; `laurelin/api/context.py` resolves it and
 builds/caches that workspace's store+catalog. A user's *effective* role is their
