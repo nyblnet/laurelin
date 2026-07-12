@@ -110,7 +110,18 @@ def _finalize(app: FastAPI) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
+        """Liveness: the process is up."""
         return {"status": "ok", "version": laurelin.__version__}
+
+    @app.get("/health/ready")
+    def ready():
+        """Readiness: the identity/control store is reachable (for k8s probes /
+        load balancers — a replica that can't reach Postgres should not serve)."""
+        try:
+            _identity_store().count_users()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(status_code=503, content={"status": "unavailable", "detail": str(exc)[:120]})
+        return {"status": "ready"}
 
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")

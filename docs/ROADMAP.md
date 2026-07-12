@@ -234,10 +234,10 @@ Enterprise:
 - ✅ **OIDC SSO** (Okta, Entra ID, Google, Keycloak, Auth0): authlib code-flow
       with PKCE, JIT user provisioning, group→role mapping (+ superadmin group).
       **done** *(the 90% of enterprise SSO)*
-- [ ] **SAML 2.0** (for the legacy 10%): SP-initiated + IdP-initiated, signed
-      assertions, metadata endpoint.
-- [ ] **SCIM 2.0 provisioning**: users + groups pushed from IdP,
-      deprovisioning disables sessions/tokens immediately.
+- ✅ **SAML 2.0**: SP-initiated + IdP-initiated, signed assertions (xmlsec1),
+      metadata endpoint, group→role mapping. **done**
+- ✅ **SCIM 2.0 provisioning**: users + groups pushed from IdP; deprovisioning
+      disables the account and immediately kills its sessions + tokens. **done**
 - [ ] **Groups**: local + IdP-synced; permissions bind to groups.
 - [ ] **MFA (TOTP)** for local accounts (SSO deployments delegate MFA to IdP).
 - [ ] **Service accounts**: non-interactive principals for pipelines/agents,
@@ -260,11 +260,11 @@ Enterprise:
       ACLs, AND row-level security + column masking (per-subject row rules;
       null/redact/hash masks with exemptions) — all enforced uniformly on the row
       API, SQL workbench, and ontology objects, and composed together. **done**
-- [ ] **Markings (mandatory access control)**: classification labels
-      (e.g. PII, CONFIDENTIAL) that *propagate through lineage* — a derived
-      dataset inherits input markings; access requires clearance regardless of
-      role. This propagation is Foundry's crown jewel and lineage makes it
-      tractable.
+- ✅ **Markings (mandatory access control)**: classification labels (PII,
+      CONFIDENTIAL, …) that *propagate through lineage* — a derived dataset
+      inherits its inputs' markings on build; a non-admin needs clearance for
+      every marking to see the data, on every read path. Foundry's crown jewel,
+      done. **done**
 - [ ] **Approvals**: protected actions/datasets require second-person approval
       (request → review → apply, all audited).
 - [ ] **Audit v2**: structured events for every read/write/login/permission
@@ -280,14 +280,16 @@ Enterprise:
 - ◑ **Storage backend**: ✅ metadata/control stores run on SQLite or PostgreSQL
       via a dialect adapter; the control plane can be Postgres (`--control-db`)
       for multi-tenant deployments. **done** (per-workspace data still SQLite dirs)
-- ◑ **Packaging**: ✅ Docker image + docker-compose (Laurelin + Postgres). **done**;
-      still to do: official Helm chart / registry-published images,
-      Helm chart (api/worker/scheduler deployments, HPA-ready), single-binary
-      embedded mode preserved forever.
-- [ ] **HA**: stateless API/workers, leader-elected scheduler (pg advisory
-      locks), zero-downtime migrations (alembic, expand-contract).
-- [ ] **Observability**: Prometheus metrics, OpenTelemetry traces, structured
-      JSON logs, health/readiness probes, built-in status page (queue depth,
+- ✅ **Packaging**: Docker image + docker-compose AND a **Helm chart** (lint-clean;
+      Deployment/Service/Ingress/HPA/PVC/Secret) with a deployment guide.
+      **done**; still to do: registry-published images.
+- ◑ **HA**: ✅ stateless API replicas, shared Postgres control plane, liveness +
+      readiness probes, additive/idempotent migrations (safe rolling deploy).
+      **done** for the API/identity tier; still to do: shared/object storage for
+      the per-workspace data plane (so >1 replica doesn't need a RWX volume), and
+      a leader-elected scheduler once the async scheduler lands.
+- ◑ **Observability**: ✅ health/readiness probes. Still to do: Prometheus
+      metrics, OpenTelemetry traces, structured JSON logs, built-in status page (queue depth,
       build latency, index lag).
 - [ ] **Backups & DR**: `laurelin backup` (metadata dump + data manifest),
       point-in-time restore docs, disaster-recovery runbook.

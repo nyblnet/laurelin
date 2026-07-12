@@ -1,0 +1,32 @@
+Laurelin {{ .Chart.AppVersion }} is deploying.
+
+1. Wait for the pod(s) to become ready:
+     kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+2. Reach the UI:
+{{- if .Values.ingress.enabled }}
+     https://{{ (index .Values.ingress.hosts 0).host }}/
+{{- else }}
+     kubectl port-forward svc/{{ include "laurelin.fullname" . }} 8787:{{ .Values.service.port }}
+     open http://localhost:8787
+{{- end }}
+
+3. First run: open the UI and create the server administrator account.
+
+{{- if not .Values.controlDatabaseUrl }}
+{{- if not .Values.existingControlDbSecret }}
+
+WARNING: no PostgreSQL control plane configured (controlDatabaseUrl /
+existingControlDbSecret). Identity + the workspace registry will use SQLite on
+the data volume — fine for a single replica, but set a Postgres URL before
+scaling to multiple replicas.
+{{- end }}
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- if ne .Values.persistence.accessMode "ReadWriteMany" }}
+
+WARNING: replicaCount > 1 but persistence.accessMode is not ReadWriteMany. All
+replicas must share the same workspace data volume — use a ReadWriteMany
+storage class (NFS/EFS/CephFS).
+{{- end }}
+{{- end }}

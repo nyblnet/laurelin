@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "laurelin.fullname" . }}
+  labels:
+    {{- include "laurelin.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "laurelin.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "laurelin.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: laurelin
+          image: {{ include "laurelin.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - laurelin
+            - serve
+            - --root
+            - {{ .Values.dataRoot | quote }}
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8787"
+            {{- if .Values.secureCookies }}
+            - --secure-cookies
+            {{- end }}
+            {{- if .Values.lockPipelines }}
+            - --lock-pipelines
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8787
+          env:
+            {{- if .Values.controlDatabaseUrl }}
+            - name: LAURELIN_CONTROL_DATABASE_URL
+              value: {{ .Values.controlDatabaseUrl | quote }}
+            {{- else if .Values.existingControlDbSecret }}
+            - name: LAURELIN_CONTROL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingControlDbSecret }}
+                  key: {{ .Values.existingControlDbSecretKey }}
+            {{- end }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- if .Values.secretEnv }}
+          envFrom:
+            - secretRef:
+                name: {{ include "laurelin.fullname" . }}-env
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.dataRoot }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-data" (include "laurelin.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

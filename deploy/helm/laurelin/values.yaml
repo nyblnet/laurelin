@@ -1,0 +1,78 @@
+# Laurelin Helm values.
+#
+# HA model: the API is stateless — run several replicas behind the Service, with
+# the shared identity/workspace *registry* in PostgreSQL (controlDatabaseUrl).
+# Per-workspace DATA (Parquet + per-workspace metadata.db) lives on the mounted
+# volume, so for >1 replica that volume must be ReadWriteMany (NFS/EFS/CephFS) so
+# every replica sees the same files. (Object-storage-backed workspaces — which
+# would remove this requirement — are on the roadmap.)
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/laurelin-data/laurelin
+  tag: ""            # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+
+# Multi-workspace root inside the container; data volume is mounted here.
+dataRoot: /data
+
+# PostgreSQL control plane. Strongly recommended in production (shared, HA-safe).
+# Provide the URL directly, or reference an existing secret key.
+controlDatabaseUrl: ""                 # e.g. postgresql://laurelin:pw@postgres:5432/laurelin
+existingControlDbSecret: ""            # name of a Secret containing the URL
+existingControlDbSecretKey: control-database-url
+
+# Extra environment (OIDC / SAML / SCIM config). Non-secret values go here...
+env: {}
+  # LAURELIN_OIDC_ISSUER: https://idp.example.com
+  # LAURELIN_OIDC_PROVIDER_NAME: Okta
+  # LAURELIN_SAML_SP_ENTITY_ID: https://laurelin.example.com/saml/metadata
+# ...secrets go here (rendered into a Secret):
+secretEnv: {}
+  # LAURELIN_OIDC_CLIENT_SECRET: "..."
+  # LAURELIN_SCIM_TOKEN: "..."
+
+secureCookies: true      # set false only when NOT behind TLS
+lockPipelines: false     # disable in-browser transform authoring (untrusted tenants)
+
+persistence:
+  enabled: true
+  storageClass: ""       # a ReadWriteMany class if replicaCount > 1
+  accessMode: ReadWriteOnce
+  size: 20Gi
+  existingClaim: ""
+
+service:
+  type: ClusterIP
+  port: 8787
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: laurelin.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Horizontal Pod Autoscaler (API is stateless, so scaling out is safe).
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
