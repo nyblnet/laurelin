@@ -8,6 +8,7 @@ transform registry and ontology are rebuilt per request so edits to
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any, Optional
@@ -673,6 +674,106 @@ def set_dataset_policy(
         actor=actor,
     )
     return {"dataset": name, "policy": policy}
+
+
+# ---------------------------------------------------------------------------
+# Classification markings (admin) — mandatory access control + lineage propagation
+# ---------------------------------------------------------------------------
+
+class MarkingCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class DatasetMarkingsRequest(BaseModel):
+    markings: list[str] = Field(default_factory=list)
+
+
+class ClearancesRequest(BaseModel):
+    markings: list[str] = Field(default_factory=list)
+
+
+_MARKING_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,47}$")
+
+
+@router.get("/markings", dependencies=[VIEWER])
+def list_markings(store: StoreDep) -> list[dict]:
+    return store.list_markings()
+
+
+@router.post("/markings", dependencies=[ADMIN])
+def create_marking(body: MarkingCreateRequest, store: StoreDep, actor: ActorDep) -> dict:
+    name = body.name.strip().lower()
+    if not _MARKING_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid marking name (a-z 0-9 _ . -, 1-48)")
+    if store.marking_exists(name):
+        raise HTTPException(status_code=409, detail=f"Marking already exists: {name!r}")
+    store.create_marking(name, body.description)
+    store.log_audit("marking_created", {"name": name}, actor=actor)
+    return {"name": name, "description": body.description}
+
+
+@router.delete("/markings/{name}", dependencies=[ADMIN])
+def delete_marking(name: str, store: StoreDep, actor: ActorDep) -> dict:
+    if not store.marking_exists(name):
+        raise KeyError(f"Marking not found: {name!r}")
+    store.delete_marking(name)
+    store.recompute_all_markings()  # its removal ripples through effective sets
+    store.log_audit("marking_deleted", {"name": name}, actor=actor)
+    return {"ok": True}
+
+
+@router.get("/dataset-markings", dependencies=[ADMIN])
+def list_dataset_markings(store: StoreDep) -> list[dict]:
+    """Explicit + effective (propagated) markings for every dataset."""
+    return [
+        {
+            "dataset": d.name,
+            "explicit": store.get_explicit_markings(d.name),
+            "effective": store.get_effective_markings(d.name),
+        }
+        for d in store.list_datasets()
+    ]
+
+
+@router.put("/datasets/{name}/markings", dependencies=[ADMIN])
+def set_dataset_markings(
+    name: str, body: DatasetMarkingsRequest, store: StoreDep, actor: ActorDep
+) -> dict:
+    if store.get_dataset(name) is None:
+        raise KeyError(f"Dataset not found: {name!r}")
+    for m in body.markings:
+        if not store.marking_exists(m):
+            raise HTTPException(status_code=400, detail=f"Unknown marking: {m!r}")
+    store.set_explicit_markings(name, body.markings)
+    store.recompute_all_markings()  # propagate downstream through lineage
+    store.log_audit(
+        "dataset_markings_set", {"dataset": name, "markings": body.markings}, actor=actor
+    )
+    return {
+        "dataset": name,
+        "explicit": store.get_explicit_markings(name),
+        "effective": store.get_effective_markings(name),
+    }
+
+
+@router.get("/users/{username}/clearances", dependencies=[ADMIN])
+def get_clearances(username: str, store: StoreDep) -> dict:
+    return {"username": username, "markings": store.get_clearances(username)}
+
+
+@router.put("/users/{username}/clearances", dependencies=[ADMIN])
+def set_clearances(
+    username: str, body: ClearancesRequest, store: StoreDep, actor: ActorDep
+) -> dict:
+    for m in body.markings:
+        if not store.marking_exists(m):
+            raise HTTPException(status_code=400, detail=f"Unknown marking: {m!r}")
+    store.set_clearances(username, body.markings)
+    store.log_audit(
+        "clearances_set", {"username": username, "markings": body.markings}, actor=actor
+    )
+    return {"username": username, "markings": store.get_clearances(username)}
 
 
 # ---------------------------------------------------------------------------

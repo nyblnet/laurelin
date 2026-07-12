@@ -163,6 +163,10 @@ class Builder:
             task.finished_at = utcnow_iso()
             self.store.upsert_build_task(build.id, task)
 
+        # Propagate classification markings along the (now-updated) lineage so
+        # every derived dataset inherits its inputs' markings.
+        self.store.recompute_all_markings()
+
         final_status = BuildStatus.failed if any_failed else BuildStatus.succeeded
         self.store.update_build(
             build.id,

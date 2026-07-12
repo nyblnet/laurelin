@@ -31,6 +31,7 @@ export interface AuthStatus {
   setup_required: boolean;
   multi?: boolean;
   oidc?: OidcStatus;
+  saml?: OidcStatus;
   user: User | null;
 }
 
@@ -292,6 +293,25 @@ export interface DatasetPolicy {
 export interface DatasetPolicyEntry {
   dataset: string;
   policy: DatasetPolicy | null;
+}
+
+// -- Classification markings ------------------------------------------------
+
+export interface Marking {
+  name: string;
+  description: string;
+  created_at?: string;
+}
+
+export interface DatasetMarkingsEntry {
+  dataset: string;
+  explicit: string[];
+  effective: string[];
+}
+
+export interface UserClearances {
+  username: string;
+  markings: string[];
 }
 
 export interface Group {

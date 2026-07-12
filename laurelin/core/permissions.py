@@ -117,8 +117,26 @@ class PermissionService:
     def _dataset_grants(self, dataset: str) -> list[Grant]:
         return [Grant(**g) for g in self.store.grants_for_dataset(dataset)]
 
+    def _has_clearance(self, user: Optional[User], dataset: str) -> bool:
+        """Mandatory access control: a non-admin must hold clearance for every
+        (effective, lineage-propagated) marking on the dataset. Admins/superadmins
+        are the data stewards and bypass markings (so they can't lock themselves
+        out); markings gate editors and viewers."""
+        if user is None:
+            return False
+        if user.role == Role.admin:
+            return True
+        needed = set(self.store.get_effective_markings(dataset))
+        if not needed:
+            return True
+        return needed <= set(self.store.get_clearances(user.username))
+
     def dataset_permission(self, user: Optional[User], dataset: str) -> tuple[bool, bool]:
-        return self._evaluate(user, self._dataset_grants(dataset))
+        # Discretionary ACL, then MANDATORY markings override (deny if uncleared).
+        view, edit = self._evaluate(user, self._dataset_grants(dataset))
+        if not self._has_clearance(user, dataset):
+            return (False, False)
+        return (view, edit)
 
     def can_view_dataset(self, user: Optional[User], dataset: str) -> bool:
         return self.dataset_permission(user, dataset)[0]

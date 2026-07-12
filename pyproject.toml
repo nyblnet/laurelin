@@ -36,6 +36,8 @@ dependencies = [
 dev = ["pytest>=8"]
 # Multi-workspace / production control plane on Postgres instead of SQLite.
 postgres = ["psycopg[binary]>=3.1"]
+# SAML 2.0 SSO (needs the xmlsec1 system binary at runtime).
+saml = ["pysaml2>=7.5"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

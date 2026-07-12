@@ -78,13 +78,18 @@ export function LoginScreen() {
           {busy ? "Signing in…" : "Sign in"}
         </button>
       </form>
+      {(auth.oidc?.enabled || auth.saml?.enabled) && (
+        <div className="auth-divider">or</div>
+      )}
       {auth.oidc?.enabled && (
-        <>
-          <div className="auth-divider">or</div>
-          <a className="btn sso-btn" href="/api/v1/auth/oidc/login">
-            Sign in with {auth.oidc.provider_name || "SSO"}
-          </a>
-        </>
+        <a className="btn sso-btn" href="/api/v1/auth/oidc/login">
+          Sign in with {auth.oidc.provider_name || "SSO"}
+        </a>
+      )}
+      {auth.saml?.enabled && (
+        <a className="btn sso-btn" href="/api/v1/auth/saml/login" style={{ marginTop: 8 }}>
+          Sign in with {auth.saml.provider_name || "SAML"}
+        </a>
       )}
     </AuthShell>
   );

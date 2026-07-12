@@ -328,6 +328,27 @@ class DatasetPolicy(BaseModel):
     column_masks: list[ColumnMask] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Classification markings (mandatory access control, propagated via lineage)
+# ---------------------------------------------------------------------------
+
+class Marking(BaseModel):
+    name: str
+    description: str = ""
+    created_at: str = Field(default_factory=utcnow_iso)
+
+
+class DatasetMarkings(BaseModel):
+    dataset: str
+    explicit: list[str] = Field(default_factory=list)   # admin-assigned
+    effective: list[str] = Field(default_factory=list)  # explicit ∪ inherited via lineage
+
+
+class UserClearances(BaseModel):
+    username: str
+    markings: list[str] = Field(default_factory=list)
+
+
 class ObjectTypePermission(BaseModel):
     """The effective permission a specific user has on an object type."""
 

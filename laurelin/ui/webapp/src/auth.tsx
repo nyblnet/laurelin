@@ -33,6 +33,7 @@ interface AuthContextValue {
   setActiveWorkspace: (slug: string) => void;
   // SSO:
   oidc: OidcStatus | undefined;
+  saml: OidcStatus | undefined;
   refresh: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<void>;
@@ -157,6 +158,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       activeSlug,
       setActiveWorkspace,
       oidc: status.oidc,
+      saml: status.saml,
       refresh,
       login,
       setup,

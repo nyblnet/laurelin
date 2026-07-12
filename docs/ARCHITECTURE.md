@@ -208,6 +208,37 @@ enumerate slugs. **Deleting** a workspace only *unregisters* it (reversible) —
 its files stay under `<root>/<slug>/`; reusing a slug re-exposes that data, so
 purge the directory before reusing a slug for a different tenant.
 
+**Classification markings** (`markings`/`dataset_markings`/`clearances` tables;
+`PermissionService._has_clearance`). Mandatory access control layered on top of
+the discretionary ACLs: an admin defines markings (e.g. `pii`, `confidential`),
+assigns them to datasets, and grants users *clearances*. A non-admin sees a
+dataset only if they hold clearance for **every** effective marking on it
+(deny-by-default); admins/superadmins are the data stewards and bypass. The
+differentiator is **lineage propagation**: `store.recompute_all_markings()` (run
+after every build and on any marking change) recomputes each dataset's effective
+markings as its explicit markings ∪ the union of its lineage upstreams' effective
+markings — so a derived dataset inherits its inputs' classifications and
+classified data can't be laundered through a transform. Enforced everywhere via
+`dataset_permission` (row API, SQL workbench, ontology objects). Admin API:
+`/markings`, `/dataset-markings`, `/datasets/{name}/markings`,
+`/users/{username}/clearances`.
+
+**SCIM 2.0 provisioning** (`laurelin/api/scim_routes.py`, enabled by
+`LAURELIN_SCIM_TOKEN`). An IdP pushes users + groups and, importantly,
+*deprovisions* them — setting a SCIM user inactive/deleted disables the Laurelin
+user, which immediately invalidates their sessions and API tokens. SCIM maps
+onto the identity store (users/groups); the IdP authenticates with the bearer
+token. A minimal-but-real subset: `/scim/v2/Users` + `/Groups` (list/create/get/
+put/patch/delete) and `ServiceProviderConfig`.
+
+**SAML 2.0 SSO** (`laurelin/core/saml.py`, pysaml2 + xmlsec1; enabled by
+`LAURELIN_SAML_IDP_METADATA` + `LAURELIN_SAML_SP_ENTITY_ID`). SP-initiated
+(`/auth/saml/login` → IdP) and IdP-initiated (unsolicited POST to
+`/auth/saml/acs`); IdP assertions must be signed (verified via xmlsec1). Valid
+responses JIT-provision an identity and map group attributes to a role, then
+issue the normal session — same downstream path as OIDC. `/auth/saml/metadata`
+serves SP metadata for the IdP. `/auth/status` reports `saml:{enabled,name}`.
+
 **OIDC SSO** (`laurelin/core/oidc.py`). When `LAURELIN_OIDC_ISSUER` +
 `_CLIENT_ID` + `_CLIENT_SECRET` are set, an authorization-code + PKCE flow is
 enabled: `/api/v1/auth/oidc/login` stores per-flow state/nonce/verifier

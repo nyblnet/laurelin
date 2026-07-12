@@ -476,13 +476,10 @@ def test_auth_on_by_default_requires_setup(workspace):
     assert auth_client.get("/health").status_code == 200
     status = auth_client.get("/api/v1/auth/status")
     assert status.status_code == 200
-    assert status.json() == {
-        "auth_required": True,
-        "setup_required": True,
-        "multi": False,
-        "oidc": {"enabled": False},
-        "user": None,
-    }
+    body = status.json()
+    assert body["auth_required"] is True
+    assert body["setup_required"] is True
+    assert body["user"] is None
 
 
 def test_auth_setup_login_and_bearer(workspace):

@@ -224,7 +224,7 @@ def auth_status(request: Request, user: CurrentUser) -> dict:
     multi = is_multi(request)
     if request.app.state.no_auth:
         return {"auth_required": False, "setup_required": False, "multi": multi,
-                "oidc": _oidc_status(request),
+                "oidc": _oidc_status(request), "saml": _saml_status(request),
                 "user": _status_user(request, user) if user else None}
     setup_required = identity_store(request).count_users() == 0
     return {
@@ -232,6 +232,7 @@ def auth_status(request: Request, user: CurrentUser) -> dict:
         "setup_required": setup_required,
         "multi": multi,
         "oidc": _oidc_status(request),
+        "saml": _saml_status(request),
         "user": _status_user(request, user) if user else None,
     }
 
@@ -353,6 +354,63 @@ def oidc_callback(request: Request, response: Response):
     resp = RedirectResponse("/", status_code=302)
     _set_session_cookie(resp, request, token)
     store.log_audit("login_succeeded", {"username": user.username, "via": "sso"}, actor=user.username)
+    return resp
+
+
+def _saml_status(request: Request) -> dict:
+    cfg = getattr(request.app.state, "saml_config", None)
+    if cfg is None or not cfg.enabled:
+        return {"enabled": False}
+    return {"enabled": True, "provider_name": cfg.provider_name}
+
+
+@auth_router.get("/saml/metadata")
+def saml_metadata(request: Request):
+    from fastapi.responses import Response as FastResponse
+
+    cfg = getattr(request.app.state, "saml_config", None)
+    if cfg is None or not cfg.enabled:
+        raise HTTPException(status_code=404, detail="SAML is not configured")
+    xml = request.app.state.saml_provider.metadata_xml()
+    return FastResponse(content=xml, media_type="application/samlmetadata+xml")
+
+
+@auth_router.get("/saml/login")
+def saml_login(request: Request):
+    from fastapi.responses import RedirectResponse
+
+    cfg = getattr(request.app.state, "saml_config", None)
+    if cfg is None or not cfg.enabled:
+        raise HTTPException(status_code=404, detail="SAML is not configured")
+    return RedirectResponse(request.app.state.saml_provider.login_redirect(), status_code=302)
+
+
+@auth_router.post("/saml/acs")
+async def saml_acs(request: Request):
+    """Assertion Consumer Service — the IdP POSTs the SAMLResponse here."""
+    from fastapi.responses import RedirectResponse
+
+    cfg = getattr(request.app.state, "saml_config", None)
+    if cfg is None or not cfg.enabled:
+        raise HTTPException(status_code=404, detail="SAML is not configured")
+    form = await request.form()
+    saml_response = form.get("SAMLResponse")
+    if not saml_response:
+        raise HTTPException(status_code=400, detail="Missing SAMLResponse")
+    store = identity_store(request)
+    try:
+        username, groups = request.app.state.saml_provider.parse_response(str(saml_response))
+    except Exception as exc:  # noqa: BLE001 - any validation failure is an auth failure
+        store.log_audit("saml_login_failed", {"reason": str(exc)[:200]}, actor="saml")
+        raise HTTPException(status_code=400, detail=f"SAML validation failed: {exc}")
+    auth = identity_auth(request)
+    user = auth.provision_oidc_user(username, cfg.role_for(groups), cfg.is_superadmin(groups))
+    if user.disabled:
+        raise HTTPException(status_code=403, detail="Account is disabled")
+    token, user = auth.login(user)
+    resp = RedirectResponse("/", status_code=302)
+    _set_session_cookie(resp, request, token)
+    store.log_audit("login_succeeded", {"username": user.username, "via": "saml"}, actor=user.username)
     return resp
 
 

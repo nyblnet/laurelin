@@ -159,6 +159,24 @@ CREATE TABLE IF NOT EXISTS oidc_flows (
     redirect_uri TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS markings (
+    name TEXT PRIMARY KEY {{NOCASE}},
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dataset_markings (
+    dataset TEXT NOT NULL,
+    marking TEXT NOT NULL,
+    inherited INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (dataset, marking, inherited)
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_markings ON dataset_markings (dataset);
+CREATE TABLE IF NOT EXISTS clearances (
+    username TEXT NOT NULL {{NOCASE}},
+    marking TEXT NOT NULL,
+    PRIMARY KEY (username, marking)
+);
+CREATE INDEX IF NOT EXISTS idx_clearances_user ON clearances (username);
 {{EXTRA_DDL}}
 """
 
@@ -908,6 +926,125 @@ class MetadataStore:
     def purge_oidc_flows(self, before_iso: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM oidc_flows WHERE created_at < ?", (before_iso,))
+
+    # -- classification markings --------------------------------------------------
+
+    def list_markings(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT name, description, created_at FROM markings ORDER BY name"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_marking(self, name: str, description: str = "") -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO markings (name, description, created_at) VALUES (?, ?, ?)",
+                (name.lower(), description, utcnow_iso()),
+            )
+
+    def marking_exists(self, name: str) -> bool:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM markings WHERE name = ?", (name.lower(),)
+            ).fetchone() is not None
+
+    def delete_marking(self, name: str) -> None:
+        name = name.lower()
+        with self._conn() as c:
+            c.execute("DELETE FROM markings WHERE name = ?", (name,))
+            c.execute("DELETE FROM dataset_markings WHERE marking = ?", (name,))
+            c.execute("DELETE FROM clearances WHERE marking = ?", (name,))
+
+    def _markings_for(self, dataset: str, inherited: int) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT marking FROM dataset_markings WHERE dataset = ? AND inherited = ? "
+                "ORDER BY marking",
+                (dataset, inherited),
+            ).fetchall()
+        return [r["marking"] for r in rows]
+
+    def get_explicit_markings(self, dataset: str) -> list[str]:
+        return self._markings_for(dataset, 0)
+
+    def get_effective_markings(self, dataset: str) -> list[str]:
+        return self._markings_for(dataset, 1)
+
+    def set_explicit_markings(self, dataset: str, markings: list[str]) -> None:
+        markings = sorted({m.lower() for m in markings})
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM dataset_markings WHERE dataset = ? AND inherited = 0", (dataset,)
+            )
+            c.executemany(
+                "INSERT INTO dataset_markings (dataset, marking, inherited) VALUES (?, ?, 0)",
+                [(dataset, m) for m in markings],
+            )
+
+    def _set_effective_markings(self, c: Connection, dataset: str, markings: set[str]) -> None:
+        c.execute("DELETE FROM dataset_markings WHERE dataset = ? AND inherited = 1", (dataset,))
+        c.executemany(
+            "INSERT INTO dataset_markings (dataset, marking, inherited) VALUES (?, ?, 1)",
+            [(dataset, m) for m in sorted(markings)],
+        )
+
+    def get_clearances(self, username: str) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT marking FROM clearances WHERE username = ? ORDER BY marking",
+                (username.lower(),),
+            ).fetchall()
+        return [r["marking"] for r in rows]
+
+    def set_clearances(self, username: str, markings: list[str]) -> None:
+        username = username.lower()
+        markings = sorted({m.lower() for m in markings})
+        with self._conn() as c:
+            c.execute("DELETE FROM clearances WHERE username = ?", (username,))
+            c.executemany(
+                "INSERT INTO clearances (username, marking) VALUES (?, ?)",
+                [(username, m) for m in markings],
+            )
+
+    def recompute_all_markings(self) -> None:
+        """Recompute every dataset's *effective* markings as its explicit markings
+        plus the union of its lineage upstreams' effective markings. This is the
+        propagation: a derived dataset inherits its inputs' classifications, so
+        classified data can't be laundered through a transform. Runs a single
+        topological pass over the dataset-level lineage graph (cycle-safe)."""
+        datasets = [d.name for d in self.list_datasets()]
+        # dataset-level edges: upstream_dataset -> downstream_dataset
+        upstreams: dict[str, set[str]] = {d: set() for d in datasets}
+        for e in self.list_lineage():
+            upstreams.setdefault(e.downstream_dataset, set()).add(e.upstream_dataset)
+            upstreams.setdefault(e.upstream_dataset, set())
+        explicit = {d: set(self.get_explicit_markings(d)) for d in upstreams}
+        # Topological order (Kahn); nodes in a cycle are processed last, best-effort.
+        indeg = {d: len(ups) for d, ups in upstreams.items()}
+        ready = [d for d, n in indeg.items() if n == 0]
+        downstream: dict[str, set[str]] = {d: set() for d in upstreams}
+        for d, ups in upstreams.items():
+            for u in ups:
+                downstream[u].add(d)
+        order: list[str] = []
+        while ready:
+            d = ready.pop()
+            order.append(d)
+            for c in downstream[d]:
+                indeg[c] -= 1
+                if indeg[c] == 0:
+                    ready.append(c)
+        order += [d for d in upstreams if d not in order]  # any cycle leftovers
+        effective: dict[str, set[str]] = {}
+        for d in order:
+            eff = set(explicit.get(d, set()))
+            for u in upstreams.get(d, set()):
+                eff |= effective.get(u, set())
+            effective[d] = eff
+        with self._conn() as c:
+            for d, eff in effective.items():
+                self._set_effective_markings(c, d, eff)
 
     def set_dataset_policy(self, dataset: str, policy: Optional[dict]) -> None:
         with self._conn() as c:
