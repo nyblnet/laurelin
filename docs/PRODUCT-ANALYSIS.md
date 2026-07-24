@@ -80,12 +80,15 @@ asserted, not demonstrated.**
 
 **Tier 3 — convert the skeptics (perception, not features):**
 6. **A hosted live demo** (read-only, seeded) — try it in 30s, no install.
-7. **Real numbers** — publish "works well up to X datasets / Y rows / Z
-   concurrent users," plus an explicit **"what this is / isn't."** Honesty about
-   the medium-data ceiling builds *more* trust than implying infinite scale.
-8. **Onboarding docs** — three task-shaped tutorials (ingest→transform→build;
-   model an ontology + action; lock a dataset with RLS/markings) + a
-   `SECURITY.md` and disclosure process.
+   *(Still open — needs hosting infrastructure.)*
+7. ~~**Real numbers**~~ — **done**: [SCALE.md](SCALE.md) publishes measured,
+   reproducible benchmarks plus an explicit "what this is / isn't." The
+   honesty paid off immediately: it surfaced the ontology full-scan ceiling
+   (~100 K objects/type) as the top optimization target.
+8. ~~**Onboarding docs**~~ — **done**: three task-shaped
+   [tutorials](tutorials/) (each verified end-to-end) and a
+   [`SECURITY.md`](../SECURITY.md) with trust boundaries and a disclosure
+   process.
 
 ## What's already closed vs what remains
 
@@ -109,12 +112,19 @@ per user); the MCP server (`laurelin mcp`) + `LaurelinClient` Python SDK —
 agents operate datasets, SQL, the ontology, actions, and builds through the
 normal token/permission/audit path.
 
+**Closed since (Tier-3 pass, trust):** three task-shaped tutorials
+(ingest→transform→build; ontology + actions; locking a dataset down), each
+verified end-to-end against a real workspace; `SECURITY.md` with the security
+model, named trust boundaries, and a disclosure process; and `docs/SCALE.md` —
+published, reproducible benchmarks (`bench/benchmark.py`) with an explicit
+"what this is / isn't," including the ontology full-scan ceiling.
+
 **Remaining (the "opener" + scale):** more connectors + incremental cursors +
 scheduled syncs; cron/event-triggered + incremental builds and a
-multi-process worker/queue; ontology indexing; dashboard v2 (cross-filtering,
-parameters) + app builder; generated typed SDKs; object-storage-backed
-workspaces (for a fully stateless data plane and true data-plane HA); a
-hosted demo + benchmarks + tutorials.
+multi-process worker/queue; **ontology indexing** (now the top measured
+bottleneck — see SCALE.md); dashboard v2 (cross-filtering, parameters) + app
+builder; generated typed SDKs; object-storage-backed workspaces (for a fully
+stateless data plane and true data-plane HA); a hosted demo.
 
 ## The one strategic call
 

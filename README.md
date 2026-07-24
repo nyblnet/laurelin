@@ -52,6 +52,17 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   user (`pip install laurelin[mcp]`).
 - **Audit** — mutations through the API are written to an audit log.
 
+## Tutorials
+
+Three task-shaped walkthroughs that build on each other — start here:
+
+1. [Ingest → transform → build](docs/tutorials/01-ingest-transform-build.md) — a
+   CSV to a versioned dataset to a two-stage pipeline with lineage (~10 min).
+2. [Model an ontology and act on it](docs/tutorials/02-ontology-and-actions.md) —
+   object types, links, and validated write-back actions (~15 min).
+3. [Lock a dataset down](docs/tutorials/03-securing-data.md) — ACLs, row-level
+   security, column masking, and classification markings (~15 min).
+
 ## Quickstart
 
 ```bash
@@ -201,10 +212,20 @@ disabled entirely with `laurelin serve --lock-pipelines` (or
 `LAURELIN_LOCK_PIPELINES=1`) for untrusted multi-user deployments. The executed
 transform code is not yet sandboxed.
 
-## Status
+See [SECURITY.md](SECURITY.md) for the full security model, trust boundaries,
+and how to report a vulnerability.
 
-Early alpha. The core loop — upload → transform → build → ontology → act — works
-end to end; expect rough edges and breaking changes.
+## Status & scale
+
+Early alpha. The core loop — ingest → transform → build → ontology → act —
+works end to end; expect rough edges and breaking changes.
+
+Laurelin is a **single-node, medium-data platform**: strong on governance and
+semantics, deliberately not a distributed compute engine.
+[docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
+unflattering ones — the SQL path stays comfortable into the tens of millions
+of rows, while ontology object queries are full scans and hit a wall around
+100 K objects per type. Reproduce them with `python bench/benchmark.py`.
 
 ## License
 

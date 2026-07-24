@@ -377,9 +377,12 @@ The differentiator: nobody open-source has a good ontology layer.
 - WS10: semantic search + NL→SQL assist (optional module)
 
 ### Continuous
-- Docs site (tutorials, operator guide, API reference), example gallery,
+- Docs site (operator guide, API reference), example gallery,
   integration tests against real IdPs (Keycloak in CI), release cadence +
   LTS policy, CONTRIBUTING/governance for outside contributors.
+- [x] Task-shaped tutorials ([docs/tutorials](tutorials/)), `SECURITY.md`
+      (security model + trust boundaries + disclosure), and published
+      reproducible benchmarks ([SCALE.md](SCALE.md), `bench/benchmark.py`).
 
 ## Non-goals
 
