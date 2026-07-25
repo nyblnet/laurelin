@@ -125,12 +125,15 @@ with a 1% delta) — plus cursor-based incremental connector syncs; and
 ontology query pushdown into DuckDB (~26× faster; 36 s → 1.4 s at 5 M
 objects, point lookups 279 ms).
 
+RLS predicate pushdown also landed: row policies are applied with
+`Dataset.filter()` inside the scan, so the 3.6× tax is gone (1.0× at 5 M
+rows) and policied users get the fast ontology path too.
+
 **Remaining (the "opener" + scale):** more connectors; scheduled syncs;
 cron/event-triggered + incremental builds and a multi-process worker/queue;
-a true ontology *index* (queries are fast now but still linear); RLS
-predicate pushdown (still 3–4×, and it disables the ontology fast path);
-query resource limits; streaming Python transforms; dashboard v2
-(cross-filtering, parameters) + app builder; generated typed SDKs;
+a true ontology *index* (queries are fast now but still linear); query
+resource limits + admission control; streaming Python transforms; dashboard
+v2 (cross-filtering, parameters) + app builder; generated typed SDKs;
 object-storage-backed workspaces (for a fully stateless data plane and true
 data-plane HA); a hosted demo.
 

@@ -109,24 +109,33 @@ uncompressed size of its inputs plus its output — for the table above, about
 100 MB per million rows. SQL transforms stream through DuckDB and don't pay
 this. If a Python transform is going to hold 50 GB, it won't.
 
-### Row-level security — a real, measurable tax
+### Row-level security — now essentially free
 
 | Rows | Aggregate, no policy | Aggregate, RLS active | Cost |
 |---:|---:|---:|---:|
-| 10 K | 12 ms | 14 ms | 1.2× |
-| 100 K | 18 ms | 22 ms | 1.3× |
-| 1 M | 40 ms | 101 ms | 2.5× |
-| 5 M | 71 ms | 256 ms | 3.6× |
+| 1 M | 39 ms | 33 ms | **1.0×** *(was 2.5×)* |
+| 5 M | 72 ms | 71 ms | **1.0×** *(was 3.6×)* |
 
-When a dataset has an active row policy or column mask for the caller,
-Laurelin reads the table and filters it through the policy engine *before*
-DuckDB sees it — so that path loses pushdown and pays for materialization.
-Un-policied datasets keep the fast lazy scan.
+Row policies used to materialize the whole table and filter it in the policy
+engine before DuckDB saw it, costing 3–4× at scale. A policy that can be
+expressed as an Arrow filter is now applied with `Dataset.filter()`, which
+keeps the object a *Dataset* — so DuckDB still pushes its own column pruning
+and predicates through it. A filtered scan costs about what an unfiltered one
+does (sometimes less: there's less data to aggregate).
 
-This is a deliberate trade: one enforcement choke point that every read path
-shares, at the cost of speed on policied datasets. **Budget ~3–4× on
-policy-protected datasets at multi-million-row scale.** Pushing predicates
-into the scan for simple row policies is a known optimization we haven't done.
+Doing this with a pre-built `Scanner` instead would freeze the column set and
+cost ~3× — the measured difference between 126 ms and 38 ms on a 3 M-row
+aggregate. The distinction matters.
+
+Two things still take the exact, materializing path:
+
+- **Hash masking**, which has no Arrow compute equivalent (sha256).
+- **Any masking** loses column pruning, because computed columns need a
+  Scanner. Row filtering alone does not.
+
+Ontology objects benefit too: a viewer restricted by a row policy now gets an
+object page over a 1 M-row dataset in **195 ms**, against ~6.7 s before, while
+seeing only their permitted rows.
 
 ### The ontology — was the ceiling, now ~26× faster
 
@@ -151,11 +160,9 @@ Two honest caveats:
    dataset size; the constant is just ~26× smaller. A real object index
    (sorted keys, zone maps) would make these sub-linear and is still on the
    roadmap.
-2. **Row-level security falls back to the exact in-memory path.** If a user
-   has an active row policy or column mask on the backing dataset, that
-   object type reverts to the old behavior and the old numbers for them.
-   Admins and un-policied datasets get the fast path. (Fixing this is the
-   RLS-pushdown item below.)
+2. **Row-level security rides along.** A row policy is pushed into the same
+   scan, so a policied viewer gets a page over 1 M objects in ~195 ms. Only
+   hash masking still forces the exact in-memory path.
 
 Sizing guidance now: **≤ 1 M objects per type is comfortable**, 5 M is usable
 for lookups and tolerable for browsing. Modeling *entities* in the ontology
@@ -188,8 +195,8 @@ state that needs `ReadWriteMany` above one replica.
 1. **Still no object index** — ontology browse/search is now pushed into
    DuckDB (~26× faster) but remains linear in dataset size. Point lookups do
    prune.
-2. **RLS loses pushdown** — 3–4× on policied datasets, and it also disables
-   the ontology fast path for affected users.
+2. **Column masking loses column pruning**, and hash masking materializes
+   (no Arrow sha256). Row policies push down fully and are free.
 3. **Python transforms are in-memory** — input size bounded by RAM. SQL
    transforms stream and don't pay this.
 4. **Builds are in-process** — a worker pool per replica, not a distributed

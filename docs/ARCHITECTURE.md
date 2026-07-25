@@ -415,12 +415,23 @@ as a grant subject.
 (`dataset_grants`, `PermissionService.dataset_permission`), enforced on **every**
 data path: `/datasets` (list filtered), `/datasets/{name}`, `/schema`, `/rows`
 (view), `/upload` (edit), and `/query` — the query registers only the datasets
-the caller can view, so a blocked dataset is simply an unknown table. Datasets
-that need no policy for the caller are registered as **lazy Arrow datasets**
-(DuckDB streams them with projection/filter pushdown, so workbench memory
-scales with the result, not the dataset); policy'd datasets are read and
-filtered through the same choke point as the row API. External access stays
-disabled either way — the SQL can never touch the filesystem. Object-type
+the caller can view, so a blocked dataset is simply an unknown table. Every
+dataset is registered through `DatasetCatalog.scan_for`, which resolves a
+`PolicyPlan` (`PermissionService.arrow_policy_fn`):
+
+- **no policy** → the bare lazy Arrow dataset (DuckDB pushes projection and
+  filters into the Parquet scan; memory tracks the result, not the dataset);
+- **row policy** → `Dataset.filter(expr)`, which stays a *Dataset*, so
+  pruning still applies and enforcement is effectively free;
+- **column masks** → a Scanner with computed columns (fixes the projection,
+  so pruning is lost);
+- **hash masking** → materialize and run the exact policy engine (no Arrow
+  sha256 equivalent).
+
+Whichever branch is taken, the rows and values are identical to the
+materializing path — `tests/test_rls_pushdown.py` asserts that equivalence
+across policy shapes and users. External access stays disabled either way, so
+the SQL can never touch the filesystem. Object-type
 access is now **composed**: effective view = ontology-view AND backing-dataset-
 view; effective edit = that view AND ontology-edit. So locking a dataset also
 hides its objects, and there is no longer a path (query / dataset rows) to read

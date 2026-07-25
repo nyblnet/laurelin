@@ -449,12 +449,40 @@ class DatasetCatalog:
         of materializing the whole table in memory."""
         return pads.dataset(self.version_files(name, version), format="parquet")
 
+    def scan_for(self, name: str, plan_for=None, version: Optional[int] = None):
+        """A scannable object for ``name`` with any row/column policy applied.
+
+        Returns a lazy pyarrow Dataset (or Scanner) whenever the policy can be
+        expressed as a filter/projection, so DuckDB streams it with pushdown;
+        falls back to a materialized, policy-filtered Table only when a rule
+        has no Arrow equivalent. Either way the caller sees exactly the rows
+        and values this user may see.
+        """
+        dataset = self.arrow_dataset(name, version)
+        plan = plan_for(name, dataset.schema) if plan_for is not None else None
+        if plan is None:
+            return dataset
+        if not plan.lazy:
+            return plan.apply(self.read(name, version))
+        scan = dataset
+        if plan.filter is not None:
+            # Dataset.filter keeps this a *Dataset*, so DuckDB can still push
+            # its own column pruning and predicates through — a filtered scan
+            # costs about the same as an unfiltered one. Building a Scanner
+            # here instead would freeze the column set and cost ~3x.
+            scan = scan.filter(plan.filter)
+        if plan.projection is not None:
+            # Masking needs computed columns, which only a Scanner can express;
+            # that fixes the projection, so masked datasets lose column pruning.
+            scan = scan.scanner(columns=plan.projection)
+        return scan
+
     def query(
         self,
         sql: str,
         max_rows: int = 1000,
         allowed: Optional[set[str]] = None,
-        policy_for: Optional[Callable[[str], Optional[Callable[[pa.Table], pa.Table]]]] = None,
+        plan_for=None,
     ) -> dict:
         """Run a read-only SQL query with each dataset's latest version exposed
         as a view named after the dataset. Returns
@@ -464,13 +492,13 @@ class DatasetCatalog:
         referencing a dataset outside ``allowed`` fails as an unknown table, so
         this is how per-dataset ACLs are enforced on the ad-hoc query surface.
 
-        ``policy_for`` maps a dataset name to an optional row-level-security /
-        masking transform. Datasets with no transform are registered as lazy
-        Arrow datasets — DuckDB streams them with projection and filter
-        pushdown, so query memory scales with the result, not the dataset.
-        Datasets that need a policy are read and filtered up front (the policy
-        engine operates on tables), which keeps the security choke point
-        identical to the row API.
+        ``plan_for`` maps ``(dataset, schema)`` to a row-level-security /
+        masking plan. Every dataset is registered through ``scan_for``, which
+        keeps the scan lazy — pushing the policy's filter and projection into
+        the Parquet read — unless a rule has no Arrow equivalent, in which case
+        it materializes and applies the exact policy engine. Query memory
+        tracks the result rather than the dataset, and the security choke point
+        is the same one the row API uses.
 
         Either way the SQL itself never touches the filesystem: only
         registered Arrow objects are visible and external access is disabled
@@ -485,11 +513,7 @@ class DatasetCatalog:
                     continue
                 if allowed is not None and ds.name not in allowed:
                     continue
-                fn = policy_for(ds.name) if policy_for is not None else None
-                if fn is None:
-                    con.register(ds.name, self.arrow_dataset(ds.name))
-                else:
-                    con.register(ds.name, fn(self.read(ds.name)))
+                con.register(ds.name, self.scan_for(ds.name, plan_for=plan_for))
             # Lock down all filesystem/network access for the untrusted query.
             con.execute("SET enable_external_access=false")
             cur = con.execute(sql)

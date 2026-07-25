@@ -93,7 +93,7 @@ def bench_size(n: int, root: Path) -> dict:
     result["parquet_mb"] = round(parquet.stat().st_size / (1024 * 1024), 2)
     result["arrow_mb"] = round(table.nbytes / (1024 * 1024), 2)
 
-    policy_for = perms.per_dataset_policy_fn(ADMIN)
+    policy_for = perms.arrow_policy_fn(ADMIN)
 
     # --- queries (through the real query path, incl. lazy Arrow scan) --------
     queries = {
@@ -114,7 +114,7 @@ def bench_size(n: int, root: Path) -> dict:
         if key == "q_self_join" and n > 1_000_000:
             result[key + "_ms"] = None
             continue
-        ms, _ = timed(lambda s=sql: catalog.query(s, max_rows=1000, policy_for=policy_for))
+        ms, _ = timed(lambda s=sql: catalog.query(s, max_rows=1000, plan_for=policy_for))
         result[key + "_ms"] = round(ms, 1)
 
     # --- the same aggregate with row-level security engaged ------------------
@@ -130,9 +130,9 @@ def bench_size(n: int, root: Path) -> dict:
         },
     )
     viewer = User(id="v", username="viewer", role=Role.viewer)
-    rls_policy_for = PermissionService(store).per_dataset_policy_fn(viewer)
+    rls_policy_for = PermissionService(store).arrow_policy_fn(viewer)
     ms, _ = timed(
-        lambda: catalog.query(queries["q_aggregate"], max_rows=1000, policy_for=rls_policy_for)
+        lambda: catalog.query(queries["q_aggregate"], max_rows=1000, plan_for=rls_policy_for)
     )
     result["q_aggregate_rls_ms"] = round(ms, 1)
     store.set_dataset_policy("orders", None)

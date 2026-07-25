@@ -166,8 +166,13 @@ Key bets, and why:
       over the backing Parquet with the edit overlay merged there, instead of
       materializing the dataset in Python — ~26× faster (36 s → 1.4 s at 5 M
       objects; point lookups 279 ms via a primary-key predicate pushed inside
-      the de-duplication window). Falls back to the exact in-memory path when
-      row-level security applies to the backing dataset.
+      the de-duplication window). Row-level security is pushed into the same
+      scan, so policied users get it too (~195 ms over 1 M objects); only hash
+      masking falls back to the exact in-memory path.
+- [x] **RLS predicate pushdown**: row policies apply via `Dataset.filter()`,
+      which preserves DuckDB's column pruning — the 3.6× policy tax at 5 M
+      rows is gone (1.0×). Column masks still need a Scanner (no pruning);
+      hash masking materializes.
 - [ ] **Object index**: materialize objects into indexed storage (Postgres
       tables w/ GIN/FTS; embedded: SQLite FTS5) so search/filter/aggregate go
       *sub-linear* rather than merely fast — sub-100 ms over millions of

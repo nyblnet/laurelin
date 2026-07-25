@@ -102,6 +102,7 @@ class OntologyService:
         ontology: OntologyDef,
         policy=None,
         policy_for=None,
+        plan_for=None,
     ):
         self.workspace = workspace
         self.catalog = catalog
@@ -116,6 +117,10 @@ class OntologyService:
         # dataset needs no filtering for this user, object queries can run
         # entirely in DuckDB instead of materializing the dataset in Python.
         self.policy_for = policy_for
+        # Optional (dataset, schema) -> PolicyPlan: lets the same enforcement
+        # be pushed into the Parquet scan, so object queries stay fast for
+        # users who have row-level security on the backing dataset.
+        self.plan_for = plan_for
 
     def _policy_for_dataset(self, dataset: str):
         """The row/column transform to apply to ``dataset`` for this user, or
@@ -206,14 +211,22 @@ class OntologyService:
         order with updates applied in place, created objects appended, deleted
         objects removed, last-wins on duplicate primary keys.
         """
-        if self._policy_for_dataset(ot.backing_dataset) is not None:
-            return None  # RLS/masking operates on tables; use the exact path
+        if self.plan_for is None and self._policy_for_dataset(ot.backing_dataset) is not None:
+            # A policy applies but we have no way to push it into the scan;
+            # never take a path that would skip enforcement.
+            return None
         try:
-            files = self.catalog.version_files(ot.backing_dataset)
             version = self.catalog.store.get_version(ot.backing_dataset, None)
+            # Row/column policy is applied inside this scan when it can be
+            # expressed as a filter/projection; otherwise scan_for returns a
+            # materialized, policy-filtered table and we still push the rest
+            # (search, filters, paging) down onto it.
+            base_scan = self.catalog.scan_for(
+                ot.backing_dataset, plan_for=self.plan_for
+            )
         except KeyError:
             return None
-        if not files or version is None:
+        if version is None:
             return None
 
         available = {c.name: c.type for c in version.schema_}
@@ -227,13 +240,12 @@ class OntologyService:
         deleted, updates, creates = self._overlay(ot)
         con = duckdb.connect()
         try:
-            # This SQL is entirely server-generated — identifiers come from the
-            # validated ontology and are quoted, values are bound parameters —
-            # but scope the connection to the workspace anyway, and lock the
-            # config so nothing can widen it.
-            root = str(self.workspace.root.resolve()).replace("'", "''")
-            con.execute(f"SET allowed_directories=['{root}']")
-            con.execute("SET lock_configuration=true")
+            # The base scan is a registered Arrow object, so this connection
+            # never needs filesystem access. The SQL is entirely
+            # server-generated: identifiers come from the validated ontology
+            # and are quoted, values are bound parameters.
+            con.execute("SET enable_external_access=false")
+            con.register("__base", base_scan)
             try:
                 base = self._register_overlay_tables(
                     con, cols, available, updates, creates
@@ -242,7 +254,7 @@ class OntologyService:
                 return None  # a payload we can't type faithfully; be exact instead
 
             sql, params = self._build_sql(
-                cols, pk, files, deleted, base, search, filters, ot
+                cols, pk, deleted, base, search, filters, ot
             )
             total = con.execute(
                 f"SELECT count(*) FROM ({sql}) t", params
@@ -298,7 +310,6 @@ class OntologyService:
         self,
         cols: list[str],
         pk: str,
-        files: list[str],
         deleted: set[str],
         registered: dict[str, bool],
         search: Optional[str],
@@ -306,7 +317,7 @@ class OntologyService:
         ot: ObjectTypeDef,
     ) -> tuple[str, list]:
         q = lambda c: '"' + c.replace('"', '""') + '"'  # noqa: E731
-        params: list = [files]
+        params: list = []
         projection = ", ".join(q(c) for c in cols)
 
         # Base scan, de-duplicated last-wins on the primary key and kept in
@@ -325,7 +336,7 @@ class OntologyService:
 
         base = (
             f"SELECT {projection}, row_number() OVER () AS __ord "
-            f"FROM read_parquet(?){scan_where}"
+            f"FROM __base{scan_where}"
         )
         base = (
             f"SELECT * FROM ({base}) b "

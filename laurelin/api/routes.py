@@ -97,6 +97,9 @@ def get_ontology_service(
         # Lets object queries tell whether *this* backing dataset actually
         # needs per-user filtering; when it doesn't, they run in DuckDB.
         policy_for=perms.per_dataset_policy_fn(user),
+        # …and lets a policy that *does* apply be pushed into the scan, so
+        # row-level security doesn't force full materialization.
+        plan_for=perms.arrow_policy_fn(user),
     )
 
 
@@ -315,7 +318,7 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
     try:
         return catalog.query(
             body.sql, max_rows=body.max_rows, allowed=allowed,
-            policy_for=perms.per_dataset_policy_fn(user),
+            plan_for=perms.arrow_policy_fn(user),
         )
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())

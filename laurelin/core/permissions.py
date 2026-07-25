@@ -27,7 +27,8 @@ data-hiding) is a separate, larger piece of work (see docs/ROADMAP.md, WS8).
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -43,6 +44,21 @@ from laurelin.core.models import (
     SubjectKind,
     User,
 )
+
+
+@dataclass(frozen=True)
+class PolicyPlan:
+    """How to enforce a dataset policy for one user on one scan.
+
+    ``lazy`` plans push a filter and/or a projection into the Parquet scan;
+    non-lazy plans materialize the table and call ``apply`` (the exact path,
+    used where a rule has no Arrow equivalent).
+    """
+
+    lazy: bool
+    filter: Any = None
+    projection: Optional[dict] = None
+    apply: Optional[Callable] = None
 
 
 class PermissionService:
@@ -232,6 +248,91 @@ class PermissionService:
             return lambda t: self.apply_table_policy(user, ds, t)
 
         return for_dataset
+
+    # -- pushdown planning ------------------------------------------------------
+    #
+    # The policy engine above operates on materialized tables, which costs
+    # 3-4x at multi-million-row scale because it defeats scan pushdown. Where a
+    # policy can be expressed as an Arrow filter + projection, it is applied
+    # *inside* the Parquet scan instead: same enforcement, no materialization.
+    # Anything not expressible (currently: hash masking, which has no Arrow
+    # compute equivalent) reports "materialize" and takes the exact path.
+
+    def arrow_policy_fn(self, user: Optional[User]):
+        """A ``(dataset, arrow_schema) -> plan`` resolver, where plan is:
+
+        * ``None`` — no filtering needed; scan the dataset as-is.
+        * ``PolicyPlan(lazy=True, filter=expr|None, projection=dict|None)`` —
+          push this filter/projection into the scan.
+        * ``PolicyPlan(lazy=False, apply=fn)`` — materialize and call ``fn``.
+        """
+        if user is not None and user.role == Role.admin:
+            return lambda ds, schema: None
+
+        def plan_for(dataset: str, schema: "pa.Schema"):
+            if user is None:
+                return PolicyPlan(lazy=True, filter=pc.scalar(False))  # fail closed
+            policy = self.dataset_policy(dataset)
+            if policy is None:
+                return None
+            return self._plan(policy, dataset, schema, user)
+
+        return plan_for
+
+    def _plan(self, policy, dataset: str, schema: "pa.Schema", user: User):
+        groups = self._user_groups(user.username)
+        names = set(schema.names)
+
+        filter_expr = None
+        if policy.row_policy is not None:
+            rp = policy.row_policy
+            if rp.column not in names:
+                return PolicyPlan(lazy=True, filter=pc.scalar(False))  # fail closed
+            allowed: set[str] = set()
+            for rule in rp.rules:
+                if self._subject_matches(
+                    rule.subject_kind, rule.normalized_subject(), user, groups
+                ):
+                    allowed.update(str(v) for v in rule.values)
+            if not allowed:
+                return PolicyPlan(lazy=True, filter=pc.scalar(False))
+            # NULLs are never "in" the set, so they are excluded — matching the
+            # fill_null(False) fail-closed behavior of the table path.
+            field = pc.field(rp.column)
+            if schema.field(rp.column).type != pa.string():
+                # Compare on the string rendering, exactly as the table path
+                # does. This costs row-group pruning, but only for non-string
+                # policy columns (tenant/region keys are normally strings).
+                field = field.cast(pa.string())
+            filter_expr = field.isin(sorted(allowed))
+
+        projection = None
+        for mask in policy.column_masks:
+            if mask.column not in names:
+                continue
+            if any(
+                self._subject_matches(ex.subject_kind, ex.normalized_subject(), user, groups)
+                for ex in mask.exempt
+            ):
+                continue  # exempt: real value
+            if mask.mode == MaskMode.hash:
+                # No Arrow compute equivalent for sha256; stay exact.
+                return PolicyPlan(
+                    lazy=False,
+                    apply=lambda t: self.apply_table_policy(user, dataset, t),
+                )
+            if projection is None:
+                projection = {n: pc.field(n) for n in schema.names}
+            if mask.mode == MaskMode.null:
+                projection[mask.column] = pc.scalar(None).cast(
+                    schema.field(mask.column).type
+                )
+            else:  # redact
+                projection[mask.column] = pc.scalar("***")
+
+        if filter_expr is None and projection is None:
+            return None
+        return PolicyPlan(lazy=True, filter=filter_expr, projection=projection)
 
     def _filter_rows(
         self, table: "pa.Table", rp: RowPolicy, user: User, groups: set[str]
