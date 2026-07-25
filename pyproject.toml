@@ -43,6 +43,8 @@ mcp = ["mcp>=1.0"]
 # Delegated compute: submit queries to a Flight SQL engine (Trino, Dremio,
 # Databricks, …) and store the reduced result. Laurelin runs no cluster.
 engines = ["adbc-driver-manager>=1.0", "adbc-driver-flightsql>=1.0"]
+# Cron scheduling (on-upstream triggers need no extra dependency).
+scheduler = ["croniter>=2.0"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

@@ -43,6 +43,9 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Builds & lineage** — builds run asynchronously on a worker pool and every
   build is recorded; the lineage graph is queryable via API and rendered in
   the UI.
+- **Schedules** — cron or on-upstream-changed triggers drive builds and
+  connector syncs, so pipelines keep themselves current. Exactly-once across
+  replicas, with no leader election.
 - **Dashboards** — grids of saved queries rendered as charts (zero-dependency
   SVG). Panels execute with the *viewer's* credentials, so row-level security
   and ACLs apply per user.

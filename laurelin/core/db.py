@@ -32,6 +32,7 @@ from laurelin.core.models import (
     LineageEdge,
     ObjectEdit,
     Role,
+    ScheduleInfo,
     SourceInfo,
     User,
     utcnow_iso,
@@ -61,6 +62,28 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     build_id TEXT,
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
+);
+CREATE TABLE IF NOT EXISTS schedules (
+    name TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    trigger_type TEXT NOT NULL DEFAULT 'cron',
+    cron TEXT NOT NULL DEFAULT '',
+    upstream_dataset TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'build',
+    targets_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT '',
+    next_run_at TEXT,
+    last_run_at TEXT,
+    last_status TEXT,
+    last_error TEXT,
+    last_build_id TEXT,
+    watermark INTEGER,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    -- Same coordination primitive as build leases: exactly one replica fires a
+    -- due schedule, and a dead replica's claim expires rather than wedging it.
+    claimed_by TEXT,
+    lease_expires_at TEXT
 );
 CREATE TABLE IF NOT EXISTS engines (
     name TEXT PRIMARY KEY,
@@ -394,6 +417,116 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- schedules -----------------------------------------------------------------
+
+    def upsert_schedule(self, info: "ScheduleInfo") -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO schedules
+                     (name, enabled, trigger_type, cron, upstream_dataset, action,
+                      targets_json, source, next_run_at, watermark, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     enabled = excluded.enabled,
+                     trigger_type = excluded.trigger_type,
+                     cron = excluded.cron,
+                     upstream_dataset = excluded.upstream_dataset,
+                     action = excluded.action,
+                     targets_json = excluded.targets_json,
+                     source = excluded.source,
+                     next_run_at = excluded.next_run_at""",
+                (
+                    info.name, 1 if info.enabled else 0, info.trigger, info.cron,
+                    info.upstream_dataset, info.action, json.dumps(info.targets),
+                    info.source, info.next_run_at, info.watermark,
+                    info.created_at, info.created_by,
+                ),
+            )
+
+    def _row_to_schedule(self, row) -> "ScheduleInfo":
+        return ScheduleInfo(
+            name=row["name"],
+            enabled=bool(row["enabled"]),
+            trigger=row["trigger_type"],
+            cron=row["cron"],
+            upstream_dataset=row["upstream_dataset"],
+            action=row["action"],
+            targets=json.loads(row["targets_json"] or "[]"),
+            source=row["source"],
+            next_run_at=row["next_run_at"],
+            last_run_at=row["last_run_at"],
+            last_status=row["last_status"],
+            last_error=row["last_error"],
+            last_build_id=row["last_build_id"],
+            watermark=row["watermark"],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+        )
+
+    def get_schedule(self, name: str) -> Optional["ScheduleInfo"]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM schedules WHERE name = ?", (name,)).fetchone()
+        return self._row_to_schedule(row) if row else None
+
+    def list_schedules(self) -> list["ScheduleInfo"]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM schedules ORDER BY name").fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    def delete_schedule(self, name: str) -> bool:
+        with self._conn() as c:
+            return c.execute("DELETE FROM schedules WHERE name = ?", (name,)).rowcount > 0
+
+    def due_schedules(self, now_iso: str) -> list["ScheduleInfo"]:
+        """Enabled schedules that want to fire: cron ones past their next run,
+        and every upstream one (whose watermark is compared by the caller)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM schedules
+                   WHERE enabled = 1
+                     AND (trigger_type = 'upstream'
+                          OR (next_run_at IS NOT NULL AND next_run_at <= ?))
+                   ORDER BY name""",
+                (now_iso,),
+            ).fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    def claim_schedule(self, name: str, worker: str, lease_seconds: int = 300) -> bool:
+        """Take ownership of a due schedule. One conditional UPDATE, so with
+        several replicas polling, exactly one fires it."""
+        now = utcnow_iso()
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE schedules SET claimed_by = ?, lease_expires_at = ?
+                   WHERE name = ? AND enabled = 1
+                     AND (claimed_by IS NULL OR lease_expires_at IS NULL
+                          OR lease_expires_at < ?)""",
+                (worker, _iso_in(lease_seconds), name, now),
+            )
+            return cur.rowcount > 0
+
+    def record_schedule_run(
+        self,
+        name: str,
+        status: str,
+        next_run_at: Optional[str] = None,
+        error: Optional[str] = None,
+        build_id: Optional[str] = None,
+        watermark: Optional[int] = None,
+    ) -> None:
+        """Record an attempt and release the claim, so the next window is
+        free regardless of how this one went."""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE schedules SET last_run_at = ?, last_status = ?,
+                     last_error = ?, last_build_id = ?, next_run_at = ?,
+                     watermark = COALESCE(?, watermark),
+                     claimed_by = NULL, lease_expires_at = NULL
+                   WHERE name = ?""",
+                (utcnow_iso(), status, error, build_id, next_run_at,
+                 watermark, name),
+            )
 
     # -- delegated engines ---------------------------------------------------------
 

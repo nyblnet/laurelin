@@ -364,6 +364,13 @@ PUT  /api/v1/dashboards/{name}                {title?, description?, panels} -> 
                                   runs each panel through POST /query, so every
                                   viewer sees their own filtered data)
 DELETE /api/v1/dashboards/{name}              -> {deleted}  (editor)
+GET  /api/v1/schedules                        -> [ScheduleInfo]  (editor)
+GET  /api/v1/schedules/{name}                 -> ScheduleInfo    (editor)
+PUT  /api/v1/schedules/{name}                 {trigger, cron|upstream_dataset,
+                                               action, targets|source, enabled}
+                                              -> ScheduleInfo (editor; validated on save)
+DELETE /api/v1/schedules/{name}               -> {deleted}  (editor)
+POST /api/v1/schedules/{name}/run             -> {queued, due_at}  (make it due now)
 GET  /api/v1/sources                          -> [SourceInfo]  (editor; secrets redacted)
 GET  /api/v1/sources/{name}                   -> SourceInfo    (editor; secrets redacted)
 PUT  /api/v1/sources/{name}                   {type, dataset, config} -> SourceInfo  (admin)

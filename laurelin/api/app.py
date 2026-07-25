@@ -34,11 +34,13 @@ from laurelin.api.auth_routes import (
 )
 from laurelin.api.routes import router
 from laurelin.api.scim_routes import scim_router
+from laurelin.api.schedule_routes import schedules_router
 from laurelin.api.source_routes import sources_router
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
+from laurelin.core import scheduler
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 
@@ -49,6 +51,60 @@ def _exc_message(exc: BaseException) -> str:
     if exc.args and isinstance(exc.args[0], str):
         return exc.args[0]
     return str(exc)
+
+
+def _scheduler_targets(app: FastAPI) -> list:
+    """The workspaces this replica should poll, each with a way to run an action.
+
+    Yields ``(label, store, run_action)``. The scheduler stays mode-agnostic:
+    one workspace in single mode, every registered one in multi mode.
+    """
+    from laurelin.core.config import Workspace
+
+    def runner(workspace: Workspace, store: MetadataStore, catalog: DatasetCatalog):
+        def run_action(schedule) -> Optional[str]:
+            if schedule.action == "sync":
+                from laurelin.connectors import sync_source
+
+                source = store.get_source(schedule.source)
+                if source is None:
+                    raise RuntimeError(f"Unknown source: {schedule.source!r}")
+                sync_source(catalog, store, source, actor="scheduler")
+                return None
+
+            from laurelin.transforms import Builder, collect_transforms
+
+            builder = Builder(
+                workspace, catalog, store, collect_transforms(workspace.pipelines_dir)
+            )
+            targets = list(schedule.targets) or None
+            builder.plan(targets)  # fail before creating a record
+            build = store.create_build(targets or [])
+            # Reuse the async path: the executor runs it, leases keep it
+            # exactly-once, and the schedule records which build it started.
+            app.state.build_executor.submit(
+                builder.execute, build.id, targets, app.state.worker_id
+            )
+            return build.id
+
+        return run_action
+
+    st = app.state
+    if st.mode == "single":
+        return [("workspace", st.store, runner(st.workspace, st.store, st.catalog))]
+
+    from laurelin.api.context import open_workspace_store
+
+    targets = []
+    for info in st.control.list_workspaces():
+        try:
+            workspace = Workspace(st.root / info.slug)
+            store = open_workspace_store(st.root, st.control, info.slug)
+            catalog = DatasetCatalog(workspace, store)
+            targets.append((info.slug, store, runner(workspace, store, catalog)))
+        except Exception:  # noqa: BLE001 - a broken workspace must not stop the rest
+            continue
+    return targets
 
 
 def _finalize(app: FastAPI) -> FastAPI:
@@ -76,6 +132,18 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.router.on_shutdown.append(
         lambda: app.state.build_executor.shutdown(wait=False)
     )
+
+    # The scheduler runs in every replica; leases make firing exactly-once, so
+    # no leader election is needed and a lost replica costs at most one window.
+    app.state.scheduler = None
+    if scheduler.enabled():
+        app.state.scheduler = scheduler.Scheduler(
+            open_stores=lambda: _scheduler_targets(app),
+            worker_id=app.state.worker_id,
+            poll_seconds=scheduler.poll_seconds(),
+        )
+        app.router.on_startup.append(app.state.scheduler.start)
+        app.router.on_shutdown.append(app.state.scheduler.stop)
 
     app.state.oidc_config = OIDCConfig.from_env()
     app.state.oidc_provider = OIDCProvider(app.state.oidc_config)
@@ -173,6 +241,7 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(scim_router, prefix="/api/v1")
     app.include_router(sources_router, prefix="/api/v1")
+    app.include_router(schedules_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

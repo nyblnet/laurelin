@@ -132,3 +132,6 @@ there is no separate migration step to run.
 | `LAURELIN_MAX_CONCURRENT_QUERIES` | Interactive queries admitted at once per replica (default `8`; `0` disables) |
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |
 | `LAURELIN_AUDIT_MAX_EVENTS` | Trim the audit log to N most recent events after each build (default `0` = unlimited) |
+| `LAURELIN_SCHEDULER=0` | Stop this replica running the scheduler (default on; leases make firing exactly-once, so every replica can) |
+| `LAURELIN_SCHEDULER_POLL` | Seconds between scheduler polls (default `15`) |
+| `LAURELIN_ENGINE_TIMEOUT` / `_MAX_ROWS` | Delegated-engine query timeout (default `300`s) and result-size cap (default `5000000`) |

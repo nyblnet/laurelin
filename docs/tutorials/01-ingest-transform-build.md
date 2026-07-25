@@ -247,6 +247,32 @@ curl -X POST localhost:8787/api/v1/datasets/raw_orders/compact
 Uploads take the same flag — `POST /datasets/{name}/upload?mode=append` adds a
 file's rows instead of replacing the dataset.
 
+## Make it run without you
+
+So far everything happens when you ask. A schedule binds a trigger to an
+action, so the pipeline keeps itself current:
+
+```bash
+# every night at 02:00
+curl -X PUT localhost:8787/api/v1/schedules/nightly \
+  -H 'Content-Type: application/json' \
+  -d '{"trigger": "cron", "cron": "0 2 * * *", "action": "build"}'
+
+# …or whenever the source data actually lands
+curl -X PUT localhost:8787/api/v1/schedules/on_new_orders \
+  -H 'Content-Type: application/json' \
+  -d '{"trigger": "upstream", "upstream_dataset": "raw_orders", "action": "build"}'
+```
+
+The `upstream` trigger is usually the better one: the pipeline follows its
+inputs instead of guessing when they arrive. Pair it with a `sync` action on a
+connector and the whole chain — pull, transform, publish — runs itself.
+
+`POST /schedules/{name}/run` fires one immediately without waiting for its
+window. A schedule that fails is recorded and *still* reschedules, so one bad
+night doesn't silently disable the pipeline; and an overdue schedule fires
+once rather than once per missed window.
+
 ---
 
 **What you built:** an immutable, versioned dataset; a two-stage pipeline

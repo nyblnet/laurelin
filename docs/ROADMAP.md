@@ -143,10 +143,13 @@ Key bets, and why:
       immediately; an in-process worker pool (LAURELIN_BUILD_WORKERS) executes
       it off the request thread and the UI polls to convergence. `wait=true`
       keeps the old blocking behavior for scripts/tests.
-- [ ] **Scheduler & workers**: cron + event triggers (upstream dataset updated),
-      Postgres-backed job queue, N separate worker processes, retries w/
-      backoff, timeouts, concurrency limits, backfill runs. Embedded mode:
-      in-process scheduler thread.
+- [x] **Scheduler**: cron and on-upstream-changed triggers driving builds or
+      connector syncs. Every replica polls; firing requires winning a
+      conditional UPDATE, so it is exactly-once without leader election, and a
+      dead replica's claim expires rather than wedging the schedule. An
+      overdue schedule fires once, not once per missed window.
+- [ ] **Workers & queue**: N separate worker processes, retries w/ backoff,
+      per-schedule concurrency limits, backfill runs.
 - [ ] **Incremental transforms**: `@transform(incremental=True)` receiving only
       new/changed input partitions; snapshot fallback on schema change.
 - [ ] **Data expectations**: `@expect(col("x").not_null(), row_count > 0)` —

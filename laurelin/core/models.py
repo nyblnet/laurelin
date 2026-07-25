@@ -61,6 +61,34 @@ class DatasetVersionInfo(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class ScheduleInfo(BaseModel):
+    """A trigger bound to an action — the piece that makes a pipeline run
+    without anyone pressing a button."""
+
+    name: str
+    enabled: bool = True
+    # "cron": fire on a schedule. "upstream": fire when a dataset gains a
+    # version, so a pipeline follows its inputs instead of a clock.
+    trigger: str = "cron"
+    cron: str = ""
+    upstream_dataset: str = ""
+    # "build" (optionally specific targets) or "sync" (one connector source).
+    action: str = "build"
+    targets: list[str] = Field(default_factory=list)
+    source: str = ""
+
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
+    last_status: Optional[str] = None  # "succeeded" | "failed"
+    last_error: Optional[str] = None
+    last_build_id: Optional[str] = None
+    # Highest upstream version already acted on, for the "upstream" trigger.
+    watermark: Optional[int] = None
+
+    created_at: str = Field(default_factory=utcnow_iso)
+    created_by: str = ""
+
+
 class SourceInfo(BaseModel):
     """A configured external data source that syncs into a dataset."""
 
