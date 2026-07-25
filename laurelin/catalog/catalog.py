@@ -387,6 +387,28 @@ class DatasetCatalog:
         """Storage keys for a version's parts."""
         return self._files_for(self._version_info(name, version))
 
+    def iter_batches(
+        self,
+        name: str,
+        version: Optional[int] = None,
+        batch_rows: int = 200_000,
+    ) -> "Iterable[pa.Table]":
+        """Stream a dataset as Arrow tables without materializing it.
+
+        The batches come off the Parquet scan lazily, so a consumer that also
+        streams its output never holds more than one batch. A federated table
+        has no local scan to iterate, so it is yielded as a single batch —
+        honest rather than pretending to stream something already collected.
+        """
+        info = self.store.get_dataset(name)
+        if info is not None and info.is_federated:
+            yield self.federated_table(name)
+            return
+        scanner = self.arrow_dataset(name, version).scanner(batch_size=batch_rows)
+        for record_batch in scanner.to_batches():
+            if record_batch.num_rows:
+                yield pa.Table.from_batches([record_batch])
+
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
         info = self.store.get_dataset(name)
         if info is not None and info.is_federated:

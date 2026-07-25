@@ -122,11 +122,36 @@ The trade-off is part accumulation — many small files slow scans — so
 `POST /datasets/{name}/compact` merges them back into one file when you want
 to pay that cost deliberately.
 
-**The caveat:** a `@transform` receives its input as one in-memory
-`pyarrow.Table`. Peak memory during a Python transform is roughly the
-uncompressed size of its inputs plus its output — for the table above, about
-100 MB per million rows. SQL transforms stream through DuckDB and don't pay
-this. If a Python transform is going to hold 50 GB, it won't.
+### Streaming transforms — memory tracks a batch, not the dataset
+
+By default a `@transform` receives its input as one in-memory `pyarrow.Table`,
+so peak memory is roughly its inputs plus its output. Add `streaming=True` and
+it receives an *iterator* of batches and yields batches, which flow straight
+to the Parquet writer:
+
+```python
+@transform(output=Output("clean_orders"), streaming=True, orders=Input("raw_orders"))
+def clean_orders(orders):
+    for batch in orders:
+        yield batch.filter(pc.field("status") != "returned")
+```
+
+Measured on a 3 M-row table (~216 MB uncompressed), same filter both ways:
+
+| Transform | Peak RSS delta |
+|---|---:|
+| whole-table | 121 MB |
+| `streaming=True` | **21 MB** |
+
+The streaming figure barely moves with dataset size; the whole-table one
+scales with it. Two constraints, both deliberate:
+
+- **Exactly one input.** Two independent batch streams have no meaningful
+  alignment, and pretending otherwise would silently produce wrong results.
+  The decorator refuses at import time.
+- **No aggregation.** A running total across batches works (the transform owns
+  the loop), but anything needing all rows at once should be a **SQL
+  transform** — DuckDB streams and spills those natively.
 
 ### Row-level security — now essentially free
 
@@ -241,7 +266,7 @@ Three deliberate limits:
 | You have | Laurelin today |
 |---|---|
 | < 1 M rows/dataset, < 1 M objects/type, a team | Comfortable. This is the sweet spot. |
-| 1–50 M rows/dataset, entities modeled separately | Works well. Sync incrementally (`mode: append`); keep Python transforms' inputs in RAM-sized chunks; expect the RLS tax. |
+| 1–50 M rows/dataset, entities modeled separately | Works well. Sync incrementally (`mode: append`), use `streaming=True` for row-wise transforms, SQL transforms for aggregation. |
 | A large table with a small daily delta | Fine — appends cost the delta, not the dataset. Compact periodically. |
 | > 100 M rows, or > 5 M objects/type | Not yet. Query it in a warehouse; use Laurelin over aggregates. |
 | Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
@@ -284,8 +309,10 @@ a laptop or a single VM, and unchanged.
    prune.
 2. **Column masking loses column pruning**, and hash masking materializes
    (no Arrow sha256). Row policies push down fully and are free.
-3. **Python transforms are in-memory** — input size bounded by RAM. SQL
-   transforms stream and don't pay this.
+3. **Whole-table Python transforms are still RAM-bound** — that's the default
+   for convenience. `streaming=True` removes the bound for row-wise work; SQL
+   transforms stream natively. Only whole-table aggregation in Python is
+   genuinely limited.
 4. **Builds are in-process** — a worker pool per replica, not a distributed
    queue; no cron/event triggers or incremental transforms yet.
 5. **Edits are an overlay** — object writes don't flow back into Parquet

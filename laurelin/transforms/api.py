@@ -33,6 +33,10 @@ class TransformSpec:
     kind: str = "python"  # "python" | "sql"
     fn: Optional[Callable] = None  # python: fn(**{param: pa.Table}) -> pa.Table
     query: Optional[str] = None  # sql: SELECT over input aliases as table names
+    # Streaming python transforms receive an *iterator* of pa.Table batches for
+    # their single input and yield pa.Tables, so neither the input nor the
+    # output is ever held whole in memory.
+    streaming: bool = False
 
 
 class TransformRegistry:
@@ -96,10 +100,31 @@ def _register(spec: TransformSpec) -> None:
         registry.register(spec)
 
 
-def transform(output: Output, **inputs: Input) -> Callable[[Callable], Callable]:
-    """Declare a python transform: fn(**{param: pa.Table}) -> pa.Table."""
+def transform(
+    output: Output, streaming: bool = False, **inputs: Input
+) -> Callable[[Callable], Callable]:
+    """Declare a python transform.
+
+    Default: ``fn(**{param: pa.Table}) -> pa.Table``. Each input arrives as one
+    in-memory table, so peak memory is roughly the inputs plus the output —
+    convenient, and fine up to datasets that comfortably fit in RAM.
+
+    ``streaming=True``: ``fn(param=Iterator[pa.Table]) -> Iterator[pa.Table]``.
+    Batches are pulled from the input scan and written out as they are
+    produced, so memory tracks one batch rather than the dataset. Requires
+    exactly one input — two independent streams have no meaningful alignment,
+    and pretending otherwise would silently produce wrong results. Aggregations
+    need all the data anyway; express those as SQL transforms, which DuckDB
+    streams and spills natively.
+    """
 
     def decorator(fn: Callable) -> Callable:
+        if streaming and len(inputs) != 1:
+            raise ValueError(
+                f"Streaming transform {fn.__name__!r} must declare exactly one "
+                f"input (got {len(inputs)}). Use a SQL transform to combine "
+                f"several inputs, or a non-streaming transform."
+            )
         spec = TransformSpec(
             name=fn.__name__,
             output=output,
@@ -107,6 +132,7 @@ def transform(output: Output, **inputs: Input) -> Callable[[Callable], Callable]
             kind="python",
             fn=fn,
             query=None,
+            streaming=streaming,
         )
         fn.__transform_spec__ = spec  # type: ignore[attr-defined]
         _register(spec)

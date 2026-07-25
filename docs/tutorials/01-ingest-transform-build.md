@@ -107,6 +107,21 @@ Two flavors, same DAG:
   name in `inputs`. The function body is ignored; it exists so the decorator
   has something to attach to.
 
+For a Python transform over a dataset too big to hold in memory, add
+`streaming=True`: the function then receives an *iterator* of Arrow batches
+and yields batches, so memory tracks one batch rather than the whole dataset.
+
+```python
+@transform(output=Output("clean_orders"), streaming=True, orders=Input("raw_orders"))
+def clean_orders(orders):
+    for batch in orders:
+        yield batch.filter(pc.not_equal(batch["status"], "returned"))
+```
+
+It takes exactly one input, and anything needing all the rows at once (a
+`GROUP BY`, a total) belongs in a SQL transform — DuckDB streams and spills
+those for you.
+
 You never declare the DAG. Laurelin reads it from the `Input`/`Output`
 declarations — `revenue_by_region` depends on `clean_orders` because it reads
 the dataset that `clean_orders` writes.

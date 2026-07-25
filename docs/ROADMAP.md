@@ -158,7 +158,11 @@ Key bets, and why:
 - [ ] **Visual pipeline builder** (later phase): node/edge canvas that emits the
       same Python/SQL files — the visual layer is a *view over code*, never a
       proprietary format.
-- [ ] **Streaming transforms** (v2): micro-batch over Kafka topics into datasets.
+- [x] **Batch-streaming transforms**: `@transform(streaming=True)` receives an
+      iterator of Arrow batches and yields batches, so peak memory tracks one
+      batch rather than the dataset (121 MB -> 21 MB on a 3 M-row filter).
+      Exactly one input; aggregation belongs in a SQL transform.
+- [ ] **Streaming ingestion** (v2): micro-batch over Kafka topics into datasets.
 - [ ] **dbt interop**: import a dbt project as transforms w/ lineage mapping.
 - [ ] Build UX: live log streaming (WebSocket), per-task Gantt, cancel/retry,
       build diffs (rows added/changed vs previous version).

@@ -176,14 +176,24 @@ class Builder:
                 # abandoned. A lost lease means another replica took over.
                 self.store.renew_build_lease(build.id, worker)
             try:
-                result = self._execute(spec)
-                version = self.catalog.write(
-                    spec.output.dataset,
-                    result,
-                    source="transform",
-                    build_id=build.id,
-                    description=spec.output.description,
-                )
+                if spec.streaming:
+                    # Batches flow input -> fn -> parquet writer, so neither
+                    # side is ever held whole.
+                    version = self.catalog.write_batches(
+                        spec.output.dataset,
+                        self._execute_streaming(spec),
+                        source="transform",
+                        build_id=build.id,
+                        description=spec.output.description,
+                    )
+                else:
+                    version = self.catalog.write(
+                        spec.output.dataset,
+                        self._execute(spec),
+                        source="transform",
+                        build_id=build.id,
+                        description=spec.output.description,
+                    )
                 task.status = BuildStatus.succeeded
                 task.rows_written = version.row_count
                 task.output_version = version.version
@@ -246,6 +256,40 @@ class Builder:
                 f"Input {param}={dataset!r} of transform {spec.name!r} is not "
                 f"available and no transform produces it: {exc.args[0]}"
             ) from exc
+
+    def _execute_streaming(self, spec: TransformSpec):
+        """Feed the transform a lazy batch iterator and yield what it produces.
+
+        Each yielded value is validated as it passes, so a transform that
+        returns the wrong type fails with a clear message mid-stream rather
+        than confusing the Parquet writer.
+        """
+        assert spec.fn is not None
+        (param, inp), = spec.inputs.items()
+        try:
+            batches = self.catalog.iter_batches(inp.dataset)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Input {param}={inp.dataset!r} of transform {spec.name!r} is "
+                f"not available and no transform produces it: {exc.args[0]}"
+            ) from exc
+
+        produced = 0
+        for chunk in spec.fn(**{param: batches}):
+            if isinstance(chunk, pa.RecordBatch):
+                chunk = pa.Table.from_batches([chunk])
+            if not isinstance(chunk, pa.Table):
+                raise TypeError(
+                    f"Streaming transform {spec.name!r} must yield pyarrow "
+                    f"Tables or RecordBatches, got {type(chunk).__name__}"
+                )
+            produced += 1
+            yield chunk
+        if produced == 0:
+            raise ValueError(
+                f"Streaming transform {spec.name!r} produced no batches; it "
+                f"must yield at least one (an empty table is fine)."
+            )
 
     def _execute_python(self, spec: TransformSpec) -> pa.Table:
         assert spec.fn is not None
