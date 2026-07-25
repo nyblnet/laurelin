@@ -92,7 +92,11 @@ def get_ontology_service(
     # Bind the row-level-security / masking transform to this user so objects
     # (which are dataset rows) honor the backing dataset's policy.
     return OntologyService(
-        workspace, catalog, store, ontology, policy=perms.query_policy_fn(user)
+        workspace, catalog, store, ontology,
+        policy=perms.query_policy_fn(user),
+        # Lets object queries tell whether *this* backing dataset actually
+        # needs per-user filtering; when it doesn't, they run in DuckDB.
+        policy_for=perms.per_dataset_policy_fn(user),
     )
 
 

@@ -246,10 +246,13 @@ def bench_ontology(root: Path, n: int) -> dict:
     svc = OntologyService(ws, catalog, store, ontology)
     page_ms, _ = timed(lambda: svc.query("order", limit=25, offset=0))
     search_ms, _ = timed(lambda: svc.query("order", search="SKU-04999", limit=25, offset=0))
+    get_ms, obj = timed(lambda: svc.get("order", str(n - 1)))
+    assert obj is not None, "point lookup should find the last object"
     return {
         "rows": n,
         "objects_page_ms": round(page_ms, 1),
         "objects_search_ms": round(search_ms, 1),
+        "objects_get_pk_ms": round(get_ms, 1),
     }
 
 

@@ -223,9 +223,10 @@ works end to end; expect rough edges and breaking changes.
 Laurelin is a **single-node, medium-data platform**: strong on governance and
 semantics, deliberately not a distributed compute engine.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
-unflattering ones — the SQL path stays comfortable into the tens of millions
-of rows, while ontology object queries are full scans and hit a wall around
-100 K objects per type. Reproduce them with `python bench/benchmark.py`.
+unflattering ones: the SQL path stays comfortable into the tens of millions of
+rows, appends cost the delta rather than the dataset, and ontology queries run
+in DuckDB (~26× faster than they were) but are still scans rather than an
+index. Reproduce them with `python bench/benchmark.py`.
 
 ## License
 

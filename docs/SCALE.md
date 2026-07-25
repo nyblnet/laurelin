@@ -128,31 +128,39 @@ shares, at the cost of speed on policied datasets. **Budget ~3–4× on
 policy-protected datasets at multi-million-row scale.** Pushing predicates
 into the scan for simple row policies is a known optimization we haven't done.
 
-### The ontology — this is the ceiling
+### The ontology — was the ceiling, now ~26× faster
 
-| Objects | Browse a page (25) | Search |
-|---:|---:|---:|
-| 10 K | 52 ms | 57 ms |
-| 100 K | 572 ms | 590 ms |
-| 1 M | 6.7 s | 7.2 s |
-| 5 M | 36 s | 38 s |
+Object queries used to materialize the entire backing dataset in Python on
+every request. They now push filtering, search, counting and paging into
+DuckDB over the Parquet parts, and merge the (small) edit overlay there:
 
-**Linear, and it will not surprise you pleasantly.** Object queries
-materialize the whole backing dataset and apply the edit overlay on every
-request. There is no object index.
+| Objects | Browse a page (25) | Search | Get by primary key |
+|---:|---:|---:|---:|
+| 10 K | 19 ms *(was 52)* | 20 ms *(was 57)* | 19 ms |
+| 100 K | 54 ms *(was 572)* | 57 ms *(was 590)* | 25 ms |
+| 1 M | 300 ms *(was 6.7 s)* | 349 ms *(was 7.2 s)* | 75 ms |
+| 5 M | 1.4 s *(was 36 s)* | 1.5 s *(was 38 s)* | 279 ms |
 
-Read that table as a boundary:
+Point lookups get an extra win: a predicate on the primary key is pushed
+*inside* the de-duplication window, so navigating to an object prunes row
+groups instead of scanning — 279 ms at 5 M objects, against 36 s before.
 
-- **≤ 100 K objects per type** — fine. Sub-second.
-- **~1 M** — usable for occasional lookups, too slow to browse.
-- **≥ 5 M** — don't. Query the backing dataset with SQL instead.
+Two honest caveats:
 
-Ontology indexing is the single highest-value performance item on the roadmap.
-Until it lands: model your *entities* in the ontology (customers, aircraft,
-cases — usually thousands to hundreds of thousands) and leave your *events* in
-datasets (orders, flights, log lines — usually millions), querying them with
-SQL. That's a reasonable modeling discipline anyway, but right now it's also a
-performance requirement, and you should know that before you build on it.
+1. **It's still a scan, not an index.** Browsing and search remain linear in
+   dataset size; the constant is just ~26× smaller. A real object index
+   (sorted keys, zone maps) would make these sub-linear and is still on the
+   roadmap.
+2. **Row-level security falls back to the exact in-memory path.** If a user
+   has an active row policy or column mask on the backing dataset, that
+   object type reverts to the old behavior and the old numbers for them.
+   Admins and un-policied datasets get the fast path. (Fixing this is the
+   RLS-pushdown item below.)
+
+Sizing guidance now: **≤ 1 M objects per type is comfortable**, 5 M is usable
+for lookups and tolerable for browsing. Modeling *entities* in the ontology
+and leaving high-volume *events* in datasets is still the right discipline —
+it's just no longer a hard requirement at the low end.
 
 ---
 
@@ -160,10 +168,10 @@ performance requirement, and you should know that before you build on it.
 
 | You have | Laurelin today |
 |---|---|
-| < 1 M rows/dataset, < 100 K objects/type, a team | Comfortable. This is the sweet spot. |
+| < 1 M rows/dataset, < 1 M objects/type, a team | Comfortable. This is the sweet spot. |
 | 1–50 M rows/dataset, entities modeled separately | Works well. Sync incrementally (`mode: append`); keep Python transforms' inputs in RAM-sized chunks; expect the RLS tax. |
 | A large table with a small daily delta | Fine — appends cost the delta, not the dataset. Compact periodically. |
-| > 100 M rows, or > 1 M objects/type | Not yet. Query it in a warehouse; use Laurelin over aggregates. |
+| > 100 M rows, or > 5 M objects/type | Not yet. Query it in a warehouse; use Laurelin over aggregates. |
 | Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
 | Sub-second streaming freshness | Wrong tool. |
 
@@ -177,9 +185,11 @@ state that needs `ReadWriteMany` above one replica.
 
 ## Known limitations, plainly
 
-1. **No object index** — ontology reads are full scans (numbers above). The
-   top-priority fix.
-2. **RLS loses pushdown** — 3–4× on policied datasets at scale.
+1. **Still no object index** — ontology browse/search is now pushed into
+   DuckDB (~26× faster) but remains linear in dataset size. Point lookups do
+   prune.
+2. **RLS loses pushdown** — 3–4× on policied datasets, and it also disables
+   the ontology fast path for affected users.
 3. **Python transforms are in-memory** — input size bounded by RAM. SQL
    transforms stream and don't pay this.
 4. **Builds are in-process** — a worker pool per replica, not a distributed

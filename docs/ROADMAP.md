@@ -162,10 +162,16 @@ Key bets, and why:
 
 ### WS4 — Ontology (Foundry: Ontology/OSv2/Actions/Functions)
 
+- [x] **Query pushdown**: object filter/search/count/paging execute in DuckDB
+      over the backing Parquet with the edit overlay merged there, instead of
+      materializing the dataset in Python — ~26× faster (36 s → 1.4 s at 5 M
+      objects; point lookups 279 ms via a primary-key predicate pushed inside
+      the de-duplication window). Falls back to the exact in-memory path when
+      row-level security applies to the backing dataset.
 - [ ] **Object index**: materialize objects into indexed storage (Postgres
-      tables w/ GIN/FTS; embedded: SQLite FTS5) instead of per-request DuckDB
-      scans — sub-100ms search/filter/aggregate over millions of objects,
-      incremental re-index on dataset build.
+      tables w/ GIN/FTS; embedded: SQLite FTS5) so search/filter/aggregate go
+      *sub-linear* rather than merely fast — sub-100 ms over millions of
+      objects, incremental re-index on dataset build.
 - [ ] **Aggregations API**: group-by/count/sum/min/max/percentiles over objects,
       powering dashboards.
 - [ ] **Action side effects**: webhooks, notifications, and enqueue-build on

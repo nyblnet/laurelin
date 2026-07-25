@@ -14,6 +14,8 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Optional
 
+import duckdb
+import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
@@ -26,6 +28,10 @@ from laurelin.core.models import (
     ObjectTypeDef,
     OntologyDef,
 )
+
+# Cap on objects returned for one link traversal (the in-memory path was
+# unbounded; a cap keeps a fan-out link from materializing a whole dataset).
+_LINK_LIMIT = 10_000
 
 _TRUE_STRINGS = {"true", "1"}
 _FALSE_STRINGS = {"false", "0"}
@@ -95,6 +101,7 @@ class OntologyService:
         store: MetadataStore,
         ontology: OntologyDef,
         policy=None,
+        policy_for=None,
     ):
         self.workspace = workspace
         self.catalog = catalog
@@ -104,6 +111,18 @@ class OntologyService:
         # transform, bound to the requesting user. Objects ARE dataset rows, so
         # applying it here keeps RLS from being bypassed via the ontology API.
         self.policy = policy
+        # Optional (dataset) -> Optional[(pa.Table) -> pa.Table]: the same
+        # enforcement, resolved per dataset. When it reports that a backing
+        # dataset needs no filtering for this user, object queries can run
+        # entirely in DuckDB instead of materializing the dataset in Python.
+        self.policy_for = policy_for
+
+    def _policy_for_dataset(self, dataset: str):
+        """The row/column transform to apply to ``dataset`` for this user, or
+        None if none is needed."""
+        if self.policy_for is not None:
+            return self.policy_for(dataset)
+        return self.policy and (lambda t: self.policy(dataset, t))
 
     # -- definitions ----------------------------------------------------------
 
@@ -127,13 +146,241 @@ class OntologyService:
             table = self.catalog.read(ot.backing_dataset)
         except KeyError:
             return []
-        if self.policy is not None:
-            table = self.policy(ot.backing_dataset, table)
+        # Resolve through the same helper the pushdown path uses, so a service
+        # given only `policy_for` still enforces row/column policy here.
+        policy = self._policy_for_dataset(ot.backing_dataset)
+        if policy is not None:
+            table = policy(table)
         keep = set(ot.properties) | {ot.primary_key}
         return [
             {k: v for k, v in row.items() if k in keep}
             for row in self.catalog.table_to_rows(table)
         ]
+
+    # -- pushdown -----------------------------------------------------------------
+
+    def _overlay(self, ot: ObjectTypeDef) -> tuple[set[str], dict[str, dict], list[dict]]:
+        """Replay the edit log into (deleted pks, updates by pk, created rows).
+
+        The overlay is a hand-edit log — thousands of entries at most, against
+        datasets of millions of rows — so it is always cheap to load whole.
+        """
+        keep = set(ot.properties) | {ot.primary_key}
+        deleted: set[str] = set()
+        updates: dict[str, dict] = {}
+        creates: dict[str, dict] = {}
+        for edit in self.store.list_object_edits(ot.api_name):
+            payload = {k: v for k, v in edit.payload.items() if k in keep}
+            if edit.kind == EditKind.create:
+                pk = str(payload.get(ot.primary_key, edit.pk_value))
+                creates[pk] = payload
+                deleted.discard(pk)
+                updates.pop(pk, None)
+            elif edit.kind == EditKind.update:
+                pk = edit.pk_value
+                if pk in creates:
+                    creates[pk].update(payload)
+                else:
+                    updates.setdefault(pk, {}).update(payload)
+            elif edit.kind == EditKind.delete:
+                pk = edit.pk_value
+                creates.pop(pk, None)
+                updates.pop(pk, None)
+                deleted.add(pk)
+        return deleted, updates, creates
+
+    def _sql_query(
+        self,
+        ot: ObjectTypeDef,
+        search: Optional[str],
+        filters: Optional[dict[str, str]],
+        limit: int,
+        offset: int,
+    ) -> Optional[dict]:
+        """Filter, search, count and page objects inside DuckDB, over the
+        backing dataset's Parquet parts.
+
+        Returns None when this can't be done faithfully (row-level security on
+        the dataset, an unbuildable overlay), so the caller falls back to the
+        in-memory path. Semantics match ``_materialize``: base rows in file
+        order with updates applied in place, created objects appended, deleted
+        objects removed, last-wins on duplicate primary keys.
+        """
+        if self._policy_for_dataset(ot.backing_dataset) is not None:
+            return None  # RLS/masking operates on tables; use the exact path
+        try:
+            files = self.catalog.version_files(ot.backing_dataset)
+            version = self.catalog.store.get_version(ot.backing_dataset, None)
+        except KeyError:
+            return None
+        if not files or version is None:
+            return None
+
+        available = {c.name: c.type for c in version.schema_}
+        pk = ot.primary_key
+        if pk not in available:
+            return None  # can't identify objects without the key column
+        # Project exactly what _materialize would keep: declared properties
+        # that actually exist in the dataset, plus the primary key.
+        cols = [c for c in available if c in (set(ot.properties) | {pk})]
+
+        deleted, updates, creates = self._overlay(ot)
+        con = duckdb.connect()
+        try:
+            # This SQL is entirely server-generated — identifiers come from the
+            # validated ontology and are quoted, values are bound parameters —
+            # but scope the connection to the workspace anyway, and lock the
+            # config so nothing can widen it.
+            root = str(self.workspace.root.resolve()).replace("'", "''")
+            con.execute(f"SET allowed_directories=['{root}']")
+            con.execute("SET lock_configuration=true")
+            try:
+                base = self._register_overlay_tables(
+                    con, cols, available, updates, creates
+                )
+            except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
+                return None  # a payload we can't type faithfully; be exact instead
+
+            sql, params = self._build_sql(
+                cols, pk, files, deleted, base, search, filters, ot
+            )
+            total = con.execute(
+                f"SELECT count(*) FROM ({sql}) t", params
+            ).fetchone()[0]
+            page = con.execute(
+                f"{sql} LIMIT ? OFFSET ?", [*params, max(0, limit), max(0, offset)]
+            ).arrow()
+            if isinstance(page, pa.RecordBatchReader):
+                page = page.read_all()
+        finally:
+            con.close()
+
+        objects = []
+        for row in self.catalog.table_to_rows(page):
+            row.pop("__ord", None)
+            obj = dict(row)
+            obj["__pk"] = str(row.get(pk))
+            obj["__title"] = ot.title_for(row)
+            objects.append(obj)
+        return {"objects": objects, "total": total}
+
+    def _register_overlay_tables(
+        self,
+        con,
+        cols: list[str],
+        available: dict[str, str],
+        updates: dict[str, dict],
+        creates: dict[str, dict],
+    ) -> dict[str, bool]:
+        """Register the (small) update and create sets as typed Arrow tables so
+        DuckDB can merge them with the base scan. Raises if a payload value
+        can't be represented in the dataset's own column type."""
+        registered = {"updates": False, "creates": False}
+
+        def build(by_pk: dict[str, dict]) -> pa.Table:
+            arrays = {"__pk": pa.array(list(by_pk), type=pa.string())}
+            for col in cols:
+                typ = pa.type_for_alias(available[col])
+                arrays[col] = pa.array(
+                    [row.get(col) for row in by_pk.values()], type=typ
+                )
+            return pa.table(arrays)
+
+        if updates:
+            con.register("__ovl_updates", build(updates))
+            registered["updates"] = True
+        if creates:
+            con.register("__ovl_creates", build(creates))
+            registered["creates"] = True
+        return registered
+
+    def _build_sql(
+        self,
+        cols: list[str],
+        pk: str,
+        files: list[str],
+        deleted: set[str],
+        registered: dict[str, bool],
+        search: Optional[str],
+        filters: Optional[dict[str, str]],
+        ot: ObjectTypeDef,
+    ) -> tuple[str, list]:
+        q = lambda c: '"' + c.replace('"', '""') + '"'  # noqa: E731
+        params: list = [files]
+        projection = ", ".join(q(c) for c in cols)
+
+        # Base scan, de-duplicated last-wins on the primary key and kept in
+        # file order — object order must be deterministic for paging.
+        # A predicate on the primary key can be applied *before* the dedup
+        # window: the window partitions by that same key, so restricting to one
+        # key keeps all of its duplicates and still picks the last. This turns
+        # a point lookup into a pruned scan instead of a full one. No other
+        # column may be pre-filtered — dropping a row before dedup could change
+        # which duplicate survives.
+        scan_where = ""
+        pk_filter = (filters or {}).get(pk)
+        if pk_filter is not None:
+            scan_where = f" WHERE CAST({q(pk)} AS VARCHAR) = ?"
+            params.append(str(pk_filter))
+
+        base = (
+            f"SELECT {projection}, row_number() OVER () AS __ord "
+            f"FROM read_parquet(?){scan_where}"
+        )
+        base = (
+            f"SELECT * FROM ({base}) b "
+            f"QUALIFY row_number() OVER (PARTITION BY CAST({q(pk)} AS VARCHAR) "
+            f"ORDER BY __ord DESC) = 1"
+        )
+        if deleted:
+            placeholders = ", ".join("?" for _ in deleted)
+            base += f" AND CAST({q(pk)} AS VARCHAR) NOT IN ({placeholders})"
+            params.extend(sorted(deleted))
+
+        if registered["updates"]:
+            # Updates apply in place, so an updated object keeps its position.
+            merged_cols = ", ".join(
+                f"COALESCE(u.{q(c)}, b.{q(c)}) AS {q(c)}" for c in cols
+            )
+            body = (
+                f"SELECT {merged_cols}, b.__ord FROM ({base}) b "
+                f"LEFT JOIN __ovl_updates u "
+                f"ON CAST(b.{q(pk)} AS VARCHAR) = u.__pk"
+            )
+        else:
+            body = f"SELECT {projection}, __ord FROM ({base})"
+
+        if registered["creates"]:
+            # Created objects are appended after the base rows, as in-memory
+            # materialization does.
+            body = (
+                f"{body} UNION ALL SELECT {projection}, "
+                f"9223372036854775807 AS __ord FROM __ovl_creates"
+            )
+
+        where: list[str] = []
+        if search:
+            string_props = [
+                c for c in cols
+                if c in ot.properties and ot.properties[c].type == "string"
+            ]
+            if not string_props:
+                where.append("false")
+            else:
+                clauses = []
+                for c in string_props:
+                    clauses.append(f"lower(CAST({q(c)} AS VARCHAR)) LIKE ?")
+                    params.append(f"%{search.lower()}%")
+                where.append("(" + " OR ".join(clauses) + ")")
+        for prop, value in (filters or {}).items():
+            where.append(f"CAST({q(prop)} AS VARCHAR) = ?")
+            params.append(str(value))
+
+        sql = f"SELECT * FROM ({body}) o"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY __ord"
+        return sql, params
 
     def _materialize(self, ot: ObjectTypeDef) -> list[dict]:
         """Base rows with the edit overlay applied, in stable order."""
@@ -173,6 +420,20 @@ class OntologyService:
         offset: int = 0,
     ) -> dict:
         ot = self._require_object_type(type_name)
+        if filters:
+            declared = set(ot.properties) | {ot.primary_key}
+            for prop in filters:
+                if prop not in declared:
+                    raise ValueError(
+                        f"Unknown filter property {prop!r} for object type {type_name!r}"
+                    )
+        # Push filtering, search, counting and paging into DuckDB when the
+        # backing dataset needs no per-user filtering. Falls back below when it
+        # can't be done faithfully.
+        pushed = self._sql_query(ot, search, filters, limit, offset)
+        if pushed is not None:
+            return pushed
+
         objects = self._materialize(ot)
 
         if search:
@@ -209,6 +470,12 @@ class OntologyService:
     def get(self, type_name: str, pk: str) -> Optional[dict]:
         ot = self._require_object_type(type_name)
         pk = str(pk)
+        # A point lookup shouldn't cost a full scan: filter on the primary key
+        # in DuckDB when possible.
+        pushed = self._sql_query(ot, None, {ot.primary_key: pk}, limit=1, offset=0)
+        if pushed is not None:
+            objects = pushed["objects"]
+            return objects[0] if objects else None
         for obj in self._materialize(ot):
             if obj["__pk"] == pk:
                 return obj
@@ -243,6 +510,13 @@ class OntologyService:
         if my_value is None:
             return []  # a null join key links to nothing, not to other nulls
         key = str(my_value)
+        # Link traversal is a filter on the other side's join column, so it
+        # rides the same pushdown as query().
+        pushed = self._sql_query(
+            other, None, {other_prop: key}, limit=_LINK_LIMIT, offset=0
+        )
+        if pushed is not None:
+            return pushed["objects"]
         return [
             o
             for o in self._materialize(other)

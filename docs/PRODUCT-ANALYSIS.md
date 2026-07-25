@@ -119,12 +119,20 @@ model, named trust boundaries, and a disclosure process; and `docs/SCALE.md` —
 published, reproducible benchmarks (`bench/benchmark.py`) with an explicit
 "what this is / isn't," including the ontology full-scan ceiling.
 
-**Remaining (the "opener" + scale):** more connectors + incremental cursors +
-scheduled syncs; cron/event-triggered + incremental builds and a
-multi-process worker/queue; **ontology indexing** (now the top measured
-bottleneck — see SCALE.md); dashboard v2 (cross-filtering, parameters) + app
-builder; generated typed SDKs; object-storage-backed workspaces (for a fully
-stateless data plane and true data-plane HA); a hosted demo.
+**Closed since (scale pass):** incremental storage — a version is a manifest
+of Parquet parts, so appends cost O(delta) not O(dataset) (~70× on 5 M rows
+with a 1% delta) — plus cursor-based incremental connector syncs; and
+ontology query pushdown into DuckDB (~26× faster; 36 s → 1.4 s at 5 M
+objects, point lookups 279 ms).
+
+**Remaining (the "opener" + scale):** more connectors; scheduled syncs;
+cron/event-triggered + incremental builds and a multi-process worker/queue;
+a true ontology *index* (queries are fast now but still linear); RLS
+predicate pushdown (still 3–4×, and it disables the ontology fast path);
+query resource limits; streaming Python transforms; dashboard v2
+(cross-filtering, parameters) + app builder; generated typed SDKs;
+object-storage-backed workspaces (for a fully stateless data plane and true
+data-plane HA); a hosted demo.
 
 ## The one strategic call
 
