@@ -246,10 +246,10 @@ class Builder:
                         f"{spec.name!r} is not available and no transform "
                         f"produces it: {exc.args[0]}"
                     ) from exc
-                escaped = glob.replace("'", "''")
+                # parquet_glob returns a SQL list literal of the version's
+                # parts (a version may be multi-part after an append).
                 con.execute(
-                    f'CREATE VIEW "{alias}" AS '
-                    f"SELECT * FROM read_parquet('{escaped}')"
+                    f'CREATE VIEW "{alias}" AS SELECT * FROM read_parquet({glob})'
                 )
             result = con.execute(spec.query).arrow()
         finally:

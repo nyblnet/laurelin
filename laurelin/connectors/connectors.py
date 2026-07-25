@@ -33,7 +33,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 import duckdb
 import pyarrow as pa
@@ -63,6 +63,18 @@ def validate_source(type_: str, config: dict[str, Any]) -> None:
         raise ValueError(
             f"Unknown source type {type_!r}: expected one of {', '.join(CONNECTOR_TYPES)}"
         )
+    mode = config.get("mode", "replace")
+    if mode not in ("replace", "append"):
+        raise ValueError("mode must be 'replace' or 'append'")
+    cursor = config.get("cursor_column")
+    if cursor is not None:
+        if mode != "append":
+            raise ValueError("cursor_column only applies to mode='append'")
+        if type_ != "postgres":
+            raise ValueError("cursor_column is only supported by postgres sources")
+        if not _PG_IDENT_RE.match(str(cursor)) or "." in str(cursor):
+            raise ValueError(f"Invalid cursor_column {cursor!r}: expected an identifier")
+
     if type_ == "postgres":
         url = config.get("url", "")
         if not str(url).startswith(("postgresql://", "postgres://")):
@@ -73,6 +85,11 @@ def validate_source(type_: str, config: dict[str, Any]) -> None:
         if table and not _PG_IDENT_RE.match(str(table)):
             raise ValueError(
                 f"Invalid table {table!r}: expected identifier or schema.identifier"
+            )
+        if cursor and query:
+            raise ValueError(
+                "cursor_column requires 'table' (the cursor predicate is added "
+                "to the generated query); embed your own WHERE clause instead"
             )
         batch = config.get("batch_size", _DEFAULT_BATCH_SIZE)
         if not isinstance(batch, int) or not (1 <= batch <= _MAX_BATCH_SIZE):
@@ -127,14 +144,22 @@ def _redact_url_password(url: str) -> str:
 # Connector implementations — each yields Arrow tables
 # ---------------------------------------------------------------------------
 
-def _pull_postgres(config: dict[str, Any]) -> Iterator[pa.Table]:
+def _pull_postgres(config: dict[str, Any], since: Optional[str] = None) -> Iterator[pa.Table]:
     import psycopg
 
+    params: list[Any] = []
     query = config.get("query")
     if not query:
-        # validate_source vetted the identifier; quote each part.
+        # validate_source vetted the identifiers; quote each part.
         parts = str(config["table"]).split(".")
         query = "SELECT * FROM " + ".".join(f'"{p}"' for p in parts)
+        cursor_column = config.get("cursor_column")
+        if cursor_column and since is not None:
+            # Only rows newer than the last high-water mark. The column name is
+            # a validated identifier; the value is bound as a parameter.
+            query += f' WHERE "{cursor_column}" > %s'
+            params.append(since)
+            query += f' ORDER BY "{cursor_column}"'
     batch_size = int(config.get("batch_size", _DEFAULT_BATCH_SIZE))
 
     with psycopg.connect(str(config["url"])) as conn:
@@ -142,7 +167,7 @@ def _pull_postgres(config: dict[str, Any]) -> Iterator[pa.Table]:
         # full result client-side.
         with conn.cursor(name="laurelin_sync") as cur:
             cur.itersize = batch_size
-            cur.execute(query)  # type: ignore[arg-type]
+            cur.execute(query, params or None)  # type: ignore[arg-type]
             columns = [d.name for d in cur.description or []]
             got_rows = False
             while True:
@@ -238,6 +263,15 @@ _PULLERS = {"postgres": _pull_postgres, "http": _pull_http, "file": _pull_file}
 # Sync
 # ---------------------------------------------------------------------------
 
+def _max_cursor(table: pa.Table, column: str) -> Optional[str]:
+    if column not in table.column_names or table.num_rows == 0:
+        return None
+    import pyarrow.compute as pc
+
+    value = pc.max(table.column(column)).as_py()
+    return None if value is None else str(value)
+
+
 def sync_source(
     catalog: DatasetCatalog,
     store: MetadataStore,
@@ -245,12 +279,37 @@ def sync_source(
     actor: str = "",
 ) -> DatasetVersionInfo:
     """Run one sync: pull from the external system, write a new dataset
-    version, and record the outcome on the source (also on failure)."""
+    version, and record the outcome on the source (also on failure).
+
+    With ``mode="append"`` the pulled rows are appended (O(delta) I/O) instead
+    of replacing the dataset. With a ``cursor_column`` as well, only rows above
+    the stored high-water mark are pulled — so a recurring sync moves just the
+    new data, in both directions.
+    """
+    mode = source.config.get("mode", "replace")
+    cursor_column = source.config.get("cursor_column")
     try:
-        chunks = _PULLERS[source.type](source.config)
-        info = catalog.write_batches(
-            source.dataset, chunks, source=f"sync:{source.type}"
-        )
+        if source.type == "postgres":
+            chunks = _pull_postgres(source.config, since=source.cursor_value)
+        else:
+            chunks = _PULLERS[source.type](source.config)
+
+        new_cursor: Optional[str] = None
+        if cursor_column:
+            # Track the high-water mark as chunks stream past, so an
+            # incremental sync never re-reads what it has already ingested.
+            def tracked(stream):
+                nonlocal new_cursor
+                for chunk in stream:
+                    seen = _max_cursor(chunk, cursor_column)
+                    if seen is not None and (new_cursor is None or seen > new_cursor):
+                        new_cursor = seen
+                    yield chunk
+
+            chunks = tracked(chunks)
+
+        writer = catalog.append_batches if mode == "append" else catalog.write_batches
+        info = writer(source.dataset, chunks, source=f"sync:{source.type}")
     except Exception as exc:
         store.record_source_sync(
             source.name, "failed", error=f"{type(exc).__name__}: {exc}"
@@ -262,15 +321,18 @@ def sync_source(
         )
         raise
     store.record_source_sync(
-        source.name, "succeeded", version=info.version, rows=info.row_count
+        source.name, "succeeded", version=info.version, rows=info.row_count,
+        cursor_value=new_cursor,
     )
     store.log_audit(
         "source_synced",
         {
             "source": source.name,
             "dataset": source.dataset,
+            "mode": mode,
             "version": info.version,
             "row_count": info.row_count,
+            **({"cursor": new_cursor} if new_cursor is not None else {}),
         },
         actor=actor,
     )

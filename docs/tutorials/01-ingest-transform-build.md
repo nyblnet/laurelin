@@ -198,6 +198,40 @@ lineage, and the access controls in tutorial 3 — applies with no changes.
 
 Credentials are stored server-side and redacted in every API response.
 
+### Sync only what's new
+
+A recurring full refresh gets expensive: re-pulling and re-writing the whole
+table every night is wasteful when 1% of it changed. Add `mode: "append"` and
+a `cursor_column`:
+
+```bash
+curl -X PUT localhost:8787/api/v1/sources/orders_pull \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "postgres", "dataset": "raw_orders",
+       "config": {"url": "postgresql://user:pw@db:5432/shop",
+                  "table": "public.orders",
+                  "mode": "append", "cursor_column": "order_id"}}'
+```
+
+Now each sync pulls only rows above the highest `order_id` it has already
+seen, and appends them — writing one small Parquet part instead of rewriting
+the dataset. A sync that finds nothing new is a no-op and doesn't mint a
+version.
+
+The saving is proportional to how much bigger your dataset is than your daily
+delta. On a 5 M-row table with a 1% delta, appending is **~70× faster and
+writes ~1% of the bytes** of a full rewrite ([SCALE.md](../SCALE.md)).
+
+Appends accumulate parts, and many small files eventually slow scans. Merge
+them when convenient:
+
+```bash
+curl -X POST localhost:8787/api/v1/datasets/raw_orders/compact
+```
+
+Uploads take the same flag — `POST /datasets/{name}/upload?mode=append` adds a
+file's rows instead of replacing the dataset.
+
 ---
 
 **What you built:** an immutable, versioned dataset; a two-stage pipeline

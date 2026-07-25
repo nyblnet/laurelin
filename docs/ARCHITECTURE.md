@@ -27,13 +27,17 @@ class DatasetCatalog:
     def create_dataset(self, name: str, description: str = "") -> DatasetInfo
     def write(self, name: str, table: pa.Table, source: str = "upload",
               build_id: str | None = None, description: str = "") -> DatasetVersionInfo
+    def append(self, name, table, ...) -> DatasetVersionInfo
+    def append_batches(self, name, chunks, ...) -> DatasetVersionInfo
+    def compact(self, name, ...) -> DatasetVersionInfo
     def read(self, name: str, version: int | None = None) -> pa.Table
+    def version_files(self, name, version=None) -> list[str]   # absolute part paths
     def parquet_glob(self, name: str, version: int | None = None) -> str
-        # absolute glob to the version's parquet files, for duckdb read_parquet()
+        # SQL list literal of the version's parts, for duckdb read_parquet(...)
     def rows(self, name: str, limit: int = 100, offset: int = 0,
              version: int | None = None) -> list[dict]      # via duckdb, JSON-safe values
-    def upload_file(self, name: str, path: Path, description: str = "") -> DatasetVersionInfo
-        # CSV (duckdb read_csv_auto) or Parquet by extension
+    def upload_file(self, name, path, description="", mode="replace") -> DatasetVersionInfo
+        # CSV (duckdb read_csv_auto) or Parquet by extension; mode="append" adds rows
 ```
 
 Rules:
@@ -43,6 +47,16 @@ Rules:
   Auto-creates the dataset row if missing.
 - Versions are immutable; `read` with no version = latest. Missing dataset/version
   raises `KeyError` (api layer maps to 404).
+- **A version is a manifest of Parquet parts** (`DatasetVersionInfo.files`,
+  workspace-relative). `write` produces one part; `append`/`append_batches`
+  write *only the delta* as a new part and carry forward the previous
+  version's parts by reference, so appending costs O(delta) rather than
+  O(dataset) — ~70× faster than a rewrite on a 5 M-row dataset with a 1%
+  delta. Version dirs are immutable and never deleted, so inherited
+  references stay valid. An empty `files` list means the pre-manifest layout
+  (glob the version dir) and is still read correctly.
+- `compact()` merges the latest version's parts back into one file; appends
+  are cheap but accumulate parts, and many small files slow scans.
 - `rows()` must convert non-JSON-safe values (timestamps, bytes, Decimal, NaN) to strings/None.
 - Schema captured as `ColumnSchema(name, type=str(arrow_type))`.
 
@@ -328,7 +342,9 @@ GET  /api/v1/datasets/{name}/schema?version=  -> [ColumnSchema]
 GET  /api/v1/datasets/{name}/rows?limit=&offset=&version= -> {"rows":[...],"row_count":N}
 POST /api/v1/query        {sql, max_rows?} -> {columns,rows,row_count,truncated}
                                  (read-only DuckDB; each dataset is a view; viewer+)
-POST /api/v1/datasets/{name}/upload           multipart file (.csv/.parquet) -> DatasetVersionInfo
+POST /api/v1/datasets/{name}/upload?mode=replace|append
+                                              multipart file (.csv/.parquet) -> DatasetVersionInfo
+POST /api/v1/datasets/{name}/compact          -> DatasetVersionInfo (merge appended parts; edit)
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
 GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset], kind}]

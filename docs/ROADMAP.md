@@ -113,8 +113,14 @@ Key bets, and why:
       discovered via entry points. First-party set: MySQL, SQL Server,
       Oracle, S3/GCS/azblob file drops, SFTP, HTTP/REST (w/ pagination recipes),
       Google Sheets, Kafka (streaming v2).
-- [ ] **Syncs**: scheduled pulls with incremental cursors (updated_at / PK
-      ranges), full-refresh fallback, per-sync health status.
+- [x] **Incremental syncs**: `mode: "append"` + `cursor_column` pulls only
+      rows above the stored high-water mark and appends them — O(delta) in
+      both directions. Full-refresh remains the default; per-sync health
+      status is recorded. (Still to do: *scheduled* pulls — see WS3.)
+- [x] **Incremental storage**: a dataset version is a manifest of Parquet
+      parts, so `append` writes only the delta and references prior parts
+      (~70× faster than a rewrite on 5 M rows w/ a 1% delta); `compact()`
+      merges parts back.
 - [ ] **CDC**: Debezium-format ingestion from Kafka; Postgres logical
       replication direct (no Kafka) for the common case.
 - [ ] **Agent mode**: an outbound-only ingestion agent for data behind

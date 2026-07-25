@@ -147,6 +147,48 @@ def bench_size(n: int, root: Path) -> dict:
     return result
 
 
+def bench_incremental(root: Path, n: int, delta_frac: float = 0.01) -> dict:
+    """Write amplification: a full rewrite vs an append of the same delta.
+
+    This is the difference between "adding today's rows costs the whole
+    dataset" and "adding today's rows costs today's rows".
+    """
+    ws = Workspace.init(root / f"incr{n}", name=f"incr{n}")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    base = make_table(n)
+    catalog.write("orders", base)
+
+    delta_rows = max(1, int(n * delta_frac))
+    delta = make_table(delta_rows)
+
+    def full_rewrite():
+        combined = pa.concat_tables([catalog.read("orders"), delta])
+        return catalog.write("orders_full", combined)
+
+    def append_delta():
+        return catalog.append("orders", delta)
+
+    catalog.write("orders_full", base)  # same starting point for a fair compare
+    rewrite_ms, _ = timed(full_rewrite, repeat=1)
+    append_ms, info = timed(append_delta, repeat=1)
+
+    def dir_bytes(dataset: str, version: int) -> int:
+        d = ws.data_dir / dataset / f"v{version:04d}"
+        return sum(f.stat().st_size for f in d.glob("*.parquet"))
+
+    return {
+        "rows": n,
+        "delta_rows": delta_rows,
+        "full_rewrite_ms": round(rewrite_ms, 1),
+        "append_ms": round(append_ms, 1),
+        "speedup": round(rewrite_ms / append_ms, 1) if append_ms else None,
+        "full_rewrite_bytes": dir_bytes("orders_full", 2),
+        "append_bytes": dir_bytes("orders", info.version),
+        "parts_after_append": len(info.files),
+    }
+
+
 def bench_build(root: Path, n: int) -> dict:
     """A two-stage pipeline (python filter -> sql aggregate) over n rows."""
     from laurelin.transforms import Builder, collect_transforms
@@ -236,13 +278,17 @@ def main() -> None:
     env["pyarrow"] = pa.__version__
     print(json.dumps(env, indent=2), "\n")
 
-    results = {"env": env, "query": [], "build": [], "ontology": []}
+    results = {"env": env, "query": [], "build": [], "ontology": [], "incremental": []}
     try:
         for n in sizes:
             print(f"--- {n:,} rows ---", flush=True)
             row = bench_size(n, tmp)
             results["query"].append(row)
             print(json.dumps(row, indent=2), flush=True)
+
+            incr = bench_incremental(tmp, n)
+            results["incremental"].append(incr)
+            print(json.dumps(incr, indent=2), flush=True)
 
             onto = bench_ontology(tmp, n)
             results["ontology"].append(onto)

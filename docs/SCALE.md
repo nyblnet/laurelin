@@ -78,6 +78,31 @@ Roughly linear, ~7 M rows/sec on ingest. A 50 M-row dataset ingests in about
 7 s and builds in about 8 s — slow enough to want the async build path
 (the default), fast enough not to be the problem.
 
+### Incremental writes — O(delta), not O(dataset)
+
+A dataset version is a *manifest of Parquet parts*. `append` writes only the
+new rows as one part and references the previous version's parts, so adding
+today's data costs today's data — not a rewrite of everything you already
+have. Same delta (1% of the dataset), two ways:
+
+| Dataset | Full rewrite | Append | Speedup | Bytes written |
+|---:|---:|---:|---:|---|
+| 100 K | 33 ms | 3.0 ms | 11× | 1.5 MB → 27 KB |
+| 1 M | 233 ms | 5.0 ms | 47× | 13.4 MB → 186 KB |
+| 5 M | 926 ms | 12.8 ms | 72× | 77.6 MB → 787 KB |
+
+**The advantage widens as the dataset grows**, because the rewrite is linear
+in total size and the append is linear in the delta. That's the difference
+between a nightly sync that gets slower every month and one that doesn't.
+
+Connector syncs use it: set `mode: "append"` with a `cursor_column` and each
+sync pulls only rows above the last high-water mark, then appends them. A
+sync with nothing new is a no-op and mints no version.
+
+The trade-off is part accumulation — many small files slow scans — so
+`POST /datasets/{name}/compact` merges them back into one file when you want
+to pay that cost deliberately.
+
 **The caveat:** a `@transform` receives its input as one in-memory
 `pyarrow.Table`. Peak memory during a Python transform is roughly the
 uncompressed size of its inputs plus its output — for the table above, about
@@ -136,7 +161,8 @@ performance requirement, and you should know that before you build on it.
 | You have | Laurelin today |
 |---|---|
 | < 1 M rows/dataset, < 100 K objects/type, a team | Comfortable. This is the sweet spot. |
-| 1–50 M rows/dataset, entities modeled separately | Works well. Keep Python transforms' inputs in RAM-sized chunks; expect the RLS tax. |
+| 1–50 M rows/dataset, entities modeled separately | Works well. Sync incrementally (`mode: append`); keep Python transforms' inputs in RAM-sized chunks; expect the RLS tax. |
+| A large table with a small daily delta | Fine — appends cost the delta, not the dataset. Compact periodically. |
 | > 100 M rows, or > 1 M objects/type | Not yet. Query it in a warehouse; use Laurelin over aggregates. |
 | Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
 | Sub-second streaming freshness | Wrong tool. |
@@ -151,15 +177,29 @@ state that needs `ReadWriteMany` above one replica.
 
 ## Known limitations, plainly
 
-1. **No object index** — ontology reads are full scans (numbers above).
+1. **No object index** — ontology reads are full scans (numbers above). The
+   top-priority fix.
 2. **RLS loses pushdown** — 3–4× on policied datasets at scale.
-3. **Python transforms are in-memory** — input size bounded by RAM.
+3. **Python transforms are in-memory** — input size bounded by RAM. SQL
+   transforms stream and don't pay this.
 4. **Builds are in-process** — a worker pool per replica, not a distributed
    queue; no cron/event triggers or incremental transforms yet.
-5. **Edits are an overlay** — object writes don't flow back into Parquet
+5. **No query resource limits** — DuckDB runs without a `memory_limit` or
+   statement timeout, and there's no admission control. One deliberately
+   expensive query can degrade a replica for everyone. Treat the SQL
+   workbench as available to trusted users.
+6. **The audit log grows without bound** — no rotation or partitioning. It's
+   small per event, but plan for it on a long-lived busy workspace.
+7. **Edits are an overlay** — object writes don't flow back into Parquet
    unless you write a transform that does it.
-6. **Single data plane** — no object-storage-backed workspaces yet, so the
-   data volume is shared state.
+8. **Single data plane** — no object-storage-backed workspaces yet, so the
+   data volume is shared state and multi-replica needs `ReadWriteMany`.
+9. **Compaction is manual** — appends accumulate parts until you call
+   `/compact`; there's no automatic policy yet.
 
 Every one of these is a roadmap item, and none of them is hidden in a footnote
 because you'd rather find out now than in month three.
+
+**Recently fixed:** write amplification — every write used to cost O(dataset),
+so a 1% daily delta rewrote the whole thing. Appends are now O(delta); see the
+incremental-writes numbers above.

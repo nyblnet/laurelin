@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     row_count INTEGER NOT NULL DEFAULT 0,
     schema_json TEXT NOT NULL DEFAULT '[]',
     path TEXT NOT NULL DEFAULT '',
+    files_json TEXT NOT NULL DEFAULT '[]',
     build_id TEXT,
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS sources (
     last_sync_status TEXT,
     last_sync_error TEXT,
     last_sync_version INTEGER,
-    last_sync_rows INTEGER
+    last_sync_rows INTEGER,
+    cursor_value TEXT
 );
 CREATE TABLE IF NOT EXISTS dashboards (
     name TEXT PRIMARY KEY,
@@ -231,19 +233,28 @@ class MetadataStore:
             c.executescript(self.backend.render_schema(_SCHEMA))
             self._migrate(c)
 
-    def _migrate(self, c: Connection) -> None:
-        """Additive migrations for databases created by older versions."""
+    def _has_column(self, c: Connection, table: str, column: str) -> bool:
         if self.dialect == "postgres":
             row = c.execute(
                 "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = 'users' AND column_name = 'superadmin'"
+                "WHERE table_name = ? AND column_name = ?",
+                (table, column),
             ).fetchone()
-            has_superadmin = row is not None
-        else:
-            cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
-            has_superadmin = "superadmin" in cols
-        if not has_superadmin:
+            return row is not None
+        return column in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self, c: Connection) -> None:
+        """Additive migrations for databases created by older versions."""
+        if not self._has_column(c, "users", "superadmin"):
             c.execute("ALTER TABLE users ADD COLUMN superadmin INTEGER NOT NULL DEFAULT 0")
+        # Manifest of Parquet parts per version. Versions predating this column
+        # keep an empty manifest and are read by globbing their version dir.
+        if not self._has_column(c, "dataset_versions", "files_json"):
+            c.execute(
+                "ALTER TABLE dataset_versions ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if not self._has_column(c, "sources", "cursor_value"):
+            c.execute("ALTER TABLE sources ADD COLUMN cursor_value TEXT")
 
     # -- datasets -------------------------------------------------------------
 
@@ -293,8 +304,9 @@ class MetadataStore:
         with self._conn() as c:
             c.execute(
                 """INSERT INTO dataset_versions
-                   (dataset, version, created_at, row_count, schema_json, path, build_id, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (dataset, version, created_at, row_count, schema_json, path,
+                    files_json, build_id, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     info.dataset,
                     info.version,
@@ -302,6 +314,7 @@ class MetadataStore:
                     info.row_count,
                     json.dumps([s.model_dump() for s in info.schema_]),
                     info.path,
+                    json.dumps(info.files),
                     info.build_id,
                     info.source,
                 ),
@@ -315,6 +328,7 @@ class MetadataStore:
             row_count=row["row_count"],
             schema=[ColumnSchema(**s) for s in json.loads(row["schema_json"])],
             path=row["path"],
+            files=json.loads(row["files_json"] or "[]"),
             build_id=row["build_id"],
             source=row["source"],
         )
@@ -374,6 +388,7 @@ class MetadataStore:
             last_sync_error=row["last_sync_error"],
             last_sync_version=row["last_sync_version"],
             last_sync_rows=row["last_sync_rows"],
+            cursor_value=row["cursor_value"],
         )
 
     def get_source(self, name: str) -> Optional["SourceInfo"]:
@@ -398,14 +413,24 @@ class MetadataStore:
         error: Optional[str] = None,
         version: Optional[int] = None,
         rows: Optional[int] = None,
+        cursor_value: Optional[str] = None,
     ) -> None:
         with self._conn() as c:
-            c.execute(
-                """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
-                   last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?
-                   WHERE name = ?""",
-                (utcnow_iso(), status, error, version, rows, name),
-            )
+            if cursor_value is None:
+                # Leave the high-water mark untouched (failed or full-refresh sync).
+                c.execute(
+                    """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
+                       last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?
+                       WHERE name = ?""",
+                    (utcnow_iso(), status, error, version, rows, name),
+                )
+            else:
+                c.execute(
+                    """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
+                       last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?,
+                       cursor_value = ? WHERE name = ?""",
+                    (utcnow_iso(), status, error, version, rows, cursor_value, name),
+                )
 
     # -- dashboards --------------------------------------------------------------
 

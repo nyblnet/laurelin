@@ -385,6 +385,25 @@ def delete_dashboard(name: str, store: StoreDep, actor: ActorDep) -> dict:
     return {"deleted": name}
 
 
+@router.post("/datasets/{name}/compact", dependencies=[EDITOR])
+def compact_dataset(
+    name: str,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+) -> dict:
+    """Merge an appended dataset's parts into a single file. Appends are cheap
+    but accumulate parts; compaction trades one rewrite for a tidy layout."""
+    _require_dataset_edit(perms, user, name)
+    info = catalog.compact(name)
+    store.log_audit(
+        "dataset_compact_requested", {"dataset": name, "version": info.version}, actor=actor
+    )
+    return _dump(info)
+
+
 @router.post("/datasets/{name}/upload")
 def upload_dataset_file(
     name: str,
@@ -394,6 +413,7 @@ def upload_dataset_file(
     user: UserDep,
     actor: ActorDep,
     file: UploadFile = File(...),
+    mode: str = Query("replace", pattern="^(replace|append)$"),
 ) -> dict:
     # Per-dataset edit. For a dataset with no grants this reduces to the old
     # editor-role requirement; a grant can elevate a viewer for one dataset.
@@ -415,7 +435,7 @@ def upload_dataset_file(
                 )
             tmp.write(chunk)
     try:
-        info = catalog.upload_file(name, tmp_path)
+        info = catalog.upload_file(name, tmp_path, mode=mode)
     finally:
         tmp_path.unlink(missing_ok=True)
     store.log_audit(
@@ -423,6 +443,7 @@ def upload_dataset_file(
         {
             "dataset": name,
             "filename": file.filename,
+            "mode": mode,
             "version": info.version,
             "row_count": info.row_count,
         },

@@ -151,14 +151,17 @@ def test_read_dataset_with_no_versions(catalog: DatasetCatalog):
 
 def test_parquet_glob_absolute(catalog: DatasetCatalog, workspace: Workspace):
     catalog.write("ds", simple_table())
-    glob = catalog.parquet_glob("ds")
-    assert Path(glob).is_absolute()
-    assert glob.endswith("*.parquet")
-    assert str(workspace.root) in glob
+    listing = catalog.parquet_glob("ds")
+    # A SQL list literal of absolute paths, so a multi-part (appended) version
+    # works the same as a single file.
+    assert listing.startswith("[") and listing.endswith("]")
+    assert str(workspace.root) in listing
+    for path in catalog.version_files("ds"):
+        assert Path(path).is_absolute()
     import duckdb
 
     n = duckdb.connect().execute(
-        "SELECT count(*) FROM read_parquet(?)", [glob]
+        f"SELECT count(*) FROM read_parquet({listing})"
     ).fetchone()[0]
     assert n == 3
 

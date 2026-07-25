@@ -40,8 +40,14 @@ class DatasetVersionInfo(BaseModel):
     row_count: int = 0
     schema_: list[ColumnSchema] = Field(default_factory=list, alias="schema")
     path: str = ""  # workspace-relative directory of this version
+    # Workspace-relative Parquet part files making up this version. A version
+    # written by `append` lists its predecessor's parts plus the new one, so an
+    # append costs O(delta) instead of rewriting the dataset. Empty means
+    # "every *.parquet under `path`" — the layout used before manifests, still
+    # read correctly.
+    files: list[str] = Field(default_factory=list)
     build_id: Optional[str] = None
-    source: str = "upload"  # "upload" | "transform" | "api"
+    source: str = "upload"  # "upload" | "transform" | "api" | "sync:*" | "append"
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -60,6 +66,9 @@ class SourceInfo(BaseModel):
     last_sync_error: Optional[str] = None
     last_sync_version: Optional[int] = None
     last_sync_rows: Optional[int] = None
+    # High-water mark for incremental (mode="append") syncs: the largest value
+    # seen in the source's cursor column, carried into the next pull's WHERE.
+    cursor_value: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

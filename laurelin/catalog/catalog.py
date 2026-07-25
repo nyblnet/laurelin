@@ -84,6 +84,7 @@ class DatasetCatalog:
         schema: pa.Schema,
         source: str,
         build_id: Optional[str],
+        inherited: Optional[list[str]] = None,
     ) -> DatasetVersionInfo:
         """Rename a fully-written temp dir to its final version directory and
         record the version. The rename is the allocation mutex: os.rename onto
@@ -103,12 +104,17 @@ class DatasetCatalog:
                     pass  # lost the race for this version; try the next
             version += 1
 
+        rel_dir = final_dir.relative_to(self.workspace.root)
+        new_parts = sorted(
+            str(rel_dir / f.name) for f in final_dir.iterdir() if f.suffix == ".parquet"
+        )
         info = DatasetVersionInfo(
             dataset=name,
             version=version,
             row_count=row_count,
             schema=[ColumnSchema(name=f.name, type=str(f.type)) for f in schema],
-            path=str(final_dir.relative_to(self.workspace.root)),
+            path=str(rel_dir),
+            files=list(inherited or []) + new_parts,
             build_id=build_id,
             source=source,
         )
@@ -203,6 +209,159 @@ class DatasetCatalog:
             source=source, build_id=build_id,
         )
 
+    def append(
+        self,
+        name: str,
+        table: pa.Table,
+        source: str = "append",
+        build_id: Optional[str] = None,
+        description: str = "",
+    ) -> DatasetVersionInfo:
+        """Add rows to a dataset as a new version, writing **only the delta**.
+
+        A full ``write`` re-serializes the whole dataset, so a daily 1% delta
+        on a 50 GB dataset costs 50 GB of I/O. An append writes one new part
+        file and records a manifest that references the previous version's
+        parts, so the cost is proportional to the new rows. The result is still
+        an immutable version: earlier versions keep their own manifests and
+        remain readable.
+
+        The appended table must be castable to the current version's schema.
+        For an empty dataset this is exactly ``write``.
+        """
+        _validate_name(name)
+        self.store.upsert_dataset(name, description)
+
+        previous = self.store.get_version(name, None)
+        if previous is None:
+            return self.write(name, table, source=source, build_id=build_id)
+
+        schema = pa.schema([pa.field(c.name, pa.type_for_alias(c.type)) for c in previous.schema_])
+        try:
+            table = table.cast(schema)
+        except (ValueError, TypeError, KeyError, pa.ArrowNotImplementedError) as exc:
+            # pyarrow signals a name mismatch as ValueError and a type mismatch
+            # as ArrowInvalid (a ValueError subclass).
+            raise ValueError(
+                f"Cannot append to {name!r}: incompatible schema "
+                f"({exc}). Column names and types must match version "
+                f"{previous.version}, or use a full write."
+            ) from exc
+
+        tmp_dir = Path(
+            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
+        )
+        try:
+            pq.write_table(table, tmp_dir / "part.parquet")
+        except Exception:
+            self._cleanup_tmp(tmp_dir)
+            raise
+        return self._commit_version(
+            name, tmp_dir,
+            row_count=previous.row_count + table.num_rows,
+            schema=schema,
+            source=source,
+            build_id=build_id,
+            inherited=self._inherited_files(previous),
+        )
+
+    def append_batches(
+        self,
+        name: str,
+        chunks: "Iterable[pa.Table]",
+        source: str = "append",
+        build_id: Optional[str] = None,
+        description: str = "",
+    ) -> DatasetVersionInfo:
+        """Streaming :meth:`append` — the incremental-sync path.
+
+        Neither the existing dataset nor the incoming delta is held whole in
+        memory: the delta streams to one new part file and the previous
+        version's parts are referenced. An incremental sync that pulls no new
+        rows is a no-op that returns the current version rather than an error.
+        """
+        _validate_name(name)
+        self.store.upsert_dataset(name, description)
+        previous = self.store.get_version(name, None)
+        if previous is None:
+            return self.write_batches(
+                name, chunks, source=source, build_id=build_id
+            )
+
+        schema = pa.schema(
+            [pa.field(c.name, pa.type_for_alias(c.type)) for c in previous.schema_]
+        )
+        tmp_dir = Path(
+            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
+        )
+        writer: Optional[pq.ParquetWriter] = None
+        added = 0
+        try:
+            for chunk in chunks:
+                if chunk.num_rows == 0:
+                    continue
+                try:
+                    chunk = chunk.cast(schema)
+                except (ValueError, TypeError, KeyError, pa.ArrowNotImplementedError) as exc:
+                    raise ValueError(
+                        f"Cannot append to {name!r}: incompatible schema ({exc})."
+                    ) from exc
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp_dir / "part.parquet", schema)
+                writer.write_table(chunk)
+                added += chunk.num_rows
+            if writer is not None:
+                writer.close()
+                writer = None
+        except Exception:
+            if writer is not None:
+                writer.close()
+            self._cleanup_tmp(tmp_dir)
+            raise
+
+        if added == 0:
+            # Nothing new upstream: don't mint an identical version.
+            self._cleanup_tmp(tmp_dir)
+            return previous
+
+        return self._commit_version(
+            name, tmp_dir,
+            row_count=previous.row_count + added,
+            schema=schema,
+            source=source,
+            build_id=build_id,
+            inherited=self._inherited_files(previous),
+        )
+
+    def _inherited_files(self, info: DatasetVersionInfo) -> list[str]:
+        """The manifest to carry forward from ``info`` — materializing the
+        pre-manifest layout (a bare version directory) into explicit paths."""
+        if info.files:
+            return list(info.files)
+        root = self.workspace.root
+        return sorted(
+            str(p.relative_to(root)) for p in (root / info.path).glob("*.parquet")
+        )
+
+    def compact(self, name: str, description: str = "") -> DatasetVersionInfo:
+        """Rewrite the latest version's parts into a single file.
+
+        Appends are cheap but accumulate parts, and many small files make scans
+        slower. Compaction trades one full rewrite for a tidy layout; earlier
+        versions are untouched and still readable.
+        """
+        _validate_name(name)
+        info = self._version_info(name, None)
+        parts = len(self._files_for(info))
+        table = self.read(name)
+        result = self.write(name, table, source="compact", description=description)
+        self.store.log_audit(
+            "dataset_compacted",
+            {"dataset": name, "parts_before": parts, "version": result.version,
+             "row_count": result.row_count},
+        )
+        return result
+
     # -- reading --------------------------------------------------------------
 
     def _version_info(self, name: str, version: Optional[int]) -> DatasetVersionInfo:
@@ -215,14 +374,34 @@ class DatasetCatalog:
             raise KeyError(f"Dataset {name!r} has no version {version}")
         return info
 
+    def _files_for(self, info: DatasetVersionInfo) -> list[str]:
+        """Absolute paths of the Parquet parts making up a version.
+
+        A version written by ``append`` lists parts that live in *earlier*
+        version directories — version dirs are immutable and never deleted, so
+        those references stay valid. An empty manifest means the pre-manifest
+        layout: everything under the version directory.
+        """
+        root = self.workspace.root
+        if info.files:
+            return [str((root / f).resolve()) for f in info.files]
+        return sorted(str(p.resolve()) for p in (root / info.path).glob("*.parquet"))
+
+    def version_files(self, name: str, version: Optional[int] = None) -> list[str]:
+        return self._files_for(self._version_info(name, version))
+
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
-        info = self._version_info(name, version)
-        return pq.read_table(self.workspace.root / info.path)
+        return pq.read_table(self.version_files(name, version))
 
     def parquet_glob(self, name: str, version: Optional[int] = None) -> str:
-        """Absolute glob over the version's parquet files, for duckdb read_parquet()."""
-        info = self._version_info(name, version)
-        return str((self.workspace.root / info.path / "*.parquet").resolve())
+        """A DuckDB ``read_parquet`` argument covering the version's parts.
+
+        Returns a SQL list literal, so it handles a multi-part (appended)
+        version as well as a single file. Embed it directly:
+        ``SELECT * FROM read_parquet(<this>)``.
+        """
+        files = self.version_files(name, version)
+        return "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in files) + "]"
 
     @staticmethod
     def table_to_rows(table: pa.Table) -> list[dict]:
@@ -247,12 +426,12 @@ class DatasetCatalog:
         """Page of rows as JSON-safe dicts, via duckdb (no row/column policy —
         callers that must enforce policy read+filter the table and slice it with
         ``table_to_rows``)."""
-        glob = self.parquet_glob(name, version)
+        files = self.version_files(name, version)
         con = duckdb.connect()
         try:
             cur = con.execute(
                 "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?",
-                [glob, limit, offset],
+                [files, limit, offset],
             )
             columns = [d[0] for d in cur.description]
             data = cur.fetchall()
@@ -268,8 +447,7 @@ class DatasetCatalog:
         """The version's parquet files as a *lazy* pyarrow dataset. DuckDB can
         scan these with projection/filter pushdown, streaming batches instead
         of materializing the whole table in memory."""
-        info = self._version_info(name, version)
-        return pads.dataset(self.workspace.root / info.path, format="parquet")
+        return pads.dataset(self.version_files(name, version), format="parquet")
 
     def query(
         self,
@@ -333,8 +511,14 @@ class DatasetCatalog:
 
     # -- file uploads ---------------------------------------------------------
 
-    def upload_file(self, name: str, path: Path, description: str = "") -> DatasetVersionInfo:
-        """Ingest a CSV or Parquet file as a new dataset version."""
+    def upload_file(
+        self, name: str, path: Path, description: str = "", mode: str = "replace"
+    ) -> DatasetVersionInfo:
+        """Ingest a CSV or Parquet file as a new dataset version.
+
+        ``mode="append"`` adds the file's rows to the existing dataset without
+        rewriting it (see :meth:`append`); the default replaces it.
+        """
         _validate_name(name)
         path = Path(path)
         if not path.exists():
@@ -356,4 +540,8 @@ class DatasetCatalog:
             )
         if isinstance(table, pa.RecordBatchReader):
             table = table.read_all()
+        if mode not in ("replace", "append"):
+            raise ValueError(f"Unknown upload mode {mode!r}: expected 'replace' or 'append'")
+        if mode == "append":
+            return self.append(name, table, source="upload", description=description)
         return self.write(name, table, source="upload", description=description)

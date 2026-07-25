@@ -236,3 +236,86 @@ def test_postgres_source_sync(clients):
 
     rows = admin.get("/api/v1/datasets/pg_rows/rows?limit=5").json()["rows"]
     assert rows[0]["name"].startswith("row-")
+
+
+# -- incremental sync ----------------------------------------------------------
+
+def test_append_mode_validation(clients):
+    admin, _, _ = clients
+    # cursor_column requires append mode and a table (not a raw query).
+    bad = {"type": "postgres", "dataset": "x",
+           "config": {"url": "postgresql://h/db", "table": "t", "cursor_column": "id"}}
+    assert admin.put("/api/v1/sources/s1", json=bad).status_code == 400
+    bad["config"]["mode"] = "append"
+    bad["config"]["query"] = "SELECT 1"
+    del bad["config"]["table"]
+    assert admin.put("/api/v1/sources/s1", json=bad).status_code == 400
+    # Injection attempt in the cursor identifier is rejected.
+    assert admin.put("/api/v1/sources/s1", json={
+        "type": "postgres", "dataset": "x",
+        "config": {"url": "postgresql://h/db", "table": "t", "mode": "append",
+                   "cursor_column": "id > 0; DROP TABLE t --"}}).status_code == 400
+    # The good shape is accepted.
+    assert admin.put("/api/v1/sources/s1", json={
+        "type": "postgres", "dataset": "x",
+        "config": {"url": "postgresql://h/db", "table": "t", "mode": "append",
+                   "cursor_column": "id"}}).status_code == 200
+
+
+def test_file_source_append_mode(clients, tmp_path):
+    admin, _, _ = clients
+    csv = tmp_path / "batch.csv"
+    csv.write_text("id,city\n1,valmar\n")
+    r = admin.put("/api/v1/sources/city_feed", json={
+        "type": "file", "dataset": "cities",
+        "config": {"path": str(csv), "mode": "append"}})
+    assert r.status_code == 200, r.text
+    assert admin.post("/api/v1/sources/city_feed/sync").json()["row_count"] == 1
+
+    csv.write_text("id,city\n2,tirion\n")
+    assert admin.post("/api/v1/sources/city_feed/sync").json()["row_count"] == 2
+    rows = admin.get("/api/v1/datasets/cities/rows").json()["rows"]
+    assert {r["city"] for r in rows} == {"valmar", "tirion"}
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LAURELIN_TEST_POSTGRES"),
+    reason="set LAURELIN_TEST_POSTGRES=<url> to run postgres connector tests",
+)
+def test_postgres_incremental_sync_moves_only_the_delta(clients):
+    """A cursor-based sync pulls only new rows and appends them, so a repeated
+    sync is O(delta) end to end — not a full refresh."""
+    import psycopg
+
+    pg_url = os.environ["LAURELIN_TEST_POSTGRES"]
+    admin, _, _ = clients
+    with psycopg.connect(pg_url) as conn:
+        conn.execute("DROP TABLE IF EXISTS laurelin_incr_test")
+        conn.execute("CREATE TABLE laurelin_incr_test (id int, payload text)")
+        conn.execute("INSERT INTO laurelin_incr_test "
+                     "SELECT g, 'row-' || g FROM generate_series(1, 100) g")
+
+    assert admin.put("/api/v1/sources/incr", json={
+        "type": "postgres", "dataset": "incr_rows",
+        "config": {"url": pg_url, "table": "laurelin_incr_test",
+                   "mode": "append", "cursor_column": "id"}}).status_code == 200
+
+    first = admin.post("/api/v1/sources/incr/sync").json()
+    assert first["row_count"] == 100
+    assert admin.get("/api/v1/sources/incr").json()["cursor_value"] == "100"
+
+    # Re-syncing with no new upstream rows must be a no-op, not a duplicate.
+    same = admin.post("/api/v1/sources/incr/sync").json()
+    assert same["row_count"] == 100
+    assert same["version"] == first["version"]
+
+    with psycopg.connect(pg_url) as conn:
+        conn.execute("INSERT INTO laurelin_incr_test "
+                     "SELECT g, 'row-' || g FROM generate_series(101, 130) g")
+
+    after = admin.post("/api/v1/sources/incr/sync").json()
+    assert after["row_count"] == 130
+    assert after["version"] == first["version"] + 1
+    assert admin.get("/api/v1/sources/incr").json()["cursor_value"] == "130"
+    # The new version references the original part plus one small delta part.
+    assert len(after["files"]) == 2
