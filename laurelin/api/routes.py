@@ -34,6 +34,7 @@ from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 from laurelin.core.models import (
     ColumnMask,
     DashboardInfo,
@@ -321,6 +322,10 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
             plan_for=perms.arrow_policy_fn(user),
             sql_policy_for=perms.sql_policy_fn(user),
         )
+    except (QueryTimeout, QueryTooLarge, QueryRejected):
+        # Resource limits carry their own status codes; don't flatten them into
+        # a generic 400 alongside syntax errors.
+        raise
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
 

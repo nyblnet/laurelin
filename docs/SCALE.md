@@ -55,7 +55,7 @@ governs the table without holding it, and you reduce at the boundary.
   server executes; an editor who can write a pipeline has code execution.
   `--lock-pipelines` exists for exactly this, but the honest posture is:
   editors are trusted colleagues. See [SECURITY.md](../SECURITY.md).
-- **Not battle-tested.** It is early. It has ~281 tests and a coherent design;
+- **Not battle-tested.** It is early. It has ~455 tests and a coherent design;
   it does not have years of production hours behind it.
 
 ---
@@ -247,11 +247,24 @@ Three deliberate limits:
 | Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
 | Sub-second streaming freshness | Wrong tool. |
 
-**Concurrency.** Each query occupies a worker for its duration and DuckDB uses
-multiple cores per query, so one replica comfortably serves a team doing
-interactive analysis — not hundreds of concurrent heavy scans. There is no
-admission control yet, so one deliberately expensive query can still degrade a
-replica for everyone.
+**Concurrency and resource limits.** Each query occupies a worker for its
+duration and DuckDB uses multiple cores per query, so one replica comfortably
+serves a team doing interactive analysis — not hundreds of concurrent heavy
+scans. Three controls keep one query from degrading the replica for everyone:
+
+| Control | Default | Behaviour at the limit |
+|---|---|---|
+| Memory per query | 2 GB | DuckDB raises rather than being OOM-killed → **400**, "narrow the query" |
+| Wall clock | 60 s | A watchdog interrupts the query → **504** |
+| Concurrent queries | 8 per replica | Refused fast with `Retry-After` → **503** |
+
+Builds get a separate, looser budget (4 GB, no timeout) — a build that runs for
+minutes is fine; a dashboard panel that does is broken. Federated scans carry
+the interactive budget, since they can be expensive on someone else's
+infrastructure too.
+
+The audit log is bounded by `LAURELIN_AUDIT_MAX_EVENTS` (unlimited by default),
+trimmed after each build.
 
 **Horizontal scaling.** With a PostgreSQL control plane, each workspace's
 metadata lives in its own schema in that database, so every replica shares one
@@ -275,26 +288,22 @@ a laptop or a single VM, and unchanged.
    transforms stream and don't pay this.
 4. **Builds are in-process** — a worker pool per replica, not a distributed
    queue; no cron/event triggers or incremental transforms yet.
-5. **No query resource limits** — DuckDB runs without a `memory_limit` or
-   statement timeout, and there's no admission control. One deliberately
-   expensive query can degrade a replica for everyone. Treat the SQL
-   workbench as available to trusted users.
-6. **The audit log grows without bound** — no rotation or partitioning. It's
-   small per event, but plan for it on a long-lived busy workspace.
-7. **Edits are an overlay** — object writes don't flow back into Parquet
+5. **Edits are an overlay** — object writes don't flow back into Parquet
    unless you write a transform that does it.
-8. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
+6. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
    single-replica by construction. Object storage is opt-in via
    `LAURELIN_DATA_URI`; without it, replicas still share a volume for Parquet.
-9. **No cross-replica scheduler** — builds are leased so they run exactly
+7. **No cross-replica scheduler** — builds are leased so they run exactly
    once, but there is no queue that spreads them across replicas, and no
    cron/event triggers yet.
-10. **Compaction is manual** — appends accumulate parts until you call
+8. **Compaction is manual** — appends accumulate parts until you call
    `/compact`; there's no automatic policy yet.
 
 Every one of these is a roadmap item, and none of them is hidden in a footnote
 because you'd rather find out now than in month three.
 
-**Recently fixed:** write amplification — every write used to cost O(dataset),
-so a 1% daily delta rewrote the whole thing. Appends are now O(delta); see the
-incremental-writes numbers above.
+**Recently fixed:** write amplification (appends are now O(delta), not
+O(dataset)); the ontology full-scan ceiling (~26× faster); the row-level
+security tax (3.6× → 1.0×); the single-replica limit (Postgres schemas +
+object storage + build leases); and the absence of query resource limits (a
+runaway query is now interrupted rather than left to degrade a replica).

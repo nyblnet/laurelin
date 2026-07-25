@@ -18,6 +18,7 @@ import duckdb
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core import limits
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -268,12 +269,15 @@ class OntologyService:
             sql, params = self._build_sql(
                 cols, pk, deleted, base, search, filters, ot
             )
-            total = con.execute(
-                f"SELECT count(*) FROM ({sql}) t", params
-            ).fetchone()[0]
-            page = con.execute(
-                f"{sql} LIMIT ? OFFSET ?", [*params, max(0, limit), max(0, offset)]
-            ).arrow()
+            # Object queries are still linear in dataset size, so they carry the
+            # same budget as any other interactive query.
+            with limits.limited(con, limits.QueryLimits.interactive()):
+                total = con.execute(
+                    f"SELECT count(*) FROM ({sql}) t", params
+                ).fetchone()[0]
+                page = con.execute(
+                    f"{sql} LIMIT ? OFFSET ?", [*params, max(0, limit), max(0, offset)]
+                ).arrow()
             if isinstance(page, pa.RecordBatchReader):
                 page = page.read_all()
         finally:

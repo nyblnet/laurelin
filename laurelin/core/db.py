@@ -768,6 +768,25 @@ class MetadataStore:
                 (utcnow_iso(), actor, action, json.dumps(details or {})),
             )
 
+    def prune_audit(self, keep: int) -> int:
+        """Trim the audit log to its most recent ``keep`` events.
+
+        The log grows with every mutation and nothing else bounds it, so a
+        long-lived busy workspace would otherwise accumulate rows forever.
+        Returns how many were removed; ``keep <= 0`` disables pruning.
+        """
+        if keep <= 0:
+            return 0
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (keep,),
+            ).fetchone()
+            if row is None:
+                return 0  # fewer than `keep` events; nothing to do
+            cur = c.execute("DELETE FROM audit_log WHERE id <= ?", (row["id"],))
+            return cur.rowcount or 0
+
     def list_audit(self, limit: int = 100) -> list[AuditEvent]:
         with self._conn() as c:
             rows = c.execute(

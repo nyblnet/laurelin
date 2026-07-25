@@ -7,10 +7,13 @@ build failed but only blocks tasks that (transitively) depend on its output.
 
 from __future__ import annotations
 
+import os
+
 import duckdb
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core import limits
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -219,6 +222,11 @@ class Builder:
         )
         if worker is not None:
             self.store.release_build(build.id)
+        # Builds are the natural periodic hook for housekeeping the audit log,
+        # which nothing else bounds.
+        keep = int(os.environ.get("LAURELIN_AUDIT_MAX_EVENTS", "0") or 0)
+        if keep > 0:
+            self.store.prune_audit(keep)
         result_build = self.store.get_build(build.id)
         assert result_build is not None
         return result_build
@@ -277,6 +285,10 @@ class Builder:
                 # keeps scan pushdown, covers multi-part (appended) versions,
                 # and works when the parts live in object storage.
                 con.register(alias, scan)
+            # Builds are allowed to be slow — nobody is waiting on a browser —
+            # but must still not exhaust the machine. No admission slot: the
+            # worker pool already bounds how many builds run at once.
+            limits.apply(con, limits.QueryLimits.build())
             result = con.execute(spec.query).arrow()
         finally:
             con.close()

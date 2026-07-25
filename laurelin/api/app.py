@@ -40,6 +40,7 @@ from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
+from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "ui" / "static"
 
@@ -129,6 +130,26 @@ def _finalize(app: FastAPI) -> FastAPI:
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):
         return JSONResponse(status_code=400, content={"detail": _exc_message(exc)})
+
+    # Resource limits. These are distinguished from ordinary 400s because the
+    # remedy differs: narrow the query, versus retry it unchanged.
+    @app.exception_handler(QueryTimeout)
+    async def query_timeout_handler(request: Request, exc: QueryTimeout):
+        return JSONResponse(status_code=504, content={"detail": _exc_message(exc)})
+
+    @app.exception_handler(QueryTooLarge)
+    async def query_too_large_handler(request: Request, exc: QueryTooLarge):
+        return JSONResponse(status_code=400, content={"detail": _exc_message(exc)})
+
+    @app.exception_handler(QueryRejected)
+    async def query_rejected_handler(request: Request, exc: QueryRejected):
+        # Refuse fast with Retry-After rather than queueing until everything is
+        # slow — a rejected query is recoverable, a saturated replica isn't.
+        return JSONResponse(
+            status_code=503,
+            content={"detail": _exc_message(exc)},
+            headers={"Retry-After": "2"},
+        )
 
     @app.get("/health")
     def health() -> dict:

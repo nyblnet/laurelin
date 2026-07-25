@@ -29,7 +29,7 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
-from laurelin.core import federation
+from laurelin.core import federation, limits
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.storage import storage_for
@@ -492,7 +492,10 @@ class DatasetCatalog:
             sql = f"SELECT {select_list} FROM {expr} WHERE {where}"
             if limit is not None:
                 sql += f" LIMIT {int(limit)}"
-            result = con.execute(sql, [*params, *policy_params]).arrow()
+            # A federated scan can be expensive on someone *else's*
+            # infrastructure, so it gets the same budget as a local one.
+            with limits.limited(con, limits.QueryLimits.interactive()):
+                result = con.execute(sql, [*params, *policy_params]).arrow()
             if isinstance(result, pa.RecordBatchReader):
                 result = result.read_all()
             return result
@@ -588,11 +591,15 @@ class DatasetCatalog:
                 con.register(ds.name, self.scan_for(ds.name, plan_for=plan_for))
             # Lock down all filesystem/network access for the untrusted query.
             con.execute("SET enable_external_access=false")
-            cur = con.execute(sql)
-            columns = [d[0] for d in cur.description] if cur.description else []
-            data = cur.fetchmany(max_rows + 1)
-            truncated = len(data) > max_rows
-            data = data[:max_rows]
+            # Resource budget + admission control: user SQL is arbitrary, so
+            # this is where one expensive query is stopped from degrading the
+            # replica for everyone else on it.
+            with limits.limited(con, limits.QueryLimits.interactive()):
+                cur = con.execute(sql)
+                columns = [d[0] for d in cur.description] if cur.description else []
+                data = cur.fetchmany(max_rows + 1)
+                truncated = len(data) > max_rows
+                data = data[:max_rows]
         finally:
             con.close()
         rows = [
