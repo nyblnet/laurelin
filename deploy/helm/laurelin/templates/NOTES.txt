@@ -23,10 +23,13 @@ scaling to multiple replicas.
 {{- end }}
 {{- end }}
 {{- if gt (int .Values.replicaCount) 1 }}
-{{- if ne .Values.persistence.accessMode "ReadWriteMany" }}
 
-WARNING: replicaCount > 1 but persistence.accessMode is not ReadWriteMany. All
-replicas must share the same workspace data volume — use a ReadWriteMany
-storage class (NFS/EFS/CephFS).
-{{- end }}
+WARNING: replicaCount is {{ .Values.replicaCount }}, but Laurelin currently
+supports only ONE replica. Per-workspace metadata is a SQLite database on the
+data volume, opened in WAL mode; SQLite's WAL needs shared memory between the
+processes using it, which does not work across hosts on a network filesystem.
+Multiple replicas sharing a volume risk CORRUPTING that database — a
+ReadWriteMany volume does not make this safe, it is what makes it dangerous.
+
+Set replicaCount=1 and scale vertically. See docs/DEPLOYMENT.md.
 {{- end }}

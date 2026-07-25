@@ -182,13 +182,25 @@ it's just no longer a hard requirement at the low end.
 | Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
 | Sub-second streaming freshness | Wrong tool. |
 
-**Concurrency.** The API is stateless and scales horizontally behind a load
-balancer (see [DEPLOYMENT.md](DEPLOYMENT.md)); a Postgres control plane makes
-the identity tier HA. But each query occupies a worker for its duration, and
-DuckDB uses multiple cores per query — so a single replica comfortably serves
-a team doing interactive analysis, not hundreds of concurrent heavy scans.
-Per-workspace data still lives on a shared volume, which is the one piece of
-state that needs `ReadWriteMany` above one replica.
+**Concurrency, and the infra ceiling.** Each query occupies a worker for its
+duration and DuckDB uses multiple cores per query, so one replica comfortably
+serves a team doing interactive analysis — not hundreds of concurrent heavy
+scans. There is also no admission control yet, so one expensive query can
+degrade a replica for everyone.
+
+More importantly: **run one replica.** The API process is stateless, but
+per-workspace metadata is a SQLite database on the data volume opened in WAL
+mode, and SQLite's WAL cannot be shared across hosts on a network filesystem.
+Several replicas on a ReadWriteMany volume risk corrupting it — RWX is
+necessary but not sufficient, and an earlier version of the deployment guide
+was wrong about this. Scale vertically for now; see
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+The fix is not a rewrite. Parquet is immutable and already safe on shared
+storage; only the metadata database isn't, and `MetadataStore` already speaks
+Postgres — workspaces use SQLite only because the path is hardcoded. Moving
+per-workspace metadata to Postgres is what unlocks safe multi-replica, with
+object-storage-backed workspaces removing the shared volume after that.
 
 ## Known limitations, plainly
 
@@ -209,9 +221,13 @@ state that needs `ReadWriteMany` above one replica.
    small per event, but plan for it on a long-lived busy workspace.
 7. **Edits are an overlay** — object writes don't flow back into Parquet
    unless you write a transform that does it.
-8. **Single data plane** — no object-storage-backed workspaces yet, so the
-   data volume is shared state and multi-replica needs `ReadWriteMany`.
-9. **Compaction is manual** — appends accumulate parts until you call
+8. **Single replica only** — per-workspace metadata is SQLite on the data
+   volume, which cannot be safely shared across hosts. Horizontal scaling
+   needs per-workspace metadata in Postgres (plumbing, not a rewrite) and
+   then object-storage-backed workspaces.
+9. **Builds aren't coordinated across replicas** — each process has its own
+   worker pool with no shared lease.
+10. **Compaction is manual** — appends accumulate parts until you call
    `/compact`; there's no automatic policy yet.
 
 Every one of these is a roadmap item, and none of them is hidden in a footnote
