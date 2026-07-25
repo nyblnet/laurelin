@@ -30,7 +30,10 @@ class TransformSpec:
     name: str
     output: Output
     inputs: dict[str, Input] = field(default_factory=dict)
-    kind: str = "python"  # "python" | "sql"
+    kind: str = "python"  # "python" | "sql" | "remote"
+    # remote: the engine that executes `query`. Laurelin submits it and stores
+    # the (reduced) result; the cluster does the work.
+    engine: Optional[str] = None
     fn: Optional[Callable] = None  # python: fn(**{param: pa.Table}) -> pa.Table
     query: Optional[str] = None  # sql: SELECT over input aliases as table names
     # Streaming python transforms receive an *iterator* of pa.Table batches for
@@ -155,6 +158,48 @@ def sql_transform(
             kind="sql",
             fn=None,
             query=query,
+        )
+        fn.__transform_spec__ = spec  # type: ignore[attr-defined]
+        _register(spec)
+        return fn
+
+    return decorator
+
+
+def remote_transform(
+    output: Output, engine: str, query: str
+) -> Callable[[Callable], Callable]:
+    """Declare a transform executed by a remote engine.
+
+    The query runs on the engine's own cluster — Trino, Dremio, Databricks,
+    anything speaking Flight SQL — and Laurelin stores what comes back as an
+    ordinary managed dataset, with lineage, markings and ACLs like any other.
+
+    This is how large data is handled without Laurelin owning a distributed
+    engine: the cluster does the reduction, Laurelin governs and keeps the
+    result. Aggregate on the engine; a query returning millions of rows has
+    not reduced anything and will be refused.
+
+    Inputs are not declared, because the query addresses tables in the
+    engine's catalog rather than Laurelin datasets. Lineage records the engine
+    as the upstream.
+    """
+
+    def decorator(fn: Callable) -> Callable:
+        if not engine or not str(engine).strip():
+            raise ValueError(
+                f"Remote transform {fn.__name__!r} must name an engine"
+            )
+        if not query or not str(query).strip():
+            raise ValueError(f"Remote transform {fn.__name__!r} needs a query")
+        spec = TransformSpec(
+            name=fn.__name__,
+            output=output,
+            inputs={},
+            kind="remote",
+            fn=None,
+            query=query,
+            engine=str(engine),
         )
         fn.__transform_spec__ = spec  # type: ignore[attr-defined]
         _register(spec)

@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
 );
+CREATE TABLE IF NOT EXISTS engines (
+    name TEXT PRIMARY KEY,
+    type TEXT NOT NULL DEFAULT 'flightsql',
+    uri TEXT NOT NULL DEFAULT '',
+    options_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS sources (
     name TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -386,6 +394,39 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- delegated engines ---------------------------------------------------------
+
+    def upsert_engine(self, name: str, type_: str, uri: str, options: dict,
+                      created_by: str = "") -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO engines (name, type, uri, options_json, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     type = excluded.type,
+                     uri = excluded.uri,
+                     options_json = excluded.options_json""",
+                (name, type_, uri, json.dumps(options), utcnow_iso(), created_by),
+            )
+
+    def get_engine(self, name: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM engines WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            return None
+        return {"name": row["name"], "type": row["type"], "uri": row["uri"],
+                "options": json.loads(row["options_json"] or "{}"),
+                "created_at": row["created_at"], "created_by": row["created_by"]}
+
+    def list_engines(self) -> list[dict]:
+        with self._conn() as c:
+            names = [r["name"] for r in c.execute("SELECT name FROM engines ORDER BY name")]
+        return [e for n in names if (e := self.get_engine(n)) is not None]
+
+    def delete_engine(self, name: str) -> bool:
+        with self._conn() as c:
+            return c.execute("DELETE FROM engines WHERE name = ?", (name,)).rowcount > 0
 
     # -- sources ------------------------------------------------------------------
 

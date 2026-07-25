@@ -13,7 +13,7 @@ import duckdb
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
-from laurelin.core import limits
+from laurelin.core import engines, limits
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -33,11 +33,15 @@ class Builder:
         catalog: DatasetCatalog,
         store: MetadataStore,
         registry: TransformRegistry,
+        engine_factory=None,
     ):
         self.workspace = workspace
         self.catalog = catalog
         self.store = store
         self.registry = registry
+        # Injectable so the orchestration around delegated compute — lineage,
+        # policy, limits, error handling — is testable without a cluster.
+        self._engine_factory = engine_factory or engines.connect
 
     # -- planning -------------------------------------------------------------
 
@@ -197,15 +201,21 @@ class Builder:
                 task.status = BuildStatus.succeeded
                 task.rows_written = version.row_count
                 task.output_version = version.version
+                upstreams = [inp.dataset for inp in spec.inputs.values()]
+                if spec.kind == "remote" and spec.engine:
+                    # A remote transform reads the engine's catalog, not
+                    # Laurelin datasets, so record the engine as the upstream —
+                    # otherwise the result would appear to come from nowhere.
+                    upstreams = [f"engine:{spec.engine}"]
                 self.store.replace_lineage_for_transform(
                     spec.name,
                     [
                         LineageEdge(
-                            upstream_dataset=inp.dataset,
+                            upstream_dataset=upstream,
                             downstream_dataset=spec.output.dataset,
                             transform_name=spec.name,
                         )
-                        for inp in spec.inputs.values()
+                        for upstream in upstreams
                     ],
                 )
             except Exception as exc:
@@ -246,7 +256,41 @@ class Builder:
             return self._execute_python(spec)
         if spec.kind == "sql":
             return self._execute_sql(spec)
+        if spec.kind == "remote":
+            return self._execute_remote(spec)
         raise ValueError(f"Unknown transform kind {spec.kind!r} for {spec.name!r}")
+
+    def _execute_remote(self, spec: TransformSpec) -> pa.Table:
+        """Submit the query to a delegated engine and keep what comes back.
+
+        The cluster does the work; Laurelin stores the reduced result. The size
+        cap is the guardrail that keeps "delegate" from becoming "download" —
+        a query returning millions of rows hasn't reduced anything.
+        """
+        assert spec.query is not None and spec.engine is not None
+        config = self.store.get_engine(spec.engine)
+        if config is None:
+            raise RuntimeError(
+                f"Transform {spec.name!r} names engine {spec.engine!r}, which is "
+                f"not registered in this workspace."
+            )
+        timeout = float(os.environ.get("LAURELIN_ENGINE_TIMEOUT", "300"))
+        max_rows = int(os.environ.get("LAURELIN_ENGINE_MAX_ROWS", "5000000"))
+
+        client = self._engine_factory(
+            engines.EngineConfig(
+                name=config["name"], type=config["type"],
+                uri=config["uri"], options=config["options"],
+            ),
+            timeout,
+        )
+        try:
+            table = client.query(spec.query)
+        finally:
+            client.close()
+        if isinstance(table, pa.RecordBatchReader):
+            table = table.read_all()
+        return engines.check_result_size(table, max_rows, spec.engine)
 
     def _read_input(self, spec: TransformSpec, param: str, dataset: str):
         try:

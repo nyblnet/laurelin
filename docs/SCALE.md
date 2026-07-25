@@ -46,9 +46,11 @@ governs the table without holding it, and you reduce at the boundary.
 
 ## What this isn't
 
-- **Not a distributed compute engine.** Compute is DuckDB in one process.
-  There is no cluster, no shuffle, no Spark. If your working set is
-  hundreds of GB, use a warehouse and point Laurelin at it.
+- **Not a distributed compute engine, by design.** Compute is DuckDB in one
+  process — no cluster, no shuffle, no Spark, and none planned. For data past
+  that, Laurelin *delegates* to an engine that is already distributed and
+  governs the result (see "delegated compute"). Building a worse Trino is not
+  on the roadmap.
 - **Not a streaming platform.** Ingestion is batch pulls and file drops. No
   CDC, no Kafka, no sub-second freshness.
 - **Not a multi-tenant SaaS with hostile tenants.** Pipelines are Python the
@@ -215,7 +217,53 @@ it's just no longer a hard requirement at the low end.
 
 ---
 
-## When the data is genuinely big: federated datasets
+## Three tiers, one governance layer
+
+| Tier | Bytes live | Compute runs | For |
+|---|---|---|---|
+| **Managed** | Laurelin | DuckDB, in process | Medium data |
+| **Federated** | Iceberg/Delta/S3/Postgres | DuckDB, in process | Large but *selective* — pruning does the work |
+| **Delegated** | A warehouse | **That warehouse's cluster** | Huge and non-selective — a 5 B-row `GROUP BY` |
+
+Same catalog, ACLs, markings and lineage across all three; the tier is a
+per-dataset property, not a deployment mode.
+
+## Genuinely big and non-selective: delegated compute
+
+Laurelin runs no distributed engine, and won't. Organizations with data at
+that scale already have one; what they lack is a governed semantic layer over
+it. So a *remote transform* submits SQL to that engine and stores what comes
+back:
+
+```python
+@remote_transform(
+    output=Output("revenue_by_region"),
+    engine="warehouse",
+    query="SELECT region, sum(amount) AS total FROM events GROUP BY region",
+)
+def revenue_by_region(): ...
+```
+
+Trino (or Dremio, Databricks — anything speaking Flight SQL) aggregates five
+billion rows across its own nodes; Laurelin receives five and stores them as an
+ordinary managed dataset with lineage back to the engine, markings, ACLs, and
+everything downstream working normally. `pip install 'laurelin[engines]'`;
+transport is ADBC over Flight SQL, an open protocol rather than a vendor SDK.
+
+**Guardrail:** delegation exists so the *cluster* reduces. A result above
+`LAURELIN_ENGINE_MAX_ROWS` (5 M default) is refused — a query returning
+millions of rows hasn't reduced anything, and pulling it defeats the purpose.
+
+**Explicit non-goals**, because these are what make a distributed engine large
+and a half-built version would be worse than the ones that exist: no shuffle,
+no distributed joins, no cluster manager, no cross-node query planner.
+
+**One v1 gap, stated rather than hidden:** ad-hoc workbench SQL can't be pushed
+to a delegated engine, because Laurelin doesn't parse user SQL and so can't
+rewrite `FROM events` into a remote query. Delegated compute is reached through
+remote transforms; interactive querying happens against the managed result.
+
+## When the data is large but selective: federated datasets
 
 Importing a 5-billion-row event table that already lives in Iceberg would be
 wasteful and pointless. Register it instead:

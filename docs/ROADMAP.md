@@ -67,10 +67,14 @@ Key bets, and why:
   evolution, and hidden partitioning for free — and Spark/Trino/Snowflake/DuckDB
   can all read our tables directly. This is the strongest possible "no lock-in"
   statement. Embedded mode keeps today's simple Parquet version dirs.
-- **DuckDB as default compute, pluggable engines above it.** DuckDB covers the
-  99% (interactive + batch up to ~1TB working sets). The transform API stays
-  engine-agnostic (Arrow in/out, SQL text) so a Spark/Trino executor is an
-  adapter, not a rewrite.
+- **DuckDB as default compute, delegation above it.** DuckDB covers the 99%
+  (interactive + batch up to ~1TB working sets). Past that Laurelin does not
+  grow a cluster — it *delegates*: `@remote_transform` submits SQL to an engine
+  that is already distributed (Trino/Dremio/Databricks via Flight SQL) and
+  stores the reduced result with full lineage and policy. **Explicit
+  non-goals: shuffle, distributed joins, a cluster manager, a cross-node query
+  planner.** Those are what make a distributed engine large, and a half-built
+  version would be worse than the ones that exist.
 - **Postgres for metadata, queue, and search in server mode.** One dependency,
   boring, HA story well-known. No Redis/Zookeeper/Kafka required to start.
 - **React + TypeScript for the web app.** The vanilla-JS SPA was right for the

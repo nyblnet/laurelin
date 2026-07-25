@@ -223,8 +223,11 @@ works end to end; expect rough edges and breaking changes.
 Laurelin runs as a single process on a laptop *or* as N stateless replicas
 behind a load balancer — identity, workspace metadata and build coordination in
 PostgreSQL, dataset Parquet in object storage (`LAURELIN_DATA_URI=s3://…`).
-Compute is still DuckDB in-process per replica: strong on governance and
-semantics, deliberately not a distributed compute engine.
+Compute is DuckDB in-process per replica: strong on governance and semantics,
+deliberately not a distributed compute engine. Data too big for that is either
+**federated** (governed in place, scanned remotely) or **delegated** — a
+`@remote_transform` runs on a Trino/Dremio/Databricks cluster and Laurelin
+stores the reduced result with lineage and policy intact.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
 unflattering ones: the SQL path stays comfortable into the tens of millions of
 rows, appends cost the delta rather than the dataset, and ontology queries run
