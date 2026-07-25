@@ -158,3 +158,37 @@ def test_upload_file_append_mode(catalog, tmp_path):
     info = catalog.upload_file("uploaded", more, mode="append")
     assert info.row_count == 3
     assert sorted(catalog.read("uploaded").column("id").to_pylist()) == [1, 2, 3]
+
+
+# -- automatic compaction --------------------------------------------------------
+
+def test_auto_compaction_triggers_on_threshold(catalog, monkeypatch):
+    """Appends stay O(delta); crossing the threshold pays once for a tidy
+    layout, the way a hash table amortizes a resize."""
+    monkeypatch.setenv("LAURELIN_AUTO_COMPACT_PARTS", "4")
+    catalog.write("events", rows(0, 10))
+    for i in range(1, 3):
+        info = catalog.append("events", rows(i * 10, 10))
+        assert len(info.files) == i + 1, "below the threshold: parts accumulate"
+
+    info = catalog.append("events", rows(30, 10))  # 4th part crosses it
+    assert len(info.files) == 1, "compacted back to a single part"
+    assert info.row_count == 40
+    assert catalog.read("events").num_rows == 40
+    assert sorted(catalog.read("events").column("id").to_pylist()) == list(range(40))
+
+
+def test_auto_compaction_is_off_by_default(catalog, monkeypatch):
+    monkeypatch.delenv("LAURELIN_AUTO_COMPACT_PARTS", raising=False)
+    catalog.write("events", rows(0, 5))
+    for i in range(1, 6):
+        catalog.append("events", rows(i * 5, 5))
+    assert len(catalog.store.get_version("events", None).files) == 6
+
+
+def test_auto_compaction_records_that_it_was_automatic(catalog, monkeypatch):
+    monkeypatch.setenv("LAURELIN_AUTO_COMPACT_PARTS", "2")
+    catalog.write("events", rows(0, 5))
+    catalog.append("events", rows(5, 5))
+    entry = next(e for e in catalog.store.list_audit() if e.action == "dataset_compacted")
+    assert entry.details["automatic"] is True

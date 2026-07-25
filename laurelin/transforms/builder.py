@@ -185,7 +185,38 @@ class Builder:
                 # abandoned. A lost lease means another replica took over.
                 self.store.renew_build_lease(build.id, worker)
             try:
-                if spec.streaming:
+                if spec.incremental:
+                    (param, only_input), = spec.inputs.items()
+                    mode, delta, input_version = self._incremental_input(spec)
+                    if mode == "unchanged":
+                        # Nothing new upstream: succeed without minting a
+                        # version. A no-op build should leave no trace.
+                        task.status = BuildStatus.succeeded
+                        task.rows_written = 0
+                        task.finished_at = utcnow_iso()
+                        self.store.upsert_build_task(build.id, task)
+                        continue
+                    result = spec.fn(**{param: delta})
+                    if not isinstance(result, pa.Table):
+                        raise TypeError(
+                            f"Transform {spec.name!r} must return a pyarrow.Table, "
+                            f"got {type(result).__name__}"
+                        )
+                    writer = (
+                        self.catalog.append if mode == "delta" else self.catalog.write
+                    )
+                    version = writer(
+                        spec.output.dataset,
+                        result,
+                        source="transform",
+                        build_id=build.id,
+                        description=spec.output.description,
+                    )
+                    self.store.set_transform_state(
+                        spec.name, only_input.dataset,
+                        input_version.version, input_version.row_count,
+                    )
+                elif spec.streaming:
                     # Batches flow input -> fn -> parquet writer, so neither
                     # side is ever held whole.
                     version = self.catalog.write_batches(
@@ -311,6 +342,46 @@ class Builder:
                 f"Input {param}={dataset!r} of transform {spec.name!r} is not "
                 f"available and no transform produces it: {exc.args[0]}"
             ) from exc
+
+    def _incremental_input(self, spec: TransformSpec):
+        """Work out what an incremental transform actually has to process.
+
+        Returns ``(mode, table, version)`` where mode is:
+
+        * ``"unchanged"`` — the input hasn't advanced; nothing to do.
+        * ``"delta"`` — the input grew by appending, so the new rows are
+          exactly the parts added since last time. Because a version is a
+          manifest and appends only ever *extend* it, a prefix check tells us
+          this precisely — and lets us read only the new parts rather than the
+          whole input.
+        * ``"full"`` — first run, or the input was rewritten rather than
+          appended to, so its history no longer lines up and everything must
+          be reprocessed.
+        """
+        (param, inp), = spec.inputs.items()
+        current = self.store.get_version(inp.dataset, None)
+        if current is None:
+            raise RuntimeError(
+                f"Input {param}={inp.dataset!r} of transform {spec.name!r} has "
+                f"no versions yet"
+            )
+
+        state = self.store.get_transform_state(spec.name, inp.dataset)
+        if state is None:
+            return "full", self.catalog.read(inp.dataset), current
+        if state["last_version"] == current.version:
+            return "unchanged", None, current
+
+        previous = self.store.get_version(inp.dataset, state["last_version"])
+        prev_files = list(previous.files) if previous else []
+        if prev_files and current.files[: len(prev_files)] == prev_files:
+            delta = current.files[len(prev_files):]
+            if not delta:
+                return "unchanged", None, current
+            return "delta", self.catalog.storage.read_table(delta), current
+        # Rewritten (or pre-manifest): the old output no longer corresponds to
+        # any prefix of this input, so appending would double-count.
+        return "full", self.catalog.read(inp.dataset), current
 
     def _execute_streaming(self, spec: TransformSpec):
         """Feed the transform a lazy batch iterator and yield what it produces.

@@ -150,8 +150,11 @@ Key bets, and why:
       overdue schedule fires once, not once per missed window.
 - [ ] **Workers & queue**: N separate worker processes, retries w/ backoff,
       per-schedule concurrency limits, backfill runs.
-- [ ] **Incremental transforms**: `@transform(incremental=True)` receiving only
-      new/changed input partitions; snapshot fallback on schema change.
+- [x] **Incremental transforms**: `@transform(incremental=True)` receives only
+      the rows its input gained since the last build and appends its result.
+      The delta comes from the version manifest — appends only extend it, so a
+      prefix check says precisely whether history still lines up; a rewritten
+      input falls back to a full rebuild rather than double-counting.
 - [ ] **Data expectations**: `@expect(col("x").not_null(), row_count > 0)` —
       fail-build or warn modes, results stored, surfaced on lineage + dataset
       pages (Foundry's Data Health).

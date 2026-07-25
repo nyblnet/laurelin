@@ -18,6 +18,7 @@ predate manifests are still read by listing their version directory.
 from __future__ import annotations
 
 import math
+import os
 import re
 import time as _time
 from datetime import date, datetime, time
@@ -259,14 +260,14 @@ class DatasetCatalog:
         except Exception:
             self.storage.delete(key)
             raise
-        return self._commit_version(
+        return self._maybe_compact(self._commit_version(
             name, [key],
             row_count=previous.row_count + table.num_rows,
             schema=schema,
             source=source,
             build_id=build_id,
             inherited=self._inherited_files(previous),
-        )
+        ))
 
     def append_batches(
         self,
@@ -325,14 +326,14 @@ class DatasetCatalog:
             self.storage.delete(key)
             return previous
 
-        return self._commit_version(
+        return self._maybe_compact(self._commit_version(
             name, [key],
             row_count=previous.row_count + added,
             schema=schema,
             source=source,
             build_id=build_id,
             inherited=self._inherited_files(previous),
-        )
+        ))
 
     def _inherited_files(self, info: DatasetVersionInfo) -> list[str]:
         """The manifest to carry forward from ``info`` — materializing the
@@ -341,7 +342,25 @@ class DatasetCatalog:
             return list(info.files)
         return [k for k in self.storage.list_keys(info.path) if k.endswith(".parquet")]
 
-    def compact(self, name: str, description: str = "") -> DatasetVersionInfo:
+    def _maybe_compact(self, info: DatasetVersionInfo) -> DatasetVersionInfo:
+        """Compact once a version has accumulated too many parts.
+
+        Appends are cheap precisely because they don't rewrite, but many small
+        parts eventually slow every scan. Rewriting on a threshold amortizes
+        that cost the way a hash table amortizes resizing: most appends stay
+        O(delta), and occasionally one pays for a tidy layout.
+
+        Off unless ``LAURELIN_AUTO_COMPACT_PARTS`` is set, because the right
+        threshold depends on how often you append versus how often you read.
+        """
+        threshold = int(os.environ.get("LAURELIN_AUTO_COMPACT_PARTS", "0") or 0)
+        if threshold <= 0 or len(info.files) < threshold:
+            return info
+        return self.compact(info.dataset, auto=True)
+
+    def compact(
+        self, name: str, description: str = "", auto: bool = False
+    ) -> DatasetVersionInfo:
         """Rewrite the latest version's parts into a single file.
 
         Appends are cheap but accumulate parts, and many small files make scans
@@ -356,7 +375,7 @@ class DatasetCatalog:
         self.store.log_audit(
             "dataset_compacted",
             {"dataset": name, "parts_before": parts, "version": result.version,
-             "row_count": result.row_count},
+             "row_count": result.row_count, "automatic": auto},
         )
         return result
 

@@ -154,6 +154,7 @@ there is no separate migration step to run.
 | `LAURELIN_MAX_CONCURRENT_QUERIES` | Interactive queries admitted at once per replica (default `8`; `0` disables) |
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |
 | `LAURELIN_AUDIT_MAX_EVENTS` | Trim the audit log to N most recent events after each build (default `0` = unlimited) |
+| `LAURELIN_AUTO_COMPACT_PARTS` | Compact a dataset once a version reaches N parts (default `0` = manual only) |
 | `LAURELIN_SCHEDULER=0` | Stop this replica running the scheduler (default on; leases make firing exactly-once, so every replica can) |
 | `LAURELIN_METRICS=0` | Disable `/metrics` (default on when `laurelin[metrics]` is installed) |
 | `LAURELIN_METRICS_PUBLIC=1` | Allow unauthenticated scraping — only when the port isn't reachable by users |

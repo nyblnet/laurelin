@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
 );
+CREATE TABLE IF NOT EXISTS transform_state (
+    transform_name TEXT NOT NULL,
+    input_dataset TEXT NOT NULL,
+    -- Highest input version already folded into the output, so the next build
+    -- knows what "new" means.
+    last_version INTEGER NOT NULL,
+    last_rows INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (transform_name, input_dataset)
+);
 CREATE TABLE IF NOT EXISTS object_apps (
     name TEXT PRIMARY KEY,
     title TEXT NOT NULL DEFAULT '',
@@ -428,6 +438,37 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- incremental transform state -----------------------------------------------
+
+    def get_transform_state(self, transform: str, dataset: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM transform_state WHERE transform_name = ? AND input_dataset = ?",
+                (transform, dataset),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"last_version": row["last_version"], "last_rows": row["last_rows"]}
+
+    def set_transform_state(
+        self, transform: str, dataset: str, last_version: int, last_rows: int
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO transform_state
+                     (transform_name, input_dataset, last_version, last_rows, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT (transform_name, input_dataset) DO UPDATE SET
+                     last_version = excluded.last_version,
+                     last_rows = excluded.last_rows,
+                     updated_at = excluded.updated_at""",
+                (transform, dataset, last_version, last_rows, utcnow_iso()),
+            )
+
+    def clear_transform_state(self, transform: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM transform_state WHERE transform_name = ?", (transform,))
 
     # -- object apps ---------------------------------------------------------------
 

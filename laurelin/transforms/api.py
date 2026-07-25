@@ -40,6 +40,9 @@ class TransformSpec:
     # their single input and yield pa.Tables, so neither the input nor the
     # output is ever held whole in memory.
     streaming: bool = False
+    # Incremental transforms see only rows added since their last successful
+    # build, and their output is appended rather than replaced.
+    incremental: bool = False
 
 
 class TransformRegistry:
@@ -104,7 +107,10 @@ def _register(spec: TransformSpec) -> None:
 
 
 def transform(
-    output: Output, streaming: bool = False, **inputs: Input
+    output: Output,
+    streaming: bool = False,
+    incremental: bool = False,
+    **inputs: Input,
 ) -> Callable[[Callable], Callable]:
     """Declare a python transform.
 
@@ -119,9 +125,25 @@ def transform(
     and pretending otherwise would silently produce wrong results. Aggregations
     need all the data anyway; express those as SQL transforms, which DuckDB
     streams and spills natively.
+
+    ``incremental=True``: the transform is passed only the rows its input has
+    gained since the last successful build, and its result is **appended** to
+    the output rather than replacing it. Reprocessing yesterday's rows to
+    produce yesterday's answers again is the most common waste in a pipeline;
+    this removes it. The first build, or one after the input is rewritten
+    rather than appended to, processes everything.
+
+    Incremental is row-wise by construction: it also requires exactly one
+    input, and the function must not depend on rows outside its batch.
     """
 
     def decorator(fn: Callable) -> Callable:
+        if incremental and len(inputs) != 1:
+            raise ValueError(
+                f"Incremental transform {fn.__name__!r} must declare exactly one "
+                f"input (got {len(inputs)}) — the delta of several inputs has no "
+                f"single meaning."
+            )
         if streaming and len(inputs) != 1:
             raise ValueError(
                 f"Streaming transform {fn.__name__!r} must declare exactly one "
@@ -136,6 +158,7 @@ def transform(
             fn=fn,
             query=None,
             streaming=streaming,
+            incremental=incremental,
         )
         fn.__transform_spec__ = spec  # type: ignore[attr-defined]
         _register(spec)
