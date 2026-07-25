@@ -345,6 +345,10 @@ POST /api/v1/query        {sql, max_rows?} -> {columns,rows,row_count,truncated}
 POST /api/v1/datasets/{name}/upload?mode=replace|append
                                               multipart file (.csv/.parquet) -> DatasetVersionInfo
 POST /api/v1/datasets/{name}/compact          -> DatasetVersionInfo (merge appended parts; edit)
+PUT  /api/v1/datasets/{name}/federated        {source, description?} -> DatasetInfo  (admin)
+                                 (source: iceberg|delta|parquet {path} or
+                                  postgres {url, table}; validated and probed
+                                  before storing; secrets redacted in responses)
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
 GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset], kind}]
@@ -431,7 +435,17 @@ dataset is registered through `DatasetCatalog.scan_for`, which resolves a
 Whichever branch is taken, the rows and values are identical to the
 materializing path — `tests/test_rls_pushdown.py` asserts that equivalence
 across policy shapes and users. External access stays disabled either way, so
-the SQL can never touch the filesystem. Object-type
+the SQL can never touch the filesystem.
+
+**Two renderers, one decision.** `PermissionService.decide()` resolves *what* a
+policy does for a user (allowed values, resolved masks) independently of how
+it will run. `_plan()` renders that as Arrow filter+projection for managed
+data; `sql_policy_fn()` renders it as a SELECT list + WHERE for **federated**
+datasets, whose bytes live in Iceberg/Delta/Parquet/Postgres and are scanned
+in place (`laurelin/core/federation.py`). One place interprets the rules, so a
+second execution engine cannot grow a second interpretation of them. The SQL
+renderer is strictly more capable — DuckDB has `sha256`, so it expresses hash
+masking inline where Arrow must materialize. Object-type
 access is now **composed**: effective view = ontology-view AND backing-dataset-
 view; effective edit = that view AND ontology-edit. So locking a dataset also
 hides its objects, and there is no longer a path (query / dataset rows) to read

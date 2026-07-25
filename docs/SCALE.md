@@ -12,11 +12,30 @@ python bench/benchmark.py --rows 10000,100000,1000000,5000000
 
 ---
 
+## What "medium data" means here
+
+The band between *small enough that a spreadsheet or one file is fine* and
+*large enough to need a cluster*. Concretely for Laurelin: **~1M–50M rows per
+dataset is the sweet spot, ~100M is workable.** At 5M rows an 8-column table
+is 73 MB of Parquet and aggregates in 72 ms; 1B rows would be ~15 GB, past the
+design.
+
+Since replicas share Postgres and object storage, the *total* data under
+management is effectively unbounded — many workspaces, many datasets. The
+medium-data limit applies to **the working set of a single query**, because
+each query runs in one DuckDB process on one replica. "Can Laurelin hold our
+data?" is largely yes; "can one query scan 500M rows?" is still no.
+
+For the data that *is* too big, see **federated datasets** below: Laurelin
+governs the table without holding it, and you reduce at the boundary.
+
 ## What this is
 
-- **A single-node, medium-data platform** with governance and an ontology
-  layer that OSS mostly doesn't have. Its job is to make a team's data
-  modeled, governed, and operable — not to be a warehouse.
+- **A medium-data platform** with governance and an ontology layer that OSS
+  mostly doesn't have. Its job is to make a team's data modeled, governed, and
+  operable — not to be a warehouse.
+- **A governance layer over data it doesn't own**, when the data is too big to
+  hold (federated datasets).
 - **Open at every layer.** Parquet data, YAML ontology, Python pipelines,
   SQLite/Postgres metadata, a documented REST API. Every artifact is readable
   without Laurelin running, and there is no proprietary format anywhere in the
@@ -170,6 +189,52 @@ and leaving high-volume *events* in datasets is still the right discipline —
 it's just no longer a hard requirement at the low end.
 
 ---
+
+## When the data is genuinely big: federated datasets
+
+Importing a 5-billion-row event table that already lives in Iceberg would be
+wasteful and pointless. Register it instead:
+
+```bash
+curl -X PUT localhost:8787/api/v1/datasets/events/federated \
+  -H 'Content-Type: application/json' \
+  -d '{"source": {"type": "iceberg", "path": "s3://warehouse/analytics/events"}}'
+```
+
+Laurelin now governs that table — catalog entry, ACLs, classification
+markings, lineage, transform input — while the bytes stay put and the scan
+happens at the source. Sources: `iceberg`, `delta`, `parquet` (path or glob,
+local or object storage) and `postgres`.
+
+**Policy still applies.** Row policies and column masks are compiled to SQL
+and wrapped around the remote scan, from the *same decision* that drives the
+Arrow path — so a policy means the same thing whether it filters a local
+Parquet file or a remote Iceberg table. A policy that cannot be compiled
+refuses the query rather than running unfiltered.
+
+**The intended workflow is to reduce at the boundary:**
+
+```
+iceberg: 5B rows  ──federated──►  transform (aggregate)  ──►  managed 2M-row rollup
+                                                                     │
+                                                       ontology · dashboards · actions
+```
+
+The big table never moves; what lands in Laurelin is medium-sized, which is
+where the ontology and dashboards are fast. Lineage and markings span the
+boundary.
+
+Three deliberate limits:
+
+- **Ontology object types cannot bind to a federated dataset.** Every object
+  page would become a full remote scan. Materialize with a transform and bind
+  to that — the error says so explicitly.
+- **Federated datasets are hidden from the ad-hoc SQL workbench by default**
+  (`LAURELIN_FEDERATION_WORKBENCH=1` to expose them). Enabling federation
+  should not silently widen what every viewer can reach. Transforms can always
+  use them.
+- **No versioning.** A federated table has no immutable snapshots, because
+  Laurelin doesn't control its writes.
 
 ## Sizing guidance
 

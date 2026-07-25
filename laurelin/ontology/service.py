@@ -215,6 +215,18 @@ class OntologyService:
             # A policy applies but we have no way to push it into the scan;
             # never take a path that would skip enforcement.
             return None
+        backing = self.catalog.store.get_dataset(ot.backing_dataset)
+        if backing is not None and backing.is_federated:
+            # Every object page would become a full remote scan, and the edit
+            # overlay has no stable row identity to merge against. Refuse
+            # loudly rather than perform catastrophically: materialize the
+            # federated table into a managed dataset with a transform and bind
+            # the object type to that.
+            raise ValueError(
+                f"Object type {ot.api_name!r} is backed by federated dataset "
+                f"{ot.backing_dataset!r}. Bind object types to managed datasets "
+                f"— use a transform to materialize the rows you need."
+            )
         try:
             version = self.catalog.store.get_version(ot.backing_dataset, None)
             # Row/column policy is applied inside this scan when it can be

@@ -319,6 +319,7 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
         return catalog.query(
             body.sql, max_rows=body.max_rows, allowed=allowed,
             plan_for=perms.arrow_policy_fn(user),
+            sql_policy_for=perms.sql_policy_fn(user),
         )
     except Exception as exc:  # duckdb parser/binder/runtime errors
         raise HTTPException(status_code=400, detail=str(exc).strip())
@@ -390,6 +391,47 @@ def delete_dashboard(name: str, store: StoreDep, actor: ActorDep) -> dict:
         raise HTTPException(status_code=404, detail=f"Dashboard not found: {name!r}")
     store.log_audit("dashboard_deleted", {"dashboard": name}, actor=actor)
     return {"deleted": name}
+
+
+class FederatedDatasetRequest(BaseModel):
+    source: dict[str, Any]
+    description: str = ""
+
+
+@router.put("/datasets/{name}/federated", dependencies=[ADMIN])
+def register_federated_dataset(
+    name: str,
+    body: FederatedDatasetRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    actor: ActorDep,
+) -> dict:
+    """Register a table Laurelin governs but does not hold.
+
+    Admin-only: a federated source carries credentials and points the server at
+    a remote system. The source is validated and probed before it is stored, so
+    an unreachable table fails here rather than at first query.
+    """
+    from laurelin.core.federation import FederationError, redacted_source
+
+    existing = store.get_dataset(name)
+    if existing is not None and not existing.is_federated:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {name!r} already exists as a managed dataset",
+        )
+    try:
+        info = catalog.register_federated(name, body.source, body.description)
+    except FederationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    store.log_audit(
+        "federated_dataset_registered",
+        {"dataset": name, "type": body.source.get("type")},
+        actor=actor,
+    )
+    out = _dump(info)
+    out["source"] = redacted_source(info.source)
+    return out
 
 
 @router.post("/datasets/{name}/compact", dependencies=[EDITOR])

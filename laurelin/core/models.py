@@ -31,6 +31,15 @@ class DatasetInfo(BaseModel):
     description: str = ""
     created_at: str = Field(default_factory=utcnow_iso)
     latest_version: Optional[int] = None
+    # "managed": Laurelin owns the Parquet and versions it.
+    # "federated": the bytes live elsewhere (Iceberg/Delta/Parquet/Postgres);
+    # Laurelin governs the table and scans it in place, so it has no versions.
+    kind: str = "managed"
+    source: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def is_federated(self) -> bool:
+        return self.kind == "federated"
 
 
 class DatasetVersionInfo(BaseModel):

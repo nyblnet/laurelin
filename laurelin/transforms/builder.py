@@ -259,7 +259,14 @@ class Builder:
         try:
             for alias, inp in spec.inputs.items():
                 try:
-                    scan = self.catalog.arrow_dataset(inp.dataset)
+                    info = self.store.get_dataset(inp.dataset)
+                    if info is not None and info.is_federated:
+                        # Reduce at the boundary: a transform may read a
+                        # federated table (scanned remotely) and write a
+                        # managed one. This is the intended path for large data.
+                        scan = self.catalog.federated_table(inp.dataset)
+                    else:
+                        scan = self.catalog.arrow_dataset(inp.dataset)
                 except KeyError as exc:
                     raise RuntimeError(
                         f"Input {alias}={inp.dataset!r} of transform "

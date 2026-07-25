@@ -46,7 +46,9 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
     name TEXT PRIMARY KEY,
     description TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'managed',
+    source_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS dataset_versions (
     dataset TEXT NOT NULL,
@@ -272,6 +274,10 @@ class MetadataStore:
         for col in ("claimed_by", "lease_expires_at"):
             if not self._has_column(c, "builds", col):
                 c.execute(f"ALTER TABLE builds ADD COLUMN {col} TEXT")
+        if not self._has_column(c, "datasets", "kind"):
+            c.execute("ALTER TABLE datasets ADD COLUMN kind TEXT NOT NULL DEFAULT 'managed'")
+        if not self._has_column(c, "datasets", "source_json"):
+            c.execute("ALTER TABLE datasets ADD COLUMN source_json TEXT NOT NULL DEFAULT '{}'")
 
     # -- datasets -------------------------------------------------------------
 
@@ -301,7 +307,17 @@ class MetadataStore:
             description=row["description"],
             created_at=row["created_at"],
             latest_version=latest,
+            kind=row["kind"],
+            source=json.loads(row["source_json"] or "{}"),
         )
+
+    def set_dataset_source(self, name: str, kind: str, source: dict) -> None:
+        """Mark a dataset as managed or federated, with its source config."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE datasets SET kind = ?, source_json = ? WHERE name = ?",
+                (kind, json.dumps(source), name),
+            )
 
     def list_datasets(self) -> list[DatasetInfo]:
         with self._conn() as c:

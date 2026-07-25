@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
+from laurelin.core import federation
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.storage import storage_for
@@ -387,6 +388,10 @@ class DatasetCatalog:
         return self._files_for(self._version_info(name, version))
 
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
+        info = self.store.get_dataset(name)
+        if info is not None and info.is_federated:
+            # No versions to pin: a federated table is read as it is now.
+            return self.federated_table(name)
         return self.storage.read_table(self.version_files(name, version))
 
     @staticmethod
@@ -412,6 +417,11 @@ class DatasetCatalog:
         """Page of rows as JSON-safe dicts, via duckdb (no row/column policy —
         callers that must enforce policy read+filter the table and slice it with
         ``table_to_rows``)."""
+        info = self.store.get_dataset(name)
+        if info is not None and info.is_federated:
+            # Page a federated table at the source rather than dragging it back.
+            table = self.federated_table(name, limit=limit + offset)
+            return self.table_to_rows(table.slice(offset, limit))
         con = duckdb.connect()
         try:
             # Register the Arrow dataset rather than passing file paths, so
@@ -438,6 +448,62 @@ class DatasetCatalog:
         scan these with projection/filter pushdown, streaming batches instead
         of materializing the whole table in memory."""
         return self.storage.dataset(self.version_files(name, version))
+
+    # -- federated datasets -----------------------------------------------------
+
+    def register_federated(
+        self, name: str, source: dict, description: str = ""
+    ) -> DatasetInfo:
+        """Register a table Laurelin governs but does not hold."""
+        _validate_name(name)
+        federation.validate_source(source)
+        federation.columns_of(source)  # fail fast if it isn't reachable
+        self.store.upsert_dataset(name, description)
+        self.store.set_dataset_source(name, "federated", source)
+        info = self.store.get_dataset(name)
+        assert info is not None
+        return info
+
+    def federated_table(
+        self,
+        name: str,
+        sql_policy_for=None,
+        limit: Optional[int] = None,
+    ) -> pa.Table:
+        """Scan a federated dataset, with row/column policy applied remotely.
+
+        The policy is compiled to SQL and wrapped around the scan, so filtering
+        happens at the source rather than after the data arrives. A policy that
+        cannot be compiled is a refusal, never an unfiltered read.
+        """
+        info = self.store.get_dataset(name)
+        if info is None or not info.is_federated:
+            raise KeyError(f"Not a federated dataset: {name!r}")
+
+        con = federation.connect(info.source)
+        try:
+            expr, params, _ = federation.scan_expression(info.source)
+            columns = federation.columns_of(info.source, con)
+            select_list, where, policy_params = "*", "TRUE", []
+            if sql_policy_for is not None:
+                policy = sql_policy_for(name, columns)
+                select_list, where = policy.select_list, policy.where
+                policy_params = policy.params
+            sql = f"SELECT {select_list} FROM {expr} WHERE {where}"
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            result = con.execute(sql, [*params, *policy_params]).arrow()
+            if isinstance(result, pa.RecordBatchReader):
+                result = result.read_all()
+            return result
+        except federation.FederationError:
+            raise
+        except duckdb.Error as exc:
+            raise federation.FederationError(
+                f"Federated scan of {name!r} failed: {exc}"
+            ) from exc
+        finally:
+            con.close()
 
     def scan_for(self, name: str, plan_for=None, version: Optional[int] = None):
         """A scannable object for ``name`` with any row/column policy applied.
@@ -473,6 +539,8 @@ class DatasetCatalog:
         max_rows: int = 1000,
         allowed: Optional[set[str]] = None,
         plan_for=None,
+        sql_policy_for=None,
+        federated_scan_limit: int = 1_000_000,
     ) -> dict:
         """Run a read-only SQL query with each dataset's latest version exposed
         as a view named after the dataset. Returns
@@ -499,9 +567,23 @@ class DatasetCatalog:
         con = duckdb.connect()
         try:
             for ds in self.store.list_datasets():
-                if ds.latest_version is None:
-                    continue
                 if allowed is not None and ds.name not in allowed:
+                    continue
+                if ds.is_federated:
+                    if not federation.workbench_enabled() or sql_policy_for is None:
+                        # Off by default: enabling federation must not silently
+                        # widen what ad-hoc SQL can reach. Unregistered means
+                        # "unknown table", the same as any dataset you can't see.
+                        continue
+                    con.register(
+                        ds.name,
+                        self.federated_table(
+                            ds.name, sql_policy_for=sql_policy_for,
+                            limit=federated_scan_limit,
+                        ),
+                    )
+                    continue
+                if ds.latest_version is None:
                     continue
                 con.register(ds.name, self.scan_for(ds.name, plan_for=plan_for))
             # Lock down all filesystem/network access for the untrusted query.
