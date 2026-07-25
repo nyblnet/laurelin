@@ -151,3 +151,84 @@ def test_masked_column_types_match_exact_path(env):
     set_policy(store, masks=[{"column": "amount", "mode": "redact", "exempt": []}])
     p, e = pushed(catalog, perms, VIEWER), exact(catalog, perms, VIEWER)
     assert p.schema.field("amount").type == e.schema.field("amount").type == pa.string()
+
+
+# -- the SQL renderer ----------------------------------------------------------
+#
+# Federated tables are scanned by a SQL engine, not by Arrow. The same decision
+# drives both renderers, so a policy must mean the same thing either way —
+# these tests are what stops the two from drifting.
+
+def sql_read(catalog, perms, user, con=None) -> pa.Table:
+    """Read through the SQL renderer, over the same Parquet the Arrow path uses."""
+    import duckdb
+
+    columns = [f.name for f in catalog.arrow_dataset("sales").schema]
+    policy = perms.sql_policy_fn(user)("sales", columns)
+    con = con or duckdb.connect()
+    con.register("__scan", catalog.arrow_dataset("sales"))
+    result = con.execute(
+        f"SELECT {policy.select_list} FROM __scan WHERE {policy.where}",
+        policy.params,
+    ).arrow()
+    return result.read_all() if isinstance(result, pa.RecordBatchReader) else result
+
+
+@pytest.mark.parametrize("label, policy", CASES, ids=[c[0] for c in CASES])
+@pytest.mark.parametrize("user", [VIEWER, OTHER], ids=["subject", "non-subject"])
+def test_sql_renderer_matches_exact(env, label, policy, user):
+    catalog, store, perms = env
+    set_policy(store, **policy)
+    assert same(sql_read(catalog, perms, user), exact(catalog, perms, user)), label
+
+
+def test_sql_renderer_handles_hash_masking_natively(env):
+    """The Arrow renderer falls back to materializing for hash masks because
+    Arrow has no sha256. SQL does, so the federated path expresses it inline —
+    and must produce the identical digest."""
+    catalog, store, perms = env
+    set_policy(store, masks=[{"column": "ssn", "mode": "hash", "exempt": []}])
+
+    assert perms.arrow_policy_fn(VIEWER)(
+        "sales", catalog.arrow_dataset("sales").schema
+    ).lazy is False, "Arrow must take the exact path for hashing"
+
+    pushed = sql_read(catalog, perms, VIEWER)
+    assert same(pushed, exact(catalog, perms, VIEWER))
+    assert "sha256" in perms.sql_policy_fn(VIEWER)(
+        "sales", [f.name for f in catalog.arrow_dataset("sales").schema]
+    ).select_list
+
+
+def test_sql_renderer_denies_all_for_anonymous(env):
+    catalog, store, perms = env
+    set_policy(store, row_policy=ROWS("region", ["us"]))
+    policy = perms.sql_policy_fn(None)("sales", ["id", "region"])
+    assert policy.where == "FALSE"
+    assert sql_read(catalog, perms, None).num_rows == 0
+
+
+def test_sql_renderer_is_parameterised(env):
+    """Policy values are bound, never interpolated — a value containing a quote
+    must not be able to alter the predicate."""
+    catalog, store, perms = env
+    set_policy(store, row_policy=ROWS("region", ["us' OR 1=1 --"]))
+    policy = perms.sql_policy_fn(VIEWER)("sales", ["id", "region"])
+    assert "OR 1=1" not in policy.where
+    assert policy.params == ["us' OR 1=1 --"]
+    assert sql_read(catalog, perms, VIEWER).num_rows == 0
+
+
+def test_sql_renderer_quotes_identifiers(env):
+    catalog, store, perms = env
+    set_policy(store, masks=[{"column": "ssn", "mode": "redact", "exempt": []}])
+    policy = perms.sql_policy_fn(VIEWER)("sales", ["id", "ssn"])
+    assert '"ssn"' in policy.select_list and '"id"' in policy.select_list
+
+
+def test_admin_and_no_policy_render_to_passthrough(env):
+    catalog, store, perms = env
+    set_policy(store, row_policy=ROWS("region", ["us"]))
+    admin_policy = perms.sql_policy_fn(ADMIN)("sales", ["id", "region"])
+    assert admin_policy.where == "TRUE" and admin_policy.params == []
+    assert sql_read(catalog, perms, ADMIN).num_rows == 60

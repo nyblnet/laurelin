@@ -27,7 +27,7 @@ data-hiding) is a separate, larger piece of work (see docs/ROADMAP.md, WS8).
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import pyarrow as pa
@@ -59,6 +59,70 @@ class PolicyPlan:
     filter: Any = None
     projection: Optional[dict] = None
     apply: Optional[Callable] = None
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    """What a policy does for one user on one dataset — engine-independent."""
+
+    denies_all: bool = False
+    row_column: Optional[str] = None
+    allowed_values: Optional[list[str]] = None
+    masks: list = field(default_factory=list)  # [(column, MaskMode)]
+
+    @property
+    def applies(self) -> bool:
+        return self.denies_all or self.row_column is not None or bool(self.masks)
+
+
+def _q(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+@dataclass(frozen=True)
+class SqlPolicy:
+    """A decision compiled to SQL: a projection list and a WHERE clause.
+
+    ``select_list`` masks in place, so callers can wrap any scan expression:
+    ``SELECT {select_list} FROM {scan} WHERE {where}``.
+    """
+
+    select_list: str
+    where: str
+    params: list
+
+    @classmethod
+    def render(cls, decision: PolicyDecision, columns: list[str]) -> "SqlPolicy":
+        if decision.denies_all:
+            return cls(select_list="*", where="FALSE", params=[])
+
+        masked = {c: m for c, m in decision.masks}
+        parts = []
+        for col in columns:
+            mode = masked.get(col)
+            if mode is None:
+                parts.append(_q(col))
+            elif mode == MaskMode.null:
+                # NULLIF(col, col) is NULL with the column's own type, so the
+                # masked column keeps its type without needing the schema.
+                parts.append(f"NULLIF({_q(col)}, {_q(col)}) AS {_q(col)}")
+            elif mode == MaskMode.redact:
+                parts.append(f"'***' AS {_q(col)}")
+            else:  # hash — DuckDB's sha256 matches the table path's digest
+                parts.append(
+                    f"CASE WHEN {_q(col)} IS NULL THEN NULL ELSE "
+                    f"substr(sha256(CAST({_q(col)} AS VARCHAR)), 1, 16) END AS {_q(col)}"
+                )
+
+        where, params = "TRUE", []
+        if decision.row_column is not None:
+            placeholders = ", ".join("?" for _ in decision.allowed_values)
+            # NULL is never IN a set, so null policy values are excluded —
+            # the same fail-closed behavior as the Arrow renderer.
+            where = f"CAST({_q(decision.row_column)} AS VARCHAR) IN ({placeholders})"
+            params = list(decision.allowed_values)
+
+        return cls(select_list=", ".join(parts) or "*", where=where, params=params)
 
 
 class PermissionService:
@@ -279,15 +343,32 @@ class PermissionService:
 
         return plan_for
 
-    def _plan(self, policy, dataset: str, schema: "pa.Schema", user: User):
-        groups = self._user_groups(user.username)
-        names = set(schema.names)
+    def decide(self, dataset: str, columns: set[str], user: Optional[User]) -> "PolicyDecision":
+        """Resolve *what* a policy does for this user, independent of how it
+        will be executed.
 
-        filter_expr = None
+        Splitting the decision from its rendering is what keeps enforcement
+        honest across execution engines: there is one place that reads the
+        policy and resolves subjects, and the Arrow and SQL renderers below
+        are pure translations of its output. A new engine adds a renderer, not
+        a second interpretation of the rules.
+        """
+        if user is None:
+            return PolicyDecision(denies_all=True)
+        if user.role == Role.admin:
+            return PolicyDecision()
+        policy = self.dataset_policy(dataset)
+        if policy is None:
+            return PolicyDecision()
+
+        groups = self._user_groups(user.username)
+        row_column: Optional[str] = None
+        allowed_values: Optional[list[str]] = None
+
         if policy.row_policy is not None:
             rp = policy.row_policy
-            if rp.column not in names:
-                return PolicyPlan(lazy=True, filter=pc.scalar(False))  # fail closed
+            if rp.column not in columns:
+                return PolicyDecision(denies_all=True)  # fail closed
             allowed: set[str] = set()
             for rule in rp.rules:
                 if self._subject_matches(
@@ -295,44 +376,82 @@ class PermissionService:
                 ):
                     allowed.update(str(v) for v in rule.values)
             if not allowed:
-                return PolicyPlan(lazy=True, filter=pc.scalar(False))
-            # NULLs are never "in" the set, so they are excluded — matching the
-            # fill_null(False) fail-closed behavior of the table path.
-            field = pc.field(rp.column)
-            if schema.field(rp.column).type != pa.string():
-                # Compare on the string rendering, exactly as the table path
-                # does. This costs row-group pruning, but only for non-string
-                # policy columns (tenant/region keys are normally strings).
-                field = field.cast(pa.string())
-            filter_expr = field.isin(sorted(allowed))
+                return PolicyDecision(denies_all=True)
+            row_column, allowed_values = rp.column, sorted(allowed)
 
-        projection = None
+        masks: list[tuple[str, MaskMode]] = []
         for mask in policy.column_masks:
-            if mask.column not in names:
+            if mask.column not in columns:
                 continue
             if any(
                 self._subject_matches(ex.subject_kind, ex.normalized_subject(), user, groups)
                 for ex in mask.exempt
             ):
                 continue  # exempt: real value
-            if mask.mode == MaskMode.hash:
-                # No Arrow compute equivalent for sha256; stay exact.
+            masks.append((mask.column, mask.mode))
+
+        return PolicyDecision(
+            row_column=row_column, allowed_values=allowed_values, masks=masks
+        )
+
+    def _plan(self, policy, dataset: str, schema: "pa.Schema", user: User):
+        """Render a decision as an Arrow filter + projection (managed data)."""
+        decision = self.decide(dataset, set(schema.names), user)
+        if decision.denies_all:
+            return PolicyPlan(lazy=True, filter=pc.scalar(False))
+        if not decision.applies:
+            return None
+
+        filter_expr = None
+        if decision.row_column is not None:
+            # NULLs are never "in" the set, so they are excluded — matching the
+            # fill_null(False) fail-closed behavior of the table path.
+            field = pc.field(decision.row_column)
+            if schema.field(decision.row_column).type != pa.string():
+                # Compare on the string rendering, exactly as the table path
+                # does. This costs row-group pruning, but only for non-string
+                # policy columns (tenant/region keys are normally strings).
+                field = field.cast(pa.string())
+            filter_expr = field.isin(decision.allowed_values)
+
+        projection = None
+        for column, mode in decision.masks:
+            if mode == MaskMode.hash:
+                # Arrow compute has no sha256, so hashing stays on the exact
+                # table path. (The SQL renderer *can* express it — see
+                # sql_policy_fn.)
                 return PolicyPlan(
                     lazy=False,
                     apply=lambda t: self.apply_table_policy(user, dataset, t),
                 )
             if projection is None:
                 projection = {n: pc.field(n) for n in schema.names}
-            if mask.mode == MaskMode.null:
-                projection[mask.column] = pc.scalar(None).cast(
-                    schema.field(mask.column).type
-                )
-            else:  # redact
-                projection[mask.column] = pc.scalar("***")
+            projection[column] = (
+                pc.scalar(None).cast(schema.field(column).type)
+                if mode == MaskMode.null
+                else pc.scalar("***")
+            )
 
         if filter_expr is None and projection is None:
             return None
         return PolicyPlan(lazy=True, filter=filter_expr, projection=projection)
+
+    # -- SQL rendering (federated data) -------------------------------------------
+
+    def sql_policy_fn(self, user: Optional[User]):
+        """A ``(dataset, columns) -> SqlPolicy`` renderer for engines that speak
+        SQL rather than Arrow — federated tables scanned in place.
+
+        The same decision drives it, so a row policy is the same rule whether
+        it filters a local Parquet scan or a remote Iceberg table.
+        """
+
+        def render(dataset: str, columns: list[str]) -> "SqlPolicy":
+            decision = self.decide(dataset, set(columns), user)
+            return SqlPolicy.render(decision, columns)
+
+        return render
+
 
     def _filter_rows(
         self, table: "pa.Table", rp: RowPolicy, user: User, groups: set[str]
