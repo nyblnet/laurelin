@@ -61,6 +61,39 @@ class DatasetVersionInfo(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class ObjectAppInfo(BaseModel):
+    """A curated view over one object type.
+
+    The ontology explorer is generic: every type, every property, every action.
+    An *app* is the opposite — one type, the columns that matter, the filters
+    that scope it, and only the actions an operator should reach for. Same
+    data and the same permissions; a narrower, nameable surface.
+
+    Configuration, not code: everything here is declarative, so an app is
+    something you define rather than a frontend you build.
+    """
+
+    name: str
+    title: str = ""
+    description: str = ""
+    object_type: str
+    # Empty means "every declared property", in ontology order.
+    columns: list[str] = Field(default_factory=list)
+    # Applied to every listing, so an app can scope itself to the rows that
+    # matter (e.g. {"status": "maintenance"}).
+    filters: dict[str, str] = Field(default_factory=dict)
+    search_placeholder: str = ""
+    # Empty means "every action available on the type"; naming them keeps an
+    # operational app to the handful of operations it is actually about.
+    actions: list[str] = Field(default_factory=list)
+    # Link types to show as panels on the detail view.
+    links: list[str] = Field(default_factory=list)
+
+    created_at: str = Field(default_factory=utcnow_iso)
+    created_by: str = ""
+    updated_at: str = Field(default_factory=utcnow_iso)
+
+
 class ScheduleInfo(BaseModel):
     """A trigger bound to an action — the piece that makes a pipeline run
     without anyone pressing a button."""

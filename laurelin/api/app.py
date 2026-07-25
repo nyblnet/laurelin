@@ -33,6 +33,7 @@ from laurelin.api.auth_routes import (
     users_router,
     workspaces_router,
 )
+from laurelin.api.app_routes import apps_router
 from laurelin.api.routes import router
 from laurelin.api.scim_routes import scim_router
 from laurelin.api.schedule_routes import schedules_router
@@ -306,6 +307,7 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.include_router(scim_router, prefix="/api/v1")
     app.include_router(sources_router, prefix="/api/v1")
     app.include_router(schedules_router, prefix="/api/v1")
+    app.include_router(apps_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

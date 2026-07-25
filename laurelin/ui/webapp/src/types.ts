@@ -96,6 +96,21 @@ export interface QueryResult {
   truncated: boolean;
 }
 
+export interface ObjectApp {
+  name: string;
+  title: string;
+  description: string;
+  object_type: string;
+  columns: string[];
+  filters: Record<string, string>;
+  search_placeholder: string;
+  actions: string[];
+  links: string[];
+  created_at: string;
+  created_by: string;
+  updated_at: string;
+}
+
 export type ChartKind = "table" | "bar" | "line" | "area" | "stat";
 
 export interface DashboardPanel {

@@ -364,6 +364,14 @@ PUT  /api/v1/dashboards/{name}                {title?, description?, panels} -> 
                                   runs each panel through POST /query, so every
                                   viewer sees their own filtered data)
 DELETE /api/v1/dashboards/{name}              -> {deleted}  (editor)
+GET  /api/v1/apps                             -> [ObjectAppInfo]  (viewer; filtered
+                                 to apps whose object type the caller may see)
+GET  /api/v1/apps/{name}                      -> ObjectAppInfo    (viewer; 403 mirrors
+                                 the object type's own permission)
+PUT  /api/v1/apps/{name}                      {object_type, columns?, filters?,
+                                               actions?, links?, title?} (admin;
+                                 validated against the live ontology on save)
+DELETE /api/v1/apps/{name}                    -> {deleted}  (admin)
 GET  /api/v1/schedules                        -> [ScheduleInfo]  (editor)
 GET  /api/v1/schedules/{name}                 -> ScheduleInfo    (editor)
 PUT  /api/v1/schedules/{name}                 {trigger, cron|upstream_dataset,

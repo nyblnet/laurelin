@@ -49,6 +49,9 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Dashboards** — grids of saved queries rendered as charts (zero-dependency
   SVG). Panels execute with the *viewer's* credentials, so row-level security
   and ACLs apply per user.
+- **Apps** — a curated view over one object type: the columns that matter, the
+  filters that scope it, the actions an operator should reach for. Configured,
+  not coded, and it grants no access the ontology doesn't already.
 - **MCP server** — `laurelin mcp` exposes datasets, SQL, the ontology, actions,
   and builds to AI agents over the Model Context Protocol. Agents authenticate
   with an API token and go through the same permission and audit path as any

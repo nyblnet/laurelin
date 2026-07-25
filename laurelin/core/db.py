@@ -30,6 +30,7 @@ from laurelin.core.models import (
     DatasetVersionInfo,
     EditKind,
     LineageEdge,
+    ObjectAppInfo,
     ObjectEdit,
     Role,
     ScheduleInfo,
@@ -62,6 +63,16 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     build_id TEXT,
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
+);
+CREATE TABLE IF NOT EXISTS object_apps (
+    name TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    object_type TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS schedules (
     name TEXT PRIMARY KEY,
@@ -417,6 +428,52 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- object apps ---------------------------------------------------------------
+
+    def upsert_object_app(self, info: "ObjectAppInfo") -> None:
+        config = info.model_dump(
+            mode="json",
+            include={"columns", "filters", "search_placeholder", "actions", "links"},
+        )
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO object_apps
+                     (name, title, description, object_type, config_json,
+                      created_at, created_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     title = excluded.title,
+                     description = excluded.description,
+                     object_type = excluded.object_type,
+                     config_json = excluded.config_json,
+                     updated_at = excluded.updated_at""",
+                (info.name, info.title, info.description, info.object_type,
+                 json.dumps(config), info.created_at, info.created_by,
+                 info.updated_at),
+            )
+
+    def _row_to_object_app(self, row) -> "ObjectAppInfo":
+        config = json.loads(row["config_json"] or "{}")
+        return ObjectAppInfo(
+            name=row["name"], title=row["title"], description=row["description"],
+            object_type=row["object_type"], created_at=row["created_at"],
+            created_by=row["created_by"], updated_at=row["updated_at"], **config,
+        )
+
+    def get_object_app(self, name: str) -> Optional["ObjectAppInfo"]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM object_apps WHERE name = ?", (name,)).fetchone()
+        return self._row_to_object_app(row) if row else None
+
+    def list_object_apps(self) -> list["ObjectAppInfo"]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM object_apps ORDER BY name").fetchall()
+        return [self._row_to_object_app(r) for r in rows]
+
+    def delete_object_app(self, name: str) -> bool:
+        with self._conn() as c:
+            return c.execute("DELETE FROM object_apps WHERE name = ?", (name,)).rowcount > 0
 
     # -- schedules -----------------------------------------------------------------
 
