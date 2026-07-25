@@ -499,8 +499,11 @@ def run_build(
     # Async (default): validate the plan now so a bad target is still a 400,
     # create the pending record, and hand execution to the build pool.
     builder.plan(targets)  # ValueError -> 400 via handler
+    store.reap_expired_builds()  # recover work stranded by a dead replica
     build = store.create_build(list(targets) if targets else [])
-    request.app.state.build_executor.submit(builder.execute, build.id, targets)
+    request.app.state.build_executor.submit(
+        builder.execute, build.id, targets, request.app.state.worker_id
+    )
     return _dump(build)
 
 

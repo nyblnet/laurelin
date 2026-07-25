@@ -89,8 +89,8 @@ def bench_size(n: int, root: Path) -> dict:
     # --- ingest: write a new immutable Parquet version -----------------------
     write_ms, info = timed(lambda: catalog.write("orders", table), repeat=1)
     result["ingest_ms"] = round(write_ms, 1)
-    parquet = ws.root / info.path / "data.parquet"
-    result["parquet_mb"] = round(parquet.stat().st_size / (1024 * 1024), 2)
+    part_bytes = sum((ws.root / k).stat().st_size for k in info.files)
+    result["parquet_mb"] = round(part_bytes / (1024 * 1024), 2)
     result["arrow_mb"] = round(table.nbytes / (1024 * 1024), 2)
 
     policy_for = perms.arrow_policy_fn(ADMIN)
@@ -170,12 +170,17 @@ def bench_incremental(root: Path, n: int, delta_frac: float = 0.01) -> dict:
         return catalog.append("orders", delta)
 
     catalog.write("orders_full", base)  # same starting point for a fair compare
+    previous_keys = set(store.get_version("orders", None).files)
     rewrite_ms, _ = timed(full_rewrite, repeat=1)
     append_ms, info = timed(append_delta, repeat=1)
 
-    def dir_bytes(dataset: str, version: int) -> int:
-        d = ws.data_dir / dataset / f"v{version:04d}"
-        return sum(f.stat().st_size for f in d.glob("*.parquet"))
+    def key_bytes(keys) -> int:
+        return sum((ws.root / k).stat().st_size for k in keys)
+
+    # Bytes actually written by each strategy: the rewrite emits a whole new
+    # part; the append emits only the part that isn't inherited.
+    rewritten = store.get_version("orders_full", None).files
+    appended = [k for k in info.files if k not in previous_keys]
 
     return {
         "rows": n,
@@ -183,8 +188,8 @@ def bench_incremental(root: Path, n: int, delta_frac: float = 0.01) -> dict:
         "full_rewrite_ms": round(rewrite_ms, 1),
         "append_ms": round(append_ms, 1),
         "speedup": round(rewrite_ms / append_ms, 1) if append_ms else None,
-        "full_rewrite_bytes": dir_bytes("orders_full", 2),
-        "append_bytes": dir_bytes("orders", info.version),
+        "full_rewrite_bytes": key_bytes(rewritten),
+        "append_bytes": key_bytes(appended),
         "parts_after_append": len(info.files),
     }
 

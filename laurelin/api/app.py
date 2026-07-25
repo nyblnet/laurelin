@@ -13,6 +13,7 @@ plain Starlette routes with no dependency hooks.
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +65,12 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.state.build_executor = ThreadPoolExecutor(
         max_workers=int(os.environ.get("LAURELIN_BUILD_WORKERS", "2")),
         thread_name_prefix="laurelin-build",
+    )
+    # Identifies this process when claiming a build lease, so that with several
+    # replicas serving a workspace a build still executes exactly once. The
+    # hostname makes an abandoned lease traceable to a pod.
+    app.state.worker_id = os.environ.get(
+        "LAURELIN_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}"
     )
     app.router.on_shutdown.append(
         lambda: app.state.build_executor.shutdown(wait=False)
@@ -159,12 +166,19 @@ def create_app(
     no_auth: bool = False,
     secure_cookies: bool = False,
     lock_pipelines: bool = False,
+    database_url: Optional[str] = None,
 ) -> FastAPI:
     """Single-workspace server (``serve --workspace``). Identity lives in the
-    workspace's metadata.db; unchanged from earlier versions."""
+    workspace's metadata store.
+
+    That store is the workspace's ``metadata.db`` by default. Pass
+    ``database_url`` (or set ``LAURELIN_DATABASE_URL``) to keep it in
+    PostgreSQL instead — required if you want to run more than one replica,
+    since SQLite cannot be shared safely across hosts."""
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
-    store = MetadataStore(workspace.metadata_path)
+    database_url = database_url or os.environ.get("LAURELIN_DATABASE_URL")
+    store = MetadataStore(database_url or workspace.metadata_path)
     catalog = DatasetCatalog(workspace, store)
 
     app = FastAPI(

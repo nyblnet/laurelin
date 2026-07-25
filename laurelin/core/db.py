@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -35,6 +36,11 @@ from laurelin.core.models import (
     User,
     utcnow_iso,
 )
+
+def _iso_in(seconds: int) -> str:
+    """An ISO timestamp `seconds` from now — lease expiry math in one place."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
@@ -84,7 +90,11 @@ CREATE TABLE IF NOT EXISTS builds (
     status TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
-    error TEXT
+    error TEXT,
+    -- Cross-replica coordination: exactly one worker may own a build, and the
+    -- lease expires so a dead replica's build can be reclaimed.
+    claimed_by TEXT,
+    lease_expires_at TEXT
 );
 CREATE TABLE IF NOT EXISTS build_tasks (
     build_id TEXT NOT NULL,
@@ -209,10 +219,13 @@ CREATE INDEX IF NOT EXISTS idx_clearances_user ON clearances (username);
 
 
 class MetadataStore:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, schema: Optional[str] = None):
         # ``path`` is a filesystem path (SQLite, embedded) or a postgres:// URL.
+        # ``schema`` scopes the tables to a Postgres schema, which is how many
+        # workspaces share one HA database instead of one SQLite file each.
         self.path = path
-        self.backend = make_backend(path)
+        self.schema = schema
+        self.backend = make_backend(path, schema=schema)
         self.dialect = self.backend.dialect
         self._ensure_schema()
 
@@ -230,6 +243,7 @@ class MetadataStore:
 
     def _ensure_schema(self) -> None:
         with self._conn() as c:
+            self.backend.ensure_namespace(c)
             c.executescript(self.backend.render_schema(_SCHEMA))
             self._migrate(c)
 
@@ -255,6 +269,9 @@ class MetadataStore:
             )
         if not self._has_column(c, "sources", "cursor_value"):
             c.execute("ALTER TABLE sources ADD COLUMN cursor_value TEXT")
+        for col in ("claimed_by", "lease_expires_at"):
+            if not self._has_column(c, "builds", col):
+                c.execute(f"ALTER TABLE builds ADD COLUMN {col} TEXT")
 
     # -- datasets -------------------------------------------------------------
 
@@ -481,6 +498,80 @@ class MetadataStore:
         with self._conn() as c:
             cur = c.execute("DELETE FROM dashboards WHERE name = ?", (name,))
             return cur.rowcount > 0
+
+    # -- build leases -------------------------------------------------------------
+    #
+    # With several replicas serving one workspace, any of them may accept
+    # "run a build". Exactly one must execute it. A single conditional UPDATE
+    # is the whole mechanism: the row is the lock, and the database decides
+    # the winner. Leases expire so a replica that dies mid-build doesn't strand
+    # its work forever.
+
+    def claim_build(self, build_id: str, worker: str, lease_seconds: int = 120) -> bool:
+        """Try to take ownership of a build. True if this caller won.
+
+        Succeeds when the build is unclaimed, already owned by this worker, or
+        held by a lease that has expired.
+        """
+        now = utcnow_iso()
+        expires = _iso_in(lease_seconds)
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE builds SET claimed_by = ?, lease_expires_at = ?
+                   WHERE id = ?
+                     AND status IN ('pending', 'running')
+                     AND (claimed_by IS NULL
+                          OR claimed_by = ?
+                          OR lease_expires_at IS NULL
+                          OR lease_expires_at < ?)""",
+                (worker, expires, build_id, worker, now),
+            )
+            return cur.rowcount > 0
+
+    def renew_build_lease(self, build_id: str, worker: str, lease_seconds: int = 120) -> bool:
+        """Extend a lease this worker still holds (heartbeat). False means the
+        lease was lost — the worker should stop touching the build."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE builds SET lease_expires_at = ? WHERE id = ? AND claimed_by = ?",
+                (_iso_in(lease_seconds), build_id, worker),
+            )
+            return cur.rowcount > 0
+
+    def release_build(self, build_id: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE builds SET lease_expires_at = NULL WHERE id = ?", (build_id,)
+            )
+
+    def reap_expired_builds(self) -> list[str]:
+        """Fail builds whose owner stopped renewing (a replica died mid-build).
+
+        Returns the ids reaped. Without this, a crashed worker leaves a build
+        stuck in ``running`` forever.
+        """
+        now = utcnow_iso()
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT id FROM builds
+                   WHERE status IN ('pending', 'running')
+                     AND lease_expires_at IS NOT NULL
+                     AND lease_expires_at < ?""",
+                (now,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            for build_id in ids:
+                c.execute(
+                    """UPDATE builds SET status = ?, finished_at = ?, error = ?,
+                       claimed_by = NULL, lease_expires_at = NULL WHERE id = ?""",
+                    (
+                        BuildStatus.failed.value,
+                        now,
+                        "Abandoned: the worker holding this build stopped responding",
+                        build_id,
+                    ),
+                )
+        return ids
 
     # -- builds -----------------------------------------------------------------
 

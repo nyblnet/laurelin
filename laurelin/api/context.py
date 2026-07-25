@@ -16,10 +16,13 @@ These helpers hide the difference so the route handlers stay mode-agnostic.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import HTTPException, Request
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.auth import AuthService
+from laurelin.core.backend import is_postgres_url
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
@@ -76,6 +79,24 @@ def _ensure_authenticated(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
 
+def workspace_schema(slug: str) -> str:
+    """Postgres schema holding one workspace's metadata."""
+    return f"ws_{slug}"
+
+
+def open_workspace_store(root: Path, control: MetadataStore, slug: str) -> MetadataStore:
+    """The metadata store for a workspace.
+
+    On a Postgres control plane, each workspace gets its own *schema* in the
+    same database — so N replicas share one HA store. With a SQLite control
+    plane (embedded mode) the workspace keeps its own file, which is correct
+    for a single process but is why that shape cannot be scaled out.
+    """
+    if is_postgres_url(str(control.path)):
+        return MetadataStore(str(control.path), schema=workspace_schema(slug))
+    return MetadataStore(Workspace(root / slug).metadata_path)
+
+
 def _bundle(request: Request, slug: str) -> tuple[Workspace, MetadataStore, DatasetCatalog]:
     """Load (and cache) the Workspace + store + catalog for a workspace slug."""
     st = request.app.state
@@ -85,7 +106,7 @@ def _bundle(request: Request, slug: str) -> tuple[Workspace, MetadataStore, Data
         if not ws.marker_path.exists():
             # Registered but never initialized on disk (e.g. manual DB edit).
             Workspace.init(ws.root, name=slug)
-        store = MetadataStore(ws.metadata_path)
+        store = open_workspace_store(st.root, st.control, slug)
         cache[slug] = (ws, store, DatasetCatalog(ws, store))
     return cache[slug]
 

@@ -48,51 +48,55 @@ sensitive env (SSO secrets, SCIM token). `helm lint` clean.
 
 ## High availability — what holds, and what to know
 
-> **Correction (supersedes earlier guidance).** A previous version of this
-> page said that more than one replica just needs a ReadWriteMany volume.
-> **That is wrong and unsafe** — see "Run one replica" below. If you are
-> running multiple replicas against a shared volume today, scale to one.
-
 **Stateless API.** The API process holds no per-request state; sessions and API
 tokens live in the database. A replica that can't reach its store fails its
-readiness probe and is pulled from rotation. The *process* is stateless — but
-see below for why that isn't yet enough to run several of them.
+readiness probe and is pulled from rotation.
 
 **Shared control plane.** Global identity + the workspace registry go in
 PostgreSQL (`--control-db` / `LAURELIN_CONTROL_DATABASE_URL`) — a single shared,
 HA-friendly store. Point Laurelin at a managed/HA Postgres and the identity tier
 is HA.
 
-**Run one replica.** Each workspace's metadata lives in a per-workspace SQLite
-file on the data volume ([`context.py`](../laurelin/api/context.py)), opened in
-WAL mode. **SQLite's WAL requires shared memory between the processes using the
-database, which does not work across hosts on a network filesystem** — so on
-NFS/EFS, WAL either fails to engage or, worse, concurrent pods can corrupt the
-database. A ReadWriteMany volume is *necessary but not sufficient*: it makes the
-bytes visible everywhere, and that is exactly what makes concurrent SQLite
-writers dangerous.
+**Per-workspace metadata in PostgreSQL.** On a Postgres control plane, each
+workspace's metadata lives in its own **schema** (`ws_<slug>`) in the same
+database. Every replica reads and writes the same store, and the database
+handles the concurrency. This is what makes multi-replica safe — it replaced a
+per-workspace SQLite file, which could not be shared across hosts (SQLite's WAL
+needs shared memory, so a ReadWriteMany volume made concurrent writers
+*dangerous* rather than safe).
 
-So today: **one replica** (`replicaCount: 1`). Scale vertically; use Postgres
-for the control plane so identity survives a restart; keep the data volume on
-storage you'd trust with a database.
+> Earlier versions of this page and the Helm chart said multi-replica only
+> needed a ReadWriteMany volume. That was wrong. **A Postgres control plane is
+> now required for more than one replica** — with a SQLite control plane
+> (embedded mode), workspaces still use their own files and you must run
+> exactly one replica.
 
-Note what is *not* the problem. Parquet data is immutable and write-once,
-published by atomic rename — it is already safe on shared storage. Only the
-mutable metadata database is not. Two changes lift the limit, both tracked on
-the roadmap:
+**Object storage for data.** Set `LAURELIN_DATA_URI` to `s3://bucket/prefix`
+(or `gs://`, `abfs://`) and dataset Parquet lives there instead of on a volume.
+Versions are manifests of immutable parts written to unique keys, and
+registering the manifest row is the commit — no atomic directory rename is
+required, so the protocol is native to object stores. With this set there is no
+shared filesystem at all: **the data plane is stateless and replicas are
+interchangeable.** Credentials come from the usual environment (instance
+profile, workload identity, `AWS_*`).
 
-1. **Per-workspace metadata in PostgreSQL.** `MetadataStore` already speaks
-   Postgres (it's the same dialect layer the control plane uses); workspaces
-   use SQLite only because the path is currently hardcoded. This is the change
-   that makes N replicas safe.
-2. **Object-storage-backed workspaces**, which remove the shared-volume
-   requirement entirely and give a fully stateless data plane.
+**Builds are leased.** Any replica may accept "run a build"; exactly one
+executes it. A worker claims the build with a single conditional `UPDATE` and
+renews the lease as it goes; if the replica dies, the lease expires and the
+build is reaped rather than sitting in `running` forever.
 
-**Builds are not coordinated across replicas.** Each process runs its own
-worker pool with no shared queue or lease, so two replicas would happily build
-the same target at once — duplicated work and confusing duplicate versions
-(not corruption; version allocation is guarded by an atomic rename). A shared
-build lease is part of the same work as (1).
+### Scaling out
+
+```bash
+helm install laurelin deploy/helm/laurelin \
+  --set replicaCount=3 \
+  --set controlDatabaseUrl='postgresql://laurelin:pw@postgres:5432/laurelin' \
+  --set env.LAURELIN_DATA_URI='s3://my-bucket/laurelin' \
+  --set persistence.enabled=false
+```
+
+With both a Postgres control plane and an object-store data URI, nothing is
+node-local: scale the Deployment freely and let the HPA drive it.
 
 **Behind TLS.** Keep `secureCookies: true` (the default) so session cookies get
 the `Secure` flag; terminate TLS at the ingress. Set `X-Forwarded-Proto: https`
@@ -118,3 +122,6 @@ there is no separate migration step to run.
 | `LAURELIN_SCIM_TOKEN` | Enable SCIM provisioning (IdP bearer token) |
 | `LAURELIN_MAX_UPLOAD_MB` | Upload size cap, also caps HTTP-connector downloads (default 1024) |
 | `LAURELIN_BUILD_WORKERS` | Async build worker threads per replica (default 2) |
+| `LAURELIN_DATA_URI` | Object store for dataset Parquet (`s3://`, `gs://`, `abfs://`). Unset = the workspace directory |
+| `LAURELIN_DATABASE_URL` | Postgres for a *single*-workspace server's metadata (multi-workspace derives it from the control plane) |
+| `LAURELIN_WORKER_ID` | Identifies this replica when claiming build leases (default `<hostname>:<pid>`) |

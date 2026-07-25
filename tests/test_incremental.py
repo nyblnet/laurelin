@@ -40,20 +40,22 @@ def test_append_adds_rows_and_keeps_history(catalog):
 
 
 def test_append_writes_only_the_delta(catalog):
-    """The whole point: the new version's *own* directory holds just the new
-    rows; the bulk of the data is referenced, not copied."""
-    catalog.write("events", rows(0, 50_000))
+    """The whole point: the append writes one small part; the bulk of the data
+    is referenced, not copied."""
+    v1 = catalog.write("events", rows(0, 50_000))
     v2 = catalog.append("events", rows(50_000, 100))
 
-    v1_dir = catalog.workspace.data_dir / "events" / "v0001"
-    v2_dir = catalog.workspace.data_dir / "events" / "v0002"
-    v1_bytes = sum(f.stat().st_size for f in v1_dir.glob("*.parquet"))
-    v2_bytes = sum(f.stat().st_size for f in v2_dir.glob("*.parquet"))
+    def size(key):
+        return (catalog.workspace.root / key).stat().st_size
 
-    assert v2_bytes < v1_bytes / 10, "append must not rewrite the dataset"
-    # The manifest references the previous part plus the new one.
+    base_bytes = sum(size(k) for k in v1.files)
+    new_part = [k for k in v2.files if k not in v1.files]
+    assert len(new_part) == 1, "an append adds exactly one part"
+    assert size(new_part[0]) < base_bytes / 10, "append must not rewrite the dataset"
+
+    # The manifest references the previous version's part plus the new one.
     assert len(v2.files) == 2
-    assert any("v0001" in f for f in v2.files)
+    assert set(v1.files) < set(v2.files)
     assert catalog.read("events").num_rows == 50_100
 
 
@@ -101,21 +103,29 @@ def test_append_rejects_incompatible_schema(catalog):
 
 
 def test_legacy_single_file_versions_still_read(catalog):
-    """Versions written before manifests have an empty file list and are read
-    by globbing their directory — including as an append base."""
+    """Versions written before manifests have an empty file list and a version
+    directory; they are read by listing that directory — including when used
+    as an append base."""
+    import pyarrow.parquet as pq
+
     info = catalog.write("events", rows(0, 10))
-    # Simulate a pre-manifest row.
+    # Reproduce the pre-manifest layout: data/<ds>/v0001/data.parquet, no manifest.
+    legacy_dir = catalog.workspace.data_dir / "events" / "v0001"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(rows(0, 10), legacy_dir / "data.parquet")
     with catalog.store._conn() as c:
         c.execute(
-            "UPDATE dataset_versions SET files_json = '[]' WHERE dataset = ? AND version = ?",
-            ("events", info.version),
+            "UPDATE dataset_versions SET files_json = '[]', path = ? "
+            "WHERE dataset = ? AND version = ?",
+            ("data/events/v0001", "events", info.version),
         )
     assert catalog.store.get_version("events", None).files == []
     assert catalog.read("events").num_rows == 10
 
     v2 = catalog.append("events", rows(10, 5))
     assert v2.row_count == 15
-    assert len(v2.files) == 2
+    # The legacy directory is materialized into the manifest, plus the delta.
+    assert v2.files == ["data/events/v0001/data.parquet"] + [v2.files[-1]]
     assert catalog.read("events").num_rows == 15
 
 

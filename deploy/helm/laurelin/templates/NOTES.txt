@@ -23,13 +23,22 @@ scaling to multiple replicas.
 {{- end }}
 {{- end }}
 {{- if gt (int .Values.replicaCount) 1 }}
+{{- if and (not .Values.controlDatabaseUrl) (not .Values.existingControlDbSecret) }}
 
-WARNING: replicaCount is {{ .Values.replicaCount }}, but Laurelin currently
-supports only ONE replica. Per-workspace metadata is a SQLite database on the
-data volume, opened in WAL mode; SQLite's WAL needs shared memory between the
-processes using it, which does not work across hosts on a network filesystem.
-Multiple replicas sharing a volume risk CORRUPTING that database — a
-ReadWriteMany volume does not make this safe, it is what makes it dangerous.
+WARNING: replicaCount is {{ .Values.replicaCount }} with no PostgreSQL control
+plane. Workspaces then keep metadata in per-workspace SQLite files, which
+CANNOT be shared safely across hosts — a ReadWriteMany volume does not make
+this safe, it is what makes it dangerous.
 
-Set replicaCount=1 and scale vertically. See docs/DEPLOYMENT.md.
+Set controlDatabaseUrl (or existingControlDbSecret), or run replicaCount=1.
+{{- else if not (index .Values.env "LAURELIN_DATA_URI") }}
+
+NOTE: replicaCount is {{ .Values.replicaCount }} with a PostgreSQL control
+plane — metadata is shared safely. Dataset Parquet still lives on the volume,
+so every replica must mount the same ReadWriteMany claim
+(persistence.accessMode is "{{ .Values.persistence.accessMode }}").
+
+To drop the shared volume entirely, set env.LAURELIN_DATA_URI to an object
+store (s3://…, gs://…, abfs://…) and persistence.enabled=false.
+{{- end }}
 {{- end }}

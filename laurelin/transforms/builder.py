@@ -94,9 +94,23 @@ class Builder:
         build = self.store.create_build(list(targets) if targets else [])
         return self.execute(build.id, targets)
 
-    def execute(self, build_id: str, targets: list[str] | None = None) -> BuildInfo:
+    def execute(
+        self,
+        build_id: str,
+        targets: list[str] | None = None,
+        worker: str | None = None,
+    ) -> BuildInfo:
         """Execute an already-created build record (the async path: the API
-        creates the record, returns it, and hands execution to a worker)."""
+        creates the record, returns it, and hands execution to a worker).
+
+        With several replicas serving one workspace, more than one may try to
+        run the same build. ``worker`` identifies this process; execution
+        proceeds only if it wins the lease, so the build runs exactly once.
+        """
+        if worker is not None and not self.store.claim_build(build_id, worker):
+            existing = self.store.get_build(build_id)
+            assert existing is not None
+            return existing  # another replica owns it
         try:
             specs = self.plan(targets)
         except ValueError as exc:
@@ -154,6 +168,10 @@ class Builder:
                 started_at=utcnow_iso(),
             )
             self.store.upsert_build_task(build.id, task)
+            if worker is not None:
+                # Heartbeat between transforms so a long build isn't reaped as
+                # abandoned. A lost lease means another replica took over.
+                self.store.renew_build_lease(build.id, worker)
             try:
                 result = self._execute(spec)
                 version = self.catalog.write(
@@ -199,6 +217,8 @@ class Builder:
         self.store.log_audit(
             "build_finished", {"build_id": build.id, "status": final_status.value}
         )
+        if worker is not None:
+            self.store.release_build(build.id)
         result_build = self.store.get_build(build.id)
         assert result_build is not None
         return result_build
@@ -239,18 +259,17 @@ class Builder:
         try:
             for alias, inp in spec.inputs.items():
                 try:
-                    glob = self.catalog.parquet_glob(inp.dataset)
+                    scan = self.catalog.arrow_dataset(inp.dataset)
                 except KeyError as exc:
                     raise RuntimeError(
                         f"Input {alias}={inp.dataset!r} of transform "
                         f"{spec.name!r} is not available and no transform "
                         f"produces it: {exc.args[0]}"
                     ) from exc
-                # parquet_glob returns a SQL list literal of the version's
-                # parts (a version may be multi-part after an append).
-                con.execute(
-                    f'CREATE VIEW "{alias}" AS SELECT * FROM read_parquet({glob})'
-                )
+                # Register the lazy Arrow dataset rather than file paths: it
+                # keeps scan pushdown, covers multi-part (appended) versions,
+                # and works when the parts live in object storage.
+                con.register(alias, scan)
             result = con.execute(spec.query).arrow()
         finally:
             con.close()

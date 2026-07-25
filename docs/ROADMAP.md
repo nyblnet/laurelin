@@ -98,7 +98,10 @@ Key bets, and why:
 - [ ] **Retention & TTL policies** per dataset (keep N versions / D days), GDPR
       purge that provably rewrites history.
 - [ ] **Media sets**: blob datasets (documents, images) with metadata tables.
-- [ ] Storage backends: local FS, S3, MinIO, GCS, Azure Blob (fsspec).
+- [x] **Storage backends**: local FS or object storage (S3/MinIO, GCS, Azure)
+      via `LAURELIN_DATA_URI`, through a pyarrow filesystem layer. A version
+      commits by inserting its manifest row — no atomic directory rename — so
+      the protocol is native to object stores.
 
 ### WS2 — Connectors & ingestion (Foundry: Data Connection)
 
@@ -315,10 +318,11 @@ Enterprise:
 - ✅ **Packaging**: Docker image + docker-compose AND a **Helm chart** (lint-clean;
       Deployment/Service/Ingress/HPA/PVC/Secret) with a deployment guide.
       **done**; still to do: registry-published images.
-- ◑ **HA**: ✅ stateless API replicas, shared Postgres control plane, liveness +
-      readiness probes, additive/idempotent migrations (safe rolling deploy).
-      **done** for the API/identity tier; still to do: shared/object storage for
-      the per-workspace data plane (so >1 replica doesn't need a RWX volume), and
+- ✅ **HA**: stateless API replicas, shared Postgres control plane, liveness +
+      readiness probes, additive/idempotent migrations (safe rolling deploy),
+      **per-workspace metadata in Postgres schemas** (what made multi-replica
+      safe), **object-storage data plane** (no RWX volume needed), and
+      **build leases** so exactly one replica executes each build. Still to do:
       a leader-elected scheduler once the async scheduler lands.
 - ◑ **Observability**: ✅ health/readiness probes. Still to do: Prometheus
       metrics, OpenTelemetry traces, structured JSON logs, built-in status page (queue depth,
@@ -358,9 +362,10 @@ The "you can put this on a server without embarrassment" release.
   SQL workbench (first new surface) — **done**
 - [ ] WS7: OIDC SSO + group→role mapping
 - [ ] WS8: projects with per-project roles; audit v2 (structured, exportable)
-- [ ] WS9: Postgres metadata backend, Docker image + compose, metrics, migrations
+- [x] WS9: Postgres metadata backend (control plane *and* per-workspace
+      schemas), Docker image + compose, migrations
 - [ ] WS3: scheduler (cron + on-upstream-update) with Postgres queue + workers
-- [ ] WS1: S3/fsspec storage backend
+- [x] WS1: object-storage backend (S3/GCS/Azure via pyarrow filesystems)
 
 ### Phase 2 — Pipeline platform (v0.3, ~3 months)
 Competes with "Foundry for pipelines" + basic BI.

@@ -220,7 +220,10 @@ and how to report a vulnerability.
 Early alpha. The core loop — ingest → transform → build → ontology → act —
 works end to end; expect rough edges and breaking changes.
 
-Laurelin is a **single-node, medium-data platform**: strong on governance and
+Laurelin runs as a single process on a laptop *or* as N stateless replicas
+behind a load balancer — identity, workspace metadata and build coordination in
+PostgreSQL, dataset Parquet in object storage (`LAURELIN_DATA_URI=s3://…`).
+Compute is still DuckDB in-process per replica: strong on governance and
 semantics, deliberately not a distributed compute engine.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
 unflattering ones: the SQL path stays comfortable into the tens of millions of

@@ -75,15 +75,22 @@ def test_write_autocreates_dataset_and_increments_versions(
     assert v2.source == "transform"
 
     assert catalog.store.get_dataset("ds").latest_version == 2
-    assert (workspace.data_dir / "ds" / "v0001" / "data.parquet").exists()
-    assert (workspace.data_dir / "ds" / "v0002" / "data.parquet").exists()
+    # Each version references its own immutable part; parts are never rewritten.
+    parts_v1 = set(catalog.version_files("ds", 1))
+    parts_v2 = set(catalog.version_files("ds", 2))
+    assert parts_v1 and parts_v2 and parts_v1 != parts_v2
+    for key in parts_v1 | parts_v2:
+        assert (workspace.root / key).exists()
 
 
-def test_write_path_is_workspace_relative(catalog: DatasetCatalog, workspace: Workspace):
+def test_version_keys_are_workspace_relative(catalog: DatasetCatalog, workspace: Workspace):
     v = catalog.write("ds", simple_table())
     assert not Path(v.path).is_absolute()
-    assert v.path == str(Path("data") / "ds" / "v0001")
-    assert (workspace.root / v.path / "data.parquet").exists()
+    assert v.files, "a version records the parts it is made of"
+    for key in v.files:
+        assert not Path(key).is_absolute()
+        assert key.startswith("data/ds/")
+        assert (workspace.root / key).exists()
 
 
 def test_write_leaves_no_temp_dirs(catalog: DatasetCatalog, workspace: Workspace):
@@ -146,29 +153,26 @@ def test_read_dataset_with_no_versions(catalog: DatasetCatalog):
         catalog.read("empty")
 
 
-# -- parquet_glob --------------------------------------------------------------
+# -- scanning -------------------------------------------------------------------
 
 
-def test_parquet_glob_absolute(catalog: DatasetCatalog, workspace: Workspace):
+def test_arrow_dataset_is_lazy_and_scannable(catalog: DatasetCatalog):
     catalog.write("ds", simple_table())
-    listing = catalog.parquet_glob("ds")
-    # A SQL list literal of absolute paths, so a multi-part (appended) version
-    # works the same as a single file.
-    assert listing.startswith("[") and listing.endswith("]")
-    assert str(workspace.root) in listing
-    for path in catalog.version_files("ds"):
-        assert Path(path).is_absolute()
+    scan = catalog.arrow_dataset("ds")
+    assert scan.count_rows() == 3
     import duckdb
 
-    n = duckdb.connect().execute(
-        f"SELECT count(*) FROM read_parquet({listing})"
-    ).fetchone()[0]
-    assert n == 3
+    con = duckdb.connect()
+    # Registering the Arrow object means DuckDB needs no filesystem access —
+    # the same path works when parts live in object storage.
+    con.execute("SET enable_external_access=false")
+    con.register("ds", scan)
+    assert con.execute("SELECT count(*) FROM ds").fetchone()[0] == 3
 
 
-def test_parquet_glob_missing(catalog: DatasetCatalog):
+def test_version_files_missing(catalog: DatasetCatalog):
     with pytest.raises(KeyError):
-        catalog.parquet_glob("nope")
+        catalog.version_files("nope")
 
 
 # -- rows -----------------------------------------------------------------------

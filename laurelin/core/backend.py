@@ -123,6 +123,14 @@ class Backend:
     def insert_or_ignore(self, table: str, columns: str, placeholders: str) -> str:
         raise NotImplementedError
 
+    def ensure_namespace(self, conn: Connection) -> None:
+        """Create the namespace this backend's tables live in, if any.
+
+        A no-op for SQLite (one file *is* the namespace); creates the schema
+        for a namespaced Postgres backend.
+        """
+        return None
+
 
 class SQLiteBackend(Backend):
     dialect = "sqlite"
@@ -164,15 +172,38 @@ class PostgresBackend(Backend):
 
     order_col = "seq"
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, schema: Optional[str] = None):
         self.url = url
+        # When set, every connection is scoped to this Postgres schema, so the
+        # identical table definitions can be instantiated once per workspace
+        # inside one database. This is what lets many workspaces share an HA
+        # Postgres instead of each owning a SQLite file on a shared volume.
+        self.schema = schema
+
+    @staticmethod
+    def quote_ident(name: str) -> str:
+        """Quote an identifier. Workspace slugs may contain '-', which is not
+        valid unquoted — and quoting avoids the collisions that sanitizing
+        (mapping '-' to '_') would introduce."""
+        return '"' + name.replace('"', '""') + '"'
 
     def connect(self) -> Connection:
         import psycopg
         from psycopg.rows import dict_row
 
         conn = psycopg.connect(self.url, row_factory=dict_row, autocommit=False)
+        if self.schema:
+            # Setting the path before the schema exists is fine: it only
+            # affects name resolution, and ensure_namespace() creates it on
+            # this same connection before any DDL runs.
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self.quote_ident(self.schema)}, public")
+            conn.commit()
         return Connection(conn, self.dialect)
+
+    def ensure_namespace(self, conn: Connection) -> None:
+        if self.schema:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.quote_ident(self.schema)}")
 
     def render_schema(self, schema: str) -> str:
         return (
@@ -189,7 +220,11 @@ class PostgresBackend(Backend):
         )
 
 
-def make_backend(path_or_url: Path | str) -> Backend:
+def make_backend(path_or_url: Path | str, schema: Optional[str] = None) -> Backend:
     if is_postgres_url(str(path_or_url)):
-        return PostgresBackend(str(path_or_url))
+        return PostgresBackend(str(path_or_url), schema=schema)
+    if schema:
+        raise ValueError(
+            "A schema-scoped store requires a postgresql:// URL; SQLite has no schemas"
+        )
     return SQLiteBackend(path_or_url)

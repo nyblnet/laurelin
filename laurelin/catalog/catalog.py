@@ -1,22 +1,24 @@
 """DatasetCatalog: versioned Parquet dataset storage.
 
-Data layout inside a workspace:
+A version is a **manifest of immutable Parquet parts**, recorded in the
+MetadataStore:
 
-    data/<dataset>/v0001/data.parquet
-    data/<dataset>/v0002/data.parquet
-    ...
+    data/<dataset>/parts/<uuid>.parquet
 
-Versions are immutable. Each write lands in a fresh version directory via an
-atomic-ish temp-dir + rename, and is recorded in the MetadataStore only after
-the files are in place.
+Parts are written to unique keys and never rewritten, so an ``append`` writes
+only its delta and references the previous version's parts. Registering the
+manifest row is the commit point: a crash before it leaves an unreferenced
+part (collectable garbage), never a registered-but-missing version.
+
+Bytes are addressed through ``laurelin.core.storage``, so the data plane can
+be a local directory or an object store. Older workspaces whose versions
+predate manifests are still read by listing their version directory.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import re
-import tempfile
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +31,7 @@ import pyarrow.parquet as pq
 
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.storage import storage_for
 from laurelin.core.models import ColumnSchema, DatasetInfo, DatasetVersionInfo
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -39,6 +42,14 @@ def _validate_name(name: str) -> None:
         raise ValueError(
             f"Invalid dataset name {name!r}: must match ^[a-z][a-z0-9_]*$"
         )
+
+
+def _is_duplicate_version(exc: BaseException) -> bool:
+    """True if this error is a (dataset, version) primary-key collision — i.e.
+    another writer claimed the version number first. Matched on message text
+    because sqlite3 and psycopg raise different exception types."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "unique" in text or "duplicate key" in text
 
 
 def _json_safe(value: Any) -> Any:
@@ -63,9 +74,12 @@ def _json_safe(value: Any) -> Any:
 class DatasetCatalog:
     """Versioned Parquet storage for one workspace."""
 
-    def __init__(self, workspace: Workspace, store: MetadataStore):
+    def __init__(self, workspace: Workspace, store: MetadataStore, storage=None):
         self.workspace = workspace
         self.store = store
+        # All dataset bytes go through here, so the data plane can be a local
+        # directory or an object store without the catalog knowing which.
+        self.storage = storage or storage_for(workspace)
 
     # -- datasets -------------------------------------------------------------
 
@@ -78,7 +92,7 @@ class DatasetCatalog:
     def _commit_version(
         self,
         name: str,
-        tmp_dir: Path,
+        new_parts: list[str],
         *,
         row_count: int,
         schema: pa.Schema,
@@ -86,47 +100,40 @@ class DatasetCatalog:
         build_id: Optional[str],
         inherited: Optional[list[str]] = None,
     ) -> DatasetVersionInfo:
-        """Rename a fully-written temp dir to its final version directory and
-        record the version. The rename is the allocation mutex: os.rename onto
-        an existing non-empty directory fails, so concurrent writers that
-        picked the same version collide here and the loser retries with the
-        next one."""
-        dataset_dir = self.workspace.data_dir / name
-        dataset_dir.mkdir(parents=True, exist_ok=True)
+        """Register already-written parts as a new version.
+
+        The parts are at unique keys, so writers never collide in storage; the
+        only thing needing arbitration is the version *number*, and the
+        metadata database does that via the (dataset, version) primary key. A
+        writer that loses the race simply retries with the next number — its
+        bytes are already safely written and don't move.
+
+        This replaces the old atomic directory rename, which had no equivalent
+        on object storage. The invariant it protected — never register a
+        version whose files aren't fully written — still holds, because the
+        row is inserted last.
+        """
+        files = list(inherited or []) + list(new_parts)
+        columns = [ColumnSchema(name=f.name, type=str(f.type)) for f in schema]
         version = self.store.next_version(name)
         while True:
-            final_dir = dataset_dir / f"v{version:04d}"
-            if not final_dir.exists():
-                try:
-                    os.rename(tmp_dir, final_dir)
-                    break
-                except OSError:
-                    pass  # lost the race for this version; try the next
-            version += 1
-
-        rel_dir = final_dir.relative_to(self.workspace.root)
-        new_parts = sorted(
-            str(rel_dir / f.name) for f in final_dir.iterdir() if f.suffix == ".parquet"
-        )
-        info = DatasetVersionInfo(
-            dataset=name,
-            version=version,
-            row_count=row_count,
-            schema=[ColumnSchema(name=f.name, type=str(f.type)) for f in schema],
-            path=str(rel_dir),
-            files=list(inherited or []) + new_parts,
-            build_id=build_id,
-            source=source,
-        )
-        self.store.add_version(info)
-        return info
-
-    @staticmethod
-    def _cleanup_tmp(tmp_dir: Path) -> None:
-        for f in tmp_dir.glob("*") if tmp_dir.exists() else []:
-            f.unlink()
-        if tmp_dir.exists():
-            tmp_dir.rmdir()
+            info = DatasetVersionInfo(
+                dataset=name,
+                version=version,
+                row_count=row_count,
+                schema=columns,
+                path=f"data/{name}",
+                files=files,
+                build_id=build_id,
+                source=source,
+            )
+            try:
+                self.store.add_version(info)
+                return info
+            except Exception as exc:  # noqa: BLE001 - dialect-specific integrity errors
+                if not _is_duplicate_version(exc):
+                    raise
+                version += 1  # another writer took this number; take the next
 
     def write(
         self,
@@ -145,16 +152,14 @@ class DatasetCatalog:
         _validate_name(name)
         self.store.upsert_dataset(name, description)
 
-        tmp_dir = Path(
-            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
-        )
+        key = self.storage.new_part_key(name)
         try:
-            pq.write_table(table, tmp_dir / "data.parquet")
+            self.storage.write_table(table, key)
         except Exception:
-            self._cleanup_tmp(tmp_dir)
+            self.storage.delete(key)
             raise
         return self._commit_version(
-            name, tmp_dir,
+            name, [key],
             row_count=table.num_rows, schema=table.schema,
             source=source, build_id=build_id,
         )
@@ -174,9 +179,7 @@ class DatasetCatalog:
         _validate_name(name)
         self.store.upsert_dataset(name, description)
 
-        tmp_dir = Path(
-            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
-        )
+        key = self.storage.new_part_key(name)
         writer: Optional[pq.ParquetWriter] = None
         schema: Optional[pa.Schema] = None
         row_count = 0
@@ -190,7 +193,7 @@ class DatasetCatalog:
                         pa.field(f.name, pa.string() if pa.types.is_null(f.type) else f.type)
                         for f in chunk.schema
                     ])
-                    writer = pq.ParquetWriter(tmp_dir / "data.parquet", schema)
+                    writer = self.storage.writer(key, schema)
                 writer.write_table(chunk.cast(schema))
                 row_count += chunk.num_rows
             if writer is None:
@@ -200,11 +203,11 @@ class DatasetCatalog:
         except Exception:
             if writer is not None:
                 writer.close()
-            self._cleanup_tmp(tmp_dir)
+            self.storage.delete(key)
             raise
         assert schema is not None
         return self._commit_version(
-            name, tmp_dir,
+            name, [key],
             row_count=row_count, schema=schema,
             source=source, build_id=build_id,
         )
@@ -248,16 +251,14 @@ class DatasetCatalog:
                 f"{previous.version}, or use a full write."
             ) from exc
 
-        tmp_dir = Path(
-            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
-        )
+        key = self.storage.new_part_key(name)
         try:
-            pq.write_table(table, tmp_dir / "part.parquet")
+            self.storage.write_table(table, key)
         except Exception:
-            self._cleanup_tmp(tmp_dir)
+            self.storage.delete(key)
             raise
         return self._commit_version(
-            name, tmp_dir,
+            name, [key],
             row_count=previous.row_count + table.num_rows,
             schema=schema,
             source=source,
@@ -291,9 +292,7 @@ class DatasetCatalog:
         schema = pa.schema(
             [pa.field(c.name, pa.type_for_alias(c.type)) for c in previous.schema_]
         )
-        tmp_dir = Path(
-            tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=self.workspace.data_dir)
-        )
+        key = self.storage.new_part_key(name)
         writer: Optional[pq.ParquetWriter] = None
         added = 0
         try:
@@ -307,7 +306,7 @@ class DatasetCatalog:
                         f"Cannot append to {name!r}: incompatible schema ({exc})."
                     ) from exc
                 if writer is None:
-                    writer = pq.ParquetWriter(tmp_dir / "part.parquet", schema)
+                    writer = self.storage.writer(key, schema)
                 writer.write_table(chunk)
                 added += chunk.num_rows
             if writer is not None:
@@ -316,16 +315,16 @@ class DatasetCatalog:
         except Exception:
             if writer is not None:
                 writer.close()
-            self._cleanup_tmp(tmp_dir)
+            self.storage.delete(key)
             raise
 
         if added == 0:
             # Nothing new upstream: don't mint an identical version.
-            self._cleanup_tmp(tmp_dir)
+            self.storage.delete(key)
             return previous
 
         return self._commit_version(
-            name, tmp_dir,
+            name, [key],
             row_count=previous.row_count + added,
             schema=schema,
             source=source,
@@ -335,13 +334,10 @@ class DatasetCatalog:
 
     def _inherited_files(self, info: DatasetVersionInfo) -> list[str]:
         """The manifest to carry forward from ``info`` — materializing the
-        pre-manifest layout (a bare version directory) into explicit paths."""
+        pre-manifest layout (a bare version directory) into explicit keys."""
         if info.files:
             return list(info.files)
-        root = self.workspace.root
-        return sorted(
-            str(p.relative_to(root)) for p in (root / info.path).glob("*.parquet")
-        )
+        return [k for k in self.storage.list_keys(info.path) if k.endswith(".parquet")]
 
     def compact(self, name: str, description: str = "") -> DatasetVersionInfo:
         """Rewrite the latest version's parts into a single file.
@@ -375,33 +371,23 @@ class DatasetCatalog:
         return info
 
     def _files_for(self, info: DatasetVersionInfo) -> list[str]:
-        """Absolute paths of the Parquet parts making up a version.
+        """Storage keys of the Parquet parts making up a version.
 
-        A version written by ``append`` lists parts that live in *earlier*
-        version directories — version dirs are immutable and never deleted, so
-        those references stay valid. An empty manifest means the pre-manifest
-        layout: everything under the version directory.
+        A version written by ``append`` references parts written for *earlier*
+        versions; parts are immutable and never rewritten, so those references
+        stay valid. An empty manifest means the pre-manifest layout: everything
+        under the version's directory.
         """
-        root = self.workspace.root
         if info.files:
-            return [str((root / f).resolve()) for f in info.files]
-        return sorted(str(p.resolve()) for p in (root / info.path).glob("*.parquet"))
+            return list(info.files)
+        return [k for k in self.storage.list_keys(info.path) if k.endswith(".parquet")]
 
     def version_files(self, name: str, version: Optional[int] = None) -> list[str]:
+        """Storage keys for a version's parts."""
         return self._files_for(self._version_info(name, version))
 
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
-        return pq.read_table(self.version_files(name, version))
-
-    def parquet_glob(self, name: str, version: Optional[int] = None) -> str:
-        """A DuckDB ``read_parquet`` argument covering the version's parts.
-
-        Returns a SQL list literal, so it handles a multi-part (appended)
-        version as well as a single file. Embed it directly:
-        ``SELECT * FROM read_parquet(<this>)``.
-        """
-        files = self.version_files(name, version)
-        return "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in files) + "]"
+        return self.storage.read_table(self.version_files(name, version))
 
     @staticmethod
     def table_to_rows(table: pa.Table) -> list[dict]:
@@ -426,12 +412,16 @@ class DatasetCatalog:
         """Page of rows as JSON-safe dicts, via duckdb (no row/column policy —
         callers that must enforce policy read+filter the table and slice it with
         ``table_to_rows``)."""
-        files = self.version_files(name, version)
         con = duckdb.connect()
         try:
+            # Register the Arrow dataset rather than passing file paths, so
+            # DuckDB needs no filesystem access — the same code path works when
+            # the parts live in object storage.
+            con.execute("SET enable_external_access=false")
+            con.register("__ds", self.arrow_dataset(name, version))
             cur = con.execute(
-                "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?",
-                [files, limit, offset],
+                "SELECT * FROM __ds LIMIT ? OFFSET ?",
+                [limit, offset],
             )
             columns = [d[0] for d in cur.description]
             data = cur.fetchall()
@@ -447,7 +437,7 @@ class DatasetCatalog:
         """The version's parquet files as a *lazy* pyarrow dataset. DuckDB can
         scan these with projection/filter pushdown, streaming batches instead
         of materializing the whole table in memory."""
-        return pads.dataset(self.version_files(name, version), format="parquet")
+        return self.storage.dataset(self.version_files(name, version))
 
     def scan_for(self, name: str, plan_for=None, version: Optional[int] = None):
         """A scannable object for ``name`` with any row/column policy applied.

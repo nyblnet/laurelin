@@ -106,6 +106,25 @@ class ControlStore(MetadataStore):
         with self._conn() as c:
             c.execute("DELETE FROM workspace_members WHERE slug = ?", (slug,))
             c.execute("DELETE FROM workspaces WHERE slug = ?", (slug,))
+        self.drop_workspace_schema(slug)
+
+    def drop_workspace_schema(self, slug: str) -> None:
+        """Remove a workspace's Postgres schema, if it has one.
+
+        On a Postgres control plane each workspace's metadata lives in its own
+        schema; deregistering the workspace without dropping it would leak the
+        tables (and silently resurrect stale metadata if the slug is reused).
+        No-op on SQLite, where the workspace owns a file the caller deletes.
+        """
+        if self.dialect != "postgres":
+            return
+        from laurelin.core.backend import PostgresBackend
+
+        with self._conn() as c:
+            c.execute(
+                f"DROP SCHEMA IF EXISTS "
+                f"{PostgresBackend.quote_ident(f'ws_{slug}')} CASCADE"
+            )
 
     # -- membership -----------------------------------------------------------
 
