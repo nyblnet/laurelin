@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import laurelin
@@ -40,7 +41,7 @@ from laurelin.catalog import DatasetCatalog
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
-from laurelin.core import scheduler
+from laurelin.core import logging as laurelin_logging, metrics, scheduler
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 
@@ -155,6 +156,47 @@ def _finalize(app: FastAPI) -> FastAPI:
         return st.control if st.mode == "multi" else st.store
 
     @app.middleware("http")
+    async def observe(request: Request, call_next):
+        """Assign a request id, time the request, and count it by route.
+
+        The *route template* is the label — never the concrete path — so
+        cardinality stays bounded by the route table rather than by however
+        many datasets exist.
+        """
+        rid = request.headers.get("X-Request-ID") or laurelin_logging.new_request_id()
+        token = laurelin_logging.request_id.set(rid)
+        ws_token = laurelin_logging.workspace_slug.set(
+            request.headers.get("X-Laurelin-Workspace")
+        )
+        started = time.perf_counter()
+        status = "500"
+        try:
+            response = await call_next(request)
+            status = str(response.status_code)
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            # The route template ("/datasets/{name}/rows"), not the concrete
+            # path. FastAPI reports it without the router's /api/v1 prefix,
+            # which is constant across the API and so loses nothing.
+            # "unmatched" covers 404s, which have no route at all.
+            route = request.scope.get("route")
+            template = (
+                getattr(route, "path_format", None)
+                or getattr(route, "path", None)
+                or "unmatched"
+            )
+            elapsed = time.perf_counter() - started
+            metrics.http_requests.labels(
+                method=request.method, route=template, status=status
+            ).inc()
+            metrics.http_duration.labels(
+                method=request.method, route=template
+            ).observe(elapsed)
+            laurelin_logging.request_id.reset(token)
+            laurelin_logging.workspace_slug.reset(ws_token)
+
+    @app.middleware("http")
     async def guard_api_docs(request: Request, call_next):
         """The API docs list the whole route surface, so they are gated behind
         the same credentials as /api/ routes. OPTIONS is exempt so CORS
@@ -223,6 +265,28 @@ def _finalize(app: FastAPI) -> FastAPI:
     def health() -> dict:
         """Liveness: the process is up."""
         return {"status": "ok", "version": laurelin.__version__}
+
+    @app.get("/metrics")
+    def prometheus_metrics(request: Request):
+        """Prometheus exposition.
+
+        Credentialed by default: metric *names* are harmless, but counts leak
+        activity patterns, so scraping without auth is opt-in
+        (``LAURELIN_METRICS_PUBLIC=1``) and meant for a port users can't reach.
+        """
+        if not metrics.enabled():
+            detail = (
+                "Metrics need the optional extra: pip install 'laurelin[metrics]'"
+                if not metrics.available()
+                else "Metrics are disabled (LAURELIN_METRICS=0)"
+            )
+            return JSONResponse(status_code=501, content={"detail": detail})
+        if not metrics.public() and not app.state.no_auth:
+            if resolve_credential(request) is None:
+                return JSONResponse(
+                    status_code=401, content={"detail": "Not authenticated"}
+                )
+        return Response(content=metrics.render(), media_type=metrics.content_type())
 
     @app.get("/health/ready")
     def ready():

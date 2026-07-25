@@ -25,6 +25,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from laurelin.core import metrics
 from laurelin.core.models import ScheduleInfo, utcnow_iso
 
 log = logging.getLogger("laurelin.scheduler")
@@ -117,6 +118,7 @@ class Scheduler:
 
     def tick(self) -> list[str]:
         """Fire everything currently due. Returns the names fired."""
+        metrics.scheduler_ticks.inc()
         fired: list[str] = []
         for label, store, run_action in self.open_stores():
             try:
@@ -171,6 +173,9 @@ class Scheduler:
                 schedule.name, "succeeded", next_run_at=next_at,
                 build_id=build_id, watermark=watermark,
             )
+            metrics.schedule_fires.labels(
+                trigger=schedule.trigger, status="succeeded"
+            ).inc()
             store.log_audit(
                 "schedule_fired",
                 {"schedule": schedule.name, "action": schedule.action,
@@ -182,6 +187,9 @@ class Scheduler:
                 schedule.name, "failed", next_run_at=next_at,
                 error=f"{type(exc).__name__}: {exc}"[:500], watermark=watermark,
             )
+            metrics.schedule_fires.labels(
+                trigger=schedule.trigger, status="failed"
+            ).inc()
             store.log_audit(
                 "schedule_failed",
                 {"schedule": schedule.name, "error": str(exc)[:300]},

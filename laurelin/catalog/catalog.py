@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import re
+import time as _time
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -29,7 +30,7 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
-from laurelin.core import federation, limits
+from laurelin.core import federation, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.storage import storage_for
@@ -616,6 +617,8 @@ class DatasetCatalog:
             # Resource budget + admission control: user SQL is arbitrary, so
             # this is where one expensive query is stopped from degrading the
             # replica for everyone else on it.
+            metrics.queries.labels(surface="workbench").inc()
+            _started = _time.perf_counter()
             with limits.limited(con, limits.QueryLimits.interactive()):
                 cur = con.execute(sql)
                 columns = [d[0] for d in cur.description] if cur.description else []
@@ -624,6 +627,9 @@ class DatasetCatalog:
                 data = data[:max_rows]
         finally:
             con.close()
+        metrics.query_duration.labels(surface="workbench").observe(
+            _time.perf_counter() - _started
+        )
         rows = [
             {col: _json_safe(val) for col, val in zip(columns, row)} for row in data
         ]

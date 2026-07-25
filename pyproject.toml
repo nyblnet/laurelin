@@ -45,6 +45,9 @@ mcp = ["mcp>=1.0"]
 engines = ["adbc-driver-manager>=1.0", "adbc-driver-flightsql>=1.0"]
 # Cron scheduling (on-upstream triggers need no extra dependency).
 scheduler = ["croniter>=2.0"]
+# Prometheus /metrics. Without it the endpoint 501s and every metric
+# is a no-op, so instrumentation costs nothing when unused.
+metrics = ["prometheus-client>=0.20"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

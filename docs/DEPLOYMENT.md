@@ -102,6 +102,28 @@ node-local: scale the Deployment freely and let the HPA drive it.
 the `Secure` flag; terminate TLS at the ingress. Set `X-Forwarded-Proto: https`
 (most ingresses do) so cookie security and redirect URLs are correct.
 
+**Observability.** `pip install 'laurelin[metrics]'` and scrape `/metrics`.
+Beyond HTTP rate and latency, the metrics worth alerting on are the ones
+covering work that happens without a user watching:
+
+| Metric | Why it matters |
+|---|---|
+| `laurelin_query_rejections_total{reason}` | `timeout` / `memory` / `admission` — three different remedies |
+| `laurelin_schedule_fires_total{status}` | A pipeline that silently stopped running |
+| `laurelin_builds_total{status}` | Build failure rate |
+| `laurelin_build_claims_total{outcome}` | Steady `lost` claims mean replicas are contending |
+| `laurelin_builds_reaped_total` | A replica died mid-build |
+| `laurelin_source_syncs_total{status}` | Ingestion broke upstream |
+| `laurelin_queries_in_flight` | Approaching the admission limit |
+
+Scraping requires credentials by default; set `LAURELIN_METRICS_PUBLIC=1` only
+on a port users can't reach. Labels are deliberately low-cardinality — route
+templates and statuses, never dataset names, workspace slugs or usernames.
+
+Set `LAURELIN_LOG_FORMAT=json` for structured logs. Every response carries an
+`X-Request-ID` (echoing the caller's if supplied), and it appears on every log
+line for that request, so a trace can be followed across replicas.
+
 **Backups.** Back up the Postgres control DB (`pg_dump`) and the workspace data
 volume together. A point-in-time restore needs both from the same moment.
 
@@ -133,5 +155,9 @@ there is no separate migration step to run.
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |
 | `LAURELIN_AUDIT_MAX_EVENTS` | Trim the audit log to N most recent events after each build (default `0` = unlimited) |
 | `LAURELIN_SCHEDULER=0` | Stop this replica running the scheduler (default on; leases make firing exactly-once, so every replica can) |
+| `LAURELIN_METRICS=0` | Disable `/metrics` (default on when `laurelin[metrics]` is installed) |
+| `LAURELIN_METRICS_PUBLIC=1` | Allow unauthenticated scraping — only when the port isn't reachable by users |
+| `LAURELIN_LOG_FORMAT=json` | One JSON object per log line, with request id / workspace / actor |
+| `LAURELIN_LOG_LEVEL` | Log level when JSON logging is on (default `INFO`) |
 | `LAURELIN_SCHEDULER_POLL` | Seconds between scheduler polls (default `15`) |
 | `LAURELIN_ENGINE_TIMEOUT` / `_MAX_ROWS` | Delegated-engine query timeout (default `300`s) and result-size cap (default `5000000`) |

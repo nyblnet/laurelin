@@ -40,6 +40,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core import metrics
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import DatasetVersionInfo, SourceInfo
 
@@ -311,6 +312,7 @@ def sync_source(
         writer = catalog.append_batches if mode == "append" else catalog.write_batches
         info = writer(source.dataset, chunks, source=f"sync:{source.type}")
     except Exception as exc:
+        metrics.syncs.labels(type=source.type, status="failed").inc()
         store.record_source_sync(
             source.name, "failed", error=f"{type(exc).__name__}: {exc}"
         )
@@ -320,6 +322,8 @@ def sync_source(
             actor=actor,
         )
         raise
+    metrics.syncs.labels(type=source.type, status="succeeded").inc()
+    metrics.sync_rows.inc(info.row_count)
     store.record_source_sync(
         source.name, "succeeded", version=info.version, rows=info.row_count,
         cursor_value=new_cursor,

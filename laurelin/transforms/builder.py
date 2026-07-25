@@ -8,12 +8,13 @@ build failed but only blocks tasks that (transitively) depend on its output.
 from __future__ import annotations
 
 import os
+import time
 
 import duckdb
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
-from laurelin.core import engines, limits
+from laurelin.core import engines, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -115,9 +116,13 @@ class Builder:
         proceeds only if it wins the lease, so the build runs exactly once.
         """
         if worker is not None and not self.store.claim_build(build_id, worker):
+            metrics.build_claims.labels(outcome="lost").inc()
             existing = self.store.get_build(build_id)
             assert existing is not None
             return existing  # another replica owns it
+        if worker is not None:
+            metrics.build_claims.labels(outcome="won").inc()
+        started_at = time.perf_counter()
         try:
             specs = self.plan(targets)
         except ValueError as exc:
@@ -231,6 +236,8 @@ class Builder:
         self.store.recompute_all_markings()
 
         final_status = BuildStatus.failed if any_failed else BuildStatus.succeeded
+        metrics.builds.labels(status=final_status.value).inc()
+        metrics.build_duration.observe(time.perf_counter() - started_at)
         self.store.update_build(
             build.id,
             status=final_status,
@@ -286,6 +293,10 @@ class Builder:
         )
         try:
             table = client.query(spec.query)
+            metrics.engine_queries.labels(status="succeeded").inc()
+        except Exception:
+            metrics.engine_queries.labels(status="failed").inc()
+            raise
         finally:
             client.close()
         if isinstance(table, pa.RecordBatchReader):

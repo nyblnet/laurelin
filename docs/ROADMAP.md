@@ -335,9 +335,11 @@ Enterprise:
       safe), **object-storage data plane** (no RWX volume needed), and
       **build leases** so exactly one replica executes each build. Still to do:
       a leader-elected scheduler once the async scheduler lands.
-- ◑ **Observability**: ✅ health/readiness probes. Still to do: Prometheus
-      metrics, OpenTelemetry traces, structured JSON logs, built-in status page (queue depth,
-      build latency, index lag).
+- ◑ **Observability**: ✅ health/readiness probes, Prometheus `/metrics`
+      (HTTP, queries, rejections by reason, builds, lease claims, scheduler
+      fires, syncs — low-cardinality labels only), structured JSON logs, and
+      request-id propagation. Still to do: OpenTelemetry traces and a built-in
+      status page.
 - [ ] **Backups & DR**: `laurelin backup` (metadata dump + data manifest),
       point-in-time restore docs, disaster-recovery runbook.
 - [ ] **Performance targets** (gate for "enterprise-grade" claim): 10k datasets,

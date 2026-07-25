@@ -28,6 +28,8 @@ from typing import Iterator, Optional
 
 import duckdb
 
+from laurelin.core import metrics
+
 
 class QueryTimeout(RuntimeError):
     """A query exceeded its wall-clock budget."""
@@ -135,13 +137,16 @@ def admit(limits: QueryLimits, wait_s: float = 2.0) -> Iterator[None]:
         yield
         return
     if not gate.acquire(timeout=wait_s):
+        metrics.query_rejections.labels(reason="admission").inc()
         raise QueryRejected(
             f"{limits.max_concurrent} queries are already running on this "
             "replica. Retry shortly."
         )
     try:
+        metrics.queries_in_flight.inc()
         yield
     finally:
+        metrics.queries_in_flight.dec()
         gate.release()
 
 
@@ -167,12 +172,14 @@ def guard(con: duckdb.DuckDBPyConnection, limits: QueryLimits) -> Iterator[None]
         yield
     except duckdb.InterruptException as exc:
         if timed_out.is_set():
+            metrics.query_rejections.labels(reason="timeout").inc()
             raise QueryTimeout(
                 f"Query exceeded the {limits.timeout_s:g}s limit. Narrow it with "
                 "a filter, an aggregate, or a smaller LIMIT."
             ) from exc
         raise
     except duckdb.OutOfMemoryException as exc:
+        metrics.query_rejections.labels(reason="memory").inc()
         raise QueryTooLarge(
             f"Query needed more than the {limits.memory_limit} memory budget. "
             "Narrow it with a filter, an aggregate, or a smaller LIMIT."
