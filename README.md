@@ -237,8 +237,10 @@ stores the reduced result with lineage and policy intact.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
 unflattering ones: the SQL path stays comfortable into the tens of millions of
 rows, appends cost the delta rather than the dataset, and ontology queries run
-in DuckDB (~26× faster than they were) but are still scans rather than an
-index. Reproduce them with `python bench/benchmark.py`.
+in DuckDB (~26× faster than they were). An object type can also be *indexed*,
+which makes key lookups constant-time (1.4 ms at a million objects) — but not
+substring search, which still scans. Reproduce them with
+`python bench/benchmark.py`.
 
 ## License
 
