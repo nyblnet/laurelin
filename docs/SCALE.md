@@ -200,18 +200,46 @@ Point lookups get an extra win: a predicate on the primary key is pushed
 *inside* the de-duplication window, so navigating to an object prunes row
 groups instead of scanning — 279 ms at 5 M objects, against 36 s before.
 
-Two honest caveats:
+Row-level security rides along: a row policy is pushed into the same scan, so
+a policied viewer gets a page over 1 M objects in ~195 ms. Only hash masking
+still forces the exact in-memory path.
 
-1. **It's still a scan, not an index.** Browsing and search remain linear in
-   dataset size; the constant is just ~26× smaller. A real object index
-   (sorted keys, zone maps) would make these sub-linear and is still on the
-   roadmap.
-2. **Row-level security rides along.** A row policy is pushed into the same
-   scan, so a policied viewer gets a page over 1 M objects in ~195 ms. Only
-   hash masking still forces the exact in-memory path.
+#### And an actual index, for types that earn one
 
-Sizing guidance now: **≤ 1 M objects per type is comfortable**, 5 M is usable
-for lookups and tolerable for browsing. Modeling *entities* in the ontology
+The scan above is fast but still linear. An object type can be *indexed* —
+materialized into the metadata store, one row per object — after which queries
+stop touching Parquet at all. It is opt-in per type (`POST
+/ontology/object-types/{name}/index`), because it costs storage and a refresh:
+
+| Objects | Browse a page (25) | Get by primary key | Search | Build the index |
+|---:|---:|---:|---:|---:|
+| 100 K | 4 ms *(scan: 53)* | 1.4 ms *(scan: 25)* | 26 ms *(scan: 53)* | 0.9 s |
+| 1 M | 27 ms *(scan: 293)* | 1.4 ms *(scan: 99)* | 132 ms *(scan: 323)* | 10 s |
+
+Key lookup becomes **constant time** — 1.4 ms whether the type holds 100 K
+objects or a million — because the primary key is a real indexed column.
+
+What the index deliberately does *not* accelerate:
+
+- **Filters on any other property.** Properties are stored as one JSON blob,
+  and extracting one per row measured *slower* than the DuckDB scan the index
+  was meant to beat. Those queries are handed straight back to the scan, which
+  prunes row groups instead. The index answers paging, search and key lookups.
+- **Substring search** is still a table scan, just a cheaper one (2.5×) —
+  `LIKE '%…%'` cannot use a b-tree. Full-text search is the next step here.
+- **Anything a row policy touches.** The index is shared across users, so a
+  request carrying row-level security never reads it. This is the safety
+  property, not an omission.
+
+**A stale index is never used.** Freshness is checked on every query against
+two things — the backing dataset's version and the number of edits in the
+overlay. If either moved, the index is bypassed and the scan answers. Builds
+refresh the indexes of types they affect; a refresh that fails drops the index
+rather than leaving a confident wrong answer in place.
+
+Sizing guidance now: **≤ 1 M objects per type is comfortable** on the scan
+alone, 5 M is usable for lookups and tolerable for browsing, and an index makes
+key lookups flat at any size in that range. Modeling *entities* in the ontology
 and leaving high-volume *events* in datasets is still the right discipline —
 it's just no longer a hard requirement at the low end.
 
@@ -352,33 +380,44 @@ a laptop or a single VM, and unchanged.
 
 ## Known limitations, plainly
 
-1. **Still no object index** — ontology browse/search is now pushed into
-   DuckDB (~26× faster) but remains linear in dataset size. Point lookups do
-   prune.
-2. **Column masking loses column pruning**, and hash masking materializes
+1. **Object search is substring, not full-text.** Indexed or not, `LIKE
+   '%…%'` scans. The index makes it 2.5× cheaper; it doesn't make it
+   sub-linear. Ranked full-text search (SQLite FTS5 / Postgres `tsvector`) is
+   the next step.
+2. **The object index covers paging, search and key lookups only.** Filters
+   on other properties fall back to the DuckDB scan — deliberately, because
+   the JSON-per-row alternative measured slower. Filterable secondary columns
+   would need a schema-per-type index.
+3. **Column masking loses column pruning**, and hash masking materializes
    (no Arrow sha256). Row policies push down fully and are free.
-3. **Whole-table Python transforms are still RAM-bound** — that's the default
+4. **Whole-table Python transforms are still RAM-bound** — that's the default
    for convenience. `streaming=True` removes the bound for row-wise work; SQL
    transforms stream natively. Only whole-table aggregation in Python is
    genuinely limited.
-4. **Builds are in-process** — a worker pool per replica, not a distributed
-   queue; no cron/event triggers or incremental transforms yet.
-5. **Edits are an overlay** — object writes don't flow back into Parquet
+5. **Builds don't spread across replicas.** Each replica runs its own worker
+   pool and leases prevent double-execution, but there is no queue that hands
+   a backlog on one replica to an idle one.
+6. **Incremental transforms need an append-only input.** The delta path
+   triggers when a new version's manifest extends the previous one; a rewrite
+   or a compaction falls back to a full recompute, which is correct but not
+   cheap.
+7. **Edits are an overlay** — object writes don't flow back into Parquet
    unless you write a transform that does it.
-6. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
+8. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
    single-replica by construction. Object storage is opt-in via
    `LAURELIN_DATA_URI`; without it, replicas still share a volume for Parquet.
-7. **No cross-replica scheduler** — builds are leased so they run exactly
-   once, but there is no queue that spreads them across replicas, and no
-   cron/event triggers yet.
-8. **Compaction is manual** — appends accumulate parts until you call
-   `/compact`; there's no automatic policy yet.
+9. **Auto-compaction is off by default** — set `LAURELIN_AUTO_COMPACT_PARTS`
+   to a part count, or keep calling `/compact` yourself. There's no
+   size-aware or tiered policy, just a threshold.
 
 Every one of these is a roadmap item, and none of them is hidden in a footnote
 because you'd rather find out now than in month three.
 
 **Recently fixed:** write amplification (appends are now O(delta), not
-O(dataset)); the ontology full-scan ceiling (~26× faster); the row-level
-security tax (3.6× → 1.0×); the single-replica limit (Postgres schemas +
-object storage + build leases); and the absence of query resource limits (a
-runaway query is now interrupted rather than left to degrade a replica).
+O(dataset)); the ontology full-scan ceiling (~26× faster, and flat for key
+lookups once indexed); the row-level security tax (3.6× → 1.0×); the
+single-replica limit (Postgres schemas + object storage + build leases); the
+absence of query resource limits (a runaway query is now interrupted rather
+than left to degrade a replica); the lack of cron and on-upstream triggers
+(leased, so firing is exactly-once across replicas); and manual-only
+compaction.

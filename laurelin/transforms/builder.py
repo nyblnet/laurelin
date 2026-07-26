@@ -265,6 +265,7 @@ class Builder:
         # Propagate classification markings along the (now-updated) lineage so
         # every derived dataset inherits its inputs' markings.
         self.store.recompute_all_markings()
+        self._refresh_object_indexes()
 
         final_status = BuildStatus.failed if any_failed else BuildStatus.succeeded
         metrics.builds.labels(status=final_status.value).inc()
@@ -342,6 +343,30 @@ class Builder:
                 f"Input {param}={dataset!r} of transform {spec.name!r} is not "
                 f"available and no transform produces it: {exc.args[0]}"
             ) from exc
+
+    def _refresh_object_indexes(self) -> None:
+        """Rebuild any object index that a build invalidated.
+
+        Only types already indexed are refreshed — indexing is opt-in, and a
+        build should not silently start materializing every object type. A
+        failure here must not fail the build: the index is an optimization,
+        and queries fall back to scanning without it.
+        """
+        from laurelin.ontology import OntologyService, load_ontology
+
+        try:
+            ontology = load_ontology(self.workspace.ontology_dir)
+        except Exception:  # noqa: BLE001 - a bad ontology is not this build's problem
+            return
+        service = OntologyService(self.workspace, self.catalog, self.store, ontology)
+        for ot in ontology.object_types:
+            if self.store.object_index_state(ot.api_name) is None:
+                continue
+            try:
+                if not service.index_is_fresh(ot):
+                    service.reindex(ot.api_name)
+            except Exception:  # noqa: BLE001
+                self.store.drop_object_index(ot.api_name)  # stale beats wrong
 
     def _incremental_input(self, spec: TransformSpec):
         """Work out what an incremental transform actually has to process.

@@ -190,10 +190,16 @@ Key bets, and why:
       which preserves DuckDB's column pruning — the 3.6× policy tax at 5 M
       rows is gone (1.0×). Column masks still need a Scanner (no pruning);
       hash masking materializes.
-- [ ] **Object index**: materialize objects into indexed storage (Postgres
-      tables w/ GIN/FTS; embedded: SQLite FTS5) so search/filter/aggregate go
-      *sub-linear* rather than merely fast — sub-100 ms over millions of
-      objects, incremental re-index on dataset build.
+- [x] **Object index**: opt-in per object type; materializes objects into the
+      metadata store, refreshed by builds. Key lookups are **constant time**
+      (1.4 ms at 1 M objects, vs 99 ms scanning), paging is ~11× faster. A
+      stale index is never read — freshness is checked against the dataset
+      version *and* the edit overlay on every query, and RLS users always take
+      the scan.
+- [ ] **Full-text object search**: search is still `LIKE '%…%'`, so it scans
+      even when indexed. SQLite FTS5 / Postgres `tsvector` would make it
+      ranked and sub-linear. Filters on non-key properties would need
+      per-type columns rather than one JSON blob.
 - [ ] **Aggregations API**: group-by/count/sum/min/max/percentiles over objects,
       powering dashboards.
 - [ ] **Action side effects**: webhooks, notifications, and enqueue-build on

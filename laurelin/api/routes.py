@@ -723,6 +723,31 @@ class GrantsRequest(BaseModel):
     grants: list[Grant] = Field(default_factory=list)
 
 
+@router.post("/ontology/object-types/{name}/index", dependencies=[EDITOR])
+def build_object_index(
+    name: str, service: OntologyDep, store: StoreDep, actor: ActorDep
+) -> dict:
+    """Materialize an object type into the index.
+
+    Opt-in per type: indexing trades storage and build time for query speed,
+    which is worth it for entities and wasteful for high-volume events. Once
+    built, the index is refreshed automatically after each build and bypassed
+    whenever it is stale.
+    """
+    count = service.reindex(name)
+    store.log_audit("object_index_built", {"object_type": name, "objects": count},
+                    actor=actor)
+    return {"object_type": name, "objects": count,
+            "state": store.object_index_state(name)}
+
+
+@router.delete("/ontology/object-types/{name}/index", dependencies=[EDITOR])
+def drop_object_index(name: str, store: StoreDep, actor: ActorDep) -> dict:
+    store.drop_object_index(name)
+    store.log_audit("object_index_dropped", {"object_type": name}, actor=actor)
+    return {"dropped": name}
+
+
 @router.get("/ontology/permissions", dependencies=[ADMIN])
 def list_permissions(service: OntologyDep, store: StoreDep) -> list[dict]:
     """Grants for every object type (empty list = default open per global RBAC)."""

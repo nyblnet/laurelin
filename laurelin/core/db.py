@@ -64,6 +64,26 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     source TEXT NOT NULL DEFAULT 'upload',
     PRIMARY KEY (dataset, version)
 );
+CREATE TABLE IF NOT EXISTS object_index (
+    object_type TEXT NOT NULL,
+    pk TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    -- Lower-cased concatenation of the string properties, for substring search
+    -- without scanning Parquet.
+    search_text TEXT NOT NULL DEFAULT '',
+    props_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (object_type, pk)
+);
+CREATE INDEX IF NOT EXISTS idx_object_index_type ON object_index (object_type);
+CREATE TABLE IF NOT EXISTS object_index_state (
+    object_type TEXT PRIMARY KEY,
+    -- The dataset version this index was built from, plus the edit-log length.
+    -- Both must still match for the index to be trusted.
+    dataset_version INTEGER NOT NULL DEFAULT 0,
+    edit_count INTEGER NOT NULL DEFAULT 0,
+    object_count INTEGER NOT NULL DEFAULT 0,
+    built_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS transform_state (
     transform_name TEXT NOT NULL,
     input_dataset TEXT NOT NULL,
@@ -438,6 +458,99 @@ class MetadataStore:
                 "SELECT * FROM dataset_versions WHERE dataset = ? ORDER BY version", (dataset,)
             ).fetchall()
         return [self._row_to_version(r) for r in rows]
+
+    # -- object index ---------------------------------------------------------------
+
+    def replace_object_index(
+        self, object_type: str, rows: list[dict], dataset_version: int, edit_count: int
+    ) -> None:
+        """Swap in a freshly built index for one object type, atomically."""
+        with self._conn() as c:
+            c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
+            for row in rows:
+                c.execute(
+                    """INSERT INTO object_index
+                         (object_type, pk, title, search_text, props_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (object_type, row["pk"], row["title"], row["search_text"],
+                     json.dumps(row["props"])),
+                )
+            c.execute(
+                """INSERT INTO object_index_state
+                     (object_type, dataset_version, edit_count, object_count, built_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT (object_type) DO UPDATE SET
+                     dataset_version = excluded.dataset_version,
+                     edit_count = excluded.edit_count,
+                     object_count = excluded.object_count,
+                     built_at = excluded.built_at""",
+                (object_type, dataset_version, edit_count, len(rows), utcnow_iso()),
+            )
+
+    def object_index_state(self, object_type: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM object_index_state WHERE object_type = ?", (object_type,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"dataset_version": row["dataset_version"],
+                "edit_count": row["edit_count"],
+                "object_count": row["object_count"],
+                "built_at": row["built_at"]}
+
+    def drop_object_index(self, object_type: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
+            c.execute("DELETE FROM object_index_state WHERE object_type = ?", (object_type,))
+
+    def count_object_edits(self, object_type: str) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT count(*) AS n FROM object_edits WHERE object_type = ?",
+                (object_type,),
+            ).fetchone()
+        return int(row["n"])
+
+    def search_object_index(
+        self,
+        object_type: str,
+        search: Optional[str] = None,
+        pk: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """Page the index. Returns ``(rows, total)``.
+
+        Only the primary key is filterable here, and deliberately: it is a real
+        indexed column, so a lookup is a b-tree probe. Filtering on an
+        arbitrary property would mean extracting JSON on every row — measured
+        *slower* than the DuckDB scan it was meant to beat — so those queries
+        are left to the scan path, which prunes Parquet row groups instead.
+        """
+        where = ["object_type = ?"]
+        params: list = [object_type]
+        if search:
+            where.append("search_text LIKE ?")
+            params.append(f"%{search.lower()}%")
+        if pk is not None:
+            where.append("pk = ?")
+            params.append(str(pk))
+        clause = " AND ".join(where)
+        with self._conn() as c:
+            total = c.execute(
+                f"SELECT count(*) AS n FROM object_index WHERE {clause}", tuple(params)
+            ).fetchone()["n"]
+            rows = c.execute(
+                f"""SELECT pk, title, props_json FROM object_index WHERE {clause}
+                    ORDER BY pk LIMIT ? OFFSET ?""",
+                tuple([*params, max(0, limit), max(0, offset)]),
+            ).fetchall()
+        return (
+            [{"pk": r["pk"], "title": r["title"], "props": json.loads(r["props_json"])}
+             for r in rows],
+            int(total),
+        )
 
     # -- incremental transform state -----------------------------------------------
 

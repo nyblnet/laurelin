@@ -140,16 +140,35 @@ class OntologyService:
     def apply_action(self, action_name: str, pk: str | None,
                      parameters: dict, actor: str = "anonymous") -> ObjectEdit
     def edits(self, type_name: str) -> list[ObjectEdit]
+    def reindex(self, type_name: str) -> int      # materialize into the index
+    def index_is_fresh(self, ot: ObjectTypeDef) -> bool
 ```
 
 Object materialization = **base + overlay**: base rows from the backing
-dataset's latest version (duckdb over parquet; if the dataset has no versions
-yet, base = empty); then apply `store.list_object_edits(type)` in order:
+dataset's latest version; then apply `store.list_object_edits(type)` in order:
 `create` adds a row (payload must include primary key), `update` shallow-merges
-payload into the row with that pk, `delete` removes it. Everything is computed
-in memory per request (fine at this scale). `search` = case-insensitive
-substring over string-typed properties; `filters` = equality on property values
-(compare as strings). pk values compared as `str(value)`.
+payload into the row with that pk, `delete` removes it. `search` =
+case-insensitive substring over string-typed properties; `filters` = equality
+on property values (compared as strings). pk values compared as `str(value)`.
+
+`query()` resolves that definition through **three paths, in order**, all of
+which must return the same answer:
+
+1. **Index** (`_index_query`) — one row per object in the metadata store.
+   Used only when the type is indexed, the index is *fresh*, the request
+   carries no row-level security, and any filter is on the primary key (a real
+   indexed column). Never touches Parquet.
+2. **SQL pushdown** (`_sql_query`) — filtering, search, counting and paging
+   run in DuckDB over the Parquet parts, with the edit overlay merged in as
+   typed Arrow tables and the row policy rendered into the same `WHERE`.
+3. **In-memory scan** — the original path, for hash masking and anything the
+   other two decline.
+
+Index freshness is `dataset_version == indexed_version AND edit_count ==
+indexed_edit_count`. Both are cheap reads, and both are checked on **every**
+query: a stale index is worse than no index, because it answers confidently.
+Builds refresh the indexes of affected types and drop any index whose refresh
+fails.
 
 `apply_action` validates: action exists; for update/delete pk must reference an
 existing object; required parameters present; parameters must be declared;
@@ -391,6 +410,8 @@ GET  /api/v1/ontology/object-types            -> [ObjectTypeDef]  (only viewable
                                  types; each carries permissions:{can_view,can_edit})
 GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions +
                                  permissions:{can_view,can_edit}  (403 if not viewable)
+POST /api/v1/ontology/object-types/{name}/index -> {object_type,objects:N,state}  (editor)
+DELETE /api/v1/ontology/object-types/{name}/index -> {"dropped": name}  (editor)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
                                               -> {"objects":[...],"total":N}  (403 if not viewable)
 GET  /api/v1/ontology/objects/{type}/{pk}     -> object dict (404 if absent)

@@ -163,6 +163,99 @@ class OntologyService:
             for row in self.catalog.table_to_rows(table)
         ]
 
+    # -- index --------------------------------------------------------------------
+
+    def index_state(self, ot: ObjectTypeDef) -> Optional[dict]:
+        """The index's record of what it was built from, if it exists."""
+        return self.store.object_index_state(ot.api_name)
+
+    def index_is_fresh(self, ot: ObjectTypeDef) -> bool:
+        """Whether the index still reflects the data.
+
+        Two things can invalidate it: a new dataset version, or a new edit in
+        the overlay. Both are cheap to check, and checking beats trusting —
+        a stale index is worse than no index, because it answers confidently.
+        """
+        state = self.store.object_index_state(ot.api_name)
+        if state is None:
+            return False
+        dataset = self.catalog.store.get_dataset(ot.backing_dataset)
+        version = dataset.latest_version if dataset else None
+        if version is None or state["dataset_version"] != version:
+            return False
+        return state["edit_count"] == self.store.count_object_edits(ot.api_name)
+
+    def reindex(self, type_name: str) -> int:
+        """Materialize an object type into the index. Returns the count.
+
+        Indexing is only worthwhile for types small enough to hold in the
+        metadata store — which is exactly the modelling advice anyway: entities
+        in the ontology, high-volume events in datasets.
+        """
+        ot = self._require_object_type(type_name)
+        backing = self.catalog.store.get_dataset(ot.backing_dataset)
+        if backing is None or backing.is_federated or backing.latest_version is None:
+            # Nothing stable to index against.
+            self.store.drop_object_index(type_name)
+            return 0
+
+        string_props = [
+            name for name, prop in ot.properties.items() if prop.type == "string"
+        ]
+        rows = []
+        for obj in self._materialize(ot):
+            searchable = " ".join(
+                str(obj[p]) for p in string_props
+                if isinstance(obj.get(p), str)
+            ).lower()
+            rows.append({
+                "pk": obj["__pk"],
+                "title": str(obj.get("__title", "")),
+                "search_text": searchable,
+                "props": {k: v for k, v in obj.items() if not k.startswith("__")},
+            })
+        self.store.replace_object_index(
+            type_name, rows, backing.latest_version,
+            self.store.count_object_edits(type_name),
+        )
+        return len(rows)
+
+    def _index_query(
+        self,
+        ot: ObjectTypeDef,
+        search: Optional[str],
+        filters: Optional[dict[str, str]],
+        limit: int,
+        offset: int,
+    ) -> Optional[dict]:
+        """Answer from the index when it is fresh and safe to use.
+
+        Row-level security is not represented in the index — it is per-user,
+        and baking one user's view into a shared table would be a serious bug —
+        so a policied user always falls through to the scan.
+        """
+        if self._policy_for_dataset(ot.backing_dataset) is not None:
+            return None
+        # Only the primary key is an indexed column. Any other filter would
+        # cost a JSON extraction per row — measured slower than the DuckDB
+        # scan — so those go to the scan, which prunes row groups instead.
+        filters = filters or {}
+        if set(filters) - {ot.primary_key}:
+            return None
+        if not self.index_is_fresh(ot):
+            return None
+        rows, total = self.store.search_object_index(
+            ot.api_name, search=search, pk=filters.get(ot.primary_key),
+            limit=limit, offset=offset,
+        )
+        objects = []
+        for row in rows:
+            obj = dict(row["props"])
+            obj["__pk"] = row["pk"]
+            obj["__title"] = row["title"]
+            objects.append(obj)
+        return {"objects": objects, "total": total}
+
     # -- pushdown -----------------------------------------------------------------
 
     def _overlay(self, ot: ObjectTypeDef) -> tuple[set[str], dict[str, dict], list[dict]]:
@@ -454,9 +547,14 @@ class OntologyService:
                     raise ValueError(
                         f"Unknown filter property {prop!r} for object type {type_name!r}"
                     )
-        # Push filtering, search, counting and paging into DuckDB when the
-        # backing dataset needs no per-user filtering. Falls back below when it
-        # can't be done faithfully.
+        # Fastest first: a fresh index answers from the metadata store without
+        # touching Parquet at all.
+        indexed = self._index_query(ot, search, filters, limit, offset)
+        if indexed is not None:
+            return indexed
+        # Otherwise push filtering, search, counting and paging into DuckDB when
+        # the backing dataset needs no per-user filtering. Falls back below when
+        # it can't be done faithfully.
         pushed = self._sql_query(ot, search, filters, limit, offset)
         if pushed is not None:
             return pushed
