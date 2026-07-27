@@ -28,7 +28,7 @@ appears as soon as you write something.)
 Save this as `orders.csv` (or use your own CSV — adjust the column names as you
 go):
 
-```csv
+```csv file=orders.csv
 order_id,customer,region,status,amount
 1001,Aule Foundry,us-east,shipped,240.50
 1002,Yavanna Seeds,eu-central,open,88.00
@@ -45,6 +45,10 @@ laurelin upload raw_orders orders.csv --workspace .
 # Uploaded orders.csv -> raw_orders v1 (6 rows)
 ```
 
+(Or drag the file onto **Datasets** in the web UI, which shows you the inferred
+schema before it creates anything. The CLI is used here so the tutorial stays
+copy-pasteable.)
+
 Look at what you got:
 
 ```bash
@@ -56,16 +60,22 @@ Two things to notice:
 - **`v1`.** Every write creates a new immutable version. Uploading again makes
   `v2`; `v1` is still there, still readable. Nothing is ever overwritten in
   place.
-- **The file is just Parquet.** `data/raw_orders/v0001/data.parquet` opens in
-  pandas, DuckDB, Spark, or anything else. If you walk away from Laurelin
-  tomorrow, your data is not trapped.
+- **The files are just Parquet.** A version is a *manifest* of one or more
+  Parquet parts under `data/<dataset>/parts/`:
+
+```bash
+ls data/raw_orders/parts/
+```
+
+  Those open in pandas, DuckDB, Spark, or anything else. If you walk away from
+  Laurelin tomorrow, your data is not trapped.
 
 ## Write a transform
 
 Transforms are plain Python files in `pipelines/`. Save this as
 `pipelines/orders.py`:
 
-```python
+```python file=pipelines/orders.py
 """Clean raw orders, then aggregate them by region."""
 
 import pyarrow as pa
@@ -132,7 +142,7 @@ the dataset that `clean_orders` writes.
 laurelin build --workspace .
 ```
 
-```
+```text
 Build 2d8896e8ef48: succeeded
 TRANSFORM          OUTPUT             STATUS     ROWS  VERSION
 -----------------  -----------------  ---------  ----  -------
@@ -151,7 +161,7 @@ Check the result:
 laurelin datasets show revenue_by_region --workspace .
 ```
 
-```
+```text
 region      orders  revenue
 ----------  ------  -------
 apac        1       412.75
@@ -167,7 +177,7 @@ of living in someone's notebook.
 
 ## See it in the UI
 
-```bash
+```bash no-run
 laurelin serve --workspace . --no-auth
 ```
 
@@ -202,7 +212,12 @@ curl -X PUT localhost:8787/api/v1/sources/orders_pull \
   -d '{"type": "postgres", "dataset": "raw_orders",
        "config": {"url": "postgresql://user:pw@db:5432/shop",
                   "table": "public.orders"}}'
+```
 
+Registering a source doesn't connect to anything. Point the `url` at a database
+you can actually reach, then pull:
+
+```bash no-run
 curl -X POST localhost:8787/api/v1/sources/orders_pull/sync
 ```
 

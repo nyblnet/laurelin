@@ -14,7 +14,7 @@ Continues [tutorial 2](02-ontology-and-actions.md).
 
 Drop `--no-auth` and restart:
 
-```bash
+```bash no-run
 laurelin serve --workspace .
 ```
 
@@ -35,6 +35,15 @@ For this tutorial, make:
 | `root` | admin | you |
 | `mira` | editor | account manager, US/EU |
 | `teo` | viewer | account manager, APAC |
+
+```bash
+laurelin users create mira --role editor --password mira-password --workspace .
+laurelin users create teo --role viewer --password teo-password --workspace .
+laurelin users list --workspace .
+```
+
+(Passwords are on the command line here so the tutorial runs unattended; omit
+`--password` and you'll be prompted, which is what you want on a real machine.)
 
 Roles are the coarse layer: **viewer** reads, **editor** writes data and runs
 builds, **admin** manages users and policy.

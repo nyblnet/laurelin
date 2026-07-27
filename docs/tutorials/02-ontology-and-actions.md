@@ -29,7 +29,7 @@ This is the layer that turns a catalog into an operational platform.
 Our orders reference customers by name; let's give customers their own
 identity. Save as `customers.csv`:
 
-```csv
+```csv file=customers.csv
 customer,tier,account_manager
 Aule Foundry,gold,mira
 Yavanna Seeds,silver,mira
@@ -45,7 +45,7 @@ laurelin upload customers customers.csv --workspace .
 
 Ontology lives in `ontology/*.yml`. Save as `ontology/orders.yml`:
 
-```yaml
+```yaml file=ontology/orders.yml
 object_types:
   - api_name: customer
     display_name: Customer
@@ -112,7 +112,7 @@ No restart needed — the ontology is re-read per request.
 
 ## Explore it
 
-```bash
+```bash no-run
 laurelin serve --workspace . --no-auth
 ```
 
@@ -162,7 +162,7 @@ something Laurelin does behind your back.
 Try to apply an action with a missing required parameter, or one that isn't
 declared:
 
-```bash
+```bash expect-fail
 curl -X POST localhost:8787/api/v1/ontology/actions/mark_shipped/apply \
   -H 'Content-Type: application/json' -d '{"pk": "1002", "parameters": {}}'
 # 400 — missing required parameter 'status'
@@ -179,7 +179,7 @@ The ontology is the contract. Anything not in it is not a capability.
 The ontology is also the cleanest surface to hand an AI agent, because the
 actions define exactly what it may do:
 
-```bash
+```bash no-run
 pip install 'laurelin[mcp]'
 laurelin mcp --url http://127.0.0.1:8787 --token <your-api-token>
 ```

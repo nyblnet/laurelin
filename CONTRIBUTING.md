@@ -73,18 +73,38 @@ For the full picture, run the real benchmarks: `python bench/benchmark.py`.
 
 ## What CI enforces
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four jobs:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five jobs:
 
 | Job | What it protects |
 |---|---|
 | `lint` | ruff, plus vermin checking the syntax floor matches `requires-python` |
 | `test` | The suite on Python 3.11–3.14, against SQLite **and** PostgreSQL |
 | `package` | The wheel installs into a clean venv, serves, and still contains the UI |
+| `docs` | The tutorials, run end to end against a real server |
 | `bench` | The scaling claims published in the docs |
 
 `tests/test_ci_guards.py` fails the run if the PostgreSQL suite skipped or an
 optional extra is missing. A skip is invisible in a green run, and that is
 exactly how a whole dialect stops being tested while the badge stays green.
+
+## The tutorials run
+
+`docs/tutorials/*.md` are executed by `tests/test_tutorials.py` — each page
+assembled into a bash script and run in order, sharing one workspace, exactly
+as a reader follows them.
+
+```bash
+pytest -q tests/test_tutorials.py
+```
+
+Blocks carry annotations that render invisibly: `no-run` for commands needing
+something a test can't supply, `expect-fail` for calls that are *supposed* to
+be rejected (that's how the docs prove validation works), and `file=path` to
+write a block to disk first. See [the tutorials README](docs/tutorials/README.md).
+
+If you change behaviour a tutorial describes, update the tutorial in the same
+pull request. Reaching for `no-run` to quieten a failure is the one move to
+avoid — it turns a caught regression into a silent one.
 
 ## Pull requests
 

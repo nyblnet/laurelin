@@ -23,3 +23,23 @@ Python pipelines — stays a file you can read, diff, and commit.
 If you would rather explore something already populated, `laurelin demo
 demo-workspace` generates an aviation workspace with data, a pipeline, and an
 ontology already in place.
+
+---
+
+## These pages are tested
+
+Every command below runs in CI (`tests/test_tutorials.py`), against a real
+workspace and a real server, in the order you'd follow them. If a command here
+stops doing what the page says, the build goes red.
+
+Fenced blocks carry annotations that are invisible when rendered:
+
+| Annotation | Meaning |
+|---|---|
+| ```` ```bash ```` | runs, and must succeed |
+| ```` ```bash expect-fail ```` | runs, and must **fail** — how the docs prove validation is real |
+| ```` ```bash no-run ```` | shown but not run: it needs something you supply (a database, a long-running server) |
+| ```` ```csv file=orders.csv ```` | written to that path before the commands that use it |
+
+`no-run` is for commands that genuinely need what a test can't provide. It is
+not for making a broken example go quiet.

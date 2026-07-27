@@ -160,7 +160,8 @@ class OntologyService:
     def query(self, type_name: str, search: str | None = None,
               filters: dict[str, str] | None = None,
               limit: int = 100, offset: int = 0) -> dict
-        # {"objects": [ {props..., "__pk": str, "__title": str} ], "total": int}
+        # {"objects": [...], "total": int, "total_capped": bool}
+        # total saturates at SEARCH_TOTAL_CAP when `search` is set; browsing is exact
     def get(self, type_name: str, pk: str) -> dict | None
     def linked(self, type_name: str, pk: str, link_name: str) -> list[dict]
         # follows link in either direction (link where from==type or to==type)
@@ -440,7 +441,7 @@ GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions
 POST /api/v1/ontology/object-types/{name}/index -> {object_type,objects:N,state}  (editor)
 DELETE /api/v1/ontology/object-types/{name}/index -> {"dropped": name}  (editor)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
-                                              -> {"objects":[...],"total":N}  (403 if not viewable)
+                                     -> {"objects":[...],"total":N,"total_capped":bool}  (403 if not viewable)
 GET  /api/v1/ontology/objects/{type}/{pk}     -> object dict (404 if absent)
 GET  /api/v1/ontology/objects/{type}/{pk}/links/{link} -> {"objects":[...]}
 GET  /api/v1/ontology/actions                 -> [ActionDef]  (viewable types only)

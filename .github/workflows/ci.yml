@@ -126,6 +126,22 @@ jobs:
             || { echo "::error::UI did not render"; exit 1; }
           curl -sf localhost:8799/api/v1/datasets
 
+  # ---------------------------------------------------------------- docs
+  #
+  # The tutorials are the first thing a newcomer reads and the last thing
+  # anyone re-checks. Running them is what stops a documented command from
+  # quietly outliving the code it documents.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev,scheduler]'
+      - name: The tutorials must still work
+        run: pytest -q -p no:warnings tests/test_tutorials.py
+
   # ---------------------------------------------------------------- benchmarks
   #
   # docs/SCALE.md publishes measured numbers. Without a gate they are a
