@@ -7,6 +7,7 @@ build failed but only blocks tasks that (transitively) depend on its output.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
@@ -25,6 +26,10 @@ from laurelin.core.models import (
     utcnow_iso,
 )
 from laurelin.transforms.api import TransformRegistry, TransformSpec
+from laurelin.transforms.expectations import ExpectationError
+from laurelin.transforms.expectations import check as check_expectations
+
+log = logging.getLogger("laurelin.builder")
 
 
 class Builder:
@@ -184,6 +189,7 @@ class Builder:
                 # Heartbeat between transforms so a long build isn't reaped as
                 # abandoned. A lost lease means another replica took over.
                 self.store.renew_build_lease(build.id, worker)
+            validate = self._expectation_validator(spec, task)
             try:
                 if spec.incremental:
                     (param, only_input), = spec.inputs.items()
@@ -211,6 +217,7 @@ class Builder:
                         source="transform",
                         build_id=build.id,
                         description=spec.output.description,
+                        validate=validate,
                     )
                     self.store.set_transform_state(
                         spec.name, only_input.dataset,
@@ -225,6 +232,7 @@ class Builder:
                         source="transform",
                         build_id=build.id,
                         description=spec.output.description,
+                        validate=validate,
                     )
                 else:
                     version = self.catalog.write(
@@ -233,6 +241,7 @@ class Builder:
                         source="transform",
                         build_id=build.id,
                         description=spec.output.description,
+                        validate=validate,
                     )
                 task.status = BuildStatus.succeeded
                 task.rows_written = version.row_count
@@ -343,6 +352,46 @@ class Builder:
                 f"Input {param}={dataset!r} of transform {spec.name!r} is not "
                 f"available and no transform produces it: {exc.args[0]}"
             ) from exc
+
+    def _expectation_validator(self, spec: TransformSpec, task):
+        """A callback the catalog runs after the output's parts are written and
+        before its manifest row is inserted.
+
+        That ordering is the whole design. The row insert *is* the
+        publication, so raising here means the failing version never existed
+        as far as any reader is concerned — no downstream build consumes it,
+        no dashboard shows it, and the orphaned parts are deleted. Checking
+        after the commit would mean deciding what to do about data people can
+        already see.
+        """
+        if not spec.expectations:
+            return None
+
+        def validate(files: list[str]) -> None:
+            con = duckdb.connect()
+            try:
+                # Register the freshly written parts as `t`. A pyarrow dataset
+                # is lazy, so a count over a billion rows is a scan, not a
+                # materialization — a streaming transform stays streaming.
+                con.register("t", self.catalog.storage.dataset(files))
+                with limits.limited(con, limits.QueryLimits.build()):
+                    results = check_expectations(
+                        con, spec.expectations, spec.output.dataset
+                    )
+            finally:
+                con.close()
+
+            task.expectations = results
+            failures = [r for r in results if not r["passed"]
+                        and r["severity"] == "error"]
+            for r in results:
+                if not r["passed"] and r["severity"] == "warn":
+                    log.warning("expectation warning on %s: %s",
+                                spec.output.dataset, r["message"])
+            if failures:
+                raise ExpectationError(spec.output.dataset, failures)
+
+        return validate
 
     def _refresh_object_indexes(self) -> None:
         """Rebuild any object index that a build invalidated.

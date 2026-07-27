@@ -178,6 +178,15 @@ export interface BuildTask {
   error: string | null;
   rows_written: number | null;
   output_version: number | null;
+  expectations?: ExpectationResult[];
+}
+
+export interface ExpectationResult {
+  expectation: string;
+  passed: boolean;
+  severity: "error" | "warn";
+  measured: number;
+  message: string;
 }
 
 export interface Build {

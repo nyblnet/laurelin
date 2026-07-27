@@ -78,9 +78,11 @@ class TransformSpec:
     kind: str                    # "python" | "sql"
     fn: Callable | None          # python transforms: fn(**{param: pa.Table}) -> pa.Table
     query: str | None            # sql transforms: SELECT over input aliases as table names
+    expectations: list[Expectation]   # assertions the output must satisfy
 
 def transform(output: Output, **inputs: Input)   # decorator for python transforms
 def sql_transform(output: Output, inputs: dict[str, Input], query: str)  # decorator (fn body ignored)
+def expect(*expectations: Expectation)           # applied ABOVE @transform
 
 class TransformRegistry:
     def register(self, spec) / get(self, name) / all(self) -> list[TransformSpec]
@@ -116,6 +118,31 @@ registered producing transform must already exist as datasets (else the task
 fails with a clear error). A failed task marks the build failed but later
 independent tasks may still run; final status failed if any task failed.
 Audit-log build start/finish.
+
+#### Data expectations
+
+`@expect(not_null(c), unique(c), row_count(min=, max=), accepted_values(c, vs),
+expression(name, predicate))`, each with `severity="error"` (default, fails the
+build) or `"warn"` (recorded, build continues).
+
+Every check is SQL counting *offending* rows — zero means it holds — which
+makes the failure message a count rather than a boolean, and lets every check
+share one code path.
+
+The important part is **when** they run. `catalog.write/append/write_batches`
+take a `validate` callback that `_commit_version` invokes after the Parquet
+parts are written and before the manifest row is inserted. Since that row
+insert *is* the publication, an expectation that raises means the failing
+version never existed for any reader: nothing downstream consumes it, and the
+caller deletes the orphaned parts. Checking after the commit would instead mean
+deciding what to do about data people can already see.
+
+The checks run against `storage.dataset(files)` — a lazy pyarrow dataset
+registered into DuckDB — so validating a streaming transform's output doesn't
+materialize what streaming just avoided materializing.
+
+Results are stored per build task (`build_tasks.expectations_json`), passes
+included, and rendered on the pipeline page.
 
 ### `laurelin/ontology`
 

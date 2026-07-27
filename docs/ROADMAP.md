@@ -155,9 +155,15 @@ Key bets, and why:
       The delta comes from the version manifest — appends only extend it, so a
       prefix check says precisely whether history still lines up; a rewritten
       input falls back to a full rebuild rather than double-counting.
-- [ ] **Data expectations**: `@expect(col("x").not_null(), row_count > 0)` —
-      fail-build or warn modes, results stored, surfaced on lineage + dataset
-      pages (Foundry's Data Health).
+- [x] **Data expectations**: `@expect(not_null("x"), unique("x"),
+      row_count(min=1), accepted_values(...), expression(...))` with
+      fail-build or `severity="warn"` modes; results stored per build task and
+      surfaced on the pipeline page. Checked against the written Parquet parts
+      **before the manifest row is inserted**, so a failing output is never
+      published rather than published and retracted — no reader sees it, no
+      downstream build consumes it, and the orphaned parts are deleted. Every
+      check is SQL evaluated by DuckDB over a lazy dataset, so a streaming
+      transform stays streaming.
 - [ ] **Git-native pipeline repos**: pipelines live in any git repo; Laurelin
       registers a repo+ref, checks out/builds from it, PR-preview builds against
       a data branch. CI helper (`laurelin ci check`) validates DAG + expectations

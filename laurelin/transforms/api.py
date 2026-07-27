@@ -43,6 +43,9 @@ class TransformSpec:
     # Incremental transforms see only rows added since their last successful
     # build, and their output is appended rather than replaced.
     incremental: bool = False
+    # Assertions the output must satisfy, checked against the written Parquet
+    # parts *before* the version is committed — see laurelin.transforms.expectations.
+    expectations: list = field(default_factory=list)
 
 
 class TransformRegistry:

@@ -198,6 +198,11 @@ class BuildTaskInfo(BaseModel):
     error: Optional[str] = None
     rows_written: Optional[int] = None
     output_version: Optional[int] = None
+    # One entry per declared expectation: {expectation, passed, severity,
+    # measured, message}. Recorded whether the build passed or failed — a
+    # check that passed is evidence, and a `warn` that fired needs somewhere
+    # to be seen.
+    expectations: list[dict] = Field(default_factory=list)
 
 
 class BuildInfo(BaseModel):

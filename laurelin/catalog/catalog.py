@@ -24,7 +24,7 @@ import time as _time
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import duckdb
 import pyarrow as pa
@@ -102,6 +102,7 @@ class DatasetCatalog:
         source: str,
         build_id: Optional[str],
         inherited: Optional[list[str]] = None,
+        validate: Optional[Callable[[list[str]], None]] = None,
     ) -> DatasetVersionInfo:
         """Register already-written parts as a new version.
 
@@ -115,8 +116,15 @@ class DatasetCatalog:
         on object storage. The invariant it protected — never register a
         version whose files aren't fully written — still holds, because the
         row is inserted last.
+
+        ``validate`` runs after the parts exist but before the row does, which
+        is exactly where a data-quality check belongs: the row insert *is* the
+        publication, so a check that raises here means the bad version was
+        never visible to anyone. The caller deletes the orphaned parts.
         """
         files = list(inherited or []) + list(new_parts)
+        if validate is not None:
+            validate(files)
         columns = [ColumnSchema(name=f.name, type=str(f.type)) for f in schema]
         version = self.store.next_version(name)
         while True:
@@ -145,6 +153,7 @@ class DatasetCatalog:
         source: str = "upload",
         build_id: Optional[str] = None,
         description: str = "",
+        validate: Optional[Callable[[list[str]], None]] = None,
     ) -> DatasetVersionInfo:
         """Write a new immutable version of a dataset.
 
@@ -158,14 +167,17 @@ class DatasetCatalog:
         key = self.storage.new_part_key(name)
         try:
             self.storage.write_table(table, key)
+            return self._commit_version(
+                name, [key],
+                row_count=table.num_rows, schema=table.schema,
+                source=source, build_id=build_id, validate=validate,
+            )
         except Exception:
+            # Covers a failed write and a failed validation alike: in both
+            # cases the part is unreferenced, so removing it leaves nothing
+            # behind rather than a version nobody registered.
             self.storage.delete(key)
             raise
-        return self._commit_version(
-            name, [key],
-            row_count=table.num_rows, schema=table.schema,
-            source=source, build_id=build_id,
-        )
 
     def write_batches(
         self,
@@ -174,6 +186,7 @@ class DatasetCatalog:
         source: str = "sync",
         build_id: Optional[str] = None,
         description: str = "",
+        validate: Optional[Callable[[list[str]], None]] = None,
     ) -> DatasetVersionInfo:
         """Stream an iterable of Arrow tables into one new dataset version
         without materializing them all in memory (used by connectors pulling
@@ -203,17 +216,17 @@ class DatasetCatalog:
                 raise ValueError(f"Sync for dataset {name!r} produced no data")
             writer.close()
             writer = None
+            assert schema is not None
+            return self._commit_version(
+                name, [key],
+                row_count=row_count, schema=schema,
+                source=source, build_id=build_id, validate=validate,
+            )
         except Exception:
             if writer is not None:
                 writer.close()
             self.storage.delete(key)
             raise
-        assert schema is not None
-        return self._commit_version(
-            name, [key],
-            row_count=row_count, schema=schema,
-            source=source, build_id=build_id,
-        )
 
     def append(
         self,
@@ -222,6 +235,7 @@ class DatasetCatalog:
         source: str = "append",
         build_id: Optional[str] = None,
         description: str = "",
+        validate: Optional[Callable[[list[str]], None]] = None,
     ) -> DatasetVersionInfo:
         """Add rows to a dataset as a new version, writing **only the delta**.
 
@@ -240,7 +254,8 @@ class DatasetCatalog:
 
         previous = self.store.get_version(name, None)
         if previous is None:
-            return self.write(name, table, source=source, build_id=build_id)
+            return self.write(name, table, source=source, build_id=build_id,
+                              validate=validate)
 
         schema = pa.schema([pa.field(c.name, pa.type_for_alias(c.type)) for c in previous.schema_])
         try:
@@ -257,17 +272,18 @@ class DatasetCatalog:
         key = self.storage.new_part_key(name)
         try:
             self.storage.write_table(table, key)
+            return self._maybe_compact(self._commit_version(
+                name, [key],
+                row_count=previous.row_count + table.num_rows,
+                schema=schema,
+                source=source,
+                build_id=build_id,
+                inherited=self._inherited_files(previous),
+                validate=validate,
+            ))
         except Exception:
             self.storage.delete(key)
             raise
-        return self._maybe_compact(self._commit_version(
-            name, [key],
-            row_count=previous.row_count + table.num_rows,
-            schema=schema,
-            source=source,
-            build_id=build_id,
-            inherited=self._inherited_files(previous),
-        ))
 
     def append_batches(
         self,

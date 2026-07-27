@@ -202,6 +202,9 @@ CREATE TABLE IF NOT EXISTS build_tasks (
     error TEXT,
     rows_written INTEGER,
     output_version INTEGER,
+    -- One JSON entry per declared expectation, pass or fail. A check that
+    -- passed is evidence worth keeping, not just noise before a failure.
+    expectations_json TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (build_id, transform_name)
 );
 CREATE TABLE IF NOT EXISTS lineage_edges (
@@ -372,6 +375,11 @@ class MetadataStore:
             c.execute("ALTER TABLE datasets ADD COLUMN kind TEXT NOT NULL DEFAULT 'managed'")
         if not self._has_column(c, "datasets", "source_json"):
             c.execute("ALTER TABLE datasets ADD COLUMN source_json TEXT NOT NULL DEFAULT '{}'")
+        if not self._has_column(c, "build_tasks", "expectations_json"):
+            c.execute(
+                "ALTER TABLE build_tasks ADD COLUMN expectations_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
 
     # -- datasets -------------------------------------------------------------
 
@@ -1044,8 +1052,9 @@ class MetadataStore:
             c.execute(
                 """INSERT INTO build_tasks
                    (build_id, transform_name, output_dataset, status, started_at,
-                    finished_at, error, rows_written, output_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    finished_at, error, rows_written, output_version,
+                    expectations_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (build_id, transform_name) DO UPDATE SET
                      output_dataset = excluded.output_dataset,
                      status = excluded.status,
@@ -1053,7 +1062,8 @@ class MetadataStore:
                      finished_at = excluded.finished_at,
                      error = excluded.error,
                      rows_written = excluded.rows_written,
-                     output_version = excluded.output_version""",
+                     output_version = excluded.output_version,
+                     expectations_json = excluded.expectations_json""",
                 (
                     build_id,
                     task.transform_name,
@@ -1064,6 +1074,7 @@ class MetadataStore:
                     task.error,
                     task.rows_written,
                     task.output_version,
+                    json.dumps(task.expectations),
                 ),
             )
 
@@ -1092,6 +1103,7 @@ class MetadataStore:
                     error=t["error"],
                     rows_written=t["rows_written"],
                     output_version=t["output_version"],
+                    expectations=json.loads(t["expectations_json"] or "[]"),
                 )
                 for t in task_rows
             ],

@@ -9,6 +9,7 @@ import { useAuth } from "../auth";
 import type {
   Build,
   BuildStatus,
+  ExpectationResult,
   LineageGraph,
   LineageNode,
   TransformSummary,
@@ -212,6 +213,24 @@ function LineageGraphView({ graph }: { graph: LineageGraph }) {
   );
 }
 
+// A transform with no declared expectations shows nothing rather than "0/0" —
+// absence of checks is a different statement from checks that all passed.
+function Expectations({ results }: { results?: ExpectationResult[] }) {
+  if (!results || results.length === 0) return <span className="dim">—</span>;
+  const failed = results.filter((r) => !r.passed);
+  if (failed.length === 0) {
+    return <Badge tone="green">{results.length} passed</Badge>;
+  }
+  const blocking = failed.some((r) => r.severity === "error");
+  return (
+    <span title={failed.map((r) => r.message).join("\n")}>
+      <Badge tone={blocking ? "red" : "gold"}>
+        {failed.length} of {results.length} failed
+      </Badge>
+    </span>
+  );
+}
+
 // -------------------------------------------------------------- build card
 
 function BuildCard({ build }: { build: Build }) {
@@ -236,6 +255,10 @@ function BuildCard({ build }: { build: Build }) {
       label: "Version",
       className: "mono",
       render: (t) => (t.output_version == null ? "—" : `v${t.output_version}`),
+    },
+    {
+      label: "Expectations",
+      render: (t) => <Expectations results={t.expectations} />,
     },
     {
       label: "Error",
