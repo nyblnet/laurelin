@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
-from laurelin.core import limits, metrics
 from laurelin.core import logging as laurelin_logging
+from laurelin.core import metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 

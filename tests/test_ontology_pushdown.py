@@ -13,9 +13,9 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
-from laurelin.core.models import EditKind, ObjectEdit
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.models import EditKind, ObjectEdit
 from laurelin.ontology import OntologyService, load_ontology
 
 ONTOLOGY = """

@@ -10,7 +10,7 @@ import pytest
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
-from laurelin.core.db import _iso_in, MetadataStore
+from laurelin.core.db import MetadataStore
 from laurelin.core.models import BuildStatus
 from laurelin.transforms import Builder, collect_transforms
 

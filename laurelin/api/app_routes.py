@@ -14,7 +14,6 @@ name a property or action that doesn't exist and fail later in front of a user.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field

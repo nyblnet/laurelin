@@ -24,7 +24,7 @@ import time as _time
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import duckdb
 import pyarrow as pa
@@ -34,8 +34,8 @@ import pyarrow.parquet as pq
 from laurelin.core import federation, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.storage import storage_for
 from laurelin.core.models import ColumnSchema, DatasetInfo, DatasetVersionInfo
+from laurelin.core.storage import storage_for
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 

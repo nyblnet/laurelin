@@ -8,7 +8,6 @@ save, so a bad cron expression fails at PUT rather than silently never firing.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field

@@ -11,7 +11,6 @@ import resource
 import sys
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pytest
 
 from laurelin.catalog import DatasetCatalog
@@ -88,7 +87,6 @@ def test_input_is_consumed_lazily(env):
     """The transform must be handed an iterator, not a materialized table —
     otherwise 'streaming' would be a comfortable lie."""
     ws, store, catalog = env
-    seen = []
 
     spec_source = """
 from laurelin.transforms import transform, Input, Output

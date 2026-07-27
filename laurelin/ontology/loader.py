@@ -50,7 +50,7 @@ def load_ontology(ontology_dir: Path) -> OntologyDef:
                 actions.append(ActionDef.model_validate(raw))
 
     _check_duplicates("object type", [o.api_name for o in object_types])
-    _check_duplicates("link type", [l.api_name for l in link_types])
+    _check_duplicates("link type", [lt.api_name for lt in link_types])
     _check_duplicates("action", [a.api_name for a in actions])
 
     return OntologyDef(

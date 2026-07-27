@@ -55,7 +55,7 @@ def _selfsigned(tmp_path):
 
 
 def _idp_server(tmp_path, cert, key):
-    from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT
+    from saml2 import BINDING_HTTP_REDIRECT
     from saml2.config import IdPConfig
     from saml2.server import Server
 

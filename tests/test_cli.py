@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from laurelin.catalog import DatasetCatalog
@@ -90,7 +89,7 @@ def test_demo_ontology_is_loadable(tmp_path):
 
     ontology = load_ontology(root / "ontology")
     assert {o.api_name for o in ontology.object_types} == {"aircraft", "flight"}
-    assert {l.api_name for l in ontology.link_types} == {"aircraft_flights"}
+    assert {lt.api_name for lt in ontology.link_types} == {"aircraft_flights"}
     assert {a.api_name for a in ontology.actions} == {
         "update_aircraft_status",
         "cancel_flight",

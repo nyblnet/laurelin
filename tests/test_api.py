@@ -345,7 +345,7 @@ def test_ontology_object_types(client):
     body = r.json()
     assert body["api_name"] == "plane"
     assert body["primary_key"] == "tail_number"
-    assert [l["api_name"] for l in body["links"]] == ["plane_flights"]
+    assert [lt["api_name"] for lt in body["links"]] == ["plane_flights"]
     assert body["links"][0]["from"] == "plane"
     assert body["links"][0]["to"] == "flight"
     assert {a["api_name"] for a in body["actions"]} == {

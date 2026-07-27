@@ -22,7 +22,6 @@ import os
 import platform
 import resource
 import shutil
-import statistics
 import sys
 import tempfile
 import time
@@ -142,7 +141,11 @@ def bench_size(n: int, root: Path) -> dict:
     result["rows_page_ms"] = round(ms, 1)
 
     result["peak_rss_mb"] = round(peak_rss_mb(), 1)
-    del table
+    # Drop the last reference so the next size starts clean. Rebinding rather
+    # than `del`: the lambdas above close over this name, and unbinding it
+    # leaves them holding a name that no longer exists — harmless today only
+    # because every one of them is called immediately.
+    table = None  # noqa: F841 - the point is releasing the Arrow table
     gc.collect()
     return result
 

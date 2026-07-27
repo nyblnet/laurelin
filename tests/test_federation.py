@@ -5,7 +5,6 @@ a warehouse — the scan path, policy compilation and sandboxing are identical
 for s3:// or Iceberg, only the extension differs.
 """
 
-import os
 
 import pyarrow as pa
 import pyarrow.parquet as pq

@@ -13,8 +13,8 @@ from laurelin.api import create_app
 from laurelin.core.auth import (
     MAX_THROTTLE_ENTRIES,
     PASSWORD_MAX_LENGTH,
-    THROTTLED,
     THROTTLE_FAILURES,
+    THROTTLED,
     AuthService,
     hash_password,
     hash_token,

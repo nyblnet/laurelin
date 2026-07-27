@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from pathlib import Path
 from typing import Optional
 
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import Role, WorkspaceInfo, utcnow_iso
+from laurelin.core.models import Role, WorkspaceInfo
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,47}$")
 

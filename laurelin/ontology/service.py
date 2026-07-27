@@ -22,9 +22,7 @@ from laurelin.core import limits
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
-    ActionDef,
     EditKind,
-    LinkTypeDef,
     ObjectEdit,
     ObjectTypeDef,
     OntologyDef,

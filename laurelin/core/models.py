@@ -288,7 +288,7 @@ class OntologyDef(BaseModel):
         return next((o for o in self.object_types if o.api_name == api_name), None)
 
     def link_type(self, api_name: str) -> Optional[LinkTypeDef]:
-        return next((l for l in self.link_types if l.api_name == api_name), None)
+        return next((lt for lt in self.link_types if lt.api_name == api_name), None)
 
     def action(self, api_name: str) -> Optional[ActionDef]:
         return next((a for a in self.actions if a.api_name == api_name), None)

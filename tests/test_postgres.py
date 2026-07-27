@@ -41,7 +41,6 @@ def store():
 
 
 def test_store_paths_that_differ_by_dialect_on_postgres(store):
-    from laurelin.core.models import DatasetVersionInfo
 
     # upsert_dataset — was broken on PG (ambiguous 'description' in ON CONFLICT)
     store.upsert_dataset("ds1", "first")

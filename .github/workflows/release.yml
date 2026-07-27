@@ -1,0 +1,95 @@
+name: Release
+
+# Fires only on a version tag you push deliberately:
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Inert until PyPI trusted publishing is configured for this repository
+# (pypi.org -> your project -> Publishing -> add a GitHub publisher for
+# owner/repo, workflow `release.yml`, environment `pypi`). Until then the
+# publish job fails at the last step and the built artifacts are still
+# attached to the run, so nothing is silently released and nothing is lost.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The tag must agree with the version in pyproject. Catching this before
+  # publishing matters because PyPI will not let a version be re-uploaded:
+  # a wrong number is permanent.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: check
+        name: Tag must match pyproject version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          ref = os.environ["GITHUB_REF_NAME"]
+          if ref.startswith("v") and ref[1:] != version:
+              raise SystemExit(
+                  f"::error::tag {ref} does not match pyproject version {version}. "
+                  "A wrong version on PyPI cannot be re-uploaded."
+              )
+          print(f"version={version}")
+          PY
+
+      - name: Full test suite must pass at this tag
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xmlsec1
+          pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics]'
+          pytest -q -p no:warnings
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build
+      - run: pip install twine && twine check dist/*
+
+      # Same guard as CI: the prebuilt UI is package data, and losing it
+      # produces a wheel that installs fine and serves a 404.
+      - name: The wheel must contain the prebuilt UI
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          if not any(n.endswith("laurelin/ui/static/index.html")
+                     for n in zipfile.ZipFile(whl).namelist()):
+              sys.exit("::error::wheel is missing the prebuilt UI")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing; no API token stored in the repo
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

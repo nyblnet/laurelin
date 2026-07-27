@@ -1,13 +1,10 @@
 """Tests for multi-workspace mode: control plane, membership roles, isolation."""
 
-import pyarrow as pa
 import pytest
 from fastapi.testclient import TestClient
 
 from laurelin.api import create_server_app
-from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
-from laurelin.core.db import MetadataStore
 
 ROOT_CREDS = {"username": "root", "password": "trustno1!"}
 

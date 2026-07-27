@@ -23,7 +23,6 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from laurelin.api.context import identity_auth, identity_store
-from laurelin.core.auth import hash_password
 from laurelin.core.models import Role, User
 
 scim_router = APIRouter(prefix="/scim/v2", tags=["scim"])

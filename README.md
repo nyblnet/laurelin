@@ -1,5 +1,9 @@
 # Laurelin
 
+[![CI](https://github.com/laurelin-data/laurelin/actions/workflows/ci.yml/badge.svg)](https://github.com/laurelin-data/laurelin/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 **An open, ontology-driven data platform.** Laurelin gives you the core ideas of
 platforms like Palantir Foundry — versioned datasets, code-based transforms with
 automatic lineage, and a semantic ontology layer with objects, links, and actions —

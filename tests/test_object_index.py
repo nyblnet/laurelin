@@ -8,6 +8,8 @@ The property that makes it safe: a stale index is never used. It answers only
 when it provably reflects both the dataset version and the edit overlay.
 """
 
+import uuid
+
 import pyarrow as pa
 import pytest
 
@@ -16,7 +18,6 @@ from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import EditKind, ObjectEdit
 from laurelin.ontology import OntologyService, load_ontology
-import uuid
 
 ONTOLOGY = """
 object_types:

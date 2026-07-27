@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import laurelin
+from laurelin.api.app_routes import apps_router
 from laurelin.api.auth_routes import (
     auth_router,
     groups_router,
@@ -33,16 +34,16 @@ from laurelin.api.auth_routes import (
     users_router,
     workspaces_router,
 )
-from laurelin.api.app_routes import apps_router
 from laurelin.api.routes import router
-from laurelin.api.scim_routes import scim_router
 from laurelin.api.schedule_routes import schedules_router
+from laurelin.api.scim_routes import scim_router
 from laurelin.api.source_routes import sources_router
 from laurelin.catalog import DatasetCatalog
+from laurelin.core import logging as laurelin_logging
+from laurelin.core import metrics, scheduler
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
-from laurelin.core import logging as laurelin_logging, metrics, scheduler
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 

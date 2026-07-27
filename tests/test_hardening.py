@@ -12,7 +12,7 @@ from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import EditKind, ObjectEdit
 from laurelin.ontology import OntologyService, load_ontology
-from laurelin.transforms import Input, Output, collect_transforms
+from laurelin.transforms import collect_transforms
 
 
 @pytest.fixture()

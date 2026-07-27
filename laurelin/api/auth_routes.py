@@ -7,6 +7,7 @@ guards used across the API. Only /docs gating lives in middleware (app.py).
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from urllib.parse import urlsplit
@@ -22,8 +23,7 @@ from laurelin.api.context import (
     is_multi,
 )
 from laurelin.core.auth import THROTTLED, AuthService
-from laurelin.core.db import MetadataStore
-from laurelin.core.models import Role, User
+from laurelin.core.models import Role, User, utcnow_iso
 
 SESSION_COOKIE = "laurelin_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
@@ -563,13 +563,9 @@ def revoke_token(token_id: str, request: Request, user: AuthenticatedUser) -> di
 # /groups (admin) — named groups of users, usable as ontology-permission subjects
 # ---------------------------------------------------------------------------
 
-import re as _re
-
-from laurelin.core.models import utcnow_iso
-
 groups_router = APIRouter(prefix="/groups", tags=["groups"])
 
-_GROUP_RE = _re.compile(r"^[a-z0-9][a-z0-9_.-]{1,31}$")
+_GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,31}$")
 
 
 class GroupCreateRequest(BaseModel):

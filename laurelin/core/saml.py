@@ -81,7 +81,7 @@ class SAMLProvider:
         self.config = config
 
     def _client(self):
-        from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT
+        from saml2 import BINDING_HTTP_POST
         from saml2.client import Saml2Client
         from saml2.config import Config
 

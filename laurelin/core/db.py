@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -38,6 +38,7 @@ from laurelin.core.models import (
     User,
     utcnow_iso,
 )
+
 
 def _iso_in(seconds: int) -> str:
     """An ISO timestamp `seconds` from now — lease expiry math in one place."""
@@ -425,7 +426,7 @@ class MetadataStore:
                 ),
             )
 
-    def _row_to_version(self, row: sqlite3.Row) -> DatasetVersionInfo:
+    def _row_to_version(self, row: dict) -> DatasetVersionInfo:
         return DatasetVersionInfo(
             dataset=row["dataset"],
             version=row["version"],
@@ -1191,7 +1192,7 @@ class MetadataStore:
     # -- users -----------------------------------------------------------------
 
     @staticmethod
-    def _row_to_user(row: sqlite3.Row) -> User:
+    def _row_to_user(row: dict) -> User:
         keys = row.keys()
         return User(
             id=row["id"],
@@ -1335,7 +1336,7 @@ class MetadataStore:
 
     # -- api tokens ---------------------------------------------------------------
 
-    def _token_row_to_dict(self, row: sqlite3.Row) -> dict:
+    def _token_row_to_dict(self, row: dict) -> dict:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -1483,7 +1484,7 @@ class MetadataStore:
         return [self._grant_row(r) for r in rows]
 
     @staticmethod
-    def _grant_row(row: sqlite3.Row) -> dict:
+    def _grant_row(row: dict) -> dict:
         return {
             "object_type": row["object_type"],
             "subject_kind": row["subject_kind"],
@@ -1519,7 +1520,7 @@ class MetadataStore:
     # -- dataset grants -----------------------------------------------------------
 
     @staticmethod
-    def _dataset_grant_row(row: sqlite3.Row) -> dict:
+    def _dataset_grant_row(row: dict) -> dict:
         return {
             "dataset": row["dataset"],
             "subject_kind": row["subject_kind"],

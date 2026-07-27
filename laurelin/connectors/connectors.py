@@ -37,7 +37,6 @@ from typing import Any, Iterator, Optional
 
 import duckdb
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import metrics

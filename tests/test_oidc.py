@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.core.config import Workspace
-from laurelin.core.oidc import OIDCConfig, OIDCProvider
+from laurelin.core.oidc import OIDCProvider
 
 ISSUER = "https://idp.example.com"
 CLIENT_ID = "laurelin-client"
