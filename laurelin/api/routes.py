@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -32,6 +33,7 @@ from laurelin.api.auth_routes import (
 )
 from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
+from laurelin.catalog.catalog import suggest_dataset_name
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
@@ -458,20 +460,19 @@ def compact_dataset(
     return _dump(info)
 
 
-@router.post("/datasets/{name}/upload")
-def upload_dataset_file(
-    name: str,
-    catalog: CatalogDep,
-    store: StoreDep,
-    perms: PermDep,
-    user: UserDep,
-    actor: ActorDep,
-    file: UploadFile = File(...),
-    mode: str = Query("replace", pattern="^(replace|append)$"),
-) -> dict:
-    # Per-dataset edit. For a dataset with no grants this reduces to the old
-    # editor-role requirement; a grant can elevate a viewer for one dataset.
-    _require_dataset_edit(perms, user, name)
+# Rows shown in an import preview. Enough to see the shape of the data and
+# spot a mis-inferred column; small enough that previewing a 5 GB file is
+# instant.
+_PREVIEW_ROWS = 50
+
+
+@contextmanager
+def _spooled_upload(file: UploadFile):
+    """Stream an upload to a temp file, enforcing the size cap as it goes.
+
+    Checked while writing rather than from Content-Length, which a client
+    controls: the cap has to bound what actually lands on disk.
+    """
     suffix = Path(file.filename or "").suffix
     max_bytes = int(os.environ.get("LAURELIN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
     written = 0
@@ -489,9 +490,55 @@ def upload_dataset_file(
                 )
             tmp.write(chunk)
     try:
-        info = catalog.upload_file(name, tmp_path, mode=mode)
+        yield tmp_path
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/datasets/preview", dependencies=[EDITOR])
+def preview_upload(catalog: CatalogDep, file: UploadFile = File(...)) -> dict:
+    """Infer a file's schema and sample its rows without creating anything.
+
+    Importing a file is a decision about types and column names, and making
+    that decision blind — upload, then discover DuckDB read every column as
+    VARCHAR — is how a dataset ends up wrong on version 1. Nothing here
+    touches storage or the metadata store.
+    """
+    with _spooled_upload(file) as tmp_path:
+        try:
+            sample = catalog.parse_upload(tmp_path, limit=_PREVIEW_ROWS)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return {
+            "suggested_name": suggest_dataset_name(file.filename or "dataset"),
+            "columns": [
+                {"name": f.name, "type": str(f.type)} for f in sample.schema
+            ],
+            "rows": catalog.table_to_rows(sample),
+            "sampled_rows": sample.num_rows,
+            # A preview reads only the first rows, so it cannot state the
+            # file's total without reading all of it. Saying "at least N"
+            # beats implying a count we didn't take.
+            "truncated": sample.num_rows >= _PREVIEW_ROWS,
+        }
+
+
+@router.post("/datasets/{name}/upload")
+def upload_dataset_file(
+    name: str,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+    file: UploadFile = File(...),
+    mode: str = Query("replace", pattern="^(replace|append)$"),
+) -> dict:
+    # Per-dataset edit. For a dataset with no grants this reduces to the old
+    # editor-role requirement; a grant can elevate a viewer for one dataset.
+    _require_dataset_edit(perms, user, name)
+    with _spooled_upload(file) as tmp_path:
+        info = catalog.upload_file(name, tmp_path, mode=mode)
     store.log_audit(
         "dataset_uploaded",
         {

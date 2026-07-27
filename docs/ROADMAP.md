@@ -134,8 +134,17 @@ Key bets, and why:
       firewalls (mirrors Foundry's agent), same connector SDK.
 - [ ] **Secrets management**: encrypted-at-rest secret store (Fernet w/ KMS-style
       key wrapping), env/Vault providers, secrets never in logs or API responses.
-- [ ] **Uploads UI**: drag-drop CSV/Parquet/Excel with schema preview + column
-      type overrides (exists in basic form; grow into wizard).
+- [x] **Uploads UI**: drag-and-drop CSV/Parquet on the Datasets page creates a
+      dataset without touching the CLI. `POST /datasets/preview` infers the
+      schema and samples rows *without creating anything*, so the import is a
+      decision rather than a guess; the dataset name is suggested from the
+      filename ("Q3 Orders (final).csv" → `q3_orders_final`) since almost no
+      real filename satisfies `^[a-z][a-z0-9_]*$`. Replace/append is now
+      selectable on an existing dataset (the API always supported it; the UI
+      never sent it).
+- [ ] **Column type overrides on import**: the preview shows inferred types but
+      can't yet change them — a mis-inferred column still needs a transform.
+      Excel input is also still unsupported.
 
 ### WS3 — Pipelines & orchestration (Foundry: Code Repos / Pipeline Builder / Data Health)
 

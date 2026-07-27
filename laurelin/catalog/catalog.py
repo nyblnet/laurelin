@@ -47,6 +47,24 @@ def _validate_name(name: str) -> None:
         )
 
 
+def suggest_dataset_name(filename: str) -> str:
+    """A valid dataset name derived from an uploaded file's name.
+
+    Dataset names are ``^[a-z][a-z0-9_]*$``, which almost no real filename
+    satisfies ("Q3 Orders (final).csv"). Rejecting those and making the user
+    invent a name is a bad first five minutes; suggesting ``q3_orders_final``
+    and letting them edit it is a good one.
+    """
+    stem = Path(filename).stem.lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if not slug:
+        return "dataset"
+    if not slug[0].isalpha():
+        slug = f"d_{slug}"
+    return slug[:48].rstrip("_")
+
+
 def _is_duplicate_version(exc: BaseException) -> bool:
     """True if this error is a (dataset, version) primary-key collision — i.e.
     another writer claimed the version number first. Matched on message text
@@ -677,6 +695,40 @@ class DatasetCatalog:
 
     # -- file uploads ---------------------------------------------------------
 
+    @staticmethod
+    def parse_upload(path: Path, limit: Optional[int] = None) -> pa.Table:
+        """Read a CSV or Parquet file into Arrow, inferring types.
+
+        Separate from :meth:`upload_file` so the same inference can answer
+        "what would importing this give me?" without creating anything —
+        showing someone the schema *before* they commit to it is the
+        difference between an import and a guess.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise ValueError(f"File not found: {path}")
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            con = duckdb.connect()
+            try:
+                sql = "SELECT * FROM read_csv_auto(?)"
+                if limit is not None:
+                    sql += f" LIMIT {int(limit)}"
+                table = con.execute(sql, [str(path)]).arrow()
+            finally:
+                con.close()
+        elif suffix in (".parquet", ".pq"):
+            table = pq.read_table(path)
+            if limit is not None:
+                table = table.slice(0, int(limit))
+        else:
+            raise ValueError(
+                f"Unsupported file type {suffix!r}: expected .csv or .parquet"
+            )
+        if isinstance(table, pa.RecordBatchReader):
+            table = table.read_all()
+        return table
+
     def upload_file(
         self, name: str, path: Path, description: str = "", mode: str = "replace"
     ) -> DatasetVersionInfo:
@@ -686,26 +738,7 @@ class DatasetCatalog:
         rewriting it (see :meth:`append`); the default replaces it.
         """
         _validate_name(name)
-        path = Path(path)
-        if not path.exists():
-            raise ValueError(f"File not found: {path}")
-        suffix = path.suffix.lower()
-        if suffix == ".csv":
-            con = duckdb.connect()
-            try:
-                table = con.execute(
-                    "SELECT * FROM read_csv_auto(?)", [str(path)]
-                ).arrow()
-            finally:
-                con.close()
-        elif suffix in (".parquet", ".pq"):
-            table = pq.read_table(path)
-        else:
-            raise ValueError(
-                f"Unsupported file type {suffix!r}: expected .csv or .parquet"
-            )
-        if isinstance(table, pa.RecordBatchReader):
-            table = table.read_all()
+        table = self.parse_upload(path)
         if mode not in ("replace", "append"):
             raise ValueError(f"Unknown upload mode {mode!r}: expected 'replace' or 'append'")
         if mode == "append":

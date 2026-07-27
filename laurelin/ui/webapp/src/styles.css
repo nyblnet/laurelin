@@ -390,6 +390,38 @@ tr.selected {
   border-radius: 10px;
   padding: 16px;
 }
+/* Import drop target. Dashed rather than solid so it reads as "put something
+   here" instead of as a filled panel. */
+.dropzone {
+  border: 1.5px dashed var(--border-2);
+  border-radius: 10px;
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  transition: border-color 0.12s, background 0.12s;
+}
+.dropzone p {
+  margin: 0 0 8px;
+}
+.dropzone-active {
+  border-color: var(--gold);
+  background: rgba(217, 178, 90, 0.06);
+}
+/* A file input styled as a link: the native control can't be restyled, so it
+   is hidden and this label triggers it. */
+.link-button {
+  color: var(--gold);
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.link-button:focus-within {
+  outline: 2px solid var(--gold);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));

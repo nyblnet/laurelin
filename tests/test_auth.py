@@ -483,6 +483,12 @@ def test_rbac_viewer_cannot_mutate(role_clients):
             "/api/v1/datasets/v_up/upload",
             files={"file": ("a.csv", b"a\n1\n", "text/csv")},
         ),
+        # Preview creates nothing, but it does read an arbitrary uploaded file
+        # through the server — so it is an editor capability, not a read.
+        viewer.post(
+            "/api/v1/datasets/preview",
+            files={"file": ("a.csv", b"a\n1\n", "text/csv")},
+        ),
         viewer.post("/api/v1/builds", json={}),
         viewer.post("/api/v1/tokens", json={"name": "nope"}),
     ]

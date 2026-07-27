@@ -84,6 +84,15 @@ export interface DatasetDetail extends Dataset {
   versions: DatasetVersion[];
 }
 
+export interface UploadPreview {
+  suggested_name: string;
+  columns: ColumnSchema[];
+  rows: Record<string, unknown>[];
+  sampled_rows: number;
+  /** The sample hit its cap, so the file has at least this many rows. */
+  truncated: boolean;
+}
+
 export interface RowsPage {
   rows: Record<string, unknown>[];
   row_count: number;

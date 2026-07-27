@@ -17,6 +17,7 @@ import type {
   DatasetDetail,
   DatasetVersion,
   RowsPage,
+  UploadPreview,
 } from "../types";
 import {
   Badge,
@@ -84,11 +85,12 @@ function DatasetList() {
         title="Datasets"
         subtitle="Versioned Parquet datasets in this workspace."
       />
+      <ImportPanel />
       {isLoading && <Spinner />}
       {error && <ErrorBox error={error} />}
       {data &&
         (data.length === 0 ? (
-          <EmptyState>No datasets yet.</EmptyState>
+          <EmptyState>No datasets yet — import a file above to make one.</EmptyState>
         ) : (
           <DataTable
             columns={columns}
@@ -100,6 +102,188 @@ function DatasetList() {
       <SourcesSection />
     </div>
   );
+}
+
+// ------------------------------------------------------------------ import
+
+/**
+ * Create a dataset from a file, without leaving the browser.
+ *
+ * The flow is deliberately preview-then-commit. Importing a file is a decision
+ * about column names and types, and making it blind — upload, then discover
+ * every column came back VARCHAR — is how a dataset ends up wrong on v1. So
+ * dropping a file shows the inferred schema and a sample first; nothing is
+ * created until "Import" is pressed.
+ */
+function ImportPanel() {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const [file, setFile] = useState<File | null>(null);
+  const [name, setName] = useState("");
+  const [dragging, setDragging] = useState(false);
+
+  const canEdit = user?.role === "editor" || user?.role === "admin";
+
+  const previewM = useMutation({
+    mutationFn: (f: File) => {
+      const form = new FormData();
+      form.append("file", f);
+      return api.upload<UploadPreview>(`${API}/datasets/preview`, form);
+    },
+    onSuccess: (p) => setName(p.suggested_name),
+  });
+
+  const importM = useMutation({
+    mutationFn: ({ f, target }: { f: File; target: string }) => {
+      const form = new FormData();
+      form.append("file", f);
+      return api.upload<DatasetVersion>(`${API}/datasets/${target}/upload`, form);
+    },
+    onSuccess: (_v, { target }) => {
+      qc.invalidateQueries({ queryKey: ["datasets"] });
+      navigate(`/datasets/${target}`);
+    },
+  });
+
+  function choose(f: File | null | undefined) {
+    if (!f) return;
+    setFile(f);
+    importM.reset();
+    previewM.mutate(f);
+  }
+
+  function reset() {
+    setFile(null);
+    setName("");
+    previewM.reset();
+    importM.reset();
+  }
+
+  if (!canEdit) return null;
+
+  const preview = previewM.data;
+  const nameValid = /^[a-z][a-z0-9_]*$/.test(name);
+
+  return (
+    <div className="card" style={{ marginBottom: 24 }}>
+      <label style={{ marginBottom: 8 }}>Import a file</label>
+
+      {!file ? (
+        <div
+          className={`dropzone${dragging ? " dropzone-active" : ""}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            choose(e.dataTransfer.files?.[0]);
+          }}
+        >
+          <p>Drop a CSV or Parquet file here</p>
+          <label className="link-button">
+            or choose a file
+            <input
+              type="file"
+              accept=".csv,.parquet"
+              style={{ display: "none" }}
+              onChange={(e) => choose(e.target.files?.[0])}
+            />
+          </label>
+        </div>
+      ) : (
+        <div>
+          <div className="toolbar" style={{ marginBottom: 12 }}>
+            <span className="mono">{file.name}</span>
+            <span className="dim">{fmtBytes(file.size)}</span>
+            <button className="small" onClick={reset}>
+              Choose another
+            </button>
+          </div>
+
+          {previewM.isPending && <Spinner />}
+          {previewM.error && <ErrorBox error={previewM.error} />}
+
+          {preview && (
+            <>
+              <div className="toolbar" style={{ marginBottom: 12 }}>
+                <label htmlFor="ds-name" style={{ marginBottom: 0 }}>
+                  Dataset name
+                </label>
+                <input
+                  id="ds-name"
+                  className="mono"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  style={{ maxWidth: 260 }}
+                />
+                <button
+                  className="primary"
+                  disabled={!nameValid || importM.isPending}
+                  onClick={() => importM.mutate({ f: file, target: name })}
+                >
+                  {importM.isPending ? "Importing…" : "Import"}
+                </button>
+              </div>
+              {!nameValid && (
+                <p className="hint" style={{ marginTop: 0 }}>
+                  Lowercase letters, digits and underscores; must start with a
+                  letter.
+                </p>
+              )}
+              {importM.error && <ErrorBox error={importM.error} />}
+
+              <p className="dim" style={{ fontSize: 12.5 }}>
+                {preview.columns.length} column
+                {preview.columns.length === 1 ? "" : "s"}, showing{" "}
+                {preview.sampled_rows} row
+                {preview.sampled_rows === 1 ? "" : "s"}
+                {preview.truncated ? " (first of more)" : ""} — types inferred
+                from the file.
+              </p>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      {preview.columns.map((c) => (
+                        <th key={c.name}>
+                          {c.name}
+                          <div className="faint mono" style={{ fontWeight: 400 }}>
+                            {c.type}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.rows.slice(0, 10).map((row, i) => (
+                      <tr key={i}>
+                        {preview.columns.map((c) => (
+                          <td key={c.name} className="mono">
+                            {fmtValue(row[c.name])}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // ------------------------------------------------------------------ detail
@@ -159,13 +343,17 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
 function UploadControl({ name }: { name: string }) {
   const qc = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
+  const [mode, setMode] = useState<"replace" | "append">("replace");
   const [done, setDone] = useState<string | null>(null);
 
   const mutation = useMutation({
     mutationFn: (f: File) => {
       const form = new FormData();
       form.append("file", f);
-      return api.upload<DatasetVersion>(`${API}/datasets/${name}/upload`, form);
+      return api.upload<DatasetVersion>(
+        `${API}/datasets/${name}/upload?mode=${mode}`,
+        form,
+      );
     },
     onSuccess: (v) => {
       qc.invalidateQueries({ queryKey: ["dataset", name] });
@@ -188,6 +376,14 @@ function UploadControl({ name }: { name: string }) {
             mutation.reset();
           }}
         />
+        <select
+          value={mode}
+          onChange={(e) => setMode(e.target.value as "replace" | "append")}
+          aria-label="Upload mode"
+        >
+          <option value="replace">Replace</option>
+          <option value="append">Append</option>
+        </select>
         <button
           className="primary"
           disabled={!file || mutation.isPending}
@@ -196,6 +392,11 @@ function UploadControl({ name }: { name: string }) {
           {mutation.isPending ? "Uploading…" : "Upload"}
         </button>
       </div>
+      <p className="hint" style={{ marginTop: 8, marginBottom: 0 }}>
+        {mode === "replace"
+          ? "Replace writes a new version containing only this file's rows."
+          : "Append adds these rows to the existing ones and writes only the delta. The schema must match."}
+      </p>
       {mutation.error && <ErrorBox error={mutation.error} />}
       {done && (
         <p className="hint ok" style={{ marginTop: 8 }}>
