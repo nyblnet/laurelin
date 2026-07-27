@@ -205,6 +205,23 @@ update/create payload keys must be declared properties of the object type
 (integer/float/boolean). Writes `ObjectEdit` + audit log. Raise `ValueError`
 with a clear message on any validation failure (api maps to 400/404).
 
+#### Aggregation
+
+`aggregate(type, group_by, metrics, filters, search, limit)` groups the same
+object set `query()` pages. Both go through `_object_scan`, which yields
+`(con, sql, params)` for "the objects of this type" — paging and aggregation
+are that question asked twice, and two definitions of it would eventually
+disagree about a deleted row or a policy.
+
+Metric ops are an **allowlist** mapping to SQL functions; anything unlisted is
+rejected rather than interpolated. Results are ordered by the first metric
+descending, so the group cap (`MAX_GROUPS`, 1000) keeps the interesting rows
+and `truncated` says when it bit.
+
+When the scan declines (hash masking, an untypeable overlay) the aggregate is
+computed over the exact in-memory objects instead. Slower, never wrong — and
+never a way to read rows the object list wouldn't show.
+
 ### `laurelin/api` — `create_app(workspace: Workspace) -> FastAPI`
 
 Construct catalog/store once; build registry + ontology **per request group**
@@ -442,6 +459,8 @@ POST /api/v1/ontology/object-types/{name}/index -> {object_type,objects:N,state}
 DELETE /api/v1/ontology/object-types/{name}/index -> {"dropped": name}  (editor)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
                                      -> {"objects":[...],"total":N,"total_capped":bool}  (403 if not viewable)
+POST /api/v1/ontology/objects/{type}/aggregate {group_by,metrics,filters,search,limit}
+                                     -> {groups:[...],group_count:N,truncated:bool}
 GET  /api/v1/ontology/objects/{type}/{pk}     -> object dict (404 if absent)
 GET  /api/v1/ontology/objects/{type}/{pk}/links/{link} -> {"objects":[...]}
 GET  /api/v1/ontology/actions                 -> [ActionDef]  (viewable types only)

@@ -706,6 +706,49 @@ def query_objects(
     )
 
 
+class MetricRequest(BaseModel):
+    op: str = Field(description="count | count_distinct | sum | avg | min | max | median")
+    property: Optional[str] = Field(default=None, description="Omit only for count")
+    alias: Optional[str] = None
+
+
+class AggregateRequest(BaseModel):
+    group_by: list[str] = Field(default_factory=list)
+    metrics: list[MetricRequest] = Field(default_factory=list)
+    filters: dict[str, str] = Field(default_factory=dict)
+    search: Optional[str] = None
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+@router.post("/ontology/objects/{type_name}/aggregate")
+def aggregate_objects(
+    type_name: str,
+    body: AggregateRequest,
+    service: OntologyDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """Group objects and compute metrics over them.
+
+    POST rather than GET because the request is a structured document — a list
+    of metrics — and encoding that in query parameters produces something
+    nobody can read or validate. It is still a read: no state changes, and the
+    same view permission applies.
+    """
+    _require_ot_view(perms, user, service, type_name)
+    try:
+        return service.aggregate(
+            type_name,
+            group_by=body.group_by,
+            metrics=[m.model_dump() for m in body.metrics],
+            filters=body.filters or None,
+            search=body.search,
+            limit=body.limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
 @router.get("/ontology/objects/{type_name}/{pk}")
 def get_object(
     type_name: str, pk: str, service: OntologyDep, perms: PermDep, user: UserDep

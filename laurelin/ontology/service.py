@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Optional
@@ -64,6 +65,41 @@ def _result(objects: list[dict], total: int, search: Optional[str]) -> dict:
     capped = bool(search) and total >= SEARCH_TOTAL_CAP
     return {"objects": objects, "total": min(total, SEARCH_TOTAL_CAP) if capped else total,
             "total_capped": capped}
+
+
+def _sortable(value: Any):
+    """A key that orders numbers naturally and never raises on mixed types."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _compute(spec: dict, members: list[dict]) -> Any:
+    op, prop = spec["op"], spec["property"]
+    if prop is None:
+        return len(members)
+    values = [m.get(prop) for m in members if m.get(prop) is not None]
+    if op == "count":
+        return len(values)
+    if op == "count_distinct":
+        return len({str(v) for v in values})
+    if not values:
+        return None
+    if op == "min":
+        return min(values)
+    if op == "max":
+        return max(values)
+    numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if not numbers:
+        return None
+    if op == "sum":
+        return sum(numbers)
+    if op == "avg":
+        return sum(numbers) / len(numbers)
+    if op == "median":
+        ordered = sorted(numbers)
+        mid = len(ordered) // 2
+        return (ordered[mid] if len(ordered) % 2
+                else (ordered[mid - 1] + ordered[mid]) / 2)
+    raise AssertionError(f"unhandled aggregation {op!r}")  # pragma: no cover
 
 
 def _coerce_parameter(name: str, value: Any, type_name: str) -> Any:
@@ -298,27 +334,27 @@ class OntologyService:
                 deleted.add(pk)
         return deleted, updates, creates
 
-    def _sql_query(
+    @contextmanager
+    def _object_scan(
         self,
         ot: ObjectTypeDef,
         search: Optional[str],
         filters: Optional[dict[str, str]],
-        limit: int,
-        offset: int,
-    ) -> Optional[dict]:
-        """Filter, search, count and page objects inside DuckDB, over the
-        backing dataset's Parquet parts.
+    ):
+        """Yield ``(con, sql, params, cols, pk)`` for one object type's rows,
+        or ``(None, ...)`` when the pushdown can't be done faithfully.
 
-        Returns None when this can't be done faithfully (row-level security on
-        the dataset, an unbuildable overlay), so the caller falls back to the
-        in-memory path. Semantics match ``_materialize``: base rows in file
-        order with updates applied in place, created objects appended, deleted
-        objects removed, last-wins on duplicate primary keys.
+        Paging and aggregation are the same question asked twice — *which
+        objects* — so they share this. Splitting it would mean two definitions
+        of "the objects of this type", and the second one would eventually
+        disagree with the first about a deleted row or a policy.
         """
+        empty = (None, None, None, None, None)
         if self.plan_for is None and self._policy_for_dataset(ot.backing_dataset) is not None:
             # A policy applies but we have no way to push it into the scan;
             # never take a path that would skip enforcement.
-            return None
+            yield empty
+            return
         backing = self.catalog.store.get_dataset(ot.backing_dataset)
         if backing is not None and backing.is_federated:
             # Every object page would become a full remote scan, and the edit
@@ -341,14 +377,17 @@ class OntologyService:
                 ot.backing_dataset, plan_for=self.plan_for
             )
         except KeyError:
-            return None
+            yield empty
+            return
         if version is None:
-            return None
+            yield empty
+            return
 
         available = {c.name: c.type for c in version.schema_}
         pk = ot.primary_key
         if pk not in available:
-            return None  # can't identify objects without the key column
+            yield empty  # can't identify objects without the key column
+            return
         # Project exactly what _materialize would keep: declared properties
         # that actually exist in the dataset, plus the primary key.
         cols = [c for c in available if c in (set(ot.properties) | {pk})]
@@ -367,11 +406,34 @@ class OntologyService:
                     con, cols, available, updates, creates
                 )
             except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
-                return None  # a payload we can't type faithfully; be exact instead
+                yield empty  # a payload we can't type faithfully; be exact instead
+                return
 
             sql, params = self._build_sql(
                 cols, pk, deleted, base, search, filters, ot
             )
+            yield con, sql, params, cols, pk
+        finally:
+            con.close()
+
+    def _sql_query(
+        self,
+        ot: ObjectTypeDef,
+        search: Optional[str],
+        filters: Optional[dict[str, str]],
+        limit: int,
+        offset: int,
+    ) -> Optional[dict]:
+        """Filter, search, count and page objects inside DuckDB.
+
+        Returns None when the pushdown can't be done faithfully, so the caller
+        falls back to the in-memory path. Semantics match ``_materialize``:
+        base rows in file order with updates applied in place, created objects
+        appended, deleted objects removed, last-wins on duplicate keys.
+        """
+        with self._object_scan(ot, search, filters) as (con, sql, params, cols, pk):
+            if con is None:
+                return None
             # Object queries are still linear in dataset size, so they carry the
             # same budget as any other interactive query.
             with limits.limited(con, limits.QueryLimits.interactive()):
@@ -386,8 +448,6 @@ class OntologyService:
                 ).arrow()
             if isinstance(page, pa.RecordBatchReader):
                 page = page.read_all()
-        finally:
-            con.close()
 
         objects = []
         for row in self.catalog.table_to_rows(page):
@@ -397,6 +457,151 @@ class OntologyService:
             obj["__title"] = ot.title_for(row)
             objects.append(obj)
         return _result(objects, total, search)
+
+    # -- aggregation ---------------------------------------------------------
+
+    # An allowlist, not a passthrough: the op becomes a SQL function name, so
+    # anything not in here would be an injection point wearing a feature's
+    # clothes. Adding one is a deliberate edit, which is the point.
+    AGGREGATIONS = {
+        "count": "count",
+        "sum": "sum",
+        "avg": "avg",
+        "min": "min",
+        "max": "max",
+        "median": "median",
+        "count_distinct": "count",  # rendered with DISTINCT below
+    }
+
+    # Groups returned by one aggregation. A group-by on a high-cardinality
+    # property is the easy way to ask for a million rows by accident, and an
+    # aggregation that returns a million rows has not aggregated anything.
+    MAX_GROUPS = 1000
+
+    def aggregate(
+        self,
+        type_name: str,
+        group_by: Optional[list[str]] = None,
+        metrics: Optional[list[dict]] = None,
+        filters: Optional[dict[str, str]] = None,
+        search: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict:
+        """Group objects and compute metrics over them.
+
+        Dashboards could always chart the *backing dataset* with SQL, but that
+        routes around the object model: it sees raw rows, not objects, so it
+        misses the edit overlay entirely and answers from data an action has
+        already changed. This aggregates the same object set that
+        :meth:`query` pages, overlay and policy included.
+        """
+        ot = self._require_object_type(type_name)
+        group_by = list(group_by or [])
+        metrics = list(metrics or [{"op": "count", "alias": "count"}])
+        limit = max(1, min(int(limit), self.MAX_GROUPS))
+
+        declared = set(ot.properties) | {ot.primary_key}
+        for prop in group_by:
+            if prop not in declared:
+                raise ValueError(
+                    f"Unknown group_by property {prop!r} for object type "
+                    f"{type_name!r}"
+                )
+        specs = [self._metric_spec(m, declared, type_name) for m in metrics]
+        if not specs:
+            raise ValueError("At least one metric is required")
+
+        with self._object_scan(ot, search, filters) as (con, sql, params, cols, _pk):
+            if con is not None:
+                missing = [p for p in group_by if p not in cols]
+                if missing:
+                    # Declared in the ontology but absent from this version of
+                    # the backing dataset: grouping on it would be a SQL error.
+                    raise ValueError(
+                        f"Property {missing[0]!r} is not present in dataset "
+                        f"{ot.backing_dataset!r}"
+                    )
+                return self._aggregate_sql(con, sql, params, group_by, specs, limit)
+
+        # No faithful pushdown (hash masking, an untypeable overlay): compute
+        # over the exact in-memory objects instead. Slower, never wrong.
+        return self._aggregate_python(ot, group_by, specs, filters, search, limit)
+
+    def _metric_spec(self, metric: dict, declared: set[str], type_name: str) -> dict:
+        op = str(metric.get("op", "")).lower()
+        if op not in self.AGGREGATIONS:
+            raise ValueError(
+                f"Unknown aggregation {op!r}: expected one of "
+                f"{', '.join(sorted(self.AGGREGATIONS))}"
+            )
+        prop = metric.get("property")
+        if op == "count" and prop is None:
+            pass  # count(*) needs no column
+        elif prop is None:
+            raise ValueError(f"Aggregation {op!r} requires a property")
+        elif prop not in declared:
+            raise ValueError(
+                f"Unknown property {prop!r} for object type {type_name!r}"
+            )
+        alias = metric.get("alias") or (f"{op}_{prop}" if prop else op)
+        return {"op": op, "property": prop, "alias": str(alias)}
+
+    def _aggregate_sql(self, con, sql: str, params: list, group_by: list[str],
+                       specs: list[dict], limit: int) -> dict:
+        q = lambda c: '"' + c.replace('"', '""') + '"'  # noqa: E731
+        selects = [q(p) for p in group_by]
+        for spec in specs:
+            fn = self.AGGREGATIONS[spec["op"]]
+            if spec["property"] is None:
+                expr = "count(*)"
+            elif spec["op"] == "count_distinct":
+                expr = f"count(DISTINCT {q(spec['property'])})"
+            else:
+                expr = f"{fn}({q(spec['property'])})"
+            selects.append(f"{expr} AS {q(spec['alias'])}")
+
+        grouped = f"SELECT {', '.join(selects)} FROM ({sql}) o"
+        if group_by:
+            keys = ", ".join(q(p) for p in group_by)
+            # Order by the first metric descending: "biggest first" is what a
+            # chart wants, and it makes the row cap keep the interesting rows
+            # rather than an arbitrary slice.
+            grouped += f" GROUP BY {keys} ORDER BY {q(specs[0]['alias'])} DESC NULLS LAST"
+
+        with limits.limited(con, limits.QueryLimits.interactive()):
+            total_groups = con.execute(
+                f"SELECT count(*) FROM ({grouped}) g", params
+            ).fetchone()[0] if group_by else 1
+            table = con.execute(f"{grouped} LIMIT ?", [*params, limit]).arrow()
+        if isinstance(table, pa.RecordBatchReader):
+            table = table.read_all()
+        rows = self.catalog.table_to_rows(table)
+        return {"groups": rows, "group_count": int(total_groups),
+                "truncated": bool(group_by) and int(total_groups) > limit}
+
+    def _aggregate_python(self, ot: ObjectTypeDef, group_by: list[str],
+                          specs: list[dict], filters, search, limit: int) -> dict:
+        """The exact path, for objects the pushdown declines to handle."""
+        objects = self.query(
+            ot.api_name, search=search, filters=filters, limit=_LINK_LIMIT, offset=0
+        )["objects"]
+
+        buckets: dict[tuple, list[dict]] = {}
+        for obj in objects:
+            key = tuple(obj.get(p) for p in group_by)
+            buckets.setdefault(key, []).append(obj)
+
+        rows = []
+        for key, members in buckets.items():
+            row = dict(zip(group_by, key))
+            for spec in specs:
+                row[spec["alias"]] = _compute(spec, members)
+            rows.append(row)
+        if group_by:
+            rows.sort(key=lambda r: (r.get(specs[0]["alias"]) is None,
+                                     _sortable(r.get(specs[0]["alias"]))), reverse=True)
+        return {"groups": rows[:limit], "group_count": len(rows),
+                "truncated": len(rows) > limit}
 
     def _register_overlay_tables(
         self,

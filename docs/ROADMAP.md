@@ -224,8 +224,15 @@ Key bets, and why:
 - [ ] **Filters on non-key properties**: would need per-type columns rather
       than one JSON blob; extracting JSON per row measured slower than the
       scan it replaced.
-- [ ] **Aggregations API**: group-by/count/sum/min/max/percentiles over objects,
-      powering dashboards.
+- [x] **Aggregations API**: `POST /ontology/objects/{type}/aggregate` —
+      group-by over declared properties with count / count_distinct / sum /
+      avg / min / max / median, pushed into DuckDB (437 ms over 1 M objects
+      grouping with two metrics). Aggregates the *object* set, so the edit
+      overlay is included — charting the backing dataset directly would answer
+      from rows an action has already changed. Ops are an allowlist, not a
+      passthrough, since the op becomes a SQL function name. Falls back to an
+      exact in-memory pass when a policy can't be pushed down, so an aggregate
+      never becomes a way to read rows you can't list.
 - [ ] **Action side effects**: webhooks, notifications, and enqueue-build on
       action apply; submission criteria (declarative preconditions: role, object
       state, parameter rules).
