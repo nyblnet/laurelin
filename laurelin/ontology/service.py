@@ -20,7 +20,7 @@ import pyarrow as pa
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import limits
 from laurelin.core.config import Workspace
-from laurelin.core.db import MetadataStore
+from laurelin.core.db import SEARCH_TOTAL_CAP, MetadataStore, count_sql
 from laurelin.core.models import (
     EditKind,
     ObjectEdit,
@@ -52,6 +52,18 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     return str(value)
+
+
+def _result(objects: list[dict], total: int, search: Optional[str]) -> dict:
+    """Shape one page of objects.
+
+    ``total`` saturates at SEARCH_TOTAL_CAP when a search term is present, so
+    the caller is told whether the number is exact or a floor rather than
+    having to guess. Browsing is never capped.
+    """
+    capped = bool(search) and total >= SEARCH_TOTAL_CAP
+    return {"objects": objects, "total": min(total, SEARCH_TOTAL_CAP) if capped else total,
+            "total_capped": capped}
 
 
 def _coerce_parameter(name: str, value: Any, type_name: str) -> Any:
@@ -252,7 +264,7 @@ class OntologyService:
             obj["__pk"] = row["pk"]
             obj["__title"] = row["title"]
             objects.append(obj)
-        return {"objects": objects, "total": total}
+        return _result(objects, total, search)
 
     # -- pushdown -----------------------------------------------------------------
 
@@ -363,8 +375,11 @@ class OntologyService:
             # Object queries are still linear in dataset size, so they carry the
             # same budget as any other interactive query.
             with limits.limited(con, limits.QueryLimits.interactive()):
+                # The same saturating count the index applies. If these two
+                # disagreed, "the index is a faster path to the same answer"
+                # would stop being true the moment a search got popular.
                 total = con.execute(
-                    f"SELECT count(*) FROM ({sql}) t", params
+                    count_sql(sql, bool(search)), params
                 ).fetchone()[0]
                 page = con.execute(
                     f"{sql} LIMIT ? OFFSET ?", [*params, max(0, limit), max(0, offset)]
@@ -381,7 +396,7 @@ class OntologyService:
             obj["__pk"] = str(row.get(pk))
             obj["__title"] = ot.title_for(row)
             objects.append(obj)
-        return {"objects": objects, "total": total}
+        return _result(objects, total, search)
 
     def _register_overlay_tables(
         self,
@@ -585,10 +600,9 @@ class OntologyService:
                     if o.get(prop) is not None and str(o.get(prop)) == str(value)
                 ]
 
-        total = len(objects)
         offset = max(0, offset)
         limit = max(0, limit)
-        return {"objects": objects[offset : offset + limit], "total": total}
+        return _result(objects[offset : offset + limit], len(objects), search)
 
     def get(self, type_name: str, pk: str) -> Optional[dict]:
         ot = self._require_object_type(type_name)

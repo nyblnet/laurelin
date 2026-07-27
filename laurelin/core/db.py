@@ -39,6 +39,27 @@ from laurelin.core.models import (
     utcnow_iso,
 )
 
+# How many matches a *search* counts before it stops counting and reports the
+# cap. Browsing is unaffected: an unfiltered count is a cheap indexed count and
+# stays exact.
+#
+# Searching is different. Substring matching is the one predicate no index can
+# make cheap for a broad term — measured, an exact count over 28,000 matches
+# was *slower* through the trigram index (130 ms) than through a plain scan
+# (63 ms), because the index has to visit every match to count it. Saturating
+# the count makes both paths fast and costs nothing real: nobody pages to
+# result 10,000, and "10,000+" is the honest answer anyway.
+#
+# Applied identically by the index and the DuckDB scan, because those two must
+# never disagree.
+SEARCH_TOTAL_CAP = 10_000
+
+
+def count_sql(inner_select: str, capped: bool, alias: str = "n") -> str:
+    """Wrap a row-producing SELECT in a count, saturating when capped."""
+    limited = f"{inner_select} LIMIT {SEARCH_TOTAL_CAP}" if capped else inner_select
+    return f"SELECT count(*) AS {alias} FROM ({limited}) t"
+
 
 def _iso_in(seconds: int) -> str:
     """An ISO timestamp `seconds` from now — lease expiry math in one place."""
@@ -461,12 +482,15 @@ class MetadataStore:
         return [self._row_to_version(r) for r in rows]
 
     # -- object index ---------------------------------------------------------------
+    #
+    # See SEARCH_TOTAL_CAP below for why a search reports a saturating total.
 
     def replace_object_index(
         self, object_type: str, rows: list[dict], dataset_version: int, edit_count: int
     ) -> None:
         """Swap in a freshly built index for one object type, atomically."""
         with self._conn() as c:
+            self.backend.ensure_search_index(c)
             c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
             for row in rows:
                 c.execute(
@@ -476,6 +500,11 @@ class MetadataStore:
                     (object_type, row["pk"], row["title"], row["search_text"],
                      json.dumps(row["props"])),
                 )
+            # Same transaction as the rows above, so the search mirror can
+            # never be left describing an index that no longer exists.
+            self.backend.sync_search_index(
+                c, object_type, [(r["pk"], r["search_text"]) for r in rows]
+            )
             c.execute(
                 """INSERT INTO object_index_state
                      (object_type, dataset_version, edit_count, object_count, built_at)
@@ -504,6 +533,7 @@ class MetadataStore:
         with self._conn() as c:
             c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
             c.execute("DELETE FROM object_index_state WHERE object_type = ?", (object_type,))
+            self.backend.clear_search_index(c, object_type)
 
     def count_object_edits(self, object_type: str) -> int:
         with self._conn() as c:
@@ -532,15 +562,15 @@ class MetadataStore:
         where = ["object_type = ?"]
         params: list = [object_type]
         if search:
-            where.append("search_text LIKE ?")
-            params.append(f"%{search.lower()}%")
+            self.backend.append_search_filter(where, params, object_type, search)
         if pk is not None:
             where.append("pk = ?")
             params.append(str(pk))
         clause = " AND ".join(where)
         with self._conn() as c:
             total = c.execute(
-                f"SELECT count(*) AS n FROM object_index WHERE {clause}", tuple(params)
+                count_sql(f"SELECT 1 FROM object_index WHERE {clause}", bool(search)),
+                tuple(params),
             ).fetchone()["n"]
             rows = c.execute(
                 f"""SELECT pk, title, props_json FROM object_index WHERE {clause}

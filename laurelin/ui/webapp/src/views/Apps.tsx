@@ -25,7 +25,7 @@ import {
   ErrorBox,
   PageHeader,
   Spinner,
-  fmtNum,
+  fmtCount,
   fmtValue,
 } from "../ui";
 import { ActionForm } from "./ontology/ActionForm";
@@ -200,7 +200,7 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
         />
         {objectsQ.data && (
           <span className="dim" style={{ fontSize: 12.5 }}>
-            {fmtNum(objectsQ.data.total)} matching
+            {fmtCount(objectsQ.data)} matching
           </span>
         )}
       </div>
@@ -259,7 +259,7 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
             </button>
             <span>
               {offset + 1}–{offset + objectsQ.data!.objects.length} of{" "}
-              {fmtNum(objectsQ.data!.total)}
+              {fmtCount(objectsQ.data!)}
             </span>
           </div>
         </>

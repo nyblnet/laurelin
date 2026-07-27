@@ -256,6 +256,12 @@ export type OntologyObject = Record<string, unknown> & {
 export interface ObjectQueryResult {
   objects: OntologyObject[];
   total: number;
+  /**
+   * True when `total` is a floor rather than an exact count. A search stops
+   * counting past a cap, because counting every substring match is the one
+   * thing no index makes cheap. Browsing is never capped.
+   */
+  total_capped?: boolean;
 }
 
 export interface AuditEvent {

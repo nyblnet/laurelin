@@ -196,10 +196,19 @@ Key bets, and why:
       stale index is never read — freshness is checked against the dataset
       version *and* the edit overlay on every query, and RLS users always take
       the scan.
-- [ ] **Full-text object search**: search is still `LIKE '%…%'`, so it scans
-      even when indexed. SQLite FTS5 / Postgres `tsvector` would make it
-      ranked and sub-linear. Filters on non-key properties would need
-      per-type columns rather than one JSON blob.
+- [x] **Accelerated object search**: trigram indexing (SQLite FTS5 trigram /
+      Postgres `pg_trgm` GIN) makes `LIKE '%…%'` sub-linear *without*
+      redefining it — a selective search is 49× faster at 800 K objects and
+      effectively constant. Deliberately not FTS: token matching finds
+      "minas" in "Minas Tirith" but never "inas Ti", and the scan path shares
+      the substring definition. Best-effort, falling back to an unindexed
+      LIKE where the extension isn't available.
+- [ ] **Ranked search**: results are ordered by primary key, not relevance,
+      with no stemming. Needs a real FTS index *alongside* the trigram one,
+      plus a way to express "rank these, but match substrings too".
+- [ ] **Filters on non-key properties**: would need per-type columns rather
+      than one JSON blob; extracting JSON per row measured slower than the
+      scan it replaced.
 - [ ] **Aggregations API**: group-by/count/sum/min/max/percentiles over objects,
       powering dashboards.
 - [ ] **Action side effects**: webhooks, notifications, and enqueue-build on

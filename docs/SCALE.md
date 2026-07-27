@@ -211,22 +211,39 @@ materialized into the metadata store, one row per object — after which queries
 stop touching Parquet at all. It is opt-in per type (`POST
 /ontology/object-types/{name}/index`), because it costs storage and a refresh:
 
-| Objects | Browse a page (25) | Get by primary key | Search | Build the index |
+| Objects | Browse a page (25) | Get by primary key | Search (selective) | Build the index |
 |---:|---:|---:|---:|---:|
-| 100 K | 4 ms *(scan: 53)* | 1.4 ms *(scan: 25)* | 26 ms *(scan: 53)* | 0.9 s |
-| 1 M | 27 ms *(scan: 293)* | 1.4 ms *(scan: 99)* | 132 ms *(scan: 323)* | 10 s |
+| 200 K | 4 ms *(scan: 53)* | 1.4 ms *(scan: 25)* | 4.9 ms *(scan: 90)* | 2.4 s |
+| 800 K | 27 ms *(scan: 293)* | 1.4 ms *(scan: 99)* | 5.9 ms *(scan: 288)* | 11 s |
 
-Key lookup becomes **constant time** — 1.4 ms whether the type holds 100 K
-objects or a million — because the primary key is a real indexed column.
+Two things become **constant time** — a key lookup (1.4 ms whether the type
+holds 200 K objects or a million) and a selective search (4.9 → 5.9 ms while
+the data quadrupled). Both because they resolve through a real index rather
+than a scan.
+
+Search is *trigram*-indexed, not full-text, and that is deliberate: object
+search means a case-insensitive **substring** match, a definition shared with
+the DuckDB scan path. Trigram indexing makes `LIKE '%…%'` fast while matching
+exactly what it always matched. Full-text search would have quietly redefined
+it — token matching finds `minas` in "Minas Tirith" but never `inas Ti`.
+
+It is best-effort on both dialects: SQLite uses an FTS5 trigram table,
+PostgreSQL a `pg_trgm` GIN index. An old SQLite without FTS5, or a managed
+Postgres that won't grant `CREATE EXTENSION`, falls back to an unindexed
+`LIKE` — same answers, less speed.
 
 What the index deliberately does *not* accelerate:
 
 - **Filters on any other property.** Properties are stored as one JSON blob,
   and extracting one per row measured *slower* than the DuckDB scan the index
   was meant to beat. Those queries are handed straight back to the scan, which
-  prunes row groups instead. The index answers paging, search and key lookups.
-- **Substring search** is still a table scan, just a cheaper one (2.5×) —
-  `LIKE '%…%'` cannot use a b-tree. Full-text search is the next step here.
+  prunes row groups instead.
+- **Counting every match of a broad search.** This is the one thing no index
+  makes cheap — counting 28,000 matches through the trigram index measured
+  *slower* (130 ms) than a plain scan (63 ms), because the index must visit
+  every match to count it. So a search stops counting at 10,000 and reports
+  `10,000+`; browsing is never capped and stays exact. With the cap in place a
+  broad search is 7.9× faster than the scan rather than 2× slower.
 - **Anything a row policy touches.** The index is shared across users, so a
   request carrying row-level security never reads it. This is the safety
   property, not an omission.
@@ -380,33 +397,35 @@ a laptop or a single VM, and unchanged.
 
 ## Known limitations, plainly
 
-1. **Object search is substring, not full-text.** Indexed or not, `LIKE
-   '%…%'` scans. The index makes it 2.5× cheaper; it doesn't make it
-   sub-linear. Ranked full-text search (SQLite FTS5 / Postgres `tsvector`) is
-   the next step.
+1. **Search has no relevance ranking.** Results come back in primary-key
+   order, not best-match-first, and there is no stemming or synonym handling.
+   Substring matching is the right primitive for an identifier-heavy object
+   model; it is the wrong one for prose.
 2. **The object index covers paging, search and key lookups only.** Filters
    on other properties fall back to the DuckDB scan — deliberately, because
    the JSON-per-row alternative measured slower. Filterable secondary columns
    would need a schema-per-type index.
-3. **Column masking loses column pruning**, and hash masking materializes
+3. **A search total saturates at 10,000.** Counting every match of a broad
+   term is the one thing an index can't make cheap. Browsing is exact.
+4. **Column masking loses column pruning**, and hash masking materializes
    (no Arrow sha256). Row policies push down fully and are free.
-4. **Whole-table Python transforms are still RAM-bound** — that's the default
+5. **Whole-table Python transforms are still RAM-bound** — that's the default
    for convenience. `streaming=True` removes the bound for row-wise work; SQL
    transforms stream natively. Only whole-table aggregation in Python is
    genuinely limited.
-5. **Builds don't spread across replicas.** Each replica runs its own worker
+6. **Builds don't spread across replicas.** Each replica runs its own worker
    pool and leases prevent double-execution, but there is no queue that hands
    a backlog on one replica to an idle one.
-6. **Incremental transforms need an append-only input.** The delta path
+7. **Incremental transforms need an append-only input.** The delta path
    triggers when a new version's manifest extends the previous one; a rewrite
    or a compaction falls back to a full recompute, which is correct but not
    cheap.
-7. **Edits are an overlay** — object writes don't flow back into Parquet
+8. **Edits are an overlay** — object writes don't flow back into Parquet
    unless you write a transform that does it.
-8. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
+9. **Horizontal scaling needs Postgres** — embedded (SQLite) mode is
    single-replica by construction. Object storage is opt-in via
    `LAURELIN_DATA_URI`; without it, replicas still share a volume for Parquet.
-9. **Auto-compaction is off by default** — set `LAURELIN_AUTO_COMPACT_PARTS`
+10. **Auto-compaction is off by default** — set `LAURELIN_AUTO_COMPACT_PARTS`
    to a part count, or keep calling `/compact` yourself. There's no
    size-aware or tiered policy, just a threshold.
 
@@ -415,7 +434,8 @@ because you'd rather find out now than in month three.
 
 **Recently fixed:** write amplification (appends are now O(delta), not
 O(dataset)); the ontology full-scan ceiling (~26× faster, and flat for key
-lookups once indexed); the row-level security tax (3.6× → 1.0×); the
+lookups once indexed, and flat for selective search once trigram-indexed);
+the row-level security tax (3.6× → 1.0×); the
 single-replica limit (Postgres schemas + object storage + build leases); the
 absence of query resource limits (a runaway query is now interrupted rather
 than left to degrade a replica); the lack of cron and on-upstream triggers

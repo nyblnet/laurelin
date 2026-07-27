@@ -131,6 +131,38 @@ class Backend:
         """
         return None
 
+    # -- accelerated substring search ------------------------------------------
+    #
+    # Object search is a case-insensitive substring match, and that definition
+    # is shared with the DuckDB scan path — the index must never return a
+    # different answer, only a faster one. So this is *trigram* indexing, which
+    # accelerates `LIKE '%needle%'` while preserving its exact semantics, not
+    # full-text search, which would silently redefine what a search means
+    # (token matching finds "minas" in "Minas Tirith" but never "inas Ti").
+    #
+    # Both dialects have it, and on both it is best-effort: an old SQLite built
+    # without FTS5, or a managed Postgres that won't grant CREATE EXTENSION,
+    # simply falls back to an unindexed LIKE. Same results, less speed.
+
+    def ensure_search_index(self, conn: Connection) -> bool:
+        """Create the trigram index if this backend can. Returns availability."""
+        return False
+
+    def sync_search_index(self, conn: Connection, object_type: str,
+                          rows: list[tuple[str, str]]) -> None:
+        """Mirror ``(pk, search_text)`` for one object type. No-op when the
+        acceleration needs no separate storage."""
+        return None
+
+    def clear_search_index(self, conn: Connection, object_type: str) -> None:
+        return None
+
+    def append_search_filter(self, where: list[str], params: list,
+                             object_type: str, needle: str) -> None:
+        """Add the substring predicate, using the trigram index if present."""
+        where.append("search_text LIKE ?")
+        params.append(f"%{needle.lower()}%")
+
 
 class SQLiteBackend(Backend):
     dialect = "sqlite"
@@ -157,6 +189,51 @@ class SQLiteBackend(Backend):
 
     def insert_or_ignore(self, table: str, columns: str, placeholders: str) -> str:
         return f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})"
+
+    # SQLite has no way to index a leading-wildcard LIKE on an ordinary column,
+    # so the trigram tokenizer is exposed through an FTS5 virtual table that
+    # mirrors (object_type, pk, search_text). It is written in the same
+    # transaction as the index itself, so the two cannot drift.
+    _has_fts: Optional[bool] = None
+
+    def ensure_search_index(self, conn: Connection) -> bool:
+        if self._has_fts is None:
+            try:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS object_search USING fts5("
+                    "  object_type UNINDEXED, pk UNINDEXED, search_text,"
+                    "  tokenize='trigram')"
+                )
+                self._has_fts = True
+            except Exception:
+                # FTS5 absent, or built without the trigram tokenizer (3.34+).
+                self._has_fts = False
+        return self._has_fts
+
+    def sync_search_index(self, conn: Connection, object_type: str,
+                          rows: list[tuple[str, str]]) -> None:
+        if not self.ensure_search_index(conn):
+            return
+        conn.execute("DELETE FROM object_search WHERE object_type = ?", (object_type,))
+        conn.executemany(
+            "INSERT INTO object_search (object_type, pk, search_text) VALUES (?, ?, ?)",
+            [(object_type, pk, text) for pk, text in rows],
+        )
+
+    def clear_search_index(self, conn: Connection, object_type: str) -> None:
+        if self._has_fts:
+            conn.execute("DELETE FROM object_search WHERE object_type = ?", (object_type,))
+
+    def append_search_filter(self, where: list[str], params: list,
+                             object_type: str, needle: str) -> None:
+        if self._has_fts:
+            where.append(
+                "pk IN (SELECT pk FROM object_search"
+                "        WHERE object_type = ? AND search_text LIKE ?)"
+            )
+            params.extend([object_type, f"%{needle.lower()}%"])
+        else:
+            super().append_search_filter(where, params, object_type, needle)
 
 
 class PostgresBackend(Backend):
@@ -204,6 +281,26 @@ class PostgresBackend(Backend):
     def ensure_namespace(self, conn: Connection) -> None:
         if self.schema:
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.quote_ident(self.schema)}")
+
+    # pg_trgm indexes the existing column, so unlike SQLite there is no mirror
+    # table and no query change at all — the same `search_text LIKE ?` simply
+    # starts using a GIN index. Creating an extension needs privileges a
+    # managed Postgres may withhold, hence best-effort.
+    _has_trgm: Optional[bool] = None
+
+    def ensure_search_index(self, conn: Connection) -> bool:
+        if self._has_trgm is None:
+            try:
+                conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_object_index_search "
+                    "ON object_index USING gin (search_text gin_trgm_ops)"
+                )
+                self._has_trgm = True
+            except Exception:
+                conn.rollback()  # the failed DDL poisons the transaction
+                self._has_trgm = False
+        return self._has_trgm
 
     def render_schema(self, schema: str) -> str:
         return (

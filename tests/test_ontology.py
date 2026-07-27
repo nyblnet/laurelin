@@ -176,7 +176,7 @@ def test_query_base_rows(service: OntologyService):
 def test_query_missing_dataset_is_empty(ws, catalog, store):
     write_ontology(ws)  # no data seeded
     svc = OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
-    assert svc.query("aircraft") == {"objects": [], "total": 0}
+    assert svc.query("aircraft") == {"objects": [], "total": 0, "total_capped": False}
 
 
 def test_query_unknown_type(service: OntologyService):

@@ -115,6 +115,16 @@ export function fmtNum(n: number | null | undefined): string {
   return n == null ? "—" : n.toLocaleString("en-US");
 }
 
+/**
+ * A result count that may be a floor rather than an exact number. A broad
+ * search stops counting at a cap, so rendering the bare number would state
+ * "10,000" when the truth is "at least 10,000".
+ */
+export function fmtCount(r: { total: number; total_capped?: boolean } | null | undefined): string {
+  if (r == null) return "—";
+  return r.total_capped ? `${fmtNum(r.total)}+` : fmtNum(r.total);
+}
+
 export function fmtTime(ts: string | null | undefined): string {
   if (!ts) return "—";
   return ts.replace("T", " ").slice(0, 19);
