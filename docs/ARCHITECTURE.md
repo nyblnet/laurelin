@@ -91,6 +91,23 @@ Not implemented, despite the name implying all of it: branches and tags,
 schema evolution, hidden partitioning, row-level deletes, small-file
 compaction.
 
+#### Dashboard panels
+
+A panel draws from exactly one of two sources, enforced by a model validator:
+`sql` (raw SQL over datasets) or `object_type` + `metrics` (an aggregation
+over ontology objects).
+
+The second exists because the first is wrong for anything the ontology models.
+SQL reads the *backing dataset*, which does not include the edit overlay — so
+after an action, a SQL panel and the object list beside it disagree, and
+nothing in the chart says so. Measured on a four-order workspace: after
+marking one order shipped, the SQL panel still reported 3 open / 1 shipped
+while the object panel reported 2 / 2.
+
+Both reduce to `{columns, rows}` in the client, so the chart never learns which
+source fed it. Panels still execute with the *viewer's* credentials, so an
+object panel is filtered per viewer exactly as a SQL one is.
+
 ### `laurelin/transforms`
 
 `laurelin/transforms/__init__.py` re-exports: `transform, sql_transform, Input, Output, TransformRegistry, Builder, collect_transforms`.

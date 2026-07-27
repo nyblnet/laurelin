@@ -90,6 +90,27 @@ class LaurelinClient:
             params["search"] = search
         return self._req("GET", f"/ontology/objects/{type_name}", params=params)
 
+    def aggregate_objects(
+        self,
+        type_name: str,
+        group_by: Optional[list[str]] = None,
+        metrics: Optional[list[dict]] = None,
+        filters: Optional[dict] = None,
+        search: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict:
+        return self._req(
+            "POST",
+            f"/ontology/objects/{type_name}/aggregate",
+            json={
+                "group_by": group_by or [],
+                "metrics": metrics or [{"op": "count", "alias": "count"}],
+                "filters": filters or {},
+                "search": search,
+                "limit": limit,
+            },
+        )
+
     def get_object(self, type_name: str, pk: str) -> dict:
         return self._req("GET", f"/ontology/objects/{type_name}/{pk}")
 

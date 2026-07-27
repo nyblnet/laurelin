@@ -4,11 +4,13 @@ panels execute through /query (so ACL/RLS filtering is per-viewer)."""
 import pyarrow as pa
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.models import DashboardPanel
 
 CREDS = {"username": "root", "password": "trustno1!"}
 
@@ -98,3 +100,65 @@ def test_dashboard_permissions_and_validation(clients):
     )
     assert r.status_code == 400
     assert admin.delete("/api/v1/dashboards/nope").status_code == 404
+
+
+# -- object-backed panels -----------------------------------------------------
+#
+# A panel charting the *backing dataset* with SQL misses the ontology's edit
+# overlay: it answers from rows an action has already changed, and nothing in
+# the chart says it disagrees with the object list beside it. An object panel
+# goes through /aggregate instead, which sees the overlay.
+
+def test_a_panel_needs_exactly_one_source():
+    with pytest.raises(ValidationError, match="either sql or object_type"):
+        DashboardPanel(id="p")
+    with pytest.raises(ValidationError, match="not both"):
+        DashboardPanel(id="p", sql="SELECT 1", object_type="order",
+                       metrics=[{"op": "count"}])
+
+
+def test_an_object_panel_needs_a_metric():
+    """Grouping with nothing to measure produces a chart of nothing."""
+    with pytest.raises(ValidationError, match="at least one metric"):
+        DashboardPanel(id="p", object_type="order")
+
+
+def test_panel_kinds_are_distinguishable():
+    sql = DashboardPanel(id="a", sql="SELECT 1")
+    obj = DashboardPanel(id="b", object_type="order", metrics=[{"op": "count"}])
+    assert not sql.is_object_panel
+    assert obj.is_object_panel
+
+
+def test_an_object_panel_round_trips_through_the_api(clients):
+    admin, _ = clients
+    body = {
+        "name": "ops",
+        "title": "Ops",
+        "panels": [{
+            "id": "p1",
+            "title": "Aircraft by status",
+            "object_type": "aircraft",
+            "group_by": ["status"],
+            "metrics": [{"op": "count", "alias": "n"}],
+            "chart": "bar",
+        }],
+    }
+    assert admin.put("/api/v1/dashboards/ops", json=body).status_code == 200
+    got = admin.get("/api/v1/dashboards/ops").json()
+    panel = got["panels"][0]
+    assert panel["object_type"] == "aircraft"
+    assert panel["group_by"] == ["status"]
+    assert panel["metrics"] == [{"op": "count", "alias": "n"}]
+    assert panel["sql"] == ""
+
+
+def test_a_panel_with_both_sources_is_rejected_by_the_api(clients):
+    admin, _ = clients
+    r = admin.put("/api/v1/dashboards/bad", json={
+        "name": "bad",
+        "panels": [{"id": "p", "sql": "SELECT 1", "object_type": "aircraft",
+                    "metrics": [{"op": "count"}]}],
+    })
+    assert r.status_code == 400
+    assert "not both" in r.json()["detail"]

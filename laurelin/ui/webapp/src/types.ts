@@ -122,10 +122,29 @@ export interface ObjectApp {
 
 export type ChartKind = "table" | "bar" | "line" | "area" | "stat";
 
+export interface AggregateMetric {
+  op: string;
+  property?: string | null;
+  alias?: string;
+}
+
+export interface AggregateResult {
+  groups: Record<string, unknown>[];
+  group_count: number;
+  truncated: boolean;
+}
+
 export interface DashboardPanel {
   id: string;
   title: string;
+  /** Source A: raw SQL over datasets. Exactly one source is set. */
   sql: string;
+  /** Source B: an aggregation over ontology objects (sees the edit overlay). */
+  object_type?: string;
+  group_by?: string[];
+  metrics?: AggregateMetric[];
+  filters?: Record<string, string>;
+  search?: string;
   chart: ChartKind;
   x: string;
   y: string[];

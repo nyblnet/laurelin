@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def utcnow_iso() -> str:
@@ -175,18 +175,62 @@ class ChartKind(str, Enum):
 
 
 class DashboardPanel(BaseModel):
-    """One saved query + presentation. Panels are executed client-side through
-    the normal /query endpoint, so each viewer sees their own ACL/RLS-filtered
-    view of the data — a dashboard adds no new read surface."""
+    """One saved query + presentation.
+
+    Panels execute client-side with the *viewer's* credentials, so each person
+    sees their own ACL/RLS-filtered view and a dashboard adds no new read
+    surface.
+
+    A panel draws from exactly one of two sources:
+
+    ``sql``
+        Arbitrary SQL over datasets. Maximum power, and it sees raw rows.
+
+    ``object_type`` + ``metrics``
+        An aggregation over ontology objects. This is the one to reach for
+        when charting something the ontology models, because SQL over the
+        *backing dataset* misses the edit overlay — it answers from rows an
+        action has already changed, and the chart gives no hint that it
+        disagrees with the object list beside it.
+    """
 
     id: str
     title: str = ""
-    sql: str
+    # -- source A: SQL
+    sql: str = ""
+    # -- source B: an object aggregation
+    object_type: str = ""
+    group_by: list[str] = Field(default_factory=list)
+    metrics: list[dict[str, Any]] = Field(default_factory=list)
+    filters: dict[str, str] = Field(default_factory=dict)
+    search: str = ""
+
     chart: ChartKind = ChartKind.table
     # Column bindings (empty = infer: first text column as x, numeric as y).
     x: str = ""
     y: list[str] = Field(default_factory=list)
     width: int = Field(default=6, ge=1, le=12)  # 12-column grid
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "DashboardPanel":
+        has_sql, has_object = bool(self.sql.strip()), bool(self.object_type.strip())
+        if has_sql and has_object:
+            raise ValueError(
+                "A panel draws from either sql or object_type, not both — "
+                "two sources would make it ambiguous which one the chart shows."
+            )
+        if not has_sql and not has_object:
+            raise ValueError("A panel needs either sql or object_type")
+        if has_object and not self.metrics:
+            raise ValueError(
+                "An object panel needs at least one metric (e.g. "
+                '{"op": "count", "alias": "count"})'
+            )
+        return self
+
+    @property
+    def is_object_panel(self) -> bool:
+        return bool(self.object_type.strip())
 
 
 class DashboardInfo(BaseModel):

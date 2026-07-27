@@ -283,6 +283,11 @@ panel"), keeping the current information-dense dark aesthetic:
       saved queries with an inline panel editor and "Add to dashboard" from
       the workbench. Panels execute through /query with the *viewer's*
       credentials, so RLS/ACLs/markings apply per user.
+- [x] **Object-backed panels**: a dashboard panel can chart an object type
+      (group-by + metrics) instead of SQL, so it reflects the ontology's edit
+      overlay. A SQL panel over the backing dataset silently disagrees with
+      the object list after an action; this closes that gap. `aggregate_objects`
+      is also an MCP tool, so agents stop hand-writing SQL for "how many X by Y".
 - [ ] **Charts & dashboards v2** (Quiver): scatter, histogram, heatmap, map;
       cross-filtering, auto-refresh, parameter controls (date range, object
       picker); dashboards as YAML files; share links; PNG/CSV export.

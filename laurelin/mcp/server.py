@@ -81,6 +81,31 @@ def build_server(client: LaurelinClient):
         return _j(client.search_objects(type_name, search=search, limit=limit, offset=offset))
 
     @server.tool()
+    def aggregate_objects(
+        type_name: str,
+        group_by: Optional[list[str]] = None,
+        metrics: Optional[list[dict]] = None,
+        filters: Optional[dict] = None,
+        search: str = "",
+        limit: int = 100,
+    ) -> str:
+        """Count or summarize objects, grouped by their properties.
+
+        Prefer this over query_sql for questions like "how many orders per
+        region" or "total amount by status": SQL reads the *backing dataset*,
+        which does not include edits made by ontology actions, so it can
+        confidently disagree with what the object list shows.
+
+        metrics: [{"op": "count"|"count_distinct"|"sum"|"avg"|"min"|"max"|"median",
+                   "property": "<name>", "alias": "<output name>"}]
+        `property` is omitted only for plain "count". Defaults to counting.
+        """
+        return _j(client.aggregate_objects(
+            type_name, group_by=group_by, metrics=metrics,
+            filters=filters, search=search or None, limit=limit,
+        ))
+
+    @server.tool()
     def get_object(type_name: str, pk: str) -> str:
         """One object by primary key."""
         return _j(client.get_object(type_name, pk))
