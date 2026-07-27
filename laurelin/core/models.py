@@ -31,9 +31,13 @@ class DatasetInfo(BaseModel):
     description: str = ""
     created_at: str = Field(default_factory=utcnow_iso)
     latest_version: Optional[int] = None
-    # "managed": Laurelin owns the Parquet and versions it.
+    # "managed":   Laurelin owns the Parquet and versions it.
     # "federated": the bytes live elsewhere (Iceberg/Delta/Parquet/Postgres);
-    # Laurelin governs the table and scans it in place, so it has no versions.
+    #              Laurelin governs the table and scans it in place, so it has
+    #              no versions.
+    # "iceberg":   Laurelin owns an Iceberg table — writable and versioned like
+    #              managed, but read at source like federated, and readable by
+    #              Spark/Trino/DuckDB without Laurelin.
     kind: str = "managed"
     source: dict[str, Any] = Field(default_factory=dict)
 
@@ -41,10 +45,27 @@ class DatasetInfo(BaseModel):
     def is_federated(self) -> bool:
         return self.kind == "federated"
 
+    @property
+    def is_iceberg(self) -> bool:
+        return self.kind == "iceberg"
+
+    @property
+    def scans_at_source(self) -> bool:
+        """Read via the source expression rather than local Parquet parts.
+
+        The distinction that matters to a *reader* is not who owns the table
+        but where the scan happens — so federated and Iceberg share every read
+        path, and with it one implementation of how policy is applied.
+        """
+        return self.kind in ("federated", "iceberg")
+
 
 class DatasetVersionInfo(BaseModel):
     dataset: str
     version: int
+    # Iceberg only: the snapshot this version pins, so a Laurelin version
+    # number and an Iceberg snapshot mean the same point in history.
+    snapshot_id: Optional[int] = None
     created_at: str = Field(default_factory=utcnow_iso)
     row_count: int = 0
     schema_: list[ColumnSchema] = Field(default_factory=list, alias="schema")

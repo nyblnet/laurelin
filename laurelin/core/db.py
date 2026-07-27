@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     files_json TEXT NOT NULL DEFAULT '[]',
     build_id TEXT,
     source TEXT NOT NULL DEFAULT 'upload',
+    -- Iceberg only: the snapshot this version pins.
+    snapshot_id BIGINT,
     PRIMARY KEY (dataset, version)
 );
 CREATE TABLE IF NOT EXISTS object_index (
@@ -375,6 +377,8 @@ class MetadataStore:
             c.execute("ALTER TABLE datasets ADD COLUMN kind TEXT NOT NULL DEFAULT 'managed'")
         if not self._has_column(c, "datasets", "source_json"):
             c.execute("ALTER TABLE datasets ADD COLUMN source_json TEXT NOT NULL DEFAULT '{}'")
+        if not self._has_column(c, "dataset_versions", "snapshot_id"):
+            c.execute("ALTER TABLE dataset_versions ADD COLUMN snapshot_id BIGINT")
         if not self._has_column(c, "build_tasks", "expectations_json"):
             c.execute(
                 "ALTER TABLE build_tasks ADD COLUMN expectations_json "
@@ -440,8 +444,8 @@ class MetadataStore:
             c.execute(
                 """INSERT INTO dataset_versions
                    (dataset, version, created_at, row_count, schema_json, path,
-                    files_json, build_id, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    files_json, build_id, source, snapshot_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     info.dataset,
                     info.version,
@@ -452,6 +456,7 @@ class MetadataStore:
                     json.dumps(info.files),
                     info.build_id,
                     info.source,
+                    info.snapshot_id,
                 ),
             )
 
@@ -466,6 +471,7 @@ class MetadataStore:
             files=json.loads(row["files_json"] or "[]"),
             build_id=row["build_id"],
             source=row["source"],
+            snapshot_id=row["snapshot_id"] if "snapshot_id" in row else None,
         )
 
     def get_version(self, dataset: str, version: Optional[int] = None) -> Optional[DatasetVersionInfo]:

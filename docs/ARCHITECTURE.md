@@ -60,6 +60,37 @@ Rules:
 - `rows()` must convert non-JSON-safe values (timestamps, bytes, Decimal, NaN) to strings/None.
 - Schema captured as `ColumnSchema(name, type=str(arrow_type))`.
 
+#### Iceberg-backed datasets
+
+A dataset's `kind` is `managed` (Laurelin owns versioned Parquet parts),
+`federated` (the bytes live elsewhere; no versions), or `iceberg` — **owned
+and versioned like managed, read at source like federated**.
+
+That split is the whole design. `DatasetInfo.scans_at_source` is what the read
+paths branch on, because what matters to a reader is not who owns the table
+but where the scan happens. So an Iceberg table is read by the same code that
+reads a foreign one, through `iceberg_scan(?)`, which means `PolicyPlan.to_sql`
+already covers it — row filters and column masks reach Iceberg with no second
+implementation of what a policy means. Writes are the only new code.
+
+Each write is an Iceberg snapshot *and* a `dataset_versions` row carrying its
+`snapshot_id`, so a Laurelin version number and an Iceberg snapshot name the
+same point in history and `read(name, version=N)` time-travels.
+
+The catalog is the database Laurelin already runs: pyiceberg's `SqlCatalog`
+takes `LAURELIN_DATABASE_URL` (or a SQLite file beside the metadata), so
+adopting Iceberg adds no service to operate and a Postgres control plane
+becomes a catalog shared across replicas. `LAURELIN_ICEBERG_WAREHOUSE` points
+the data at object storage.
+
+One asymmetry worth knowing: the SQL path prunes inside `iceberg_scan`, but
+the Arrow path (`scan_for`, used by the ontology) materializes through
+pyiceberg and applies the policy exactly. Correct, not lazy.
+
+Not implemented, despite the name implying all of it: branches and tags,
+schema evolution, hidden partitioning, row-level deletes, small-file
+compaction.
+
 ### `laurelin/transforms`
 
 `laurelin/transforms/__init__.py` re-exports: `transform, sql_transform, Input, Output, TransformRegistry, Builder, collect_transforms`.

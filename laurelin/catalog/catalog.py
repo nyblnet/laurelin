@@ -65,6 +65,10 @@ def suggest_dataset_name(filename: str) -> str:
     return slug[:48].rstrip("_")
 
 
+def _iceberg_path(location: str) -> str:
+    return location[len("file://"):] if location.startswith("file://") else location
+
+
 def _is_duplicate_version(exc: BaseException) -> bool:
     """True if this error is a (dataset, version) primary-key collision — i.e.
     another writer claimed the version number first. Matched on message text
@@ -455,7 +459,7 @@ class DatasetCatalog:
         honest rather than pretending to stream something already collected.
         """
         info = self.store.get_dataset(name)
-        if info is not None and info.is_federated:
+        if info is not None and info.scans_at_source:
             yield self.federated_table(name)
             return
         scanner = self.arrow_dataset(name, version).scanner(batch_size=batch_rows)
@@ -463,8 +467,88 @@ class DatasetCatalog:
             if record_batch.num_rows:
                 yield pa.Table.from_batches([record_batch])
 
+    # -- Iceberg ---------------------------------------------------------------
+
+    def _iceberg(self):
+        from laurelin.core.iceberg import IcebergTables
+
+        return IcebergTables(self.workspace)
+
+    def create_iceberg_dataset(self, name: str, description: str = "") -> DatasetInfo:
+        """Declare a dataset whose storage is an Iceberg table.
+
+        Laurelin still owns and versions it — the difference from `managed` is
+        that Spark, Trino, Snowflake and DuckDB can open the table without
+        Laurelin running, and each write leaves a snapshot in the table's own
+        history rather than only in ours.
+        """
+        _validate_name(name)
+        self.store.upsert_dataset(name, description)
+        self.store.set_dataset_source(name, "iceberg", {"type": "iceberg", "path": ""})
+        return self.store.get_dataset(name)
+
+    def write_iceberg(
+        self,
+        name: str,
+        table: pa.Table,
+        mode: str = "replace",
+        source: str = "upload",
+        build_id: Optional[str] = None,
+        description: str = "",
+    ) -> DatasetVersionInfo:
+        """Write an Iceberg-backed dataset and record the snapshot as a version.
+
+        The Iceberg snapshot is the commit; the Laurelin version row names it.
+        Keeping both means a version number and a snapshot id refer to the same
+        point in history, so lineage, builds and time travel keep working
+        without a second notion of "when".
+        """
+        _validate_name(name)
+        info = self.store.get_dataset(name)
+        if info is None or not info.is_iceberg:
+            self.create_iceberg_dataset(name, description)
+
+        state = self._iceberg().write(name, table, mode=mode)
+        # The metadata location changes with every snapshot, so the source is
+        # rewritten to point at the current one — that is what readers scan.
+        self.store.set_dataset_source(
+            name, "iceberg", {"type": "iceberg",
+                              "path": _iceberg_path(state["metadata_location"])}
+        )
+        version = self.store.next_version(name)
+        info = DatasetVersionInfo(
+            dataset=name,
+            version=version,
+            snapshot_id=state["snapshot_id"],
+            row_count=state["rows"],
+            schema=[ColumnSchema(name=f.name, type=str(f.type)) for f in table.schema],
+            path=f"iceberg/{name}",
+            files=[],
+            build_id=build_id,
+            source=source,
+        )
+        self.store.add_version(info)
+        return info
+
+    def iceberg_snapshots(self, name: str) -> list[dict]:
+        return self._iceberg().snapshots(name)
+
+    def read_iceberg(self, name: str, version: Optional[int] = None) -> pa.Table:
+        """Read an Iceberg dataset, optionally as of one of its versions."""
+        snapshot_id = None
+        if version is not None:
+            recorded = self.store.get_version(name, version)
+            if recorded is None:
+                raise KeyError(f"No version {version} of dataset {name!r}")
+            snapshot_id = recorded.snapshot_id
+        return self._iceberg().read(name, snapshot_id=snapshot_id)
+
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
         info = self.store.get_dataset(name)
+        if info is not None and info.is_iceberg:
+            # Unlike a federated table, this one *does* have versions — each
+            # pinned to an Iceberg snapshot, so history is readable.
+            return self.read_iceberg(name, version)
         if info is not None and info.is_federated:
             # No versions to pin: a federated table is read as it is now.
             return self.federated_table(name)
@@ -494,7 +578,7 @@ class DatasetCatalog:
         callers that must enforce policy read+filter the table and slice it with
         ``table_to_rows``)."""
         info = self.store.get_dataset(name)
-        if info is not None and info.is_federated:
+        if info is not None and info.scans_at_source:
             # Page a federated table at the source rather than dragging it back.
             table = self.federated_table(name, limit=limit + offset)
             return self.table_to_rows(table.slice(offset, limit))
@@ -553,7 +637,7 @@ class DatasetCatalog:
         cannot be compiled is a refusal, never an unfiltered read.
         """
         info = self.store.get_dataset(name)
-        if info is None or not info.is_federated:
+        if info is None or not info.scans_at_source:
             raise KeyError(f"Not a federated dataset: {name!r}")
 
         con = federation.connect(info.source)
@@ -593,6 +677,15 @@ class DatasetCatalog:
         has no Arrow equivalent. Either way the caller sees exactly the rows
         and values this user may see.
         """
+        info = self.store.get_dataset(name)
+        if info is not None and info.scans_at_source:
+            # No local Parquet parts to build a lazy Dataset over. Read the
+            # table and apply the plan exactly — correct, not lazy. The
+            # pushdown that matters for Iceberg happens in `iceberg_scan`,
+            # which the SQL path (query/federated_table) uses instead.
+            table = self.read(name, version)
+            plan = plan_for(name, table.schema) if plan_for is not None else None
+            return plan.apply(table) if plan is not None else table
         dataset = self.arrow_dataset(name, version)
         plan = plan_for(name, dataset.schema) if plan_for is not None else None
         if plan is None:
@@ -647,6 +740,15 @@ class DatasetCatalog:
         try:
             for ds in self.store.list_datasets():
                 if allowed is not None and ds.name not in allowed:
+                    continue
+                if ds.is_iceberg:
+                    # Laurelin owns this table, so it is registered like any
+                    # other dataset — the workbench gate below exists to stop
+                    # ad-hoc SQL reaching *foreign* systems, and this isn't one.
+                    con.register(
+                        ds.name,
+                        self.federated_table(ds.name, sql_policy_for=sql_policy_for),
+                    )
                     continue
                 if ds.is_federated:
                     if not federation.workbench_enabled() or sql_policy_for is None:

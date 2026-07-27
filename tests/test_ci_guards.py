@@ -52,6 +52,7 @@ def test_the_postgres_suite_is_enabled():
         ("adbc_driver_flightsql", "engines"),
         ("croniter", "scheduler"),
         ("prometheus_client", "metrics"),
+        ("pyiceberg", "iceberg"),
     ],
 )
 def test_optional_extras_are_installed(module, extra):

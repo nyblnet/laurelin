@@ -428,6 +428,10 @@ a laptop or a single VM, and unchanged.
 10. **Auto-compaction is off by default** — set `LAURELIN_AUTO_COMPACT_PARTS`
    to a part count, or keep calling `/compact` yourself. There's no
    size-aware or tiered policy, just a threshold.
+11. **Iceberg support is interoperability, not the rest of Iceberg.** Tables
+   are written, versioned and readable by other engines, but there are no
+   branches, no schema evolution, no hidden partitioning, no row-level
+   deletes and no small-file compaction.
 
 Every one of these is a roadmap item, and none of them is hidden in a footnote
 because you'd rather find out now than in month three.

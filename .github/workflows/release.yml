@@ -50,7 +50,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xmlsec1
-          pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics]'
+          pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg]'
           pytest -q -p no:warnings
 
   build:

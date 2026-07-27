@@ -88,8 +88,23 @@ Key bets, and why:
 
 ### WS1 — Storage & catalog (Foundry: Datasets/Catalog)
 
-- [ ] **Iceberg table format** in server mode (pyiceberg + REST catalog we host);
-      embedded mode stays Parquet-dirs. One `Dataset` abstraction over both.
+- [x] **Iceberg table format**: `kind="iceberg"` datasets, written and
+      versioned by Laurelin and readable by Spark/Trino/Snowflake/DuckDB
+      without it — a test opens one from a DuckDB that knows nothing about
+      Laurelin. Each write is an Iceberg snapshot *and* a Laurelin version
+      pinned to it, so time travel, lineage and builds share one notion of
+      "when". Managed Parquet remains the default; this is opt-in per dataset.
+
+      No REST catalog: pyiceberg's `SqlCatalog` points at the database
+      Laurelin already runs, so adopting Iceberg adds no service to operate
+      and a Postgres control plane becomes a shared catalog across replicas
+      for free. The roadmap called for hosting a catalog; hosting one turned
+      out to be unnecessary.
+- [ ] **Iceberg branches, schema evolution, hidden partitioning, row-level
+      deletes, small-file compaction**: the reasons to want Iceberg *beyond*
+      interoperability, and none of them are implemented. Reads also
+      materialize through pyiceberg for the Arrow path (the SQL path prunes
+      via `iceberg_scan`).
 - [ ] **Branches & merges**: `laurelin branch create staging`, build against a
       branch, diff datasets between branches, merge = atomic metadata swap.
       (Iceberg refs make this cheap.)
