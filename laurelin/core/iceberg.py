@@ -20,10 +20,16 @@ path federated datasets already take, which means the SQL policy renderer
 Iceberg tables without a second implementation of what a policy means. Writes
 are the only genuinely new code.
 
-What this does *not* do yet, stated plainly because the Iceberg name implies
-all of it: no branches or tags, no schema evolution, no hidden partitioning,
-no row-level deletes, no compaction of small files. Those are the reasons to
-reach for Iceberg beyond interoperability, and they are not here.
+Branches and schema evolution are here; a branch is a named pointer into the
+snapshot history, so cutting one copies no data, and Iceberg tracks columns by
+id rather than position, so adding one leaves every existing snapshot
+readable.
+
+What this still does *not* do, stated plainly because the Iceberg name implies
+all of it: no tags, no hidden partitioning, no row-level deletes, no
+compaction of small files, and merges are **fast-forward only** — a three-way
+merge of two diverged histories needs a row-level conflict policy, and
+guessing one would silently pick a winner between two people's writes.
 """
 
 from __future__ import annotations
@@ -135,7 +141,8 @@ class IcebergTables:
             return False
         return True
 
-    def write(self, name: str, table: pa.Table, mode: str = "replace") -> dict:
+    def write(self, name: str, table: pa.Table, mode: str = "replace",
+              branch: str = "main") -> dict:
         """Write a table, returning ``{metadata_location, snapshot_id, rows}``.
 
         ``mode="append"`` adds a snapshot on top of the existing data; the
@@ -153,19 +160,23 @@ class IcebergTables:
             tbl = self.catalog.create_table(identifier, schema=table.schema)
 
         if mode == "append":
-            tbl.append(table)
+            tbl.append(table, branch=branch)
         else:
-            tbl.overwrite(table)
+            tbl.overwrite(table, branch=branch)
         tbl.refresh()
-        return self.state(name)
+        return self.state(name, branch=branch)
 
-    def state(self, name: str) -> dict:
+    def state(self, name: str, branch: str = "main") -> dict:
         tbl = self.catalog.load_table(self._identifier(name))
-        snapshot = tbl.current_snapshot()
+        snapshot_id = (
+            self._ref_snapshot(tbl, branch) if branch != "main"
+            else (tbl.current_snapshot().snapshot_id if tbl.current_snapshot() else None)
+        )
+        scan = tbl.scan(snapshot_id=snapshot_id) if snapshot_id else tbl.scan()
         return {
             "metadata_location": tbl.metadata_location,
-            "snapshot_id": snapshot.snapshot_id if snapshot else None,
-            "rows": tbl.scan().to_arrow().num_rows,
+            "snapshot_id": snapshot_id,
+            "rows": scan.to_arrow().num_rows,
         }
 
     def snapshots(self, name: str) -> list[dict]:
@@ -180,11 +191,143 @@ class IcebergTables:
             for s in tbl.metadata.snapshots
         ]
 
-    def read(self, name: str, snapshot_id: Optional[int] = None) -> pa.Table:
-        """Read the table, optionally as of a past snapshot."""
+    def read(self, name: str, snapshot_id: Optional[int] = None,
+             branch: Optional[str] = None) -> pa.Table:
+        """Read the table, optionally as of a past snapshot or a branch."""
         tbl = self.catalog.load_table(self._identifier(name))
+        if branch and snapshot_id is None:
+            snapshot_id = self._ref_snapshot(tbl, branch)
         scan = tbl.scan(snapshot_id=snapshot_id) if snapshot_id else tbl.scan()
         return scan.to_arrow()
+
+    # -- branches ---------------------------------------------------------------
+
+    @staticmethod
+    def _ref_snapshot(tbl, ref: str) -> int:
+        if ref not in tbl.metadata.refs:
+            raise KeyError(f"No branch {ref!r} on this table")
+        return tbl.metadata.refs[ref].snapshot_id
+
+    def create_branch(self, name: str, branch: str,
+                      snapshot_id: Optional[int] = None) -> dict:
+        """Branch a dataset so work can happen without touching what readers see.
+
+        A branch is a named pointer into the snapshot history, so creating one
+        copies no data — it is the same cheap operation as a git branch, for
+        the same reason.
+        """
+        if branch == "main":
+            raise ValueError("'main' is the trunk, not a branch you create")
+        if not _NAMESPACE_RE.match(branch):
+            raise ValueError(
+                f"Invalid branch name {branch!r}: lowercase letters, digits "
+                "and underscores, starting with a letter"
+            )
+        tbl = self.catalog.load_table(self._identifier(name))
+        if branch in tbl.metadata.refs:
+            raise ValueError(f"Branch {branch!r} already exists")
+        base = snapshot_id or self._ref_snapshot(tbl, "main")
+        tbl.manage_snapshots().create_branch(
+            snapshot_id=base, branch_name=branch
+        ).commit()
+        tbl.refresh()
+        return {"branch": branch, "snapshot_id": base}
+
+    def branches(self, name: str) -> list[dict]:
+        tbl = self.catalog.load_table(self._identifier(name))
+        return [
+            {"branch": ref, "snapshot_id": meta.snapshot_id}
+            for ref, meta in sorted(tbl.metadata.refs.items())
+        ]
+
+    def delete_branch(self, name: str, branch: str) -> None:
+        if branch == "main":
+            raise ValueError("Refusing to delete 'main'")
+        tbl = self.catalog.load_table(self._identifier(name))
+        tbl.manage_snapshots().remove_branch(branch_name=branch).commit()
+
+    def merge_branch(self, name: str, branch: str) -> dict:
+        """Fast-forward main to the branch's tip.
+
+        A metadata swap, not a data rewrite — main's history keeps every
+        snapshot it had, so a merge is as reversible as anything else here.
+
+        Deliberately *only* fast-forward: a three-way merge of two diverged
+        snapshot histories needs a row-level conflict policy, and guessing one
+        would silently pick a winner between two people's writes.
+        """
+        tbl = self.catalog.load_table(self._identifier(name))
+        tip = self._ref_snapshot(tbl, branch)
+        main = self._ref_snapshot(tbl, "main")
+        if tip == main:
+            return {"branch": branch, "snapshot_id": main, "changed": False}
+        if not self._descends_from(tbl, tip, main):
+            raise ValueError(
+                f"Branch {branch!r} has diverged from main — main has moved on "
+                "since the branch was cut. Only fast-forward merges are "
+                "supported; re-cut the branch from the current main."
+            )
+        tbl.manage_snapshots().set_current_snapshot(snapshot_id=tip).commit()
+        tbl.refresh()
+        return {"branch": branch, "snapshot_id": tip, "changed": True}
+
+    @staticmethod
+    def _descends_from(tbl, snapshot_id: int, ancestor_id: int) -> bool:
+        """Whether ``ancestor_id`` is on ``snapshot_id``'s parent chain."""
+        by_id = {s.snapshot_id: s for s in tbl.metadata.snapshots}
+        current = by_id.get(snapshot_id)
+        while current is not None:
+            if current.snapshot_id == ancestor_id:
+                return True
+            current = by_id.get(current.parent_snapshot_id)
+        return False
+
+    # -- schema evolution --------------------------------------------------------
+
+    def schema_names(self, name: str) -> list[str]:
+        tbl = self.catalog.load_table(self._identifier(name))
+        return [f.name for f in tbl.schema().fields]
+
+    def evolve_schema(self, name: str, add: Optional[dict] = None,
+                      drop: Optional[list[str]] = None,
+                      rename: Optional[dict] = None) -> list[str]:
+        """Apply a schema change. Returns the resulting column names.
+
+        Iceberg tracks columns by id rather than position, so adding one
+        leaves every existing snapshot readable — which is why additive
+        changes are safe to make casually and destructive ones are not.
+        """
+        from pyiceberg.types import (
+            BooleanType,
+            DoubleType,
+            LongType,
+            StringType,
+            TimestampType,
+        )
+
+        types = {
+            "string": StringType(), "integer": LongType(), "long": LongType(),
+            "float": DoubleType(), "double": DoubleType(),
+            "boolean": BooleanType(), "timestamp": TimestampType(),
+        }
+        tbl = self.catalog.load_table(self._identifier(name))
+        with tbl.update_schema() as update:
+            for column, type_name in (add or {}).items():
+                if type_name not in types:
+                    raise ValueError(
+                        f"Unknown column type {type_name!r}: expected one of "
+                        f"{', '.join(sorted(types))}"
+                    )
+                # Added columns are optional: existing rows have no value for
+                # them, and pretending otherwise would make old snapshots
+                # unreadable against the new schema.
+                update.add_column(column, types[type_name], required=False)
+            for column in drop or []:
+                update.delete_column(column)
+            for old_name, new_name in (rename or {}).items():
+                update.rename_column(old_name, new_name)
+        tbl.refresh()
+        return [f.name for f in tbl.schema().fields]
 
     def metadata_location(self, name: str) -> str:
         return self.catalog.load_table(self._identifier(name)).metadata_location

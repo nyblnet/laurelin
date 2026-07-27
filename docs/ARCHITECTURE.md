@@ -87,8 +87,19 @@ One asymmetry worth knowing: the SQL path prunes inside `iceberg_scan`, but
 the Arrow path (`scan_for`, used by the ontology) materializes through
 pyiceberg and applies the policy exactly. Correct, not lazy.
 
-Not implemented, despite the name implying all of it: branches and tags,
-schema evolution, hidden partitioning, row-level deletes, small-file
+**Branches** are named pointers into the snapshot history, so cutting one
+copies nothing. Merging fast-forwards main and records a Laurelin version —
+without that row the merge would be invisible to lineage, builds and time
+travel, which all speak in versions. Only fast-forward: merging two diverged
+histories needs a row-level conflict policy, and inventing one would silently
+pick a winner between two people's writes.
+
+**Schema evolution** is additive by default, because Iceberg tracks columns by
+id and old snapshots stay readable. Dropping or renaming needs
+`allow_breaking=True`, and the refusal lists the transitive downstream
+datasets from lineage.
+
+Not implemented: tags, hidden partitioning, row-level deletes, small-file
 compaction.
 
 #### Dashboard panels

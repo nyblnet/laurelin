@@ -100,11 +100,20 @@ Key bets, and why:
       and a Postgres control plane becomes a shared catalog across replicas
       for free. The roadmap called for hosting a catalog; hosting one turned
       out to be unnecessary.
-- [ ] **Iceberg branches, schema evolution, hidden partitioning, row-level
-      deletes, small-file compaction**: the reasons to want Iceberg *beyond*
-      interoperability, and none of them are implemented. Reads also
-      materialize through pyiceberg for the Arrow path (the SQL path prunes
-      via `iceberg_scan`).
+- [x] **Iceberg branches**: cut a branch (a named pointer into the snapshot
+      history, so it copies no data), write to it without main seeing it, and
+      merge as a metadata swap. **Fast-forward only** — a three-way merge of
+      two diverged histories needs a row-level conflict policy, and guessing
+      one silently picks a winner between two people's writes, so a diverged
+      branch is refused with an explanation.
+- [x] **Schema evolution**: additive by default and always allowed, since
+      Iceberg tracks columns by id and old snapshots stay readable. Dropping
+      or renaming requires `allow_breaking=True`, and the refusal names the
+      transitive downstream datasets from lineage — the question is never "is
+      this safe?" but "what breaks when I do it?"
+- [ ] **Iceberg tags, hidden partitioning, row-level deletes, small-file
+      compaction**. The Arrow read path also still materializes through
+      pyiceberg (the SQL path prunes via `iceberg_scan`).
 - [ ] **Branches & merges**: `laurelin branch create staging`, build against a
       branch, diff datasets between branches, merge = atomic metadata swap.
       (Iceberg refs make this cheap.)

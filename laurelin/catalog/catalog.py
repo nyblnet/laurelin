@@ -543,6 +543,111 @@ class DatasetCatalog:
             snapshot_id = recorded.snapshot_id
         return self._iceberg().read(name, snapshot_id=snapshot_id)
 
+    # -- Iceberg branches & schema ----------------------------------------------
+
+    def iceberg_branch(self, name: str, branch: str,
+                       from_version: Optional[int] = None) -> dict:
+        """Cut a branch so work can happen without touching what readers see."""
+        snapshot_id = None
+        if from_version is not None:
+            recorded = self.store.get_version(name, from_version)
+            if recorded is None:
+                raise KeyError(f"No version {from_version} of dataset {name!r}")
+            snapshot_id = recorded.snapshot_id
+        return self._iceberg().create_branch(name, branch, snapshot_id=snapshot_id)
+
+    def iceberg_branches(self, name: str) -> list[dict]:
+        return self._iceberg().branches(name)
+
+    def delete_iceberg_branch(self, name: str, branch: str) -> None:
+        self._iceberg().delete_branch(name, branch)
+
+    def merge_iceberg_branch(self, name: str, branch: str) -> DatasetVersionInfo:
+        """Fast-forward main to a branch, recording the result as a version.
+
+        Without the version row the merge would be invisible to everything
+        outside Iceberg — lineage, builds and time travel all speak in
+        Laurelin versions.
+        """
+        result = self._iceberg().merge_branch(name, branch)
+        state = self._iceberg().state(name)
+        self.store.set_dataset_source(
+            name, "iceberg",
+            {"type": "iceberg", "path": _iceberg_path(state["metadata_location"])},
+        )
+        table = self._iceberg().read(name)
+        info = DatasetVersionInfo(
+            dataset=name,
+            version=self.store.next_version(name),
+            snapshot_id=result["snapshot_id"],
+            row_count=table.num_rows,
+            schema=[ColumnSchema(name=f.name, type=str(f.type)) for f in table.schema],
+            path=f"iceberg/{name}",
+            files=[],
+            source=f"merge:{branch}",
+        )
+        self.store.add_version(info)
+        return info
+
+    def downstream_of(self, dataset: str) -> list[str]:
+        """Datasets derived from this one, transitively.
+
+        A breaking schema change is only safe to reason about with this in
+        hand: the question is never "is dropping this column fine?" but "what
+        breaks when I do?"
+        """
+        edges = self.store.list_lineage()
+        children: dict[str, set[str]] = {}
+        for edge in edges:
+            children.setdefault(edge.upstream_dataset, set()).add(edge.downstream_dataset)
+        seen: set[str] = set()
+        queue = list(children.get(dataset, ()))
+        while queue:
+            current = queue.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            queue.extend(children.get(current, ()))
+        return sorted(seen)
+
+    def evolve_iceberg_schema(
+        self,
+        name: str,
+        add: Optional[dict] = None,
+        drop: Optional[list[str]] = None,
+        rename: Optional[dict] = None,
+        allow_breaking: bool = False,
+    ) -> list[str]:
+        """Change an Iceberg dataset's schema.
+
+        Adding a column is additive and always allowed: Iceberg tracks columns
+        by id, so old snapshots stay readable and nothing downstream can break
+        by gaining a field it doesn't reference.
+
+        Dropping or renaming one is different — it breaks every transform,
+        object type and dashboard that names it — so it requires
+        ``allow_breaking=True`` and the error names what is downstream. The
+        point is not to forbid the change but to stop it being made without
+        seeing the blast radius.
+        """
+        if (drop or rename) and not allow_breaking:
+            affected = self.downstream_of(name)
+            impact = (", ".join(affected) if affected
+                      else "no derived datasets, but object types and dashboards "
+                           "may still reference it")
+            raise ValueError(
+                f"Dropping or renaming a column on {name!r} is a breaking change. "
+                f"Downstream: {impact}. Pass allow_breaking=True once you've "
+                "checked what references it."
+            )
+        columns = self._iceberg().evolve_schema(name, add=add, drop=drop, rename=rename)
+        state = self._iceberg().state(name)
+        self.store.set_dataset_source(
+            name, "iceberg",
+            {"type": "iceberg", "path": _iceberg_path(state["metadata_location"])},
+        )
+        return columns
+
     def read(self, name: str, version: Optional[int] = None) -> pa.Table:
         info = self.store.get_dataset(name)
         if info is not None and info.is_iceberg:

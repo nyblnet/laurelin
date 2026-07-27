@@ -188,3 +188,134 @@ def test_an_invalid_namespace_is_rejected(tmp_path):
     ws = Workspace.init(tmp_path / "ws", name="ice")
     with pytest.raises(ValueError, match="namespace"):
         iceberg.IcebergTables(ws, namespace="not a namespace")
+
+
+# -- branches -----------------------------------------------------------------
+#
+# A branch is a named pointer into the snapshot history, so cutting one copies
+# no data. What it buys is the thing "build against staging" needs: work that
+# readers of main cannot see until it's merged.
+
+def test_a_branch_is_isolated_from_main(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.iceberg_branch("orders", "staging")
+    cat._iceberg().write("orders", MORE, mode="append", branch="staging")
+
+    assert cat.read("orders").num_rows == 3, "main must not see branch writes"
+    assert cat._iceberg().read("orders", branch="staging").num_rows == 4
+
+
+def test_branches_are_listed_with_main(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.iceberg_branch("orders", "staging")
+    assert [b["branch"] for b in cat.iceberg_branches("orders")] == ["main", "staging"]
+
+
+def test_merging_fast_forwards_main_and_records_a_version(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.iceberg_branch("orders", "staging")
+    cat._iceberg().write("orders", MORE, mode="append", branch="staging")
+
+    merged = cat.merge_iceberg_branch("orders", "staging")
+    assert cat.read("orders").num_rows == 4
+    # Without the version row the merge would be invisible to lineage, builds
+    # and time travel, which all speak in Laurelin versions.
+    assert merged.source == "merge:staging"
+    assert cat.store.get_dataset("orders").latest_version == merged.version
+
+
+def test_history_survives_a_merge(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.iceberg_branch("orders", "staging")
+    cat._iceberg().write("orders", MORE, mode="append", branch="staging")
+    cat.merge_iceberg_branch("orders", "staging")
+    assert cat.read("orders", version=1).num_rows == 3
+
+
+def test_a_diverged_branch_refuses_to_merge(cat):
+    """Fast-forward only. A three-way merge needs a row-level conflict policy,
+    and guessing one silently picks a winner between two people's writes."""
+    cat.write_iceberg("orders", FIRST)
+    cat.iceberg_branch("orders", "staging")
+    cat._iceberg().write("orders", MORE, mode="append", branch="staging")
+    cat.write_iceberg("orders", MORE, mode="append")  # main moves on
+
+    with pytest.raises(ValueError, match="diverged"):
+        cat.merge_iceberg_branch("orders", "staging")
+
+
+def test_branching_from_an_older_version(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+    cat.iceberg_branch("orders", "rewind", from_version=1)
+    assert cat._iceberg().read("orders", branch="rewind").num_rows == 3
+
+
+@pytest.mark.parametrize("branch, message", [
+    ("main", "trunk"),
+    ("Not A Branch", "Invalid branch name"),
+])
+def test_bad_branch_names_are_rejected(cat, branch, message):
+    cat.write_iceberg("orders", FIRST)
+    with pytest.raises(ValueError, match=message):
+        cat.iceberg_branch("orders", branch)
+
+
+def test_main_cannot_be_deleted(cat):
+    cat.write_iceberg("orders", FIRST)
+    with pytest.raises(ValueError, match="Refusing to delete"):
+        cat.delete_iceberg_branch("orders", "main")
+
+
+# -- schema evolution ---------------------------------------------------------
+
+def test_adding_a_column_is_additive_and_keeps_history_readable(cat):
+    cat.write_iceberg("orders", FIRST)
+    columns = cat.evolve_iceberg_schema("orders", add={"priority": "string"})
+    assert columns == ["id", "region", "amount", "priority"]
+    # Iceberg tracks columns by id, so the old snapshot still reads.
+    assert cat.read("orders", version=1).num_rows == 3
+
+
+def test_an_unknown_column_type_is_rejected(cat):
+    cat.write_iceberg("orders", FIRST)
+    with pytest.raises(ValueError, match="Unknown column type"):
+        cat.evolve_iceberg_schema("orders", add={"x": "blob"})
+
+
+def test_dropping_a_column_needs_explicit_consent(cat):
+    """The point isn't to forbid the change — it's to stop it being made
+    without seeing what breaks."""
+    cat.write_iceberg("orders", FIRST)
+    with pytest.raises(ValueError, match="breaking change"):
+        cat.evolve_iceberg_schema("orders", drop=["amount"])
+
+    columns = cat.evolve_iceberg_schema("orders", drop=["amount"], allow_breaking=True)
+    assert columns == ["id", "region"]
+
+
+def test_a_breaking_change_names_what_is_downstream(cat):
+    from laurelin.core.models import LineageEdge
+
+    cat.write_iceberg("orders", FIRST)
+    cat.store.replace_lineage_for_transform("roll_up", [
+        LineageEdge(upstream_dataset="orders", downstream_dataset="daily",
+                    transform_name="roll_up"),
+    ])
+    cat.store.replace_lineage_for_transform("summarize", [
+        LineageEdge(upstream_dataset="daily", downstream_dataset="monthly",
+                    transform_name="summarize"),
+    ])
+    # Transitive: breaking `orders` breaks `monthly` too, via `daily`.
+    assert cat.downstream_of("orders") == ["daily", "monthly"]
+
+    with pytest.raises(ValueError, match="daily, monthly"):
+        cat.evolve_iceberg_schema("orders", rename={"amount": "value"})
+
+
+def test_renaming_a_column_works_once_allowed(cat):
+    cat.write_iceberg("orders", FIRST)
+    columns = cat.evolve_iceberg_schema(
+        "orders", rename={"amount": "value"}, allow_breaking=True
+    )
+    assert columns == ["id", "region", "value"]
