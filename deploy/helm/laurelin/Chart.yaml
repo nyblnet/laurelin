@@ -2,8 +2,8 @@ apiVersion: v2
 name: laurelin
 description: An open, ontology-driven data platform (multi-workspace, Postgres control plane)
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/laurelin-data/laurelin
 sources:
   - https://github.com/laurelin-data/laurelin

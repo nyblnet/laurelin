@@ -145,7 +145,7 @@ actions:
 my-workspace/
 ├── laurelin.yml      # workspace config
 ├── metadata.db       # SQLite: versions, builds, lineage, edits, audit
-├── data/             # <dataset>/v<N>/data.parquet  (immutable versions)
+├── data/             # <dataset>/parts/*.parquet  (immutable; a version is a manifest of parts)
 ├── pipelines/        # your transform code (plain Python)
 └── ontology/         # object types, links, actions (plain YAML)
 ```
@@ -227,8 +227,10 @@ and how to report a vulnerability.
 
 ## Status & scale
 
-Early alpha. The core loop — ingest → transform → build → ontology → act —
-works end to end; expect rough edges and breaking changes.
+**0.2.0** — the first published release; see [CHANGELOG.md](CHANGELOG.md).
+Early alpha: the core loop — ingest → transform → build → ontology → act —
+works end to end, with 662 tests run against both SQLite and PostgreSQL, but
+expect rough edges and breaking changes before 1.0.
 
 Laurelin runs as a single process on a laptop *or* as N stateless replicas
 behind a load balancer — identity, workspace metadata and build coordination in
@@ -244,7 +246,12 @@ rows, appends cost the delta rather than the dataset, and ontology queries run
 in DuckDB (~26× faster than they were). An object type can also be *indexed*,
 which makes key lookups constant-time (1.4 ms at a million objects) — but not
 substring search, which still scans. Reproduce them with
-`python bench/benchmark.py`.
+`python bench/benchmark.py`, and note that CI re-checks those claims as ratios
+on every push, so they can't quietly rot.
+
+Datasets can also be **Apache Iceberg** tables (`pip install
+'laurelin[iceberg]'`), which Spark, Trino, Snowflake and DuckDB open directly —
+with branches, time travel and schema evolution.
 
 ## License
 

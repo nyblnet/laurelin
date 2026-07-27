@@ -42,9 +42,11 @@ class DatasetCatalog:
 
 Rules:
 - Dataset names: `^[a-z][a-z0-9_]*$`, validate on create/write. Raise `ValueError` otherwise.
-- `write()` is atomic-ish: write parquet to a temp dir inside `data/`, then
-  `os.rename` to `data/<name>/v{version:04d}/`; only then `store.add_version(...)`.
-  Auto-creates the dataset row if missing.
+- `write()` writes each part to a unique key under `data/<name>/parts/` and
+  *then* inserts the manifest row — that insert is the commit, so a crash
+  leaves an unreferenced part (garbage) rather than a registered-but-missing
+  version. This replaced an `os.rename` of a version directory, which had no
+  equivalent on object storage. Auto-creates the dataset row if missing.
 - Versions are immutable; `read` with no version = latest. Missing dataset/version
   raises `KeyError` (api layer maps to 404).
 - **A version is a manifest of Parquet parts** (`DatasetVersionInfo.files`,
