@@ -54,6 +54,10 @@ from laurelin.core.models import (
 # never disagree.
 SEARCH_TOTAL_CAP = 10_000
 
+# Rank assigned to a hit that matches somewhere other than the title. Larger
+# than any realistic title position, so title matches always sort first.
+RANK_BODY_ONLY = 1_000_000
+
 
 def count_sql(inner_select: str, capped: bool, alias: str = "n") -> str:
     """Wrap a row-producing SELECT in a count, saturating when capped."""
@@ -91,6 +95,11 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
 CREATE TABLE IF NOT EXISTS object_index (
     object_type TEXT NOT NULL,
     pk TEXT NOT NULL,
+    -- Position in the object order (the backing dataset's file order, with
+    -- created objects appended). The scan path pages in this order, so the
+    -- index must too — otherwise indexing a type silently changes which
+    -- objects land on page 1.
+    ord INTEGER NOT NULL DEFAULT 0,
     title TEXT NOT NULL DEFAULT '',
     -- Lower-cased concatenation of the string properties, for substring search
     -- without scanning Parquet.
@@ -377,6 +386,13 @@ class MetadataStore:
             c.execute("ALTER TABLE datasets ADD COLUMN kind TEXT NOT NULL DEFAULT 'managed'")
         if not self._has_column(c, "datasets", "source_json"):
             c.execute("ALTER TABLE datasets ADD COLUMN source_json TEXT NOT NULL DEFAULT '{}'")
+        if not self._has_column(c, "object_index", "ord"):
+            # Indexes built before this column paged in the wrong order, so
+            # they are dropped rather than migrated: rebuilding is cheap and
+            # keeping a subtly-wrong index is not.
+            c.execute("DELETE FROM object_index")
+            c.execute("DELETE FROM object_index_state")
+            c.execute("ALTER TABLE object_index ADD COLUMN ord INTEGER NOT NULL DEFAULT 0")
         if not self._has_column(c, "dataset_versions", "snapshot_id"):
             c.execute("ALTER TABLE dataset_versions ADD COLUMN snapshot_id BIGINT")
         if not self._has_column(c, "build_tasks", "expectations_json"):
@@ -506,12 +522,12 @@ class MetadataStore:
         with self._conn() as c:
             self.backend.ensure_search_index(c)
             c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
-            for row in rows:
+            for i, row in enumerate(rows):
                 c.execute(
                     """INSERT INTO object_index
-                         (object_type, pk, title, search_text, props_json)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (object_type, row["pk"], row["title"], row["search_text"],
+                         (object_type, pk, ord, title, search_text, props_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (object_type, row["pk"], i, row["title"], row["search_text"],
                      json.dumps(row["props"])),
                 )
             # Same transaction as the rows above, so the search mirror can
@@ -586,10 +602,24 @@ class MetadataStore:
                 count_sql(f"SELECT 1 FROM object_index WHERE {clause}", bool(search)),
                 tuple(params),
             ).fetchone()["n"]
+            order, rank_params = "ord", []
+            if search:
+                # Rank by where the term appears in the title: an object whose
+                # *name* matches is what someone typing meant, and one that
+                # matches only in some other property is a weaker hit. Ties and
+                # body-only matches keep object order, so paging stays stable.
+                #
+                # This reorders results; it never changes which ones match.
+                # The scan path applies the identical expression, because an
+                # index that paged differently from the scan is exactly the bug
+                # this column was added to fix.
+                pos = self.backend.strpos("lower(title)")
+                order = f"CASE WHEN {pos} > 0 THEN {pos} ELSE {RANK_BODY_ONLY} END, ord"
+                rank_params = [search.lower(), search.lower()]
             rows = c.execute(
                 f"""SELECT pk, title, props_json FROM object_index WHERE {clause}
-                    ORDER BY pk LIMIT ? OFFSET ?""",
-                tuple([*params, max(0, limit), max(0, offset)]),
+                    ORDER BY {order} LIMIT ? OFFSET ?""",
+                tuple([*params, *rank_params, max(0, limit), max(0, offset)]),
             ).fetchall()
         return (
             [{"pk": r["pk"], "title": r["title"], "props": json.loads(r["props_json"])}

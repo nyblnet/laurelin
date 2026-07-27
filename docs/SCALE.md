@@ -397,10 +397,12 @@ a laptop or a single VM, and unchanged.
 
 ## Known limitations, plainly
 
-1. **Search has no relevance ranking.** Results come back in primary-key
-   order, not best-match-first, and there is no stemming or synonym handling.
-   Substring matching is the right primitive for an identifier-heavy object
-   model; it is the wrong one for prose.
+1. **Search ranking is positional, not linguistic.** Hits are ordered by
+   where the term appears in the object's title, with body-only matches
+   after. There is no stemming, no synonyms, and no phrase or boolean
+   operators — substring matching already covers prefixes (`order` finds
+   `orders`), which is most of what stemming would buy on identifier-heavy
+   data, but it is still the wrong primitive for prose.
 2. **The object index covers paging, search and key lookups only.** Filters
    on other properties fall back to the DuckDB scan — deliberately, because
    the JSON-per-row alternative measured slower. Filterable secondary columns

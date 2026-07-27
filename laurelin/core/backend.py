@@ -163,6 +163,14 @@ class Backend:
         where.append("search_text LIKE ?")
         params.append(f"%{needle.lower()}%")
 
+    def strpos(self, haystack: str, needle_placeholder: str = "?") -> str:
+        """1-based position of a substring, 0 when absent.
+
+        Ranking needs this in three engines: SQLite spells it ``instr``,
+        DuckDB and PostgreSQL ``strpos``.
+        """
+        return f"instr({haystack}, {needle_placeholder})"
+
 
 class SQLiteBackend(Backend):
     dialect = "sqlite"
@@ -301,6 +309,9 @@ class PostgresBackend(Backend):
                 conn.rollback()  # the failed DDL poisons the transaction
                 self._has_trgm = False
         return self._has_trgm
+
+    def strpos(self, haystack: str, needle_placeholder: str = "?") -> str:
+        return f"strpos({haystack}, {needle_placeholder})"
 
     def render_schema(self, schema: str) -> str:
         return (

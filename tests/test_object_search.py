@@ -134,3 +134,75 @@ def test_a_narrow_search_reports_an_exact_total(svc):
     got = svc.query("place", search="osgil", limit=5)
     assert got["total"] == 1
     assert got["total_capped"] is False
+
+
+# -- ranking ------------------------------------------------------------------
+#
+# Results used to come back in object order, so the best match could be
+# anywhere on the page. Ranking reorders them; it must never change *which*
+# ones match, and the index and the scan must rank identically — an indexed
+# type that paged differently from an unindexed one is the bug this file's
+# ordering assertions exist to catch.
+
+RANKED = ["Riverside Depot", "Tirith Works", "Minas Tirith", "Old Mill"]
+RANKED_NOTES = ["near tirith road", "", "", "tirith adjacent"]
+
+ONTOLOGY_RANK = """
+object_types:
+  - api_name: place
+    backing_dataset: places
+    primary_key: name
+    title_property: name
+    properties:
+      name: {type: string}
+      notes: {type: string}
+"""
+
+
+@pytest.fixture()
+def ranked(tmp_path):
+    ws = Workspace.init(tmp_path / "rank", name="rank")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("places", pa.table({"name": RANKED, "notes": RANKED_NOTES}))
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY_RANK)
+    return OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
+
+
+def test_title_matches_rank_above_body_matches(ranked):
+    got = [o["__pk"] for o in ranked.query("place", search="tirith", limit=10)["objects"]]
+    assert got == [
+        "Tirith Works",     # title, position 1
+        "Minas Tirith",     # title, position 7
+        "Riverside Depot",  # notes only — object order from here
+        "Old Mill",
+    ]
+
+
+def test_the_index_ranks_identically(ranked):
+    before = [o["__pk"] for o in ranked.query("place", search="tirith", limit=10)["objects"]]
+    ranked.reindex("place")
+    after = [o["__pk"] for o in ranked.query("place", search="tirith", limit=10)["objects"]]
+    assert after == before
+
+
+def test_ranking_does_not_change_what_matches(ranked):
+    """The whole safety property: an ordering change must not become a
+    filtering change."""
+    unranked = {o["__pk"] for o in ranked.query("place", search="tirith", limit=10)["objects"]}
+    assert unranked == {"Tirith Works", "Minas Tirith", "Riverside Depot", "Old Mill"}
+    assert ranked.query("place", search="tirith", limit=10)["total"] == 4
+
+
+def test_ranking_pages_consistently(ranked):
+    """Paging a ranked search must not repeat or drop a result."""
+    ranked.reindex("place")
+    page1 = [o["__pk"] for o in ranked.query("place", search="tirith", limit=2)["objects"]]
+    page2 = [o["__pk"] for o in ranked.query("place", search="tirith", limit=2, offset=2)["objects"]]
+    assert page1 + page2 == ["Tirith Works", "Minas Tirith", "Riverside Depot", "Old Mill"]
+
+
+def test_browsing_is_unaffected_by_ranking(ranked):
+    """No search term, no ranking — object order stands."""
+    ranked.reindex("place")
+    assert [o["__pk"] for o in ranked.query("place", limit=10)["objects"]] == RANKED

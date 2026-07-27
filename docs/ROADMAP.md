@@ -233,9 +233,14 @@ Key bets, and why:
       "minas" in "Minas Tirith" but never "inas Ti", and the scan path shares
       the substring definition. Best-effort, falling back to an unindexed
       LIKE where the extension isn't available.
-- [ ] **Ranked search**: results are ordered by primary key, not relevance,
-      with no stemming. Needs a real FTS index *alongside* the trigram one,
-      plus a way to express "rank these, but match substrings too".
+- [x] **Ranked search**: hits are ordered by where the term appears in the
+      title, body-only matches after, applied identically by the index and
+      the DuckDB scan. Reorders results without changing which ones match, so
+      the substring guarantee the two paths share is untouched — no second
+      FTS index needed.
+- [ ] **Linguistic search**: stemming, synonyms, phrase and boolean
+      operators. These change *what matches*, so they need to be an explicit
+      opt-in mode rather than a silent upgrade of the default.
 - [ ] **Filters on non-key properties**: would need per-type columns rather
       than one JSON blob; extracting JSON per row measured slower than the
       scan it replaced.

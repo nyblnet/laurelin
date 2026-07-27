@@ -73,10 +73,40 @@ def test_indexed_results_match_the_scan(svc):
 
     for i, kw in enumerate(cases):
         indexed = svc.query("city", **kw)
-        assert {o["__pk"] for o in indexed["objects"]} == {
+        # Order, not just membership. Comparing sets is what let the index
+        # ship paging in a different order from the scan: `total` matched and
+        # every object appeared *somewhere*, so page 1 could still differ.
+        assert [o["__pk"] for o in indexed["objects"]] == [
             o["__pk"] for o in before[i]["objects"]
-        }, kw
+        ], kw
         assert indexed["total"] == before[i]["total"], kw
+
+
+def test_paging_agrees_when_file_order_is_not_key_order(tmp_path):
+    """The case the set-based assertion above used to miss.
+
+    Objects are ordered by the backing dataset's file order. When that happens
+    to match primary-key order — as it does in most fixtures — an index that
+    wrongly ordered by key looked correct.
+    """
+    ws = Workspace.init(tmp_path / "shuffled", name="shuf")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", pa.table({
+        "name": ["city-c", "city-a", "city-d", "city-b"],
+        "realm": ["valinor"] * 4,
+        "pop": pa.array([1, 2, 3, 4], type=pa.int64()),
+    }))
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+    svc = OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
+
+    for limit, offset in [(2, 0), (2, 2), (1, 1), (4, 0)]:
+        scanned = [o["__pk"] for o in svc.query("city", limit=limit, offset=offset)["objects"]]
+        svc.reindex("city")
+        indexed = [o["__pk"] for o in svc.query("city", limit=limit, offset=offset)["objects"]]
+        svc.store.drop_object_index("city")
+        assert indexed == scanned, f"limit={limit} offset={offset}"
+    assert scanned == ["city-c", "city-a", "city-d", "city-b"], "file order, not key order"
 
 
 def test_a_new_dataset_version_invalidates_the_index(svc):

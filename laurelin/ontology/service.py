@@ -21,7 +21,12 @@ import pyarrow as pa
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import limits
 from laurelin.core.config import Workspace
-from laurelin.core.db import SEARCH_TOTAL_CAP, MetadataStore, count_sql
+from laurelin.core.db import (
+    RANK_BODY_ONLY,
+    SEARCH_TOTAL_CAP,
+    MetadataStore,
+    count_sql,
+)
 from laurelin.core.models import (
     EditKind,
     ObjectEdit,
@@ -717,7 +722,21 @@ class OntologyService:
         sql = f"SELECT * FROM ({body}) o"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY __ord"
+        if search and ot.title_property and ot.title_property in cols:
+            # The identical ranking the index applies: by where the term
+            # appears in the title, with body-only matches after it in object
+            # order. Reorders results, never changes which ones match — and
+            # the two paths must agree, or paging an indexed type would
+            # differ from paging an unindexed one.
+            title = f"lower(CAST({q(ot.title_property)} AS VARCHAR))"
+            pos = f"strpos({title}, ?)"
+            sql += (
+                f" ORDER BY CASE WHEN {pos} > 0 THEN {pos} ELSE {RANK_BODY_ONLY} END,"
+                f" __ord"
+            )
+            params.extend([search.lower(), search.lower()])
+        else:
+            sql += " ORDER BY __ord"
         return sql, params
 
     def _materialize(self, ot: ObjectTypeDef) -> list[dict]:
