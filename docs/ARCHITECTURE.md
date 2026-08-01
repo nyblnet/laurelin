@@ -66,8 +66,17 @@ Rules:
 
 A dataset's `kind` is `managed` (Laurelin owns versioned Parquet parts),
 `federated` (the bytes live elsewhere; no versions), `iceberg` — **owned
-and versioned like managed, read at source like federated** — or `clickhouse`
-(read-only, scanned in place by embedded ClickHouse; see below).
+and versioned like managed, read at source like federated** — `clickhouse`
+(read-only, scanned in place by embedded ClickHouse) or `starrocks`
+(read-only, scanned by a StarRocks server). Both of the last two are below.
+
+The mapping from kind to dialect is **total and has no default**
+(`models._SQL_DIALECTS`), and so is the mapping from kind to reader
+(`DatasetCatalog._SOURCE_READERS`). A kind missing from either raises, because
+the alternative — falling back to DuckDB — puts the *newest*, least-checked
+engine behind the quoter and statement shape that were never tested against
+it, and `source_table`'s dialect-mismatch guard cannot catch that: both sides
+would say "duckdb".
 
 That split is the whole design. `DatasetInfo.scans_at_source` is what the read
 paths branch on, because what matters to a reader is not who owns the table
@@ -92,6 +101,10 @@ pyiceberg and applies the policy exactly. Correct, not lazy.
 
 #### ClickHouse-backed datasets (`kind="clickhouse"`)
 
+*Role: the serving tier — a governed, read-only path over a table the serving
+engine owns. StarRocks (below) is the flagship of that role; ClickHouse is a
+fully supported peer, and the engine that proved the seam bends.*
+
 A second SQL dialect, added to prove that "one decision, N renderers" survives
 an engine whose rules genuinely differ from DuckDB's. It reads a Parquet path
 through **chdb** — ClickHouse embedded in this process — so there is no
@@ -113,6 +126,34 @@ chdb 4.2.1, and each is a silent leak if you assume SQL is SQL:
 | null mask | `NULLIF(c, c)` | `if(0, c, NULL)` — `NULLIF` leaves NaN unmasked, since NaN ≠ NaN |
 | hash mask | `substr(sha256(CAST(c AS VARCHAR)), 1, 16)` | `substring(lower(hex(SHA256(toString(c)))), 1, 16)` |
 | statement shape | flat | filter **nested strictly below** the projection: ClickHouse resolves `WHERE` against `SELECT` aliases, so a flat statement evaluates the row policy against the *mask* — a full row-policy bypass that fails open |
+| portable types | String, Bool, integer, Date, **Decimal**; plus Float64 for hash masks | String, Bool, integer, Date only |
+
+That last row is the one that is not about spelling. A row policy is
+`<column as text> IN (<allowlist>)` and a hash mask is `sha256(<column as
+text>)`, so both mean whatever the engine's stringifier means — and there are
+four stringifiers, no two the same:
+
+| | function |
+|---|---|
+| Arrow, row key | `pc.cast(col, string)` |
+| Arrow, digest input | `str(value)` |
+| DuckDB | `CAST(c AS VARCHAR)` |
+| ClickHouse | `toString(c)` |
+
+On Decimal, Float64 above 1e10 and every temporal type they disagree, and the
+disagreement changes *which rows a user sees*: measured on a `decimal(12,2)`
+tenant key with the policy value `'1.1'`, `/datasets/{name}/rows` returned
+nothing and `/query` returned another tenant's rows. So each dialect declares
+the Arrow types it renders identically to the reference
+(`SqlDialect.row_key_matches_arrow` / `hash_text_matches_arrow`) and
+`SqlPolicy.render` **refuses** everything else, rather than enforcing a
+different policy here than the row API enforces. Masks `null` and `redact`
+need no rendering and stay available on every column of every type, which is
+the escape hatch the error message names.
+
+`tests/test_text_agreement.py` re-derives both tables from the live engines
+every run, in both directions — a dialect that over-claims leaks, and one that
+under-claims denies service for nothing.
 
 `tests/test_dialects.py` pins DuckDB's output byte-for-byte against literals
 copied from before the seam existed, so adding an engine cannot quietly change
@@ -123,29 +164,32 @@ matters — every (policy, user) returns the same rows and values as
 **What this is not**, stated because the name implies all of it:
 
 - **No writes.** `catalog.write`/`append`/`upload_file` refuse any
-  source-scanned dataset outright. A serving tier is a different project.
+  source-scanned dataset outright. Laurelin does not write to a serving engine:
+  the engine serves, and Laurelin governs the read.
 - **No server mode.** chdb only. `clickhouse-connect`, TLS, credential storage
   and a settings-profile threat analysis are not in this slice.
 - **No versions or time travel** (`latest_version` stays `None`), and no
   ontology object types (refused, as for federated).
-- **No filesystem sandbox.** Federated DuckDB scans run behind
-  `disabled_filesystems` + `lock_configuration`. chdb has **no equivalent** —
-  `file('/etc/passwd', LineAsString)` succeeds and `readonly=1` rejects the
-  whole query rather than restricting the filesystem. The primary control
-  still holds (only server-generated SQL reaches the engine; callers get an
-  Arrow table, never a connection), but defense in depth is *reduced*. That is
-  why ClickHouse datasets are admin-registered and stay behind the same opt-in
-  workbench gate as federated ones.
+- **No filesystem sandbox.** `file('/etc/passwd', LineAsString)` succeeds under
+  chdb, and `readonly=1` rejects the whole query rather than restricting the
+  filesystem. Registering a source is therefore "may read any file the server
+  process can read", which is why it is admin-only and behind the same opt-in
+  workbench gate as federated. This is **parity with the federated path, not a
+  step down from it**: `federation.connect` sets `disabled_filesystems` only
+  when `is_local_source(source)` is false, and a local Parquet path — the one
+  source type ClickHouse supports — is a local source, so DuckDB reads it
+  unrestricted too. The primary control is the same on both: only
+  server-generated SQL reaches the engine, because callers get an Arrow table
+  and never a connection.
 
-**Known divergence, shared with DuckDB and not fixed here.** Row policies and
-hash masks compare/hash the column's *text* rendering, and the three engines
-render floats differently: Arrow `str(1.0)` → `'1.0'`, ClickHouse `toString`
-→ `'1'`, DuckDB `CAST AS VARCHAR` → `'1.0'`. So on a **row policy** ClickHouse
-agrees with the Arrow reference and DuckDB does not; on a **hash mask over a
-float column** DuckDB agrees and ClickHouse does not. Neither is a leak —
-values stay masked and filters stay fail-closed — but a hash token is not
-joinable across engines for float columns. Pinned by tests rather than
-tolerated silently.
+**What a text-defined policy still cannot promise.** Where an engine agrees
+with the Arrow reference, a hash token is the same token everywhere and joins
+across engines. Where it does not, the read is refused rather than served with
+a token that silently only matches itself — so the guarantee is "portable or
+refused", never "quietly different". Bool is the one type where *both* SQL
+engines disagree with the digest input (`str(True)` is `'True'`; both engines
+say `'true'`), which predates ClickHouse; hash masks on Bool columns are
+refused on both, and `redact` is the answer.
 
 **Branches** are named pointers into the snapshot history, so cutting one
 copies nothing. Merging fast-forwards main and records a Laurelin version —
@@ -161,6 +205,73 @@ datasets from lineage.
 
 Not implemented: tags, hidden partitioning, row-level deletes, small-file
 compaction.
+
+#### StarRocks-backed datasets (`kind="starrocks"`)
+
+*Role: the serving tier, and its flagship. Querying Iceberg is a first-class
+path in StarRocks, so "open at rest" survives the serving tier instead of being
+traded away for it; it joins natively, and an ontology link* is *a join; and it
+has primary-key tables with real upserts, which is what an operational store
+needs. Read-only from Laurelin's side, like every source-scanned kind.*
+
+A third dialect, and the first one that is a **server** rather than a library.
+`laurelin/core/starrocks.py` reads a StarRocks table over the MySQL wire
+protocol (`mysql-connector-python`, the `starrocks` extra) with the row/column
+policy compiled to StarRocks SQL and pushed down.
+
+The change of shape matters more than the change of syntax. chdb is embedded,
+holds no credentials and cannot be written to. StarRocks has an account, and
+two things were measured that decide the design:
+
+- **Stacked statements execute.** `SELECT 1; INSERT INTO t VALUES (99)` on one
+  `execute()` runs the INSERT, and asking the client for
+  `-ClientFlag.MULTI_STATEMENTS` reports the flag off while the INSERT still
+  lands. Feeding the policy value `us') OR 1=1; INSERT … --` through naive
+  concatenation returned every row *and* wrote one.
+- **Parameters bind faithfully.** `length(?)` equalled `len(value.encode())`
+  for all 334 hostile values fuzzed — NUL bytes, newlines, lone backslashes,
+  300 control characters.
+
+So `StarRocksDialect.literal()` **raises**, and no escaper ships even unused:
+on ClickHouse an escaping defect leaks a read, and here it would be a remote
+write. Defence in depth on top: Laurelin runs everything through a *prepared*
+cursor, and StarRocks rejects INSERT in the prepared protocol outright (error
+1295), so the library's own execution channel cannot express a write at all.
+Point it at an account holding `SELECT` and nothing else.
+
+| | DuckDB | ClickHouse | StarRocks |
+|---|---|---|---|
+| identifier quoting | `"a""b"` | `` `a\`b` `` | `` `a` `` — a backtick is **unspellable**: doubling *drops* it, so the quoter refuses rather than addressing the wrong column. DuckDB's `"s"` is a string *literal* here, which fails **open** |
+| policy values | bound (`?`) | escaped literals | bound (`?`); `literal()` raises |
+| null mask | `NULLIF(c, c)` | `if(0, c, NULL)` | `if(FALSE, c, NULL)` |
+| hash mask | `substr(sha256(CAST(c AS VARCHAR)), 1, 16)` | `substring(lower(hex(SHA256(toString(c)))), 1, 16)` | `substr(sha2(CAST(c AS STRING), 256), 1, 16)` — `sha2` already returns hex, so porting ClickHouse's mandatory `lower(hex(…))` yields 128 characters and every token stops joining |
+| statement shape | flat | nested | nested, and the derived table **must be aliased** (error 1248) |
+| portable row keys | String, Bool, integer, Date, Decimal | String, Bool, integer, Date | String, integer, Date, Decimal — **not Bool**: `CAST(b AS STRING)` is `'1'` where Arrow says `'true'`, so the one type that is portable on both other engines is not portable here |
+
+Column discovery uses `DESC`, not the result-set metadata and not
+`information_schema` — both were measured to report a `BOOLEAN` as a
+`TINYINT`, which would make it look like an integer and hand it back its
+row-key portability. `information_schema` also reports a 128-bit `LARGEINT` as
+`bigint(20) unsigned`.
+
+Budgets ride in a `/*+ SET_VAR(query_timeout=…, query_mem_limit=…) */` hint
+(there is no trailing `SETTINGS` clause). `query_timeout` must be integral —
+`7.5` is error 1232 — so a fractional budget is rounded up rather than dropped.
+
+**What this is not.** No writes, no Stream Load, no primary-key upserts, no
+object store, no versions, no ontology object types (refused as for every
+source-scanned kind). Scalar columns only: `ARRAY`/`MAP`/`STRUCT`/`JSON`/
+`BITMAP`/`HLL`/`VARBINARY` are refused **by name** at registration, because a
+guessed Arrow type is a guessed text form and a row policy is a comparison of
+text.
+
+**Not verified, and load-bearing enough to say so.** Reading a table through a
+StarRocks **Iceberg external catalog** is untested: the three-part
+`catalog.db.table` scan expression works, but the type-agreement tables were
+measured on *native* StarRocks columns, and the Iceberg→StarRocks mapping
+could move DECIMAL scale or DATETIME precision. The opt-in CI job that runs
+these suites has also never executed on GitHub Actions — it is written from the
+local container's behaviour.
 
 #### Dashboard panels
 
@@ -286,9 +397,13 @@ class OntologyService:
         # follows link in either direction (link where from==type or to==type)
     def apply_action(self, action_name: str, pk: str | None,
                      parameters: dict, actor: str = "anonymous") -> ObjectEdit
-    def edits(self, type_name: str) -> list[ObjectEdit]
-    def reindex(self, type_name: str) -> int      # materialize into the index
-    def index_is_fresh(self, ot: ObjectTypeDef) -> bool
+    def edits(self, type_name: str, live_only: bool = True) -> list[ObjectEdit]
+    def reindex(self, type_name: str) -> int      # full rebuild
+    def catch_up(self, type_name: str) -> int     # replay the pending delta
+    def store_is_caught_up(self, ot: ObjectTypeDef) -> bool   # alias: index_is_fresh
+    def verify_digest(self, ot: ObjectTypeDef) -> bool
+    def writeback(self, type_name: str, actor: str = "anonymous",
+                  allow_transform_backed: bool = False) -> dict
 ```
 
 Object materialization = **base + overlay**: base rows from the backing
@@ -301,21 +416,121 @@ on property values (compared as strings). pk values compared as `str(value)`.
 `query()` resolves that definition through **three paths, in order**, all of
 which must return the same answer:
 
-1. **Index** (`_index_query`) — one row per object in the metadata store.
-   Used only when the type is indexed, the index is *fresh*, the request
-   carries no row-level security, and any filter is on the primary key (a real
-   indexed column). Never touches Parquet.
+1. **Operational object store** (`_index_query`, `laurelin/ontology/store.py`) —
+   one row per object, materialized. Used only when the type is materialized,
+   the store proves it is level with the log, the request carries no row-level
+   security, and any filter is on the primary key (a real indexed column).
+   Never touches Parquet.
 2. **SQL pushdown** (`_sql_query`) — filtering, search, counting and paging
    run in DuckDB over the Parquet parts, with the edit overlay merged in as
    typed Arrow tables and the row policy rendered into the same `WHERE`.
 3. **In-memory scan** — the original path, for hash masking and anything the
-   other two decline.
+   other two decline. Also the oracle the other two are tested against.
 
-Index freshness is `dataset_version == indexed_version AND edit_count ==
-indexed_edit_count`. Both are cheap reads, and both are checked on **every**
-query: a stale index is worse than no index, because it answers confidently.
-Builds refresh the indexes of affected types and drop any index whose refresh
-fails.
+### The object store is a materialization, and the log is the truth
+
+The store is **pluggable**: `MetadataObjectStore` (the default, co-located with
+the edit log, zero new dependencies) or `StarRocksObjectStore` (for scale, via
+Stream Load — see the caveat below). Either way the edit log in the metadata
+store is the source of truth and the store is a materialization of it.
+
+"Pluggable" today means *there is a seam*, not *an operator can switch stores*.
+`OntologyService` constructs `MetadataObjectStore` and takes no env var, route
+or config key that swaps it; the only construction of `StarRocksObjectStore`
+anywhere is a test assigning `svc.object_store` directly. So the default store
+is what every deployment runs, and no documentation should imply otherwise.
+
+An edit **upserts** the materialization; it does not invalidate it. What used to
+be an `edit_count` invalidation flag is now an `applied_seq` **catch-up
+watermark**, and `object_edits.edit_seq` is a gapless per-type position
+allocated inside the append transaction (a UNIQUE index serializes concurrent
+appends). Gapless is what makes "replay everything above the watermark" a
+*complete* description of the lag rather than a hopeful one; the ordering column
+cannot serve, because Postgres allocates identity values before commit, so a
+cursor parked at 6 can skip a 5 that commits later.
+
+A store is **caught up** iff a state row exists, its `dataset_version` matches
+the dataset's latest, its `applied_seq` is level with the log, and (for the
+metadata store) the page and the state were read in one transaction. Anything
+else — including *unreachable*, a missing state row, or a dropped table — means
+**behind**, and a store that is behind returns nothing so the read falls through
+to (2) and (3). Both read the log directly, so both are always correct. Never an
+empty page: "these objects do not exist" is a valid-looking answer the write
+path's existence check would act on.
+
+Ordering: the log commits first, the materialization catches up, the watermark
+advances last. A watermark behind its rows costs one idempotent replay; a
+watermark ahead of them is a silent permanent stale read.
+
+A new **dataset version still invalidates outright** — it can rewrite arbitrary
+base rows and renumbers every ordinal, so no delta expresses it. So does a
+change to the **object-type definition**: `object_index_state.type_fingerprint`
+hashes the key, the title property and the declared properties with their types,
+and a mismatch means behind. Without it, withdrawing a property from the
+ontology took effect on every other read path (they project to the declared set
+on every read) and not on the materialization, which kept serving it — and each
+subsequent write copied it forward, because the write merges onto the stored
+bag. A build or a definition change are the only things that invalidate.
+
+**The rows an edit writes are built inside the transaction that writes them.**
+`commit_edit` takes a `build(pre_image, seq)` callback rather than finished
+rows, and the implementation reads the pre-image and allocates `seq` before
+calling it, under a lock on the type's state row. This is the whole correctness
+argument for concurrent writes, and it was originally missing: building the rows
+outside made every edit a read-modify-write with the read on another connection,
+which lost an update when two people edited one object, resurrected a deleted
+object when a delete raced an update, gave four concurrent creates the same
+ordinal, and computed the divergence digest from a superseded base. Every one of
+those was **silent** — the watermark advanced normally, so the store was not
+behind, it was wrong while level, and rule 2 never applied.
+
+The lock is taken with a no-op `UPDATE` rather than `SELECT ... FOR UPDATE`:
+Python's sqlite3 driver only opens a transaction at the first DML statement, so
+on SQLite a leading `SELECT` reads in autocommit — outside the transaction it
+was meant to be protected by.
+
+`commit_edit` is **all or nothing**: either the edit is logged and its position
+returned, or nothing is logged and it raises. The caller's recovery path appends
+the edit itself, so a store that logged first and then failed would produce
+either a duplicate or — as StarRocks did — an exception reported to a user whose
+write was durable and visible to every reader, with no audit record of an action
+that took effect.
+
+Ordinals: `ord(base row i) = i`, `ord(created object) = 2**62 + edit_seq`. The
+column is `BIGINT`, and that is load-bearing rather than tidy: `INTEGER` is
+64-bit on SQLite and 32-bit on PostgreSQL, so on the default production control
+plane the first object create overflowed it, the write path swallowed the error
+and fell back to a log-only append, the user was told the write succeeded, and
+the materialization was dead from then on with reads silently back on the full
+scan. A rebuild hit the same overflow. A
+create for a key that already exists keeps that key's ordinal (it is a
+replacement); a create after a delete of the same key takes a new one. A rebuild
+recomputes the *same* numbers rather than renumbering, or paging would reshuffle
+on every rebuild.
+
+Divergence: a watermark cannot detect it (a drifted store can be perfectly
+caught up by position), so each materialization also carries a **digest** — XOR
+of per-row SHA-256 over `(pk, applied_seq, canonical props JSON)`, maintained
+incrementally, order-independent, computed in Python and stored rather than
+recomputed by the engine. `verify_digest()` recomputes and compares.
+
+**StarRocks object store: UNVERIFIED against a real server.** The engine
+behaviours it relies on were measured (Stream Load is byte-faithful with no
+escaping, upsert-by-pk works, a bad row aborts the whole load, data rows plus a
+sentinel land in one transaction), but the class itself has only run against an
+in-memory double. It writes exclusively via Stream Load — never SQL, because
+`StarRocksDialect.literal()` raises by construction — and keeps its watermark in
+StarRocks as a reserved `ord = -1` row excluded from every page.
+
+Having no shared transaction, it cannot take the state-row lock, so it uses the
+watermark instead: an edit is loaded **only** when the watermark is exactly one
+position behind it. Anything else means an unaccounted-for edit could already
+have changed the row this pre-image describes, so it skips the load, stays
+behind, and lets `catch_up` replay in log order — which *is* single-writer. A
+failed load is caught rather than raised, because the log commit already
+happened. **NOT IMPLEMENTED there:** strict per-row position ordering on the row
+itself (StarRocks resolves duplicate keys by load order and the DDL declares no
+sequence column); the watermark gate above is what stands in for it.
 
 `apply_action` validates: action exists; for update/delete pk must reference an
 existing object; required parameters present; parameters must be declared;
@@ -323,6 +538,73 @@ update/create payload keys must be declared properties of the object type
 (reject unknown, except pk on create). Coerce parameter values per declared type
 (integer/float/boolean). Writes `ObjectEdit` + audit log. Raise `ValueError`
 with a clear message on any validation failure (api maps to 400/404).
+
+The existence check stays on the **policied** path; the row written to the store
+is built from the **store's own** pre-image. Both halves matter: pointing the
+existence check at an unfiltered store would make it an enumeration oracle over
+other tenants' keys, and taking the pre-image from a policied read would write
+one user's masked, row-filtered view into a table everyone shares.
+`MetadataStore.add_object_edit` still exists and is still correct, but it is
+log-only and therefore a footgun; `commit_object_edit` is the public write.
+
+A **create for a key that already exists is a replacement** — it takes over that
+object's ordinal and a fold writes it over that row in the dataset. For a caller
+under a dataset policy that is a cross-tenant destructive write, so it is
+refused: `_policy_admits` closed the half where a policied user *reads* an
+overlay create, and this closes the half where they *write* one. The refusal is
+uniform over existing keys, visible or hidden, so it does not distinguish
+"yours" from "someone else's"; it does remain an existence oracle over a key the
+caller already named, which is inherent to a shared unique key and is stated
+rather than papered over. Unpoliced callers keep create-as-replacement.
+
+The `index` block of `GET /ontology/object-types/{name}` reports `objects`,
+`lag` and `applied_seq` as `null` to callers the backing dataset's policy
+narrows: those counters describe the shared, unpoliced materialization, so a
+tenant seeing three of six objects was being told there were six.
+
+### Writeback (manual only)
+
+`POST /ontology/object-types/{name}/writeback` folds the overlay into a new
+dataset version — `catalog.write(..., source="writeback")`, never `append` (an
+overlay delete has no expression as an appended row) — then marks exactly the
+edits it captured as folded. Marked, not deleted: `folded_into_version` is what
+makes a folded version reproducible, and the audit log is not a substitute
+because `prune_audit` trims it by design.
+
+Three races, handled: an edit arriving mid-build is not in the captured id list
+so it stays live and applies on top of the new version; the write happens before
+the marking, so a crash between them replays idempotently rather than losing
+edits; and the fold publishes with **compare-and-set** —
+`catalog.write(..., expect_version=base)` takes exactly `base + 1` or registers
+nothing and raises `StaleBaseVersion`. It was a read-the-version-then-write
+check, and the gap between the two was reachable by two operators, a double
+click, a client retry or a nightly build: one fold marked an edit folded while
+the other published a version rebuilt from the old base without it (the live log
+was then empty, so nothing could restore it), and a concurrent build lost its
+whole version the same way.
+
+It runs unpoliced (a fold through a policy would rewrite the dataset as one user
+sees it) and reads **all** columns (an object type rarely declares every column;
+folding through the projection would delete the rest — as would emitting a
+create's row wholesale over an existing one, which is why a create contributes
+only its *declared* columns and inherits the rest from the row it replaces).
+Overlay updates merge with a per-column "was assigned" flag rather than
+`COALESCE`, which cannot tell an assigned NULL from an absent one — so clearing
+a property survives a fold, and keeps working afterwards.
+
+It refuses a backing dataset that is scanned at the source; a backing whose
+declared primary key is **not unique**, because the object view's last-wins
+dedup would otherwise be materialized into the dataset and delete rows no edit
+referenced; and a transform-produced backing by name unless explicitly
+overridden — otherwise the next build overwrites the folded edits silently,
+hours later. "Transform-produced" looks at *every* version's source, not the
+latest: writeback stamps its own version `writeback` and compaction stamps
+`compact`, so the latest-only test erased the evidence and the guard fired
+exactly once per dataset.
+
+**NOT IMPLEMENTED:** automatic unfolding when a rebuild supersedes a folded
+version (which is *why* `folded_into_version` is a column), automatic writeback
+triggers, and `prune_object_edits`. Writeback bounds **read cost, not disk**.
 
 #### Aggregation
 
@@ -537,6 +819,12 @@ PUT  /api/v1/datasets/{name}/clickhouse       {source, description?} -> DatasetI
                                   chdb; probed before storing; read-only —
                                   upload/append to it is a 400; 501 without
                                   the `clickhouse` extra)
+PUT  /api/v1/datasets/{name}/starrocks        {source, description?} -> DatasetInfo  (admin)
+                                 (source: table {url: starrocks://user:pw@host:9030/db,
+                                  table: "db.tbl" or "catalog.db.tbl"}; probed
+                                  before storing, DSN redacted in responses;
+                                  read-only — upload/append is a 400; 501
+                                  without the `starrocks` extra)
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
 GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset], kind}]
@@ -581,6 +869,11 @@ GET  /api/v1/ontology/object-types/{name}     -> ObjectTypeDef + links + actions
                                  permissions:{can_view,can_edit}  (403 if not viewable)
 POST /api/v1/ontology/object-types/{name}/index -> {object_type,objects:N,state}  (editor)
 DELETE /api/v1/ontology/object-types/{name}/index -> {"dropped": name}  (editor)
+POST /api/v1/ontology/object-types/{name}/writeback -> {object_type, folded:N,
+                                 version, row_count, objects}  (editor on the
+                                 object type AND edit on the backing dataset —
+                                 this rewrites a dataset, which is a different
+                                 privilege from recording an edit)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
                                      -> {"objects":[...],"total":N,"total_capped":bool}  (403 if not viewable)
 POST /api/v1/ontology/objects/{type}/aggregate {group_by,metrics,filters,search,limit}
@@ -649,9 +942,10 @@ policy does for a user (allowed values, resolved masks) independently of how
 it will run. `_plan()` renders that as Arrow filter+projection for managed
 data; `sql_policy_fn(user, dialect=…)` renders it as a SELECT list + WHERE for
 datasets scanned in place — federated (Iceberg/Delta/Parquet/Postgres via
-DuckDB, `laurelin/core/federation.py`) and ClickHouse (via chdb,
-`laurelin/core/clickhouse.py`). One place interprets the rules, so a second
-execution engine cannot grow a second interpretation of them; a *dialect*
+DuckDB, `laurelin/core/federation.py`), ClickHouse (via chdb,
+`laurelin/core/clickhouse.py`) and StarRocks (over the MySQL wire protocol,
+`laurelin/core/starrocks.py`). One place interprets the rules, so a second or
+third execution engine cannot grow a second interpretation of them; a *dialect*
 (`laurelin/core/dialects.py`) chooses only how the decision is spelled, and
 `catalog.source_table` refuses a policy rendered for the wrong one. The SQL
 renderers are strictly more capable than Arrow — both engines have SHA-256, so

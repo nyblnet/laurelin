@@ -55,7 +55,8 @@ Every feature below must preserve these, or it doesn't ship:
 ├──────────────┴──────────────────┴─────────────────────────────────┤
 │ Metadata: Postgres (embedded: SQLite)                             │
 │ Data: S3/MinIO/GCS/azblob via Iceberg tables (embedded: local FS) │
-│ Compute: DuckDB per-worker (pluggable: Spark/Trino for huge jobs) │
+│ Compute: DuckDB per-worker  ·  delegation to Flight SQL engines   │
+│ Serving: StarRocks (flagship) / ClickHouse — governed, read-only  │
 │ Index: Postgres FTS → optional OpenSearch (embedded: SQLite FTS)  │
 │ Queue: Postgres-backed (no Redis requirement)                     │
 └───────────────────────────────────────────────────────────────────┘
@@ -67,11 +68,20 @@ Key bets, and why:
   evolution, and hidden partitioning for free — and Spark/Trino/Snowflake/DuckDB
   can all read our tables directly. This is the strongest possible "no lock-in"
   statement. Embedded mode keeps today's simple Parquet version dirs.
-- **DuckDB as default compute, delegation above it.** DuckDB covers the 99%
-  (interactive + batch up to ~1TB working sets). Past that Laurelin does not
-  grow a cluster — it *delegates*: `@remote_transform` submits SQL to an engine
-  that is already distributed (Trino/Dremio/Databricks via Flight SQL) and
-  stores the reduced result with full lineage and policy. **Explicit
+- **Four roles, one governance layer.** (1) *Embedded default*: DuckDB
+  in-process per worker, covering the 99% — interactive plus batch up to ~1TB
+  working sets. (2) *Federation*: federated datasets scanned in place
+  (Iceberg/Delta/Parquet/Postgres) and delegated compute — `@remote_transform`
+  submits SQL to an engine that is already distributed (Trino/Dremio/Databricks
+  via Flight SQL) and stores the reduced result with full lineage and policy.
+  (3) *Serving tier*: StarRocks (flagship) and ClickHouse (supported peer) —
+  governed, policy-pushed-down, **read-only** queries against a table the
+  serving engine owns. StarRocks leads because querying Iceberg is first-class
+  there (so "open at rest" survives the serving tier), because it joins
+  natively and an ontology link *is* a join, and because its primary-key tables
+  have real upserts. (4) *Operational store*: the materialization of ontology
+  object state, defaulting to the metadata store. Past the first role Laurelin
+  does not grow a cluster and does not operate an engine. **Explicit
   non-goals: shuffle, distributed joins, a cluster manager, a cross-node query
   planner.** Those are what make a distributed engine large, and a half-built
   version would be worse than the ones that exist.
@@ -121,12 +131,16 @@ Key bets, and why:
       snapshot replace.
 - [ ] **Schema evolution** with enforcement: additive by default, breaking
       changes require explicit migration + downstream impact report from lineage.
-- [ ] **External / federated tables**: register existing Postgres/MySQL/S3
-      parquet/Iceberg/Delta locations as read-only datasets (DuckDB attach).
+- [x] **External / federated tables**: register existing Postgres/S3
+      parquet/Iceberg/Delta locations as read-only datasets (DuckDB attach),
+      with the row policy and column masks compiled to SQL around the remote
+      scan. Shipped as `PUT /datasets/{name}/federated`. Still open: MySQL as
+      a federated source.
 - [x] **ClickHouse-backed datasets** (`kind="clickhouse"`, read-only, via
-      embedded **chdb** — no server to run). The point was never ClickHouse's
-      speed; it was proving that one policy decision renders correctly onto a
-      *second* SQL dialect. It does not: five things had to change, and each
+      embedded **chdb** — no server to run). The *seam* was the point and
+      ClickHouse was the proof; it is a supported peer in the serving tier, not
+      an exercise. Proving that one policy decision renders correctly onto a
+      *second* SQL dialect did not come free: five things had to change, and each
       would have been a silent leak. DuckDB's identifier quoter resolves a
       ClickHouse column to a **different column** and returns its data;
       ClickHouse's named-parameter channel is **not byte-preserving**, so
@@ -141,12 +155,30 @@ Key bets, and why:
       are fixed for every dialect: an empty column list rendered
       `select_list='*'` with masks pending, and a mask differing from a real
       column only in case masked nothing at all.
-- [ ] **ClickHouse writes / server mode**: `INSERT` into MergeTree, and
-      talking to a real ClickHouse server (`clickhouse-connect`, TLS,
-      credential storage, a settings-profile threat analysis). Deliberately
-      out of the read-only slice — a serving tier is a different project, and
-      half of one produces a dataset that is part local Parquet and part
-      remote table.
+- [x] **StarRocks-backed datasets** (`kind="starrocks"`, read-only, over the
+      MySQL wire protocol, `pip install 'laurelin[starrocks]'`). The flagship
+      of the serving tier: querying Iceberg is a first-class path there so
+      "open at rest" survives the serving tier rather than being traded for
+      it, it joins natively and an ontology link *is* a join, and its
+      primary-key tables have real upserts. First engine that is a **server**
+      rather than a library, which changes the threat model more than the
+      syntax: stacked statements execute, so `StarRocksDialect.literal()`
+      **raises** and every query goes through a prepared cursor that StarRocks
+      will not let express an INSERT (error 1295).
+
+      **Caveats, stated rather than discovered:** reading through a StarRocks
+      **Iceberg external catalog is untested** — the three-part
+      `catalog.db.table` scan expression works, but the type-agreement tables
+      were measured on native columns and the Iceberg→StarRocks mapping could
+      move DECIMAL scale or DATETIME precision. The opt-in CI job covering the
+      StarRocks suites has **never executed on GitHub Actions**; the behaviour
+      is written from a local container.
+- [ ] **Writes into a serving engine** (ClickHouse `INSERT` into MergeTree;
+      StarRocks Stream Load for datasets), and a real ClickHouse *server*
+      connection (`clickhouse-connect`, TLS, credential storage, a
+      settings-profile threat analysis). Deliberately a separate slice from
+      governed reads: half of one produces a dataset that is part local Parquet
+      and part remote table.
 - [ ] **Retention & TTL policies** per dataset (keep N versions / D days), GDPR
       purge that provably rewrites history.
 - [ ] **Media sets**: blob datasets (documents, images) with metadata tables.
@@ -271,6 +303,39 @@ Key bets, and why:
       the DuckDB scan. Reorders results without changing which ones match, so
       the substring guarantee the two paths share is untouched — no second
       FTS index needed.
+- [x] **Operational object store**: an edit **upserts** the materialization
+      instead of invalidating it, in the same transaction that appends it to
+      the log. `edit_count` became an `applied_seq` catch-up watermark,
+      `object_edits` gained a gapless per-type `edit_seq`, and each
+      materialization carries a content **digest** (a watermark cannot detect
+      divergence — a drifted store can be perfectly caught up by position). A
+      store that cannot prove it applied every committed edit returns nothing
+      and the read falls through to the scan. The backend is pluggable:
+      `MetadataObjectStore` (default) or `StarRocksObjectStore` via Stream
+      Load with primary-key upserts. An edit's rows are built **inside** the
+      transaction that writes them, under a lock on the object type's state
+      row: they are a read-modify-write of the current rows, and doing that
+      read on another connection lost a committed update when two people
+      edited one object, resurrected a deleted object, gave concurrent creates
+      the same ordinal, and raised a false digest alarm — all while the
+      watermark reported the store level with the log.
+- [x] **Definition changes invalidate the materialization**:
+      `object_index_state.type_fingerprint` hashes the object type's key,
+      title property and declared properties. Without it, withdrawing a
+      property took effect on every read path except the one that had
+      materialized it, and each subsequent write copied it forward.
+- [ ] **Verify `StarRocksObjectStore` against a real server, and wire it to
+      configuration.** It has only ever run against an in-memory double, and
+      no env var, route or config key selects it — `OntologyService`
+      constructs `MetadataObjectStore`, so every deployment runs the default.
+      "Pluggable" is currently a seam with an implementation behind it, not a
+      switch an operator can throw. Also unimplemented there: strict per-row
+      position ordering (StarRocks resolves duplicate keys by load order and
+      the DDL declares no sequence column). Having no shared transaction it
+      cannot take the state-row lock the metadata store uses, so it loads an
+      edit only when its watermark is exactly one position behind — otherwise
+      it stays behind and lets `catch_up` replay in log order. Sound, and
+      slower under concurrency by construction.
 - [ ] **Linguistic search**: stemming, synonyms, phrase and boolean
       operators. These change *what matches*, so they need to be an explicit
       opt-in mode rather than a silent upgrade of the default.
@@ -291,8 +356,22 @@ Key bets, and why:
       state, parameter rules).
 - [ ] **Functions**: server-side logic (sandboxed Python) callable via API —
       computed properties, custom action logic, derived links.
-- [ ] **Writeback datasets**: edits materialized back into a dataset so
-      pipelines can consume user edits (closing Foundry's writeback loop).
+- ◑ **Writeback datasets**: ✅ `POST /ontology/object-types/{name}/writeback`
+      folds the edit overlay into a new dataset version so pipelines can
+      consume user edits. Requires edit rights on the **backing dataset**, not
+      just the object type, and refuses a transform-produced backing unless
+      overridden — otherwise the next build silently reverts the folded edits.
+      It bounds **read cost, not disk**: folded edits are *marked*, not
+      deleted, because `folded_into_version` is what keeps a folded version
+      reproducible. It publishes with compare-and-set
+      (`catalog.write(..., expect_version=...)`), because the version check it
+      had was a check-then-act: two concurrent folds could mark an edit folded
+      into one version while publishing another that lacked it, and a fold
+      could discard a concurrent build's whole version. It also refuses a
+      backing whose declared primary key is not unique, rather than
+      materializing the object view's dedup into the dataset and deleting rows
+      no edit referenced. Still to do: pruning folded edits, and an automatic
+      (rather than manual-only) trigger.
 - [ ] **Time series properties**: attach a timeseries dataset to an object type;
       efficient range queries + downsampling for charts.
 - [ ] **Geospatial**: point/geometry property types (DuckDB spatial), map query
@@ -519,7 +598,9 @@ The differentiator: nobody open-source has a good ontology layer.
 
 ## Non-goals
 
-- Reimplementing Spark. Big-compute plugs in; DuckDB is the default.
+- Reimplementing Spark. Big-compute plugs in; DuckDB is the default. And not
+  *operating* a serving tier either: Laurelin reads the StarRocks or ClickHouse
+  you run, it does not run one for you.
 - A proprietary notebook format, chart format, or DSL of any kind.
 - Multi-region active-active storage replication (defer to S3/Postgres).
 - Feature-flag-gated "enterprise edition". One product, Apache-2.0.

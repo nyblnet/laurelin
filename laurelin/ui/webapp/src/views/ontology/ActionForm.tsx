@@ -63,6 +63,12 @@ export function ActionForm({
       if (selectedPk) {
         qc.invalidateQueries({ queryKey: ["object", type, selectedPk] });
       }
+      // An edit moves the object store's watermark, and when the store cannot
+      // apply it, its lag. The health card reads that from the object-type
+      // query, so without this the card keeps reporting the state from before
+      // the edit — and lag is exactly the number someone watches to decide
+      // whether to rebuild.
+      qc.invalidateQueries({ queryKey: ["object-type", type] });
       setValues({});
     },
   });

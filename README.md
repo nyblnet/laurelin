@@ -62,6 +62,45 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   user (`pip install laurelin[mcp]`).
 - **Audit** — mutations through the API are written to an audit log.
 
+## Where compute happens
+
+Four roles, one governance layer. The role is a per-dataset property, not a
+deployment mode — the same catalog, ACLs, markings, row policies and lineage
+apply across all four.
+
+- **Embedded analytical default — DuckDB, in process, per replica.** Managed
+  Parquet datasets, the SQL workbench, dashboards, transforms and ontology
+  pushdown all run here. It is the default, it needs no infrastructure, and for
+  medium data it is the only role you ever touch.
+- **Federation over foreign systems — DuckDB attach, and Flight SQL engines.**
+  Register an existing Iceberg/Delta/Parquet/PostgreSQL table as a *federated*
+  dataset and Laurelin governs bytes it does not hold, scanning them in place
+  with the policy compiled around the remote scan. For work that is genuinely
+  huge and non-selective, a `@remote_transform` *delegates* to Trino, Dremio or
+  Databricks over Flight SQL and stores the reduced result with lineage and
+  policy intact. Laurelin runs no cluster and does not intend to.
+- **Serving tier — StarRocks (flagship) and ClickHouse (supported peer).**
+  Governed, policy-pushed-down reads of a table the serving engine owns.
+  StarRocks leads because querying Iceberg is a first-class path there, so
+  "open at rest" survives the serving tier instead of being traded away for it;
+  because it joins natively, and an ontology link *is* a join; and because it
+  has primary-key tables with real upserts. ClickHouse shipped the same day and
+  is fully supported — embedded via **chdb**, so there is no server to run.
+  Both are **read-only from Laurelin**: the engine serves, Laurelin governs the
+  read. Laurelin does not operate or load a serving engine.
+- **Operational store — the materialization of ontology object state.** The
+  metadata store is the default and the only backend wired to configuration.
+  A StarRocks-backed store exists behind the same seam, writing via Stream Load
+  with primary-key upserts, but it has **only run against an in-memory double —
+  never a real StarRocks server** — and no env var selects it, so every
+  deployment today runs the metadata store.
+
+**Open at rest, in every role.** Datasets can be **Apache Iceberg** tables
+(`pip install 'laurelin[iceberg]'`) with branches, time travel and schema
+evolution, which Spark, Trino, Snowflake and DuckDB open directly. That is also
+what makes the serving tier coherent rather than a lock-in: the table a
+serving engine reads can be the same open table everything else reads.
+
 ## Tutorials
 
 Three task-shaped walkthroughs that build on each other — start here:
@@ -161,11 +200,17 @@ my-workspace/
 │  Catalog   │  Transforms  │  Ontology                │
 │  versioned │  DAG builder │  objects / links /       │
 │  datasets  │  + lineage   │  actions + edit overlay  │
-├────────────┴──────────────┴──────────────────────────┤
-│   Parquet (data)  ·  SQLite (metadata)  ·  DuckDB    │
-│                    (query engine)                    │
-└──────────────────────────────────────────────────────┘
+├────────────┼──────────────┴──────────────────────────┤
+│  Storage   │  Parquet · Iceberg (data)               │
+│            │  SQLite / PostgreSQL (metadata)         │
+├────────────┼─────────────────────────────────────────┤
+│  Compute   │  DuckDB embedded · federation ·         │
+│            │  serving tier · operational store       │
+└────────────┴─────────────────────────────────────────┘
 ```
+
+The four compute roles are [below](#where-compute-happens); DuckDB embedded is
+the default and the only one you need to start.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module-level detail.
 
@@ -229,17 +274,17 @@ and how to report a vulnerability.
 
 **0.2.0** — the first published release; see [CHANGELOG.md](CHANGELOG.md).
 Early alpha: the core loop — ingest → transform → build → ontology → act —
-works end to end, with 662 tests run against both SQLite and PostgreSQL, but
+works end to end, with 1,256 tests run against both SQLite and PostgreSQL, but
 expect rough edges and breaking changes before 1.0.
 
 Laurelin runs as a single process on a laptop *or* as N stateless replicas
 behind a load balancer — identity, workspace metadata and build coordination in
 PostgreSQL, dataset Parquet in object storage (`LAURELIN_DATA_URI=s3://…`).
-Compute is DuckDB in-process per replica: strong on governance and semantics,
-deliberately not a distributed compute engine. Data too big for that is either
-**federated** (governed in place, scanned remotely) or **delegated** — a
-`@remote_transform` runs on a Trino/Dremio/Databricks cluster and Laurelin
-stores the reduced result with lineage and policy intact.
+Compute is four roles behind one governance layer — see [Where compute
+happens](#where-compute-happens). The default is DuckDB in-process per replica:
+strong on governance and semantics, deliberately not a distributed compute
+engine. Data too big for that is federated, delegated, or served from a
+StarRocks/ClickHouse table Laurelin reads but does not operate.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
 unflattering ones: the SQL path stays comfortable into the tens of millions of
 rows, appends cost the delta rather than the dataset, and ontology queries run
@@ -247,11 +292,10 @@ in DuckDB (~26× faster than they were). An object type can also be *indexed*,
 which makes key lookups constant-time (1.4 ms at a million objects) — but not
 substring search, which still scans. Reproduce them with
 `python bench/benchmark.py`, and note that CI re-checks those claims as ratios
-on every push, so they can't quietly rot.
-
-Datasets can also be **Apache Iceberg** tables (`pip install
-'laurelin[iceberg]'`), which Spark, Trino, Snowflake and DuckDB open directly —
-with branches, time travel and schema evolution.
+on every push, so they can't quietly rot. There is **no published number for
+the serving tier** — no benchmark, no latency, no comparison against DuckDB.
+Every figure above was produced by `bench/benchmark.py` on the managed DuckDB
+path and stays attached to it.
 
 ## License
 

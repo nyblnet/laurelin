@@ -9,7 +9,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { API, api } from "../api";
+import { API, ApiError, api } from "../api";
 import { useAuth } from "../auth";
 import type {
   ColumnSchema,
@@ -65,6 +65,10 @@ function DatasetList() {
           {d.kind === "federated" && <Badge tone="blue">federated</Badge>}
           {d.kind === "iceberg" && <Badge tone="green">iceberg</Badge>}
           {d.kind === "clickhouse" && <Badge tone="blue">clickhouse</Badge>}
+          {/* Gold, not blue: blue is the peer tone federated and clickhouse
+              already carry, and gold is what this UI uses for the thing you
+              are meant to notice. */}
+          {d.kind === "starrocks" && <Badge tone="gold">starrocks</Badge>}
         </span>
       ),
     },
@@ -316,10 +320,42 @@ function fmtBytes(n: number): string {
 
 // --------------------------------------------------------------- federated
 
-// "clickhouse" is not a federated *source* type — it selects a different
-// engine and a different route. Kept in one dropdown because to the person
-// registering, the question is the same one: where does this table live?
-type FederatedType = "iceberg" | "delta" | "parquet" | "postgres" | "clickhouse";
+// "clickhouse" and "starrocks" are not federated *source* types — each selects
+// a different engine and a different route. Kept in one dropdown because to the
+// person registering, the question is the same one: where does this table live?
+type FederatedType =
+  | "starrocks"
+  | "iceberg"
+  | "delta"
+  | "parquet"
+  | "postgres"
+  | "clickhouse";
+
+/** Which registration route a kind uses. */
+function routeFor(type: FederatedType): string {
+  if (type === "starrocks") return "starrocks";
+  if (type === "clickhouse") return "clickhouse";
+  return "federated";
+}
+
+/**
+ * The `source` body for a kind.
+ *
+ * Split out of the JSX because three special cases in one ternary stopped being
+ * readable. Note the trap in the starrocks branch: its source `type` is the
+ * literal "table" — `validate_source` accepts nothing else, and "starrocks"
+ * there is a 400.
+ */
+function sourceFor(
+  type: FederatedType,
+  f: { path: string; url: string; table: string },
+): Record<string, string> {
+  if (type === "starrocks") return { type: "table", url: f.url, table: f.table };
+  if (type === "postgres") return { type, url: f.url, table: f.table };
+  // ClickHouse reads files here, so it registers a parquet source and differs
+  // only in the route (and therefore the engine that scans it).
+  return { type: type === "clickhouse" ? "parquet" : type, path: f.path };
+}
 
 /**
  * Register a table Laurelin governs but does not hold.
@@ -342,18 +378,18 @@ function FederatedPanel() {
   if (user?.role !== "admin") return null;
 
   const clickhouse = type === "clickhouse";
-  const source =
-    type === "postgres"
-      ? { type, url, table }
-      : { type: clickhouse ? "parquet" : type, path };
+  const starrocks = type === "starrocks";
+  // Both remote-server kinds are addressed by url + table; the rest by a path.
+  const remote = starrocks || type === "postgres";
+  const source = sourceFor(type, { path, url, table });
 
   const complete =
     /^[a-z][a-z0-9_]*$/.test(name) &&
-    (type === "postgres" ? url.trim() !== "" && table.trim() !== "" : path.trim() !== "");
+    (remote ? url.trim() !== "" && table.trim() !== "" : path.trim() !== "");
 
   const register = useMutation({
     mutationFn: () =>
-      api.put(`${API}/datasets/${name}/${clickhouse ? "clickhouse" : "federated"}`, {
+      api.put(`${API}/datasets/${name}/${routeFor(type)}`, {
         source,
         description: "",
       }),
@@ -371,7 +407,7 @@ function FederatedPanel() {
     return (
       <div style={{ margin: "0 0 24px" }}>
         <button className="small" onClick={() => setOpen(true)}>
-          Register a federated table…
+          Register an external table…
         </button>
       </div>
     );
@@ -380,12 +416,13 @@ function FederatedPanel() {
   return (
     <div className="card" style={{ marginBottom: 24 }}>
       <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-        <label style={{ marginBottom: 0 }}>Register a federated table</label>
+        <label style={{ marginBottom: 0 }}>Register an external table</label>
         <button className="small" onClick={() => setOpen(false)}>Cancel</button>
       </div>
       <p className="hint" style={{ marginTop: 4 }}>
-        A table Laurelin governs and scans in place — it isn't copied, and it has
-        no versions. Governed by the same ACLs and policies as any dataset.
+        A table Laurelin governs and scans where it already lives — it isn't
+        copied, and it has no versions. Which engine does the scanning depends on
+        the kind you pick; the ACLs and policies are the same either way.
       </p>
 
       <div className="toolbar" style={{ gap: 12, flexWrap: "wrap", marginTop: 8 }}>
@@ -397,6 +434,9 @@ function FederatedPanel() {
         <div className="field">
           <label>Kind</label>
           <select value={type} onChange={(e) => setType(e.target.value as FederatedType)}>
+            {/* First on purpose: StarRocks is the serving tier this project
+                leads with, and option order is the cheapest way to say so. */}
+            <option value="starrocks">StarRocks (remote server)</option>
             <option value="iceberg">Iceberg</option>
             <option value="delta">Delta Lake</option>
             <option value="parquet">Parquet file/glob</option>
@@ -406,19 +446,51 @@ function FederatedPanel() {
         </div>
       </div>
 
-      {type === "postgres" ? (
-        <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
-          <div className="field" style={{ flex: "1 1 260px" }}>
-            <label>Connection URL</label>
-            <input className="mono" value={url} onChange={(e) => setUrl(e.target.value)}
-              placeholder="postgresql://user:pw@host:5432/db" />
+      {remote ? (
+        <>
+          <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
+            <div className="field" style={{ flex: "1 1 260px" }}>
+              <label>Connection URL</label>
+              <input className="mono" value={url} onChange={(e) => setUrl(e.target.value)}
+                placeholder={
+                  starrocks
+                    ? "starrocks://laurelin_ro:password@fe.internal:9030/analytics"
+                    : "postgresql://user:pw@host:5432/db"
+                } />
+              {starrocks && (
+                <p className="hint">
+                  The FE's MySQL-protocol port (9030 by default). The database
+                  segment is required.
+                </p>
+              )}
+            </div>
+            <div className="field">
+              <label>Table</label>
+              <input className="mono" value={table} onChange={(e) => setTable(e.target.value)}
+                placeholder={starrocks ? "analytics.orders" : "public.orders"} />
+              {starrocks && (
+                <p className="hint">
+                  <code>table</code>, <code>db.table</code>, or{" "}
+                  <code>catalog.db.table</code> for an external Iceberg/Hive
+                  catalog.
+                </p>
+              )}
+            </div>
           </div>
-          <div className="field">
-            <label>Table</label>
-            <input className="mono" value={table} onChange={(e) => setTable(e.target.value)}
-              placeholder="public.orders" />
-          </div>
-        </div>
+          {starrocks && (
+            <div className="field">
+              <p className="hint" style={{ marginTop: 0 }}>
+                Use an account that holds SELECT and nothing else. Stacked
+                statements execute on StarRocks, so this credential is the blast
+                radius.
+              </p>
+              <p className="hint">
+                Not yet run against a live StarRocks server — every StarRocks path
+                here has only been exercised against an in-memory double.
+              </p>
+            </div>
+          )}
+        </>
       ) : (
         <div className="field">
           <label>Path or URI</label>
@@ -478,8 +550,12 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
   // Mirrors DatasetInfo.scans_at_source on the server: what the *reader* cares
   // about is not who owns the table but whether there are local versions to
   // show. Iceberg has them; federated and clickhouse do not.
-  const atSource = detail.kind === "federated" || detail.kind === "clickhouse";
+  const atSource =
+    detail.kind === "federated" ||
+    detail.kind === "clickhouse" ||
+    detail.kind === "starrocks";
   const iceberg = detail.kind === "iceberg";
+  const starrocks = detail.kind === "starrocks";
   const schemaVersion =
     detail.versions.find((v) => v.version === detail.latest_version) ??
     detail.versions[detail.versions.length - 1];
@@ -493,7 +569,9 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         subtitle={detail.description || undefined}
         actions={
           detail.kind && detail.kind !== "managed" ? (
-            <Badge tone={iceberg ? "green" : "blue"}>{detail.kind}</Badge>
+            <Badge tone={starrocks ? "gold" : iceberg ? "green" : "blue"}>
+              {detail.kind}
+            </Badge>
           ) : undefined
         }
       />
@@ -525,7 +603,11 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
       )}
 
       <h3>Row preview</h3>
-      <RowPreview name={detail.name} schema={schemaVersion?.schema} />
+      <RowPreview
+        name={detail.name}
+        schema={schemaVersion?.schema}
+        atSource={atSource}
+      />
     </div>
   );
 }
@@ -542,23 +624,55 @@ function FederatedSource({
   source?: Record<string, unknown>;
   kind?: DatasetKind;
 }) {
-  const type = String(source?.type ?? "external");
-  const location = String(source?.path ?? source?.table ?? source?.url ?? "");
   const clickhouse = kind === "clickhouse";
+  const starrocks = kind === "starrocks";
+  // A StarRocks source's `type` is always the literal "table" — showing it
+  // would be noise, so the badge carries the kind instead.
+  const type = starrocks ? "starrocks" : String(source?.type ?? "external");
+  const table = source?.table ? String(source.table) : "";
+  const url = source?.url ? String(source.url) : "";
+  const location = String(source?.path ?? source?.table ?? source?.url ?? "");
   return (
     <div className="card" style={{ marginBottom: 20 }}>
       <label style={{ marginBottom: 4 }}>
-        {clickhouse ? "ClickHouse source" : "Federated source"}
+        {starrocks
+          ? "StarRocks source"
+          : clickhouse
+            ? "ClickHouse source"
+            : "Federated source"}
       </label>
       <p className="hint" style={{ marginTop: 0 }}>
         Laurelin governs and scans this table in place — it isn't copied and has
         no versions. Same ACLs and policies as any dataset.
         {clickhouse && " Read-only: Laurelin does not write to ClickHouse."}
+        {starrocks &&
+          " Read-only: Laurelin holds SELECT on this table and nothing else." +
+            " No writes, no versions, no time travel."}
       </p>
-      <div className="mono" style={{ fontSize: 13 }}>
-        <Badge tone="blue">{type}</Badge>{" "}
-        {location && <span className="dim">{location}</span>}
-      </div>
+      {starrocks ? (
+        <>
+          {/* Table and server both matter here: the table names what you are
+              reading, the url names the cluster and the account reading it. */}
+          <div className="mono" style={{ fontSize: 13 }}>
+            <Badge tone="gold">{type}</Badge>{" "}
+            {table && <span className="dim">{table}</span>}
+          </div>
+          {url && (
+            <div className="mono faint" style={{ fontSize: 12, marginTop: 4 }}>
+              {url}
+            </div>
+          )}
+          <p className="hint" style={{ marginBottom: 0 }}>
+            Untested against a live StarRocks server — the read path has only run
+            against an in-memory double.
+          </p>
+        </>
+      ) : (
+        <div className="mono" style={{ fontSize: 13 }}>
+          <Badge tone="blue">{type}</Badge>{" "}
+          {location && <span className="dim">{location}</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -727,9 +841,11 @@ function VersionHistory({ versions }: { versions: DatasetVersion[] }) {
 function RowPreview({
   name,
   schema,
+  atSource = false,
 }: {
   name: string;
   schema: ColumnSchema[] | undefined;
+  atSource?: boolean;
 }) {
   const [offset, setOffset] = useState(0);
   const { data, isLoading, error } = useQuery({
@@ -741,7 +857,31 @@ function RowPreview({
   });
 
   if (isLoading) return <Spinner />;
-  if (error) return <ErrorBox error={error} />;
+  if (error) {
+    // The rows endpoint does not map a source-connection failure to a status
+    // that carries its reason: StarRocksError, ClickHouseError and
+    // FederationError are each caught when the table is *registered* but not
+    // when it is *read*, so an unreachable remote arrives here as a bare 500
+    // with the diagnostic left in the server log. Verified by pointing a
+    // registered dataset at a host that does not resolve. Until the read path
+    // maps those the way the registration routes already do, say where the
+    // reason went rather than leaving "Internal Server Error" as the whole
+    // story.
+    const opaque =
+      atSource && error instanceof ApiError && error.status >= 500;
+    return (
+      <>
+        <ErrorBox error={error} />
+        {opaque && (
+          <p className="hint" style={{ marginTop: 0 }}>
+            This table is scanned where it lives, so a failure here is usually
+            the source being unreachable or the credentials being wrong. The
+            server log holds the reason this response does not.
+          </p>
+        )}
+      </>
+    );
+  }
   if (!data) return null;
 
   const { rows, row_count } = data;

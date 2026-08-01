@@ -46,6 +46,44 @@ The chart renders a Deployment (liveness `/health`, readiness `/health/ready`),
 Service, optional Ingress + HPA, a PVC for workspace data, and a Secret for
 sensitive env (SSO secrets, SCIM token). `helm lint` clean.
 
+## Engines by role
+
+Compute is four roles behind one governance layer (see
+[SCALE.md](SCALE.md#four-roles-one-governance-layer)). Only the first is
+required; the rest are optional extras you install when you need that role.
+
+| Role | Extra | What must be running |
+|---|---|---|
+| Embedded analytical default | none — built in | Nothing |
+| Iceberg storage | `laurelin[iceberg]` | Nothing. pyiceberg's `SqlCatalog` points at the database you already have — no REST catalog to operate |
+| Federation (scan in place) | none for parquet/delta/iceberg/postgres | The foreign system (S3 bucket, Postgres, …) |
+| Federation (delegated compute) | `laurelin[engines]` | A Flight SQL engine: Trino, Dremio, Databricks |
+| Serving tier — **StarRocks** | `laurelin[starrocks]` | A StarRocks FE reachable on 9030, with an account holding `SELECT` and nothing else |
+| Serving tier — ClickHouse | `laurelin[clickhouse]` | Nothing. chdb is ClickHouse embedded in the Laurelin process |
+| Operational object store | none | The metadata database |
+
+Two things an operator should know before planning around this section:
+
+**The StarRocks object store is not selectable in this release.** The ontology
+object store is pluggable in the sense that there is a seam with a second
+implementation behind it — `StarRocksObjectStore`, writing via Stream Load with
+primary-key upserts. There is no env var, route or config key that switches to
+it; `OntologyService` constructs `MetadataObjectStore`. That implementation has
+also **only ever run against an in-memory double, never a real StarRocks
+server.** The metadata store is what runs, everywhere, today. (This is separate
+from `kind="starrocks"` *datasets*, whose read path was measured against a real
+StarRocks container — do not read one status as the other.)
+
+**Licensing, for the `starrocks` extra.** `mysql-connector-python` is **GPLv2
+with the FOSS exception**, and Laurelin is Apache-2.0. It is an *optional*
+extra, imported only by the StarRocks backend, so nothing in a default install
+links it — but anyone redistributing a build with this extra installed should
+make that call deliberately. It was chosen because it is the only
+MySQL-protocol client of the three candidates that genuinely *binds*
+parameters; client-side interpolation would put this codebase's only injection
+surface inside a third-party library, and on StarRocks that is a remote write
+primitive rather than a wrong read.
+
 ## High availability — what holds, and what to know
 
 **Stateless API.** The API process holds no per-request state; sessions and API
@@ -133,6 +171,14 @@ there is no separate migration step to run.
 
 ## Configuration reference (environment)
 
+Engine-related variables are grouped by role rather than by vendor:
+`LAURELIN_ICEBERG_*` configures **storage**; `LAURELIN_ENGINE_*` configures
+**federation's** delegated-compute path; `LAURELIN_FEDERATION_WORKBENCH` gates
+what federation *and* the **serving tier** expose to ad-hoc SQL; and the
+`LAURELIN_QUERY_*` budgets apply to whichever engine answers, translated into
+that engine's own settings. The **operational object store** has no variables —
+it is the metadata database.
+
 | Variable | Purpose |
 |---|---|
 | `LAURELIN_CONTROL_DATABASE_URL` | Postgres URL for the multi-workspace control plane |
@@ -149,9 +195,9 @@ there is no separate migration step to run.
 | `LAURELIN_WORKER_ID` | Identifies this replica when claiming build leases (default `<hostname>:<pid>`) |
 | `LAURELIN_ICEBERG_WAREHOUSE` | Where Iceberg table data lives (`s3://…`); default: `<workspace>/iceberg` |
 | `LAURELIN_ICEBERG_CATALOG` | SQLAlchemy URL for the Iceberg catalog; default: the metadata database |
-| `LAURELIN_FEDERATION_WORKBENCH=1` | Expose federated **and ClickHouse** datasets to ad-hoc SQL (off by default) |
-| `LAURELIN_QUERY_MEMORY_LIMIT` | Memory budget per interactive query (default `2GB`; also becomes ClickHouse's `max_memory_usage`) |
-| `LAURELIN_QUERY_TIMEOUT` | Seconds before an interactive query is interrupted (default `60`; `0` disables). DuckDB uses a watchdog thread; ClickHouse enforces it natively as `max_execution_time` |
+| `LAURELIN_FEDERATION_WORKBENCH=1` | Expose federated, ClickHouse **and StarRocks** datasets to ad-hoc SQL (off by default) |
+| `LAURELIN_QUERY_MEMORY_LIMIT` | Memory budget per interactive query (default `2GB`; also becomes ClickHouse's `max_memory_usage` and StarRocks' `query_mem_limit`) |
+| `LAURELIN_QUERY_TIMEOUT` | Seconds before an interactive query is interrupted (default `60`; `0` disables). DuckDB uses a watchdog thread; ClickHouse enforces it natively as `max_execution_time`; StarRocks as `query_timeout`, rounded **up** to a whole second because it rejects a fractional one |
 | `LAURELIN_QUERY_THREADS` | Cap cores per interactive query (default: DuckDB's own) |
 | `LAURELIN_MAX_CONCURRENT_QUERIES` | Interactive queries admitted at once per replica (default `8`; `0` disables) |
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |

@@ -70,7 +70,16 @@ export interface DatasetVersion {
   source: string;
 }
 
-export type DatasetKind = "managed" | "federated" | "iceberg" | "clickhouse";
+// Mirrors DATASET_KINDS in laurelin/core/models.py. Kept exhaustive on purpose:
+// every kind comparison in the Datasets view narrows on this union, so a kind
+// the server can return but this type cannot name falls through to the managed
+// branch and renders controls the server will refuse.
+export type DatasetKind =
+  | "managed"
+  | "federated"
+  | "iceberg"
+  | "clickhouse"
+  | "starrocks";
 
 export interface Dataset {
   name: string;
@@ -289,13 +298,46 @@ export interface ObjectIndexStatus {
   indexed: boolean;
   /** A stale index is bypassed, so this is what decides whether it's used. */
   fresh: boolean;
-  objects: number;
+  /**
+   * How many objects the shared materialization holds — **null for a caller
+   * the backing dataset's row-level security narrows.** It counts every
+   * tenant's objects, so handing it to a user who can see three of six would
+   * disclose the other three's existence. Same reason for `lag` and
+   * `applied_seq`: they describe the shared store, not this user's slice.
+   */
+  objects: number | null;
+  /**
+   * Edits recorded since the materialization last caught up. It splits the one
+   * thing `fresh: false` conflates: lag > 0 means "behind by N edits", which the
+   * next write catches up incrementally; lag === 0 with fresh false means the
+   * backing dataset moved to a new version, and only a full rebuild expresses
+   * that. Same badge colour, different remedy.
+   */
+  lag: number | null;
+  /** Where the materialized objects live — "metadata" or "starrocks". */
+  store: string | null;
+  /** Last edit-log position the materialization has applied. */
+  applied_seq: number | null;
 }
 
 export interface ObjectTypeDetail extends ObjectTypeDef {
   links: LinkTypeDef[];
   actions: ActionDef[];
   index?: ObjectIndexStatus;
+}
+
+/** Result of folding the edit overlay into a new backing-dataset version. */
+export interface WritebackResult {
+  object_type: string;
+  /** Edit-log rows marked folded. 0 means nothing happened. */
+  folded: number;
+  /** The new version — or, when folded is 0, the unchanged current one. */
+  version: number | null;
+  /** Absent on the no-edits early return, so it must stay optional. */
+  row_count?: number;
+  /** Objects reindexed after the write; null when the type has no
+   *  materialization, which is normal rather than a failure. */
+  objects: number | null;
 }
 
 export type OntologyObject = Record<string, unknown> & {
