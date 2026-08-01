@@ -69,7 +69,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlsec1
 
       - name: Install
-        run: pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg]'
+        run: pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg,clickhouse]'
 
       # Every optional extra is installed above, so this run exercises the
       # SAML, MCP, Flight SQL, croniter and prometheus paths rather than

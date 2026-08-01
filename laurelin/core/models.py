@@ -38,6 +38,9 @@ class DatasetInfo(BaseModel):
     # "iceberg":   Laurelin owns an Iceberg table — writable and versioned like
     #              managed, but read at source like federated, and readable by
     #              Spark/Trino/DuckDB without Laurelin.
+    # "clickhouse": read-only, scanned in place by embedded ClickHouse (chdb).
+    #              Like federated in every way a reader cares about, except
+    #              that the SQL is a different dialect — see `sql_dialect`.
     kind: str = "managed"
     source: dict[str, Any] = Field(default_factory=dict)
 
@@ -50,14 +53,31 @@ class DatasetInfo(BaseModel):
         return self.kind == "iceberg"
 
     @property
+    def is_clickhouse(self) -> bool:
+        return self.kind == "clickhouse"
+
+    @property
     def scans_at_source(self) -> bool:
         """Read via the source expression rather than local Parquet parts.
 
         The distinction that matters to a *reader* is not who owns the table
-        but where the scan happens — so federated and Iceberg share every read
-        path, and with it one implementation of how policy is applied.
+        but where the scan happens — so federated, Iceberg and ClickHouse share
+        every read path, and with it one implementation of how policy is
+        applied.
         """
-        return self.kind in ("federated", "iceberg")
+        return self.kind in ("federated", "iceberg", "clickhouse")
+
+    @property
+    def sql_dialect(self) -> str:
+        """Which SQL dialect a policy must be rendered in for this dataset.
+
+        Until ClickHouse, ``scans_at_source`` silently encoded two facts —
+        "read via the source expression" *and* "DuckDB renders the SQL". They
+        diverge here, and in a governance layer a derivation that drifts is a
+        leak rather than a wrong number, so the second fact gets a name and one
+        definition instead of N call sites re-deriving it.
+        """
+        return "clickhouse" if self.kind == "clickhouse" else "duckdb"
 
 
 class DatasetVersionInfo(BaseModel):

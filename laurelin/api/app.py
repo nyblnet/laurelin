@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import laurelin
+from laurelin.api import iceberg_routes  # noqa: F401 - registers routes on the shared router
 from laurelin.api.app_routes import apps_router
 from laurelin.api.auth_routes import (
     auth_router,
@@ -34,7 +35,6 @@ from laurelin.api.auth_routes import (
     users_router,
     workspaces_router,
 )
-from laurelin.api import iceberg_routes  # noqa: F401 - registers routes on the shared router
 from laurelin.api.engine_routes import engines_router
 from laurelin.api.routes import router
 from laurelin.api.schedule_routes import schedules_router

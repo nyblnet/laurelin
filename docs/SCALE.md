@@ -355,6 +355,41 @@ Three deliberate limits:
 - **No versioning.** A federated table has no immutable snapshots, because
   Laurelin doesn't control its writes.
 
+## A second engine: ClickHouse-backed datasets
+
+```bash
+pip install 'laurelin[clickhouse]'
+curl -X PUT localhost:8787/api/v1/datasets/events/clickhouse \
+  -H 'Content-Type: application/json' \
+  -d '{"source": {"type": "parquet", "path": "/data/events/*.parquet"}}'
+```
+
+`kind="clickhouse"` reads through **chdb** — ClickHouse embedded in the
+Laurelin process — so there is no ClickHouse service to run and no cluster to
+size. It exists to prove that Laurelin's governance layer renders one policy
+decision correctly onto a *second* SQL dialect; the same row policies and
+column masks apply, compiled to ClickHouse SQL instead of DuckDB SQL, and
+`tests/test_clickhouse_governance.py` asserts row-for-row equality with the
+Arrow reference across the policy space.
+
+What it does **not** do, and will not pretend to:
+
+- **Read-only.** No `INSERT`, no MergeTree ingest, no upload/append — those
+  refuse. This is not a serving tier.
+- **Embedded only.** Connecting to a real ClickHouse server is not
+  implemented; `clickhouse-connect` is deliberately not a dependency.
+- **No versions, no time travel, no ontology object types** (same as
+  federated).
+- **Weaker sandbox than the federated path.** DuckDB scans run behind
+  `disabled_filesystems` + `lock_configuration`; chdb offers no equivalent, so
+  ClickHouse datasets are admin-registered and sit behind the same
+  `LAURELIN_FEDERATION_WORKBENCH` gate.
+- **Floats stringify differently across engines.** Row policies compare, and
+  hash masks hash, the column's *text*. `1.0` renders as `'1.0'` in Arrow and
+  DuckDB but `'1'` in ClickHouse. Nothing leaks — filters stay fail-closed and
+  masks stay masked — but a hash token over a float column is not joinable
+  across engines. Documented rather than papered over.
+
 ## Sizing guidance
 
 | You have | Laurelin today |

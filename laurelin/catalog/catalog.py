@@ -31,10 +31,12 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
-from laurelin.core import federation, limits, metrics
+from laurelin.core import clickhouse, federation, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.dialects import CLICKHOUSE, DUCKDB
 from laurelin.core.models import ColumnSchema, DatasetInfo, DatasetVersionInfo
+from laurelin.core.permissions import PolicyRenderError
 from laurelin.core.storage import storage_for
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -112,6 +114,26 @@ class DatasetCatalog:
         _validate_name(name)
         return self.store.upsert_dataset(name, description)
 
+    def _refuse_write_at_source(self, name: str) -> None:
+        """Writing to a dataset that is scanned at source is not a partial
+        feature, it is a corrupt one.
+
+        The write would land in local Parquet parts and mint a version row,
+        while ``read()`` keeps returning the remote table — leaving a dataset
+        that is half managed and half remote, and reporting only the half you
+        did not write. Iceberg is exempt because Laurelin owns and writes that
+        table for real (``write_iceberg``).
+        """
+        info = self.store.get_dataset(name)
+        if info is None or not info.scans_at_source or info.is_iceberg:
+            return
+        raise ValueError(
+            f"Dataset {name!r} is a {info.kind} dataset: it is scanned at the "
+            "source and Laurelin does not write to it. Land the rows in a "
+            "managed dataset instead (a transform can read this one and write "
+            "that one)."
+        )
+
     # -- writing --------------------------------------------------------------
 
     def _commit_version(
@@ -184,6 +206,7 @@ class DatasetCatalog:
         mid-write never leaves a registered-but-missing version.
         """
         _validate_name(name)
+        self._refuse_write_at_source(name)
         self.store.upsert_dataset(name, description)
 
         key = self.storage.new_part_key(name)
@@ -215,6 +238,7 @@ class DatasetCatalog:
         large external tables). Every chunk is cast to the first chunk's
         schema; an incompatible chunk fails the whole write."""
         _validate_name(name)
+        self._refuse_write_at_source(name)
         self.store.upsert_dataset(name, description)
 
         key = self.storage.new_part_key(name)
@@ -272,6 +296,7 @@ class DatasetCatalog:
         For an empty dataset this is exactly ``write``.
         """
         _validate_name(name)
+        self._refuse_write_at_source(name)
         self.store.upsert_dataset(name, description)
 
         previous = self.store.get_version(name, None)
@@ -323,6 +348,7 @@ class DatasetCatalog:
         rows is a no-op that returns the current version rather than an error.
         """
         _validate_name(name)
+        self._refuse_write_at_source(name)
         self.store.upsert_dataset(name, description)
         previous = self.store.get_version(name, None)
         if previous is None:
@@ -460,7 +486,7 @@ class DatasetCatalog:
         """
         info = self.store.get_dataset(name)
         if info is not None and info.scans_at_source:
-            yield self.federated_table(name)
+            yield self.source_table(name)
             return
         scanner = self.arrow_dataset(name, version).scanner(batch_size=batch_rows)
         for record_batch in scanner.to_batches():
@@ -654,9 +680,10 @@ class DatasetCatalog:
             # Unlike a federated table, this one *does* have versions — each
             # pinned to an Iceberg snapshot, so history is readable.
             return self.read_iceberg(name, version)
-        if info is not None and info.is_federated:
-            # No versions to pin: a federated table is read as it is now.
-            return self.federated_table(name)
+        if info is not None and info.scans_at_source:
+            # No versions to pin: a federated or ClickHouse table is read as it
+            # is now. (Iceberg is handled above — it really does have history.)
+            return self.source_table(name)
         return self.storage.read_table(self.version_files(name, version))
 
     @staticmethod
@@ -685,7 +712,7 @@ class DatasetCatalog:
         info = self.store.get_dataset(name)
         if info is not None and info.scans_at_source:
             # Page a federated table at the source rather than dragging it back.
-            table = self.federated_table(name, limit=limit + offset)
+            table = self.source_table(name, limit=limit + offset)
             return self.table_to_rows(table.slice(offset, limit))
         con = duckdb.connect()
         try:
@@ -714,7 +741,79 @@ class DatasetCatalog:
         of materializing the whole table in memory."""
         return self.storage.dataset(self.version_files(name, version))
 
-    # -- federated datasets -----------------------------------------------------
+    # -- source-scanned datasets -------------------------------------------------
+    #
+    # Federated, Iceberg and ClickHouse datasets are all read through
+    # `source_table` below, which is the ONLY place a SqlPolicy is applied to a
+    # scan. Keeping it that way is the point: a second apply site is a second
+    # interpretation of what a policy means, and the two will drift.
+    #
+    # The engines differ in three things — how a scan expression is written,
+    # how policy values travel, and how the statement is assembled — so each
+    # gets a small reader below. Everything else, including the fail-closed
+    # rules, is shared.
+
+    class _DuckDbSource:
+        """Federated and Iceberg: DuckDB, bound parameters, hardened connection."""
+
+        dialect = DUCKDB
+
+        def __init__(self, source: dict):
+            self.source = source
+            self.con = federation.connect(source)
+
+        def schema(self) -> pa.Schema:
+            return federation.schema_of(self.source, self.con)
+
+        def run(self, select_list: str, where: str, params: list, limit) -> pa.Table:
+            expr, scan_params, _ = federation.scan_expression(self.source)
+            sql = DUCKDB.assemble(select_list, expr, where, limit)
+            # A scan can be expensive on someone *else's* infrastructure, so it
+            # gets the same budget as a local one.
+            with limits.limited(self.con, limits.QueryLimits.interactive()):
+                result = self.con.execute(sql, [*scan_params, *params]).arrow()
+            if isinstance(result, pa.RecordBatchReader):
+                result = result.read_all()
+            return result
+
+        def close(self) -> None:
+            self.con.close()
+
+    class _ClickHouseSource:
+        """ClickHouse via chdb: no connection to hold, no parameters to bind.
+
+        The budgets ride in the statement's SETTINGS clause because ClickHouse
+        enforces them itself; there is no watchdog thread and no `interrupt()`.
+        """
+
+        dialect = CLICKHOUSE
+
+        def __init__(self, source: dict):
+            self.source = source
+
+        def schema(self) -> pa.Schema:
+            return clickhouse.schema_of(self.source)
+
+        def run(self, select_list: str, where: str, params: list, limit) -> pa.Table:
+            assert not params, "the ClickHouse dialect binds nothing"
+            budget = limits.QueryLimits.interactive()
+            sql = CLICKHOUSE.assemble(
+                select_list,
+                clickhouse.scan_expression(self.source),
+                where,
+                limit,
+                limits.clickhouse_settings(budget),
+            )
+            with limits.clickhouse_limited(budget):
+                return clickhouse.run(sql)
+
+        def close(self) -> None:
+            pass
+
+    def _source_reader(self, info: DatasetInfo):
+        if info.is_clickhouse:
+            return self._ClickHouseSource(info.source)
+        return self._DuckDbSource(info.source)
 
     def register_federated(
         self, name: str, source: dict, description: str = ""
@@ -729,49 +828,97 @@ class DatasetCatalog:
         assert info is not None
         return info
 
-    def federated_table(
+    def register_clickhouse(
+        self, name: str, source: dict, description: str = ""
+    ) -> DatasetInfo:
+        """Register a read-only table scanned by embedded ClickHouse.
+
+        Probed before it is stored, so an unreachable table fails here rather
+        than at first query — and so does one whose column list comes back
+        empty, since an unknown column set cannot be masked.
+        """
+        _validate_name(name)
+        source = clickhouse.validate_source(source)
+        clickhouse.columns_of(source)
+        self.store.upsert_dataset(name, description)
+        self.store.set_dataset_source(name, "clickhouse", source)
+        info = self.store.get_dataset(name)
+        assert info is not None
+        return info
+
+    def source_table(
         self,
         name: str,
         sql_policy_for=None,
         limit: Optional[int] = None,
     ) -> pa.Table:
-        """Scan a federated dataset, with row/column policy applied remotely.
+        """Scan a source-backed dataset, with row/column policy applied remotely.
 
-        The policy is compiled to SQL and wrapped around the scan, so filtering
-        happens at the source rather than after the data arrives. A policy that
-        cannot be compiled is a refusal, never an unfiltered read.
+        The policy is compiled to the *reader's* dialect and wrapped around the
+        scan, so filtering happens at the source rather than after the data
+        arrives. A policy that cannot be compiled exactly is a refusal, never an
+        unfiltered read.
+
+        ``sql_policy_for=None`` means "no policy", which is deliberately
+        fail-*open* and safe only because of a three-way coupling that every
+        caller is part of: ``transforms/builder.py`` runs server-authored SQL as
+        the system, ``rows()`` reaches here only once ``row_policy_fn`` has
+        already returned None, and ``read()``'s callers apply the Arrow policy
+        themselves. A new call site that omits a policy where one applies leaks
+        silently — so don't add one.
         """
         info = self.store.get_dataset(name)
         if info is None or not info.scans_at_source:
-            raise KeyError(f"Not a federated dataset: {name!r}")
+            raise KeyError(f"Not a source-scanned dataset: {name!r}")
 
-        con = federation.connect(info.source)
+        reader = self._source_reader(info)
         try:
-            expr, params, _ = federation.scan_expression(info.source)
-            columns = federation.columns_of(info.source, con)
-            select_list, where, policy_params = "*", "TRUE", []
+            schema = reader.schema()
+            columns = list(schema.names)
+            if not columns:
+                # Not "a table with no columns" — that isn't a thing. This is
+                # discovery having failed, and it must not become an unmasked
+                # read: with an empty column list `decide()` skips every mask
+                # (none of their columns are "present") and the renderer would
+                # then have nothing left to refuse.
+                raise PolicyRenderError(
+                    f"Could not determine the columns of {name!r}, so its "
+                    "policy cannot be placed. Refusing the read."
+                )
+            select_list, where, params = "*", "TRUE", []
             if sql_policy_for is not None:
-                policy = sql_policy_for(name, columns)
+                # The types travel with the names: a row filter or a hash mask
+                # is a text comparison, and the renderer refuses one it cannot
+                # prove this engine spells the way the Arrow path does.
+                policy = sql_policy_for(
+                    name,
+                    columns,
+                    reader.dialect,
+                    {f.name: f.type for f in schema},
+                )
+                if policy.dialect is not reader.dialect:
+                    # A policy rendered for another engine would still *look*
+                    # like valid SQL here and quietly mean something else.
+                    raise PolicyRenderError(
+                        f"Policy for {name!r} was rendered for "
+                        f"{policy.dialect.name} but the dataset is read by "
+                        f"{reader.dialect.name}. Refusing the read."
+                    )
                 select_list, where = policy.select_list, policy.where
-                policy_params = policy.params
-            sql = f"SELECT {select_list} FROM {expr} WHERE {where}"
-            if limit is not None:
-                sql += f" LIMIT {int(limit)}"
-            # A federated scan can be expensive on someone *else's*
-            # infrastructure, so it gets the same budget as a local one.
-            with limits.limited(con, limits.QueryLimits.interactive()):
-                result = con.execute(sql, [*params, *policy_params]).arrow()
-            if isinstance(result, pa.RecordBatchReader):
-                result = result.read_all()
-            return result
+                params = policy.params
+            return reader.run(select_list, where, params, limit)
         except federation.FederationError:
             raise
         except duckdb.Error as exc:
             raise federation.FederationError(
-                f"Federated scan of {name!r} failed: {exc}"
+                f"Scan of {name!r} failed: {exc}"
             ) from exc
         finally:
-            con.close()
+            reader.close()
+
+    # Kept as a name: builder.py and tests/test_federation.py call it, and
+    # "federated" is still what it does for every dataset that isn't ClickHouse.
+    federated_table = source_table
 
     def scan_for(self, name: str, plan_for=None, version: Optional[int] = None):
         """A scannable object for ``name`` with any row/column policy applied.
@@ -787,10 +934,26 @@ class DatasetCatalog:
             # No local Parquet parts to build a lazy Dataset over. Read the
             # table and apply the plan exactly — correct, not lazy. The
             # pushdown that matters for Iceberg happens in `iceberg_scan`,
-            # which the SQL path (query/federated_table) uses instead.
+            # which the SQL path (query/source_table) uses instead.
             table = self.read(name, version)
             plan = plan_for(name, table.schema) if plan_for is not None else None
-            return plan.apply(table) if plan is not None else table
+            if plan is None:
+                return table
+            if not plan.lazy:
+                return plan.apply(table)
+            # A *lazy* plan carries a filter/projection rather than an apply()
+            # callable, and this branch used to call plan.apply unconditionally
+            # — a TypeError for every source-scanned dataset with a row policy,
+            # federated and Iceberg included. Nothing is streamed here (the
+            # table is already materialized), but running the same Arrow
+            # expressions keeps this path's answer identical to the managed
+            # one's rather than approximately so.
+            scan = pads.dataset(table)
+            if plan.filter is not None:
+                scan = scan.filter(plan.filter)
+            if plan.projection is not None:
+                return scan.scanner(columns=plan.projection).to_table()
+            return scan.to_table()
         dataset = self.arrow_dataset(name, version)
         plan = plan_for(name, dataset.schema) if plan_for is not None else None
         if plan is None:
@@ -852,10 +1015,16 @@ class DatasetCatalog:
                     # ad-hoc SQL reaching *foreign* systems, and this isn't one.
                     con.register(
                         ds.name,
-                        self.federated_table(ds.name, sql_policy_for=sql_policy_for),
+                        self.source_table(ds.name, sql_policy_for=sql_policy_for),
                     )
                     continue
-                if ds.is_federated:
+                if ds.is_federated or ds.is_clickhouse:
+                    # ClickHouse joins the *federated* arm, never the Iceberg
+                    # one: the reader is external, and unlike Iceberg, Laurelin
+                    # neither owns the data nor has a filesystem sandbox to put
+                    # it behind (see laurelin/core/clickhouse.py). Both
+                    # conditions below must hold, so an unpolicied registration
+                    # is impossible.
                     if not federation.workbench_enabled() or sql_policy_for is None:
                         # Off by default: enabling federation must not silently
                         # widen what ad-hoc SQL can reach. Unregistered means
@@ -863,7 +1032,7 @@ class DatasetCatalog:
                         continue
                     con.register(
                         ds.name,
-                        self.federated_table(
+                        self.source_table(
                             ds.name, sql_policy_for=sql_policy_for,
                             limit=federated_scan_limit,
                         ),
@@ -945,6 +1114,7 @@ class DatasetCatalog:
         rewriting it (see :meth:`append`); the default replaces it.
         """
         _validate_name(name)
+        self._refuse_write_at_source(name)
         table = self.parse_upload(path)
         if mode not in ("replace", "append"):
             raise ValueError(f"Unknown upload mode {mode!r}: expected 'replace' or 'append'")

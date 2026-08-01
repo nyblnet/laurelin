@@ -8,9 +8,11 @@ must produce identical rows and values.**
 """
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core import clickhouse as _clickhouse
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
@@ -163,8 +165,11 @@ def sql_read(catalog, perms, user, con=None) -> pa.Table:
     """Read through the SQL renderer, over the same Parquet the Arrow path uses."""
     import duckdb
 
-    columns = [f.name for f in catalog.arrow_dataset("sales").schema]
-    policy = perms.sql_policy_fn(user)("sales", columns)
+    schema = catalog.arrow_dataset("sales").schema
+    columns = [f.name for f in schema]
+    policy = perms.sql_policy_fn(user)(
+        "sales", columns, None, {f.name: f.type for f in schema}
+    )
     con = con or duckdb.connect()
     con.register("__scan", catalog.arrow_dataset("sales"))
     result = con.execute(
@@ -195,8 +200,9 @@ def test_sql_renderer_handles_hash_masking_natively(env):
 
     pushed = sql_read(catalog, perms, VIEWER)
     assert same(pushed, exact(catalog, perms, VIEWER))
+    schema = catalog.arrow_dataset("sales").schema
     assert "sha256" in perms.sql_policy_fn(VIEWER)(
-        "sales", [f.name for f in catalog.arrow_dataset("sales").schema]
+        "sales", [f.name for f in schema], None, {f.name: f.type for f in schema}
     ).select_list
 
 
@@ -213,7 +219,9 @@ def test_sql_renderer_is_parameterised(env):
     must not be able to alter the predicate."""
     catalog, store, perms = env
     set_policy(store, row_policy=ROWS("region", ["us' OR 1=1 --"]))
-    policy = perms.sql_policy_fn(VIEWER)("sales", ["id", "region"])
+    policy = perms.sql_policy_fn(VIEWER)(
+        "sales", ["id", "region"], None, {"id": pa.int64(), "region": pa.string()}
+    )
     assert "OR 1=1" not in policy.where
     assert policy.params == ["us' OR 1=1 --"]
     assert sql_read(catalog, perms, VIEWER).num_rows == 0
@@ -232,3 +240,92 @@ def test_admin_and_no_policy_render_to_passthrough(env):
     admin_policy = perms.sql_policy_fn(ADMIN)("sales", ["id", "region"])
     assert admin_policy.where == "TRUE" and admin_policy.params == []
     assert sql_read(catalog, perms, ADMIN).num_rows == 60
+
+
+# -- the third renderer --------------------------------------------------------
+#
+# ClickHouse is not "SQL with different keywords". Its identifier quoting, its
+# string literals, its NULL handling and its name resolution all differ from
+# DuckDB's, and each difference was a silent leak before it was found. The
+# equivalence suite above is the right home for the third renderer because the
+# reference it compares against — `apply_table_policy` — is the same one.
+#
+# Note the reference deliberately is NOT the DuckDB renderer: DuckDB is already
+# measurably different for Float64 policy columns (CAST(1.0 AS VARCHAR) is
+# '1.0' where Arrow and ClickHouse both render '1'). See
+# tests/test_clickhouse_governance.py for that divergence in full.
+
+clickhouse_only = pytest.mark.skipif(
+    not _clickhouse.available(), reason="needs chdb: pip install 'laurelin[clickhouse]'"
+)
+
+
+def clickhouse_read(catalog, perms, user, tmp_path) -> pa.Table:
+    """Read through the ClickHouse renderer, over the same rows the Arrow path
+    uses — written out once as a Parquet file chdb can open with file()."""
+    from laurelin.core.dialects import CLICKHOUSE
+
+    path = tmp_path / "sales.parquet"
+    if not path.exists():
+        pq.write_table(catalog.read("sales"), path)
+    source = {"type": "parquet", "path": str(path)}
+    schema = _clickhouse.schema_of(source)
+    columns = list(schema.names)
+    policy = perms.sql_policy_fn(user, dialect=CLICKHOUSE)(
+        "sales", columns, None, {f.name: f.type for f in schema}
+    )
+    sql = CLICKHOUSE.assemble(
+        policy.select_list, _clickhouse.scan_expression(source), policy.where,
+        None, "transform_null_in=0",
+    )
+    return _clickhouse.run(sql)
+
+
+def _comparable(table: pa.Table):
+    """NaN != NaN, so compare it by name rather than by value."""
+    return [
+        {k: ("nan" if isinstance(v, float) and v != v else v) for k, v in row.items()}
+        for row in table.to_pylist()
+    ]
+
+
+@clickhouse_only
+@pytest.mark.parametrize("label, policy", CASES, ids=[c[0] for c in CASES])
+@pytest.mark.parametrize("user", [VIEWER, OTHER], ids=["subject", "non-subject"])
+def test_clickhouse_renderer_matches_exact(env, tmp_path, label, policy, user):
+    catalog, store, perms = env
+    set_policy(store, **policy)
+    got = clickhouse_read(catalog, perms, user, tmp_path)
+    assert _comparable(got) == _comparable(exact(catalog, perms, user)), label
+
+
+@clickhouse_only
+def test_clickhouse_hash_mask_equals_the_arrow_digest(env, tmp_path):
+    catalog, store, perms = env
+    set_policy(store, masks=[{"column": "ssn", "mode": "hash", "exempt": []}])
+    got = clickhouse_read(catalog, perms, VIEWER, tmp_path).column("ssn").to_pylist()
+    want = exact(catalog, perms, VIEWER).column("ssn").to_pylist()
+    assert got == want
+    assert all(len(v) == 16 and v.islower() and v.isalnum() for v in got)
+
+
+@clickhouse_only
+def test_clickhouse_renderer_denies_all_for_anonymous(env, tmp_path):
+    from laurelin.core.dialects import CLICKHOUSE
+
+    catalog, store, perms = env
+    set_policy(store, row_policy=ROWS("region", ["us"]))
+    policy = perms.sql_policy_fn(None, dialect=CLICKHOUSE)("sales", ["id", "region"])
+    assert policy.where == "FALSE"
+    assert clickhouse_read(catalog, perms, None, tmp_path).num_rows == 0
+
+
+@clickhouse_only
+@pytest.mark.parametrize("payload", ["us') OR 1=1 --", "us\\' OR 1=1 --"])
+def test_clickhouse_renderer_cannot_be_escaped_out_of(env, tmp_path, payload):
+    """The backslash payload is the one that defeats quote-doubling: ClickHouse
+    honours backslash escapes inside string literals and DuckDB does not, so an
+    escaper that only doubles quotes lets the second value close the string."""
+    catalog, store, perms = env
+    set_policy(store, row_policy=ROWS("region", [payload]))
+    assert clickhouse_read(catalog, perms, VIEWER, tmp_path).num_rows == 0

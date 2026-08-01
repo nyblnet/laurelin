@@ -70,7 +70,7 @@ export interface DatasetVersion {
   source: string;
 }
 
-export type DatasetKind = "managed" | "federated" | "iceberg";
+export type DatasetKind = "managed" | "federated" | "iceberg" | "clickhouse";
 
 export interface Dataset {
   name: string;

@@ -15,6 +15,7 @@ import type {
   ColumnSchema,
   Dataset,
   DatasetDetail,
+  DatasetKind,
   DatasetVersion,
   RowsPage,
   UploadPreview,
@@ -63,6 +64,7 @@ function DatasetList() {
           <Link to={`/datasets/${d.name}`}>{d.name}</Link>
           {d.kind === "federated" && <Badge tone="blue">federated</Badge>}
           {d.kind === "iceberg" && <Badge tone="green">iceberg</Badge>}
+          {d.kind === "clickhouse" && <Badge tone="blue">clickhouse</Badge>}
         </span>
       ),
     },
@@ -314,7 +316,10 @@ function fmtBytes(n: number): string {
 
 // --------------------------------------------------------------- federated
 
-type FederatedType = "iceberg" | "delta" | "parquet" | "postgres";
+// "clickhouse" is not a federated *source* type — it selects a different
+// engine and a different route. Kept in one dropdown because to the person
+// registering, the question is the same one: where does this table live?
+type FederatedType = "iceberg" | "delta" | "parquet" | "postgres" | "clickhouse";
 
 /**
  * Register a table Laurelin governs but does not hold.
@@ -336,10 +341,11 @@ function FederatedPanel() {
 
   if (user?.role !== "admin") return null;
 
+  const clickhouse = type === "clickhouse";
   const source =
     type === "postgres"
       ? { type, url, table }
-      : { type, path };
+      : { type: clickhouse ? "parquet" : type, path };
 
   const complete =
     /^[a-z][a-z0-9_]*$/.test(name) &&
@@ -347,7 +353,10 @@ function FederatedPanel() {
 
   const register = useMutation({
     mutationFn: () =>
-      api.put(`${API}/datasets/${name}/federated`, { source, description: "" }),
+      api.put(`${API}/datasets/${name}/${clickhouse ? "clickhouse" : "federated"}`, {
+        source,
+        description: "",
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["datasets"] });
       setName("");
@@ -392,6 +401,7 @@ function FederatedPanel() {
             <option value="delta">Delta Lake</option>
             <option value="parquet">Parquet file/glob</option>
             <option value="postgres">PostgreSQL table</option>
+            <option value="clickhouse">ClickHouse (embedded, read-only)</option>
           </select>
         </div>
       </div>
@@ -420,6 +430,13 @@ function FederatedPanel() {
                   ? "s3://bucket/path/to/delta-table"
                   : "/data/exports/*.parquet or s3://bucket/file.parquet"
             } />
+          {clickhouse && (
+            <p className="hint" style={{ marginTop: 4 }}>
+              Scanned by ClickHouse embedded in this server (chdb) — there is no
+              ClickHouse service to run, and Laurelin never writes to it.
+              Connecting to a real ClickHouse server is not implemented.
+            </p>
+          )}
         </div>
       )}
 
@@ -458,7 +475,11 @@ function DatasetDetailPage() {
 
 function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
   const auth = useAuth();
-  const federated = detail.kind === "federated";
+  // Mirrors DatasetInfo.scans_at_source on the server: what the *reader* cares
+  // about is not who owns the table but whether there are local versions to
+  // show. Iceberg has them; federated and clickhouse do not.
+  const atSource = detail.kind === "federated" || detail.kind === "clickhouse";
+  const iceberg = detail.kind === "iceberg";
   const schemaVersion =
     detail.versions.find((v) => v.version === detail.latest_version) ??
     detail.versions[detail.versions.length - 1];
@@ -472,32 +493,30 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         subtitle={detail.description || undefined}
         actions={
           detail.kind && detail.kind !== "managed" ? (
-            <Badge tone={federated ? "blue" : "green"}>{detail.kind}</Badge>
+            <Badge tone={iceberg ? "green" : "blue"}>{detail.kind}</Badge>
           ) : undefined
         }
       />
 
-      {federated ? (
-        <FederatedSource source={detail.source} />
+      {atSource ? (
+        <FederatedSource source={detail.source} kind={detail.kind} />
       ) : auth.can("editor") ? (
-        <UploadControl name={detail.name} iceberg={detail.kind === "iceberg"} />
+        <UploadControl name={detail.name} iceberg={iceberg} />
       ) : (
         <p className="faint" style={{ margin: "0 0 20px" }}>
           Uploading a new version requires the editor role.
         </p>
       )}
 
-      {detail.kind === "iceberg" && auth.can("editor") && (
-        <IcebergManager name={detail.name} />
-      )}
+      {iceberg && auth.can("editor") && <IcebergManager name={detail.name} />}
 
-      {!federated && <SchemaSection version={schemaVersion} />}
+      {!atSource && <SchemaSection version={schemaVersion} />}
 
-      {!federated && (
+      {!atSource && (
         <>
           <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
             <h3 style={{ marginBottom: 0 }}>Version history</h3>
-            {auth.can("editor") && detail.kind !== "iceberg" && detail.latest_version != null && (
+            {auth.can("editor") && !iceberg && detail.latest_version != null && (
               <CompactButton name={detail.name} />
             )}
           </div>
@@ -512,19 +531,29 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
 }
 
 /**
- * What a federated dataset shows instead of upload / versions: where the data
- * actually lives. It's scanned in place, so there are no versions to manage —
- * saying "no versions yet" would imply one is coming, which is wrong.
+ * What a source-scanned dataset shows instead of upload / versions: where the
+ * data actually lives. It's scanned in place, so there are no versions to
+ * manage — saying "no versions yet" would imply one is coming, which is wrong.
  */
-function FederatedSource({ source }: { source?: Record<string, unknown> }) {
+function FederatedSource({
+  source,
+  kind,
+}: {
+  source?: Record<string, unknown>;
+  kind?: DatasetKind;
+}) {
   const type = String(source?.type ?? "external");
   const location = String(source?.path ?? source?.table ?? source?.url ?? "");
+  const clickhouse = kind === "clickhouse";
   return (
     <div className="card" style={{ marginBottom: 20 }}>
-      <label style={{ marginBottom: 4 }}>Federated source</label>
+      <label style={{ marginBottom: 4 }}>
+        {clickhouse ? "ClickHouse source" : "Federated source"}
+      </label>
       <p className="hint" style={{ marginTop: 0 }}>
         Laurelin governs and scans this table in place — it isn't copied and has
         no versions. Same ACLs and policies as any dataset.
+        {clickhouse && " Read-only: Laurelin does not write to ClickHouse."}
       </p>
       <div className="mono" style={{ fontSize: 13 }}>
         <Badge tone="blue">{type}</Badge>{" "}

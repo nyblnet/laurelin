@@ -189,6 +189,91 @@ def guard(con: duckdb.DuckDBPyConnection, limits: QueryLimits) -> Iterator[None]
             timer.cancel()
 
 
+# -- ClickHouse ---------------------------------------------------------------
+#
+# ClickHouse enforces both budgets itself, per query, so there is no watchdog
+# thread here: `apply`/`guard` above are DuckDB-typed (con.interrupt(),
+# duckdb.InterruptException) and have no ClickHouse equivalent. What is needed
+# instead is a settings string and a translation of ClickHouse's error codes,
+# because without it a timeout and an out-of-memory both flatten into the
+# generic 400 at routes.py and lose the 408/413 distinction that route
+# deliberately preserves.
+
+def _bytes_of(limit: str) -> int:
+    """A DuckDB-style memory limit ('2GB') as bytes, for max_memory_usage."""
+    text = limit.strip().upper().replace("IB", "B")
+    scale = {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    for suffix, factor in scale.items():
+        if text.endswith(suffix):
+            return int(float(text[: -len(suffix)]) * factor)
+    return int(float(text.rstrip("B") or 0))
+
+
+def clickhouse_settings(limits: QueryLimits) -> str:
+    """Query-level ``SETTINGS`` for a governed ClickHouse statement.
+
+    Query-level settings override whatever profile the engine was started
+    with — that is the point of putting them here rather than configuring the
+    engine once.
+
+    ``transform_null_in=0`` is a *semantic* pin rather than a budget: with it
+    on, a NULL in the value list would match a NULL in the policy column, and a
+    row whose tenant is merely unknown would start being admitted. Laurelin's
+    renderer never emits a NULL literal (policy values are strings), so today
+    this is defence in depth against a future renderer, not a live fix — but
+    the cost of pinning it is one clause and the cost of not pinning it is a
+    silent semantics change under someone else's server profile.
+
+    ``schema_inference_make_columns_nullable=0`` is deliberately never set: it
+    turns NULL into '', which then hashes to e3b0c44298fc1c14 — a real-looking
+    digest for data that is absent.
+    """
+    parts = ["transform_null_in=0"]
+    if limits.timeout_s and limits.timeout_s > 0:
+        parts.append(f"max_execution_time={limits.timeout_s:g}")
+    parts.append(f"max_memory_usage={_bytes_of(limits.memory_limit)}")
+    return ", ".join(parts)
+
+
+@contextmanager
+def clickhouse_guard(limits: QueryLimits) -> Iterator[None]:
+    """Translate ClickHouse's resource errors into Laurelin's.
+
+    Codes are matched, not messages: 159 is TIMEOUT_EXCEEDED and 241 is
+    MEMORY_LIMIT_EXCEEDED, both measured against chdb 4.2.1.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - chdb raises bare RuntimeError
+        text = str(exc)
+        if "Code: 159" in text or "TIMEOUT_EXCEEDED" in text:
+            metrics.query_rejections.labels(reason="timeout").inc()
+            raise QueryTimeout(
+                f"Query exceeded the {limits.timeout_s:g}s limit. Narrow it with "
+                "a filter, an aggregate, or a smaller LIMIT."
+            ) from exc
+        if "Code: 241" in text or "MEMORY_LIMIT_EXCEEDED" in text:
+            metrics.query_rejections.labels(reason="memory").inc()
+            raise QueryTooLarge(
+                f"Query needed more than the {limits.memory_limit} memory budget. "
+                "Narrow it with a filter, an aggregate, or a smaller LIMIT."
+            ) from exc
+        raise
+
+
+@contextmanager
+def clickhouse_limited(limits: Optional[QueryLimits] = None) -> Iterator[None]:
+    """Admission control plus error translation for one ClickHouse statement.
+
+    ``admit`` is engine-agnostic — it bounds how many queries this *process*
+    runs at once — so it is reused unchanged; the budgets themselves ride
+    along in the statement's SETTINGS clause.
+    """
+    limits = limits or QueryLimits.interactive()
+    with admit(limits), clickhouse_guard(limits):
+        yield
+
+
 @contextmanager
 def limited(
     con: duckdb.DuckDBPyConnection,

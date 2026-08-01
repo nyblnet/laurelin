@@ -31,6 +31,7 @@ import re
 from typing import Any, Optional
 
 import duckdb
+import pyarrow as pa  # noqa: F401 - schema_of's return annotation
 
 SOURCE_TYPES = ("parquet", "iceberg", "delta", "postgres")
 
@@ -175,16 +176,29 @@ def connect(source: dict[str, Any]) -> duckdb.DuckDBPyConnection:
     return con
 
 
-def columns_of(source: dict[str, Any], con: Optional[duckdb.DuckDBPyConnection] = None) -> list[str]:
-    """Column names of the remote table, read without fetching rows."""
+def schema_of(
+    source: dict[str, Any], con: Optional[duckdb.DuckDBPyConnection] = None
+) -> "pa.Schema":
+    """Arrow schema of the remote table, read without fetching rows.
+
+    Types, not just names, because the policy renderer needs them: a row filter
+    and a hash mask both compare the column *as text*, and whether DuckDB
+    spells a value the way ``pyarrow.compute.cast`` does depends entirely on
+    the type (see ``SqlDialect.row_key_matches_arrow``). Reading the schema
+    through ``LIMIT 0`` costs the same round trip the name-only lookup did.
+    """
     owned = con is None
     con = con or connect(source)
     try:
         expr, params, _ = scan_expression(source)
-        cur = con.execute(f"SELECT * FROM {expr} LIMIT 0", params)
-        return [d[0] for d in (cur.description or [])]
+        return con.execute(f"SELECT * FROM {expr} LIMIT 0", params).arrow().schema
     except duckdb.Error as exc:
         raise FederationError(f"Could not read the federated source: {exc}") from exc
     finally:
         if owned:
             con.close()
+
+
+def columns_of(source: dict[str, Any], con: Optional[duckdb.DuckDBPyConnection] = None) -> list[str]:
+    """Column names of the remote table, read without fetching rows."""
+    return list(schema_of(source, con).names)

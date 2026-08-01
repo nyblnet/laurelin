@@ -65,8 +65,9 @@ Rules:
 #### Iceberg-backed datasets
 
 A dataset's `kind` is `managed` (Laurelin owns versioned Parquet parts),
-`federated` (the bytes live elsewhere; no versions), or `iceberg` — **owned
-and versioned like managed, read at source like federated**.
+`federated` (the bytes live elsewhere; no versions), `iceberg` — **owned
+and versioned like managed, read at source like federated** — or `clickhouse`
+(read-only, scanned in place by embedded ClickHouse; see below).
 
 That split is the whole design. `DatasetInfo.scans_at_source` is what the read
 paths branch on, because what matters to a reader is not who owns the table
@@ -88,6 +89,63 @@ the data at object storage.
 One asymmetry worth knowing: the SQL path prunes inside `iceberg_scan`, but
 the Arrow path (`scan_for`, used by the ontology) materializes through
 pyiceberg and applies the policy exactly. Correct, not lazy.
+
+#### ClickHouse-backed datasets (`kind="clickhouse"`)
+
+A second SQL dialect, added to prove that "one decision, N renderers" survives
+an engine whose rules genuinely differ from DuckDB's. It reads a Parquet path
+through **chdb** — ClickHouse embedded in this process — so there is no
+ClickHouse service to run.
+
+`DatasetInfo` gained `sql_dialect` alongside `scans_at_source`, because until
+now those were the same fact wearing one name ("read via the source
+expression" also implied "DuckDB renders the SQL"). They diverge here, and in
+a governance layer a derivation that drifts is a leak rather than a wrong
+number.
+
+`laurelin/core/dialects.py` owns the divergences. Each was measured against
+chdb 4.2.1, and each is a silent leak if you assume SQL is SQL:
+
+| | DuckDB | ClickHouse |
+|---|---|---|
+| identifier quoting | `"a""b"` | `` `a\`b` `` — backslash is an escape, so DuckDB's rule resolves a column to a *different* column and returns its data, no error |
+| policy values | bound parameters (`?`) | escaped literals: there is no positional placeholder, and the named `{p:String}` channel is **not byte-preserving** (`a\nb` arrives 3 bytes, not 4) |
+| null mask | `NULLIF(c, c)` | `if(0, c, NULL)` — `NULLIF` leaves NaN unmasked, since NaN ≠ NaN |
+| hash mask | `substr(sha256(CAST(c AS VARCHAR)), 1, 16)` | `substring(lower(hex(SHA256(toString(c)))), 1, 16)` |
+| statement shape | flat | filter **nested strictly below** the projection: ClickHouse resolves `WHERE` against `SELECT` aliases, so a flat statement evaluates the row policy against the *mask* — a full row-policy bypass that fails open |
+
+`tests/test_dialects.py` pins DuckDB's output byte-for-byte against literals
+copied from before the seam existed, so adding an engine cannot quietly change
+the first one. `tests/test_clickhouse_governance.py` asserts the property that
+matters — every (policy, user) returns the same rows and values as
+`apply_table_policy` — plus each divergence above as its own named threat.
+
+**What this is not**, stated because the name implies all of it:
+
+- **No writes.** `catalog.write`/`append`/`upload_file` refuse any
+  source-scanned dataset outright. A serving tier is a different project.
+- **No server mode.** chdb only. `clickhouse-connect`, TLS, credential storage
+  and a settings-profile threat analysis are not in this slice.
+- **No versions or time travel** (`latest_version` stays `None`), and no
+  ontology object types (refused, as for federated).
+- **No filesystem sandbox.** Federated DuckDB scans run behind
+  `disabled_filesystems` + `lock_configuration`. chdb has **no equivalent** —
+  `file('/etc/passwd', LineAsString)` succeeds and `readonly=1` rejects the
+  whole query rather than restricting the filesystem. The primary control
+  still holds (only server-generated SQL reaches the engine; callers get an
+  Arrow table, never a connection), but defense in depth is *reduced*. That is
+  why ClickHouse datasets are admin-registered and stay behind the same opt-in
+  workbench gate as federated ones.
+
+**Known divergence, shared with DuckDB and not fixed here.** Row policies and
+hash masks compare/hash the column's *text* rendering, and the three engines
+render floats differently: Arrow `str(1.0)` → `'1.0'`, ClickHouse `toString`
+→ `'1'`, DuckDB `CAST AS VARCHAR` → `'1.0'`. So on a **row policy** ClickHouse
+agrees with the Arrow reference and DuckDB does not; on a **hash mask over a
+float column** DuckDB agrees and ClickHouse does not. Neither is a leak —
+values stay masked and filters stay fail-closed — but a hash token is not
+joinable across engines for float columns. Pinned by tests rather than
+tolerated silently.
 
 **Branches** are named pointers into the snapshot history, so cutting one
 copies nothing. Merging fast-forwards main and records a Laurelin version —
@@ -474,6 +532,11 @@ PUT  /api/v1/datasets/{name}/federated        {source, description?} -> DatasetI
                                  (source: iceberg|delta|parquet {path} or
                                   postgres {url, table}; validated and probed
                                   before storing; secrets redacted in responses)
+PUT  /api/v1/datasets/{name}/clickhouse       {source, description?} -> DatasetInfo  (admin)
+                                 (source: parquet {path}, read by embedded
+                                  chdb; probed before storing; read-only —
+                                  upload/append to it is a 400; 501 without
+                                  the `clickhouse` extra)
 GET  /api/v1/lineage                          -> {"nodes":[{id,type:"dataset"|"transform"}],"edges":[{from,to}]}
                                                  (dataset->transform->dataset graph derived from lineage_edges)
 GET  /api/v1/transforms                       -> [{name, output, inputs:[dataset], kind}]
@@ -584,12 +647,22 @@ the SQL can never touch the filesystem.
 **Two renderers, one decision.** `PermissionService.decide()` resolves *what* a
 policy does for a user (allowed values, resolved masks) independently of how
 it will run. `_plan()` renders that as Arrow filter+projection for managed
-data; `sql_policy_fn()` renders it as a SELECT list + WHERE for **federated**
-datasets, whose bytes live in Iceberg/Delta/Parquet/Postgres and are scanned
-in place (`laurelin/core/federation.py`). One place interprets the rules, so a
-second execution engine cannot grow a second interpretation of them. The SQL
-renderer is strictly more capable — DuckDB has `sha256`, so it expresses hash
-masking inline where Arrow must materialize. Object-type
+data; `sql_policy_fn(user, dialect=…)` renders it as a SELECT list + WHERE for
+datasets scanned in place — federated (Iceberg/Delta/Parquet/Postgres via
+DuckDB, `laurelin/core/federation.py`) and ClickHouse (via chdb,
+`laurelin/core/clickhouse.py`). One place interprets the rules, so a second
+execution engine cannot grow a second interpretation of them; a *dialect*
+(`laurelin/core/dialects.py`) chooses only how the decision is spelled, and
+`catalog.source_table` refuses a policy rendered for the wrong one. The SQL
+renderers are strictly more capable than Arrow — both engines have SHA-256, so
+they express hash masking inline where Arrow must materialize.
+
+Two rules that were fail-*open* before ClickHouse forced them into the light,
+and now apply to every dialect: an empty column list is a **refusal** (it used
+to render `select_list='*'` with masks pending), and a mask whose column name
+differs from a real one only in **case** is a refusal rather than a silent
+no-op (a mask on a genuinely dropped column still passes, so schema evolution
+does not start denying datasets). Object-type
 access is now **composed**: effective view = ontology-view AND backing-dataset-
 view; effective edit = that view AND ontology-edit. So locking a dataset also
 hides its objects, and there is no longer a path (query / dataset rows) to read

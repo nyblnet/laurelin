@@ -51,6 +51,11 @@ iceberg = ["pyiceberg[sql-sqlite]>=0.10"]
 # Prometheus /metrics. Without it the endpoint 501s and every metric
 # is a no-op, so instrumentation costs nothing when unused.
 metrics = ["prometheus-client>=0.20"]
+# Read-only ClickHouse-backed datasets, governed by the same policies as any
+# other. chdb is ClickHouse embedded in-process — no server to run — but it is
+# a large manylinux-only binary, so it is never a base dependency. Server mode
+# (clickhouse-connect) is deliberately absent: it is not implemented.
+clickhouse = ["chdb>=4.2"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

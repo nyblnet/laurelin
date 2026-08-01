@@ -53,6 +53,7 @@ def test_the_postgres_suite_is_enabled():
         ("croniter", "scheduler"),
         ("prometheus_client", "metrics"),
         ("pyiceberg", "iceberg"),
+        ("chdb", "clickhouse"),
     ],
 )
 def test_optional_extras_are_installed(module, extra):

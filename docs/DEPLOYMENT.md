@@ -149,9 +149,9 @@ there is no separate migration step to run.
 | `LAURELIN_WORKER_ID` | Identifies this replica when claiming build leases (default `<hostname>:<pid>`) |
 | `LAURELIN_ICEBERG_WAREHOUSE` | Where Iceberg table data lives (`s3://…`); default: `<workspace>/iceberg` |
 | `LAURELIN_ICEBERG_CATALOG` | SQLAlchemy URL for the Iceberg catalog; default: the metadata database |
-| `LAURELIN_FEDERATION_WORKBENCH=1` | Expose federated datasets to ad-hoc SQL (off by default) |
-| `LAURELIN_QUERY_MEMORY_LIMIT` | Memory budget per interactive query (default `2GB`) |
-| `LAURELIN_QUERY_TIMEOUT` | Seconds before an interactive query is interrupted (default `60`; `0` disables) |
+| `LAURELIN_FEDERATION_WORKBENCH=1` | Expose federated **and ClickHouse** datasets to ad-hoc SQL (off by default) |
+| `LAURELIN_QUERY_MEMORY_LIMIT` | Memory budget per interactive query (default `2GB`; also becomes ClickHouse's `max_memory_usage`) |
+| `LAURELIN_QUERY_TIMEOUT` | Seconds before an interactive query is interrupted (default `60`; `0` disables). DuckDB uses a watchdog thread; ClickHouse enforces it natively as `max_execution_time` |
 | `LAURELIN_QUERY_THREADS` | Cap cores per interactive query (default: DuckDB's own) |
 | `LAURELIN_MAX_CONCURRENT_QUERIES` | Interactive queries admitted at once per replica (default `8`; `0` disables) |
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |

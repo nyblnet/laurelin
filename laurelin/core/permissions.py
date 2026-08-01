@@ -27,6 +27,7 @@ data-hiding) is a separate, larger piece of work (see docs/ROADMAP.md, WS8).
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from laurelin.core.db import MetadataStore
+from laurelin.core.dialects import CLICKHOUSE, DUCKDB, SqlDialect  # noqa: F401
 from laurelin.core.models import (
     ColumnMask,
     DatasetPolicy,
@@ -75,54 +77,211 @@ class PolicyDecision:
         return self.denies_all or self.row_column is not None or bool(self.masks)
 
 
-def _q(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+# Kept as a name because it is the DuckDB quoter and always was; it is not a
+# general-purpose one. Anything targeting another engine must go through that
+# engine's dialect — see laurelin/core/dialects.py for the measured reason.
+_q = DUCKDB.quote
+
+
+class PolicyRenderError(RuntimeError):
+    """A policy could not be applied *exactly*.
+
+    Raised instead of returning something approximate, because the only thing
+    worse than refusing a read is serving one whose policy was rounded off.
+    """
+
+
+def _confusable(name: str) -> str:
+    """The form two identifiers must share to be "the same name, mistyped".
+
+    Case is the classic one (``SSN`` for ``ssn``). Trailing whitespace and
+    compatibility-equivalent characters are the same mistake wearing a
+    different hat: ``'ssn '`` and ``'ｓsn'`` both read as ``ssn`` to whoever
+    wrote the policy, and both currently sail past a case-only comparison into
+    a plaintext read.
+    """
+    return unicodedata.normalize("NFKC", name).strip().casefold()
+
+
+def _reject_case_mismatch(column: str, available) -> None:
+    """Refuse a mask whose column name differs from a real one only in typo.
+
+    A mask naming a column the dataset does not have is skipped, and that is
+    right: a genuinely dropped column must not deny the whole dataset, or
+    schema evolution becomes a denial of service. But a mask authored as
+    ``SSN`` against a column ``ssn`` is not a dropped column — it is a typo
+    that silently masks nothing and serves the plaintext. ClickHouse made this
+    acute (its identifiers are case-sensitive; ``REGION`` is error 47) but the
+    hole was never dialect-specific: the Arrow path no-ops on it too.
+
+    An exact hit short-circuits, which is not a micro-optimisation: casefold is
+    not injective, so ``'ß'.casefold() == 'ss'``. Folding first and looking the
+    result up in a dict let a *real* column named ``ss`` be reported as a typo
+    for a neighbouring ``ß`` — refusing a read that both ``decide()`` and the
+    Arrow renderer serve correctly.
+    """
+    if column in available:
+        return
+    near = [c for c in available if _confusable(c) == _confusable(column)]
+    if near:
+        raise PolicyRenderError(
+            f"Column mask names {column!r} but the dataset has "
+            + " / ".join(repr(c) for c in near)
+            + ". Identifier case, whitespace and unicode form all matter; fix "
+            "the policy rather than serve the column unmasked."
+        )
+
+
+def _reject_unportable_text(
+    role: str, column: str, arrow_type, dialect: SqlDialect, portable
+) -> None:
+    """Refuse to compare or digest a value whose text this engine spells its own way.
+
+    Row policies and hash masks are both defined on the *text* of a value: the
+    Arrow renderer compares ``pc.cast(col, string)`` against the allowlist and
+    digests ``str(value)``. ``toString`` and ``CAST AS VARCHAR`` are neither of
+    those functions, and where they differ the divergence is not cosmetic — it
+    changes which rows a user sees. Measured, one dataset, one user, one policy
+    value ``'1.1'`` on a ``decimal(12,2)`` column: the Arrow renderer returned
+    0 rows and the ClickHouse renderer returned 2, another tenant's.
+
+    So the renderer refuses rather than approximating, and says which mask
+    modes *are* exact everywhere — ``null`` and ``redact`` need no rendering at
+    all, so they remain available on any column of any type.
+    """
+    if arrow_type is not None and portable(arrow_type):
+        return
+    if arrow_type is None:
+        detail = (
+            f"the type of {column!r} is unknown to the renderer, so there is no "
+            "way to tell whether it does"
+        )
+    else:
+        detail = f"{dialect.name} does not, for a column of type {arrow_type}"
+    raise PolicyRenderError(
+        f"A {role} on {column!r} compares the column as text, which only means "
+        f"the same thing if this engine renders it the way Arrow does — and "
+        f"{detail}. Refusing the read rather than enforcing a different policy "
+        "here than the row API enforces. Mask modes 'null' and 'redact' are "
+        "exact on every engine and every type."
+    )
 
 
 @dataclass(frozen=True)
 class SqlPolicy:
     """A decision compiled to SQL: a projection list and a WHERE clause.
 
-    ``select_list`` masks in place, so callers can wrap any scan expression:
-    ``SELECT {select_list} FROM {scan} WHERE {where}``.
+    ``select_list`` masks in place; ``dialect.assemble`` wraps it around a scan
+    expression. The dialect travels *with* the policy so a caller cannot pair a
+    ClickHouse-rendered policy with a DuckDB statement, which would be a
+    plausible-looking query and a real leak.
     """
 
     select_list: str
     where: str
     params: list
+    dialect: SqlDialect = DUCKDB
 
     @classmethod
-    def render(cls, decision: PolicyDecision, columns: list[str]) -> "SqlPolicy":
-        if decision.denies_all:
-            return cls(select_list="*", where="FALSE", params=[])
+    def render(
+        cls,
+        decision: PolicyDecision,
+        columns: list[str],
+        dialect: SqlDialect = DUCKDB,
+        column_types: Optional[dict] = None,
+    ) -> "SqlPolicy":
+        """Compile ``decision`` for ``dialect``.
 
-        masked = {c: m for c, m in decision.masks}
+        ``column_types`` maps column name to its Arrow type and is **required**
+        whenever the decision compares or digests a value as text — a row
+        filter or a hash mask. Without it the renderer cannot tell whether this
+        engine spells the value the way the Arrow reference does, and an
+        allowlist compared against a different spelling is a different policy.
+        Null and redact masks need no schema: ``NULL`` is ``NULL`` and ``'***'``
+        is ``'***'`` on every engine.
+        """
+        if decision.denies_all:
+            return cls(select_list="*", where="FALSE", params=[], dialect=dialect)
+
+        # Masks compose in policy order rather than last-one-wins. Collapsing
+        # them to a dict meant `redact` then `hash` digested the *plaintext*
+        # while the Arrow renderer digested '***' — sha256 of the very secret
+        # the first mask was there to remove.
+        masked: dict[str, list] = {}
+        for column, mode in decision.masks:
+            masked.setdefault(column, []).append(mode)
+
+        if not columns:
+            if decision.applies:
+                # Column discovery failed (unreachable source, empty DESCRIBE).
+                # The old code joined an empty list and fell back to "*", which
+                # is an *unmasked* read of a dataset that has masks pending —
+                # fail open, in the one place that must not.
+                raise PolicyRenderError(
+                    "Cannot render the policy: the dataset's columns could not "
+                    "be determined, so masks and filters cannot be placed. "
+                    "Refusing the read."
+                )
+            return cls(select_list="*", where="TRUE", params=[], dialect=dialect)
+
+        # decide() already rejects this for policies it reads; repeated here so
+        # a hand-built PolicyDecision cannot slip past it.
+        for col in masked:
+            _reject_case_mismatch(col, columns)
+
         parts = []
         for col in columns:
-            mode = masked.get(col)
-            if mode is None:
-                parts.append(_q(col))
-            elif mode == MaskMode.null:
-                # NULLIF(col, col) is NULL with the column's own type, so the
-                # masked column keeps its type without needing the schema.
-                parts.append(f"NULLIF({_q(col)}, {_q(col)}) AS {_q(col)}")
-            elif mode == MaskMode.redact:
-                parts.append(f"'***' AS {_q(col)}")
-            else:  # hash — DuckDB's sha256 matches the table path's digest
-                parts.append(
-                    f"CASE WHEN {_q(col)} IS NULL THEN NULL ELSE "
-                    f"substr(sha256(CAST({_q(col)} AS VARCHAR)), 1, 16) END AS {_q(col)}"
-                )
+            modes = masked.get(col)
+            quoted = dialect.quote(col)
+            if not modes:
+                parts.append(quoted)
+                continue
+            expr = quoted
+            # The type the *expression* has now, which is not the column's once
+            # a mask has rewritten it: redact yields a string, and a hash over
+            # a string is portable whatever the column started as.
+            expr_type = None if column_types is None else column_types.get(col)
+            for mode in modes:
+                if mode == MaskMode.null:
+                    expr = dialect.null_mask(expr)
+                elif mode == MaskMode.redact:
+                    expr = dialect.redact_mask(expr)
+                    expr_type = pa.string()
+                else:  # hash — must reproduce the table path's digest exactly
+                    _reject_unportable_text(
+                        "hash mask", col, expr_type, dialect,
+                        dialect.hash_text_matches_arrow,
+                    )
+                    expr = dialect.hash_mask(expr)
+                    expr_type = pa.string()
+            parts.append(f"{expr} AS {quoted}")
 
         where, params = "TRUE", []
         if decision.row_column is not None:
-            placeholders = ", ".join("?" for _ in decision.allowed_values)
+            _reject_unportable_text(
+                "row policy",
+                decision.row_column,
+                None if column_types is None else column_types.get(decision.row_column),
+                dialect,
+                dialect.row_key_matches_arrow,
+            )
             # NULL is never IN a set, so null policy values are excluded —
             # the same fail-closed behavior as the Arrow renderer.
-            where = f"CAST({_q(decision.row_column)} AS VARCHAR) IN ({placeholders})"
-            params = list(decision.allowed_values)
+            if dialect.binds_values:
+                values = ", ".join(
+                    dialect.placeholder(i) for i, _ in enumerate(decision.allowed_values)
+                )
+                params = list(decision.allowed_values)
+            else:
+                # No binding channel on this engine; literal() is the single
+                # audited place where a policy value becomes SQL text.
+                values = ", ".join(dialect.literal(v) for v in decision.allowed_values)
+            column = dialect.to_text(dialect.quote(decision.row_column))
+            where = f"{column} IN ({values})"
 
-        return cls(select_list=", ".join(parts) or "*", where=where, params=params)
+        return cls(
+            select_list=", ".join(parts), where=where, params=params, dialect=dialect
+        )
 
 
 class PermissionService:
@@ -382,6 +541,7 @@ class PermissionService:
         masks: list[tuple[str, MaskMode]] = []
         for mask in policy.column_masks:
             if mask.column not in columns:
+                _reject_case_mismatch(mask.column, columns)
                 continue
             if any(
                 self._subject_matches(ex.subject_kind, ex.normalized_subject(), user, groups)
@@ -407,7 +567,17 @@ class PermissionService:
             # NULLs are never "in" the set, so they are excluded — matching the
             # fill_null(False) fail-closed behavior of the table path.
             field = pc.field(decision.row_column)
-            if schema.field(decision.row_column).type != pa.string():
+            row_type = schema.field(decision.row_column).type
+            if pa.types.is_nested(row_type):
+                # Same refusal as the table path: a nested column has no text
+                # form, so there is nothing for the allowlist to mean. Caught
+                # here rather than as a cast failure deep inside the scan.
+                raise PolicyRenderError(
+                    f"Row policy column {decision.row_column!r} has type "
+                    f"{row_type}, which has no text form to compare an "
+                    "allowlist against. Point the row policy at a scalar column."
+                )
+            if row_type != pa.string():
                 # Compare on the string rendering, exactly as the table path
                 # does. This costs row-group pruning, but only for non-string
                 # policy columns (tenant/region keys are normally strings).
@@ -438,17 +608,37 @@ class PermissionService:
 
     # -- SQL rendering (federated data) -------------------------------------------
 
-    def sql_policy_fn(self, user: Optional[User]):
+    def sql_policy_fn(self, user: Optional[User], dialect: SqlDialect = DUCKDB):
         """A ``(dataset, columns) -> SqlPolicy`` renderer for engines that speak
-        SQL rather than Arrow — federated tables scanned in place.
+        SQL rather than Arrow — tables scanned in place.
 
         The same decision drives it, so a row policy is the same rule whether
-        it filters a local Parquet scan or a remote Iceberg table.
+        it filters a local Parquet scan, a remote Iceberg table or a ClickHouse
+        one. ``dialect`` chooses only how it is *spelled*; the default keeps
+        every existing caller on DuckDB unchanged.
+
+        The returned renderer takes an optional per-call dialect, because one
+        ``sql_policy_for`` is handed to a catalog that may hold datasets read
+        by different engines. The reader asks for its own dialect and refuses
+        the read if what comes back is rendered for another one. It also passes
+        ``column_types`` — a name→Arrow-type map — without which a row filter
+        or a hash mask is a refusal, because neither can be shown to mean the
+        same thing on this engine as it does on the Arrow path.
         """
 
-        def render(dataset: str, columns: list[str]) -> "SqlPolicy":
+        def render(
+            dataset: str,
+            columns: list[str],
+            for_dialect: Optional[SqlDialect] = None,
+            column_types: Optional[dict] = None,
+        ) -> "SqlPolicy":
             decision = self.decide(dataset, set(columns), user)
-            return SqlPolicy.render(decision, columns)
+            return SqlPolicy.render(
+                decision,
+                columns,
+                dialect=for_dialect or dialect,
+                column_types=column_types,
+            )
 
         return render
 
@@ -464,7 +654,20 @@ class PermissionService:
                 allowed.update(str(v) for v in rule.values)
         if not allowed:
             return table.slice(0, 0)  # policy present but no rule grants this user rows
-        col_as_str = pc.cast(table.column(rp.column), pa.string())
+        try:
+            col_as_str = pc.cast(table.column(rp.column), pa.string())
+        except pa.lib.ArrowNotImplementedError as exc:
+            # A list/struct/map column has no string form, so the reference
+            # implementation cannot express this policy at all — and a policy
+            # nothing validates is one the SQL renderers would be enforcing
+            # unchecked. Refuse in the reference too, with a message that says
+            # what is wrong instead of an Arrow cast error.
+            raise PolicyRenderError(
+                f"Row policy column {rp.column!r} has type "
+                f"{table.schema.field(rp.column).type}, which has no text form "
+                "to compare an allowlist against. Point the row policy at a "
+                "scalar column."
+            ) from exc
         mask = pc.is_in(col_as_str, value_set=pa.array(sorted(allowed), pa.string()))
         # NULLs in the policy column are never "in" the set -> excluded (fail closed).
         mask = pc.fill_null(mask, False)
@@ -474,6 +677,10 @@ class PermissionService:
         self, table: "pa.Table", mask: ColumnMask, user: User, groups: set[str]
     ) -> "pa.Table":
         if mask.column not in table.column_names:
+            # Same rule as decide(): a dropped column is fine, a case typo is
+            # a refusal. Kept here too so the exact table path — which does not
+            # go through decide() — cannot be the one that serves plaintext.
+            _reject_case_mismatch(mask.column, table.column_names)
             return table
         for ex in mask.exempt:
             if self._subject_matches(ex.subject_kind, ex.normalized_subject(), user, groups):

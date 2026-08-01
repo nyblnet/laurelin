@@ -41,6 +41,7 @@ from laurelin.core.models import (
     ColumnMask,
     DashboardInfo,
     DashboardPanel,
+    DatasetInfo,
     DatasetVersionInfo,
     Grant,
     RowPolicy,
@@ -183,7 +184,17 @@ def _require_ot_edit(perms, user, service, type_name: str) -> None:
 
 
 def _dump(model: BaseModel) -> dict:
-    return model.model_dump(mode="json", by_alias=True)
+    out = model.model_dump(mode="json", by_alias=True)
+    if isinstance(model, DatasetInfo) and out.get("source"):
+        # GET /datasets and /datasets/{name} are viewer-readable, and a source
+        # config carries credentials — a federated postgres dataset was
+        # returning postgresql://user:password@host/db to anyone who could see
+        # the dataset. Redact at the single serialization point rather than at
+        # each route, so a new dataset kind cannot reopen the same hole.
+        from laurelin.core.federation import redacted_source
+
+        out["source"] = redacted_source(model.source)
+    return out
 
 
 def _version_info(
@@ -304,11 +315,15 @@ def get_dataset_rows(
         raise KeyError(f"Dataset not found: {name!r}")
     policy = perms.row_policy_fn(user, name)
 
-    if ds.is_federated:
-        # A federated dataset has no versions to pin — it's scanned in place —
-        # so the version-based path would reject it. Page at source instead.
-        # row_count is left null: counting would mean a full remote scan, and
-        # faking a number is worse than admitting it's unknown.
+    if ds.scans_at_source:
+        # A source-scanned dataset has no local parts to page, so the
+        # version-based path below cannot serve it. Page at the source instead.
+        # row_count is left null: counting would mean a full scan of someone
+        # else's system, and faking a number is worse than admitting it's
+        # unknown. Iceberg moves onto this branch too — `catalog.rows` has
+        # always ignored `version` for source-scanned datasets, so the version
+        # path was pairing the *current* rows with an *old* version's count,
+        # which is worse than null.
         if policy is None:
             rows = catalog.rows(name, limit=limit, offset=offset)
         else:
@@ -449,6 +464,48 @@ def register_federated_dataset(
         raise HTTPException(status_code=502, detail=str(exc))
     store.log_audit(
         "federated_dataset_registered",
+        {"dataset": name, "type": body.source.get("type")},
+        actor=actor,
+    )
+    out = _dump(info)
+    out["source"] = redacted_source(info.source)
+    return out
+
+
+@router.put("/datasets/{name}/clickhouse", dependencies=[ADMIN])
+def register_clickhouse_dataset(
+    name: str,
+    body: FederatedDatasetRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    actor: ActorDep,
+) -> dict:
+    """Register a read-only table scanned by embedded ClickHouse.
+
+    Admin-only, for the same reason federation is, and one more: chdb has no
+    equivalent of the filesystem sandbox the DuckDB path runs behind (see
+    laurelin/core/clickhouse.py), so the set of people who may point the server
+    at a path is deliberately the smallest one.
+    """
+    from laurelin.core.clickhouse import ClickHouseError, available, redacted_source
+
+    if not available():
+        raise HTTPException(
+            status_code=501,
+            detail="ClickHouse support needs chdb: pip install 'laurelin[clickhouse]'",
+        )
+    existing = store.get_dataset(name)
+    if existing is not None and not existing.is_clickhouse:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {name!r} already exists as a {existing.kind} dataset",
+        )
+    try:
+        info = catalog.register_clickhouse(name, body.source, body.description)
+    except ClickHouseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    store.log_audit(
+        "clickhouse_dataset_registered",
         {"dataset": name, "type": body.source.get("type")},
         actor=actor,
     )

@@ -123,6 +123,30 @@ Key bets, and why:
       changes require explicit migration + downstream impact report from lineage.
 - [ ] **External / federated tables**: register existing Postgres/MySQL/S3
       parquet/Iceberg/Delta locations as read-only datasets (DuckDB attach).
+- [x] **ClickHouse-backed datasets** (`kind="clickhouse"`, read-only, via
+      embedded **chdb** — no server to run). The point was never ClickHouse's
+      speed; it was proving that one policy decision renders correctly onto a
+      *second* SQL dialect. It does not: five things had to change, and each
+      would have been a silent leak. DuckDB's identifier quoter resolves a
+      ClickHouse column to a **different column** and returns its data;
+      ClickHouse's named-parameter channel is **not byte-preserving**, so
+      policy values must be escaped by an audited in-repo function;
+      `NULLIF(c, c)` leaves **NaN unmasked**; and because ClickHouse resolves
+      `WHERE` against `SELECT` aliases, a flat statement evaluates the row
+      policy **against the mask** — a total row-policy bypass that fails open.
+
+      The seam is `laurelin/core/dialects.py`, and DuckDB's output is pinned
+      byte-for-byte by a golden test so that adding an engine cannot change
+      the first one. Two pre-existing fail-open bugs surfaced on the way and
+      are fixed for every dialect: an empty column list rendered
+      `select_list='*'` with masks pending, and a mask differing from a real
+      column only in case masked nothing at all.
+- [ ] **ClickHouse writes / server mode**: `INSERT` into MergeTree, and
+      talking to a real ClickHouse server (`clickhouse-connect`, TLS,
+      credential storage, a settings-profile threat analysis). Deliberately
+      out of the read-only slice — a serving tier is a different project, and
+      half of one produces a dataset that is part local Parquet and part
+      remote table.
 - [ ] **Retention & TTL policies** per dataset (keep N versions / D days), GDPR
       purge that provably rewrites history.
 - [ ] **Media sets**: blob datasets (documents, images) with metadata tables.

@@ -245,7 +245,7 @@ class OntologyService:
         """
         ot = self._require_object_type(type_name)
         backing = self.catalog.store.get_dataset(ot.backing_dataset)
-        if backing is None or backing.is_federated or backing.latest_version is None:
+        if backing is None or backing.scans_at_source or backing.latest_version is None:
             # Nothing stable to index against.
             self.store.drop_object_index(type_name)
             return 0
@@ -361,16 +361,19 @@ class OntologyService:
             yield empty
             return
         backing = self.catalog.store.get_dataset(ot.backing_dataset)
-        if backing is not None and backing.is_federated:
-            # Every object page would become a full remote scan, and the edit
-            # overlay has no stable row identity to merge against. Refuse
+        if backing is not None and backing.scans_at_source:
+            # Every object page would become a full scan at the source, and the
+            # edit overlay has no stable row identity to merge against. Refuse
             # loudly rather than perform catastrophically: materialize the
-            # federated table into a managed dataset with a transform and bind
-            # the object type to that.
+            # table into a managed dataset with a transform and bind the object
+            # type to that. This covers ClickHouse and Iceberg as well as
+            # federated — the predicate was `is_federated`, which let an
+            # Iceberg-backed type through to a path with no local parts.
             raise ValueError(
-                f"Object type {ot.api_name!r} is backed by federated dataset "
-                f"{ot.backing_dataset!r}. Bind object types to managed datasets "
-                f"— use a transform to materialize the rows you need."
+                f"Object type {ot.api_name!r} is backed by {backing.kind} dataset "
+                f"{ot.backing_dataset!r}, which is scanned at the source. Bind "
+                f"object types to managed datasets — use a transform to "
+                f"materialize the rows you need."
             )
         try:
             version = self.catalog.store.get_version(ot.backing_dataset, None)
