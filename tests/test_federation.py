@@ -299,6 +299,28 @@ def test_registration_is_admin_only_and_redacts(tmp_path):
                      ).status_code == 502
 
 
+def test_rows_endpoint_previews_a_federated_dataset(tmp_path):
+    """Regression: the rows route required a version, but a federated dataset
+    has none — so its row preview 404'd with "has no versions". Nobody hit it
+    until the UI could create a federated dataset. It must page at source, with
+    a null row_count (counting would be a full remote scan)."""
+    remote = tmp_path / "r.parquet"
+    pq.write_table(events(7), remote)
+    ws = Workspace.init(tmp_path / "wsr", name="rows")
+    app = create_app(ws)
+    admin = TestClient(app)
+    admin.post("/api/v1/auth/setup", json=CREDS)
+    admin.post("/api/v1/auth/login", json=CREDS)
+    admin.put("/api/v1/datasets/remote/federated",
+              json={"source": {"type": "parquet", "path": str(remote)}})
+
+    r = admin.get("/api/v1/datasets/remote/rows?limit=3")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["rows"]) == 3
+    assert body["row_count"] is None, "unknown total, not a fabricated one"
+
+
 def test_cannot_shadow_a_managed_dataset(tmp_path):
     remote = tmp_path / "r.parquet"
     pq.write_table(events(5), remote)

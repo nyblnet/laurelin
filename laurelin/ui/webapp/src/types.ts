@@ -70,17 +70,22 @@ export interface DatasetVersion {
   source: string;
 }
 
+export type DatasetKind = "managed" | "federated" | "iceberg";
+
 export interface Dataset {
   name: string;
   description: string;
   created_at: string;
   latest_version: number | null;
+  kind?: DatasetKind;
   // Present on permission-aware responses (dataset list/detail): the current
   // user's effective access to this dataset.
   permissions?: ObjectTypePermission;
 }
 
 export interface DatasetDetail extends Dataset {
+  /** Federated/iceberg only: the (redacted) source Laurelin scans. */
+  source?: Record<string, unknown>;
   versions: DatasetVersion[];
 }
 

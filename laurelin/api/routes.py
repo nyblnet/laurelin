@@ -299,8 +299,24 @@ def get_dataset_rows(
     version: Optional[int] = None,
 ) -> dict:
     _require_dataset_view(perms, user, name)
-    info = _version_info(store, name, version)
+    ds = store.get_dataset(name)
+    if ds is None:
+        raise KeyError(f"Dataset not found: {name!r}")
     policy = perms.row_policy_fn(user, name)
+
+    if ds.is_federated:
+        # A federated dataset has no versions to pin — it's scanned in place —
+        # so the version-based path would reject it. Page at source instead.
+        # row_count is left null: counting would mean a full remote scan, and
+        # faking a number is worse than admitting it's unknown.
+        if policy is None:
+            rows = catalog.rows(name, limit=limit, offset=offset)
+        else:
+            table = policy(catalog.read(name))
+            rows = catalog.table_to_rows(table.slice(offset, limit))
+        return {"rows": rows, "row_count": None}
+
+    info = _version_info(store, name, version)
     if policy is None:
         rows = catalog.rows(name, limit=limit, offset=offset, version=version)
         return {"rows": rows, "row_count": info.row_count}

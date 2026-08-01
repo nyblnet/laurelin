@@ -57,7 +57,13 @@ function DatasetList() {
     {
       label: "Name",
       className: "mono",
-      render: (d) => <Link to={`/datasets/${d.name}`}>{d.name}</Link>,
+      render: (d) => (
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <Link to={`/datasets/${d.name}`}>{d.name}</Link>
+          {d.kind === "federated" && <Badge tone="blue">federated</Badge>}
+          {d.kind === "iceberg" && <Badge tone="green">iceberg</Badge>}
+        </span>
+      ),
     },
     {
       label: "Description",
@@ -86,6 +92,7 @@ function DatasetList() {
         subtitle="Versioned Parquet datasets in this workspace."
       />
       <ImportPanel />
+      <FederatedPanel />
       {isLoading && <Spinner />}
       {error && <ErrorBox error={error} />}
       {data &&
@@ -286,6 +293,129 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// --------------------------------------------------------------- federated
+
+type FederatedType = "iceberg" | "delta" | "parquet" | "postgres";
+
+/**
+ * Register a table Laurelin governs but does not hold.
+ *
+ * Admin-only, and collapsed by default: this points the server at a remote
+ * system with credentials, so it isn't the common path and shouldn't crowd the
+ * import flow that is. The server probes the source before storing it, so an
+ * unreachable table fails here rather than at first query.
+ */
+function FederatedPanel() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [type, setType] = useState<FederatedType>("iceberg");
+  const [path, setPath] = useState("");
+  const [url, setUrl] = useState("");
+  const [table, setTable] = useState("");
+
+  if (user?.role !== "admin") return null;
+
+  const source =
+    type === "postgres"
+      ? { type, url, table }
+      : { type, path };
+
+  const complete =
+    /^[a-z][a-z0-9_]*$/.test(name) &&
+    (type === "postgres" ? url.trim() !== "" && table.trim() !== "" : path.trim() !== "");
+
+  const register = useMutation({
+    mutationFn: () =>
+      api.put(`${API}/datasets/${name}/federated`, { source, description: "" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["datasets"] });
+      setName("");
+      setPath("");
+      setUrl("");
+      setTable("");
+      setOpen(false);
+    },
+  });
+
+  if (!open) {
+    return (
+      <div style={{ margin: "0 0 24px" }}>
+        <button className="small" onClick={() => setOpen(true)}>
+          Register a federated table…
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 24 }}>
+      <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+        <label style={{ marginBottom: 0 }}>Register a federated table</label>
+        <button className="small" onClick={() => setOpen(false)}>Cancel</button>
+      </div>
+      <p className="hint" style={{ marginTop: 4 }}>
+        A table Laurelin governs and scans in place — it isn't copied, and it has
+        no versions. Governed by the same ACLs and policies as any dataset.
+      </p>
+
+      <div className="toolbar" style={{ gap: 12, flexWrap: "wrap", marginTop: 8 }}>
+        <div className="field">
+          <label>Dataset name</label>
+          <input className="mono" value={name} onChange={(e) => setName(e.target.value)}
+            placeholder="external_orders" style={{ maxWidth: 220 }} />
+        </div>
+        <div className="field">
+          <label>Kind</label>
+          <select value={type} onChange={(e) => setType(e.target.value as FederatedType)}>
+            <option value="iceberg">Iceberg</option>
+            <option value="delta">Delta Lake</option>
+            <option value="parquet">Parquet file/glob</option>
+            <option value="postgres">PostgreSQL table</option>
+          </select>
+        </div>
+      </div>
+
+      {type === "postgres" ? (
+        <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
+          <div className="field" style={{ flex: "1 1 260px" }}>
+            <label>Connection URL</label>
+            <input className="mono" value={url} onChange={(e) => setUrl(e.target.value)}
+              placeholder="postgresql://user:pw@host:5432/db" />
+          </div>
+          <div className="field">
+            <label>Table</label>
+            <input className="mono" value={table} onChange={(e) => setTable(e.target.value)}
+              placeholder="public.orders" />
+          </div>
+        </div>
+      ) : (
+        <div className="field">
+          <label>Path or URI</label>
+          <input className="mono" value={path} onChange={(e) => setPath(e.target.value)}
+            placeholder={
+              type === "iceberg"
+                ? "s3://bucket/warehouse/db/table/metadata/….metadata.json"
+                : type === "delta"
+                  ? "s3://bucket/path/to/delta-table"
+                  : "/data/exports/*.parquet or s3://bucket/file.parquet"
+            } />
+        </div>
+      )}
+
+      {register.error && <ErrorBox error={register.error} />}
+
+      <div className="toolbar" style={{ marginTop: 8, justifyContent: "flex-end" }}>
+        <button className="primary" disabled={!complete || register.isPending}
+          onClick={() => register.mutate()}>
+          {register.isPending ? "Probing source…" : "Register"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ------------------------------------------------------------------ detail
 
 function DatasetDetailPage() {
@@ -309,6 +439,7 @@ function DatasetDetailPage() {
 
 function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
   const auth = useAuth();
+  const federated = detail.kind === "federated";
   const schemaVersion =
     detail.versions.find((v) => v.version === detail.latest_version) ??
     detail.versions[detail.versions.length - 1];
@@ -317,9 +448,19 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
 
   return (
     <div>
-      <PageHeader title={detail.name} subtitle={detail.description || undefined} />
+      <PageHeader
+        title={detail.name}
+        subtitle={detail.description || undefined}
+        actions={
+          detail.kind && detail.kind !== "managed" ? (
+            <Badge tone={federated ? "blue" : "green"}>{detail.kind}</Badge>
+          ) : undefined
+        }
+      />
 
-      {auth.can("editor") ? (
+      {federated ? (
+        <FederatedSource source={detail.source} />
+      ) : auth.can("editor") ? (
         <UploadControl name={detail.name} />
       ) : (
         <p className="faint" style={{ margin: "0 0 20px" }}>
@@ -327,18 +468,45 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         </p>
       )}
 
-      <SchemaSection version={schemaVersion} />
+      {!federated && <SchemaSection version={schemaVersion} />}
 
-      <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-        <h3 style={{ marginBottom: 0 }}>Version history</h3>
-        {auth.can("editor") && detail.latest_version != null && (
-          <CompactButton name={detail.name} />
-        )}
-      </div>
-      <VersionHistory versions={versions} />
+      {!federated && (
+        <>
+          <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+            <h3 style={{ marginBottom: 0 }}>Version history</h3>
+            {auth.can("editor") && detail.latest_version != null && (
+              <CompactButton name={detail.name} />
+            )}
+          </div>
+          <VersionHistory versions={versions} />
+        </>
+      )}
 
       <h3>Row preview</h3>
       <RowPreview name={detail.name} schema={schemaVersion?.schema} />
+    </div>
+  );
+}
+
+/**
+ * What a federated dataset shows instead of upload / versions: where the data
+ * actually lives. It's scanned in place, so there are no versions to manage —
+ * saying "no versions yet" would imply one is coming, which is wrong.
+ */
+function FederatedSource({ source }: { source?: Record<string, unknown> }) {
+  const type = String(source?.type ?? "external");
+  const location = String(source?.path ?? source?.table ?? source?.url ?? "");
+  return (
+    <div className="card" style={{ marginBottom: 20 }}>
+      <label style={{ marginBottom: 4 }}>Federated source</label>
+      <p className="hint" style={{ marginTop: 0 }}>
+        Laurelin governs and scans this table in place — it isn't copied and has
+        no versions. Same ACLs and policies as any dataset.
+      </p>
+      <div className="mono" style={{ fontSize: 13 }}>
+        <Badge tone="blue">{type}</Badge>{" "}
+        {location && <span className="dim">{location}</span>}
+      </div>
     </div>
   );
 }
@@ -569,13 +737,18 @@ function RowPreview({
         </button>
         <button
           className="small"
-          disabled={offset + rows.length >= row_count}
+          // For a federated dataset the total is unknown (row_count null), so
+          // fall back to "was this page full?" — a short page means the end.
+          disabled={
+            row_count == null ? rows.length < PAGE_SIZE : offset + rows.length >= row_count
+          }
           onClick={() => setOffset(offset + PAGE_SIZE)}
         >
           Next
         </button>
         <span>
-          Rows {offset + 1}–{offset + rows.length} of {fmtNum(row_count)}
+          Rows {offset + 1}–{offset + rows.length}
+          {row_count == null ? "" : ` of ${fmtNum(row_count)}`}
         </span>
       </div>
     </div>
