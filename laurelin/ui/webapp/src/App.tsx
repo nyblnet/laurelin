@@ -18,6 +18,7 @@ import { DatasetsView } from "./views/Datasets";
 import { DashboardsView } from "./views/Dashboards";
 import { AppsView } from "./views/Apps";
 import { PipelineView } from "./views/Pipeline";
+import { SchedulesView } from "./views/Schedules";
 import { TransformsView } from "./views/Transforms";
 import { OntologyView } from "./views/Ontology";
 import { WorkbenchView } from "./views/Workbench";
@@ -73,6 +74,7 @@ export function App() {
             <Route path="/datasets/*" element={scoped(<DatasetsView />)} />
             <Route path="/dashboards/*" element={scoped(<DashboardsView />)} />
             <Route path="/pipeline" element={scoped(<PipelineView />)} />
+            <Route path="/schedules" element={scoped(<SchedulesView />)} />
             <Route path="/transforms" element={scoped(<TransformsView />)} />
             <Route path="/apps/*" element={scoped(<AppsView />)} />
             <Route path="/ontology/*" element={scoped(<OntologyView />)} />

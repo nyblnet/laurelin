@@ -13,6 +13,7 @@ const NAV = [
   { to: "/datasets", label: "Datasets" },
   { to: "/dashboards", label: "Dashboards" },
   { to: "/pipeline", label: "Pipeline" },
+  { to: "/schedules", label: "Schedules" },
   { to: "/transforms", label: "Transforms" },
   { to: "/apps", label: "Apps" },
   { to: "/ontology", label: "Ontology" },

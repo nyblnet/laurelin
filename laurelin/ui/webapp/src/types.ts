@@ -309,6 +309,27 @@ export interface ObjectQueryResult {
   total_capped?: boolean;
 }
 
+export type ScheduleTrigger = "cron" | "upstream";
+export type ScheduleAction = "build" | "sync";
+
+export interface Schedule {
+  name: string;
+  enabled: boolean;
+  trigger: ScheduleTrigger;
+  cron: string;
+  upstream_dataset: string;
+  action: ScheduleAction;
+  targets: string[];
+  source: string;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status: "succeeded" | "failed" | null;
+  last_error: string | null;
+  last_build_id: string | null;
+  created_at: string;
+  created_by: string;
+}
+
 export interface AuditEvent {
   id: number;
   timestamp: string;
