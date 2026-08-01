@@ -329,11 +329,51 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
 
       <SchemaSection version={schemaVersion} />
 
-      <h3>Version history</h3>
+      <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+        <h3 style={{ marginBottom: 0 }}>Version history</h3>
+        {auth.can("editor") && detail.latest_version != null && (
+          <CompactButton name={detail.name} />
+        )}
+      </div>
       <VersionHistory versions={versions} />
 
       <h3>Row preview</h3>
       <RowPreview name={detail.name} schema={schemaVersion?.schema} />
+    </div>
+  );
+}
+
+// --------------------------------------------------------------- compaction
+
+/**
+ * Merge a dataset's Parquet parts back into one file.
+ *
+ * Appends are cheap but leave a version made of many small parts, and many
+ * small files eventually slow scans. Compaction pays that cost once,
+ * deliberately — which is why it's a button, not automatic (unless
+ * LAURELIN_AUTO_COMPACT_PARTS is set on the server).
+ */
+function CompactButton({ name }: { name: string }) {
+  const qc = useQueryClient();
+  const m = useMutation({
+    mutationFn: () => api.post<DatasetVersion>(`${API}/datasets/${name}/compact`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dataset", name] });
+      qc.invalidateQueries({ queryKey: ["datasets"] });
+    },
+  });
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      {m.isError && <ErrorBox error={m.error} />}
+      {m.isSuccess && <span className="hint ok" style={{ margin: 0 }}>Compacted.</span>}
+      <button
+        className="small"
+        disabled={m.isPending}
+        onClick={() => m.mutate()}
+        title="Merge the latest version's parts into one file"
+      >
+        {m.isPending ? "Compacting…" : "Compact"}
+      </button>
     </div>
   );
 }

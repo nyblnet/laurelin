@@ -280,9 +280,17 @@ export interface ActionDef {
   parameters: Record<string, ActionParameterDef>;
 }
 
+export interface ObjectIndexStatus {
+  indexed: boolean;
+  /** A stale index is bypassed, so this is what decides whether it's used. */
+  fresh: boolean;
+  objects: number;
+}
+
 export interface ObjectTypeDetail extends ObjectTypeDef {
   links: LinkTypeDef[];
   actions: ActionDef[];
+  index?: ObjectIndexStatus;
 }
 
 export type OntologyObject = Record<string, unknown> & {

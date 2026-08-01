@@ -681,6 +681,16 @@ def get_object_type(name: str, service: OntologyDep, perms: PermDep, user: UserD
         for action in service.ontology.actions
         if action.object_type == name
     ]
+    # Index status, so the UI can show "indexed / stale / not indexed" on load
+    # rather than only after a build. Freshness is the interesting bit: a stale
+    # index is bypassed, so telling the user is the difference between "why is
+    # this slow" and "oh, it needs a rebuild".
+    state = service.index_state(ot)
+    result["index"] = {
+        "indexed": state is not None,
+        "fresh": service.index_is_fresh(ot) if state is not None else False,
+        "objects": state["object_count"] if state else 0,
+    }
     return result
 
 
