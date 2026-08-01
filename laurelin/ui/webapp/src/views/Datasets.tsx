@@ -32,6 +32,7 @@ import {
   fmtValue,
 } from "../ui";
 import { SourcesSection } from "./Sources";
+import { IcebergManager } from "./IcebergManager";
 
 const PAGE_SIZE = 50;
 
@@ -141,11 +142,18 @@ function ImportPanel() {
     onSuccess: (p) => setName(p.suggested_name),
   });
 
+  const [asIceberg, setAsIceberg] = useState(false);
+
   const importM = useMutation({
     mutationFn: ({ f, target }: { f: File; target: string }) => {
       const form = new FormData();
       form.append("file", f);
-      return api.upload<DatasetVersion>(`${API}/datasets/${target}/upload`, form);
+      // Same upload, different backend: the Iceberg path writes a snapshot
+      // table other engines can open, at the cost of the [iceberg] extra.
+      const endpoint = asIceberg
+        ? `${API}/datasets/${target}/iceberg`
+        : `${API}/datasets/${target}/upload`;
+      return api.upload<DatasetVersion>(endpoint, form);
     },
     onSuccess: (_v, { target }) => {
       qc.invalidateQueries({ queryKey: ["datasets"] });
@@ -241,6 +249,17 @@ function ImportPanel() {
                   letter.
                 </p>
               )}
+              <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 8px" }}>
+                <input
+                  type="checkbox"
+                  checked={asIceberg}
+                  onChange={(e) => setAsIceberg(e.target.checked)}
+                />
+                <span style={{ fontSize: 13 }}>
+                  Store as an Iceberg table — versioned, branchable, and readable
+                  by Spark / Trino / DuckDB directly.
+                </span>
+              </label>
               {importM.error && <ErrorBox error={importM.error} />}
 
               <p className="dim" style={{ fontSize: 12.5 }}>
@@ -461,11 +480,15 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
       {federated ? (
         <FederatedSource source={detail.source} />
       ) : auth.can("editor") ? (
-        <UploadControl name={detail.name} />
+        <UploadControl name={detail.name} iceberg={detail.kind === "iceberg"} />
       ) : (
         <p className="faint" style={{ margin: "0 0 20px" }}>
           Uploading a new version requires the editor role.
         </p>
+      )}
+
+      {detail.kind === "iceberg" && auth.can("editor") && (
+        <IcebergManager name={detail.name} />
       )}
 
       {!federated && <SchemaSection version={schemaVersion} />}
@@ -474,7 +497,7 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         <>
           <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
             <h3 style={{ marginBottom: 0 }}>Version history</h3>
-            {auth.can("editor") && detail.latest_version != null && (
+            {auth.can("editor") && detail.kind !== "iceberg" && detail.latest_version != null && (
               <CompactButton name={detail.name} />
             )}
           </div>
@@ -548,7 +571,7 @@ function CompactButton({ name }: { name: string }) {
 
 // ------------------------------------------------------------------ upload
 
-function UploadControl({ name }: { name: string }) {
+function UploadControl({ name, iceberg = false }: { name: string; iceberg?: boolean }) {
   const qc = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<"replace" | "append">("replace");
@@ -558,10 +581,12 @@ function UploadControl({ name }: { name: string }) {
     mutationFn: (f: File) => {
       const form = new FormData();
       form.append("file", f);
-      return api.upload<DatasetVersion>(
-        `${API}/datasets/${name}/upload?mode=${mode}`,
-        form,
-      );
+      // An iceberg dataset's new versions must go through the iceberg writer,
+      // or they'd land as managed Parquet parts on a table marked iceberg.
+      const base = iceberg
+        ? `${API}/datasets/${name}/iceberg`
+        : `${API}/datasets/${name}/upload`;
+      return api.upload<DatasetVersion>(`${base}?mode=${mode}`, form);
     },
     onSuccess: (v) => {
       qc.invalidateQueries({ queryKey: ["dataset", name] });

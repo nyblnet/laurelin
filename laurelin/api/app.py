@@ -34,6 +34,7 @@ from laurelin.api.auth_routes import (
     users_router,
     workspaces_router,
 )
+from laurelin.api import iceberg_routes  # noqa: F401 - registers routes on the shared router
 from laurelin.api.engine_routes import engines_router
 from laurelin.api.routes import router
 from laurelin.api.schedule_routes import schedules_router

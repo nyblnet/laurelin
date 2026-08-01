@@ -11,6 +11,7 @@ a managed one and read like a federated one, so the SQL policy renderer covers
 it with no new code.
 """
 
+import io
 import warnings
 
 import pyarrow as pa
@@ -319,3 +320,87 @@ def test_renaming_a_column_works_once_allowed(cat):
         "orders", rename={"amount": "value"}, allow_breaking=True
     )
     assert columns == ["id", "region", "value"]
+
+
+# -- HTTP routes --------------------------------------------------------------
+#
+# Every Iceberg capability the catalog implements had no REST surface, so the
+# feature the CHANGELOG advertises could only be driven from Python. These
+# cover the routes that make it reachable.
+
+
+def _client(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+
+    ws = Workspace.init(tmp_path / "ws", name="ibhttp")
+    return TestClient(create_app(ws, no_auth=True))
+
+
+def _csv(rows="id,region\n1,us\n2,eu\n3,us\n"):
+    return {"file": ("d.csv", io.BytesIO(rows.encode()), "text/csv")}
+
+
+def test_create_and_snapshot_over_http(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/v1/datasets/orders/iceberg", files=_csv())
+    assert r.status_code == 200, r.text
+    assert r.json()["row_count"] == 3
+
+    r = c.post("/api/v1/datasets/orders/iceberg?mode=append",
+               files=_csv("id,region\n4,apac\n"))
+    assert r.json()["version"] == 2
+
+    snaps = c.get("/api/v1/datasets/orders/iceberg/snapshots").json()
+    assert len(snaps) == 2
+
+
+def test_branch_lifecycle_over_http(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/v1/datasets/orders/iceberg", files=_csv())
+
+    assert c.post("/api/v1/datasets/orders/iceberg/branches",
+                  json={"branch": "staging"}).status_code == 200
+    branches = c.get("/api/v1/datasets/orders/iceberg/branches").json()
+    assert {b["branch"] for b in branches} == {"main", "staging"}
+
+    merged = c.post("/api/v1/datasets/orders/iceberg/branches/staging/merge")
+    assert merged.status_code == 200
+
+    assert c.delete("/api/v1/datasets/orders/iceberg/branches/staging").status_code == 200
+
+
+def test_a_diverged_merge_is_a_409(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/v1/datasets/orders/iceberg", files=_csv())
+    c.post("/api/v1/datasets/orders/iceberg/branches", json={"branch": "staging"})
+    # move main on so staging is behind and diverged
+    c.post("/api/v1/datasets/orders/iceberg?mode=append", files=_csv("id,region\n9,us\n"))
+
+    r = c.post("/api/v1/datasets/orders/iceberg/branches/staging/merge")
+    assert r.status_code == 409
+    assert "diverged" in r.json()["detail"]
+
+
+def test_schema_evolution_over_http(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/v1/datasets/orders/iceberg", files=_csv())
+
+    # additive is fine
+    r = c.post("/api/v1/datasets/orders/iceberg/schema",
+               json={"add": {"priority": "string"}})
+    assert r.status_code == 200
+    assert "priority" in r.json()["columns"]
+
+    # a breaking change is refused without consent, and the impact is queryable
+    impact = c.get("/api/v1/datasets/orders/iceberg/schema/impact").json()
+    assert "downstream" in impact
+    r = c.post("/api/v1/datasets/orders/iceberg/schema", json={"drop": ["region"]})
+    assert r.status_code == 400
+    assert "breaking" in r.json()["detail"]
+    # …and allowed with it
+    r = c.post("/api/v1/datasets/orders/iceberg/schema",
+               json={"drop": ["region"], "allow_breaking": True})
+    assert r.status_code == 200
+    assert "region" not in r.json()["columns"]
