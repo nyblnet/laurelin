@@ -26,6 +26,7 @@ import { OntologyAccessSection } from "./admin/OntologyAccessSection";
 import { DatasetAccessSection } from "./admin/DatasetAccessSection";
 import { DataSecuritySection } from "./admin/DataSecuritySection";
 import { MarkingsSection } from "./admin/MarkingsSection";
+import { EnginesSection } from "./admin/EnginesSection";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
 
@@ -460,6 +461,7 @@ export function AdminView() {
           <DatasetAccessSection />
           <DataSecuritySection />
           <MarkingsSection />
+          <EnginesSection />
         </>
       )}
     </div>

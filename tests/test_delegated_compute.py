@@ -191,3 +191,64 @@ def test_flight_sql_client_reports_a_clear_connection_error():
     with pytest.raises(engines.EngineError, match="Could not connect|rejected"):
         client = engines.connect(cfg, timeout_s=2)
         client.query("SELECT 1")
+
+
+# -- HTTP routes --------------------------------------------------------------
+#
+# The engine registry had no REST surface — engines could only be created by
+# calling upsert_engine() in Python — so a delegated pipeline could be written
+# but its target never configured through the product.
+
+def _admin_client(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.core.config import Workspace
+
+    ws = Workspace.init(tmp_path / "ws", name="eng")
+    app = create_app(ws)
+    c = TestClient(app)
+    creds = {"username": "root", "password": "trustno1!"}
+    c.post("/api/v1/auth/setup", json=creds)
+    c.post("/api/v1/auth/login", json=creds)
+    return app, c, creds
+
+
+def test_engine_crud_over_http(tmp_path):
+    _, admin, _ = _admin_client(tmp_path)
+
+    ok = admin.put("/api/v1/engines/trino", json={
+        "type": "flightsql", "uri": "grpc+tls://trino.internal:443",
+        "options": {"username": "svc", "password": "hunter2"},
+    })
+    assert ok.status_code == 200, ok.text
+    # Credentials never come back.
+    assert ok.json()["options"]["password"] == "*****"
+
+    listed = admin.get("/api/v1/engines").json()
+    assert [e["name"] for e in listed] == ["trino"]
+    assert listed[0]["options"]["password"] == "*****"
+
+    assert admin.delete("/api/v1/engines/trino").status_code == 200
+    assert admin.get("/api/v1/engines").json() == []
+
+
+def test_a_bad_engine_uri_is_rejected_at_put(tmp_path):
+    _, admin, _ = _admin_client(tmp_path)
+    r = admin.put("/api/v1/engines/bad", json={"uri": "http://not-grpc"})
+    assert r.status_code == 400
+    assert "grpc" in r.json()["detail"]
+
+
+def test_engines_are_admin_only(tmp_path):
+    app, admin, _ = _admin_client(tmp_path)
+    from fastapi.testclient import TestClient
+
+    admin.post("/api/v1/users",
+               json={"username": "ed", "password": "password123", "role": "editor"})
+    editor = TestClient(app)
+    editor.post("/api/v1/auth/login", json={"username": "ed", "password": "password123"})
+
+    assert editor.get("/api/v1/engines").status_code == 403
+    assert editor.put("/api/v1/engines/x",
+                      json={"uri": "grpc://h:443"}).status_code == 403
