@@ -26,6 +26,30 @@ class ColumnSchema(BaseModel):
     type: str  # arrow type name, e.g. "string", "int64", "double", "timestamp[us]"
 
 
+# Every dataset kind, mapped to the SQL dialect a policy must be rendered in
+# for it. **Total by construction and with no default**: a kind that is not a
+# key here has no dialect, and asking for one raises.
+#
+# The alternative -- `"clickhouse" if kind == "clickhouse" else "duckdb"` --
+# was live until StarRocks, and it is the shape that makes a governance bug
+# out of a forgotten line. A new source-scanned kind added without touching
+# it would be read with DuckDB's *flat* statement and DuckDB's *quoter*, and
+# the guard in `catalog.source_table` that compares the policy's dialect with
+# the reader's could not catch it: both sides would say "duckdb".
+_SQL_DIALECTS: dict[str, str] = {
+    "managed": "duckdb",
+    "federated": "duckdb",
+    "iceberg": "duckdb",
+    "clickhouse": "clickhouse",
+    "starrocks": "starrocks",
+}
+
+# Kinds read through the source expression rather than local Parquet parts.
+_SCANNED_AT_SOURCE = frozenset({"federated", "iceberg", "clickhouse", "starrocks"})
+
+DATASET_KINDS = tuple(_SQL_DIALECTS)
+
+
 class DatasetInfo(BaseModel):
     name: str
     description: str = ""
@@ -41,6 +65,10 @@ class DatasetInfo(BaseModel):
     # "clickhouse": read-only, scanned in place by embedded ClickHouse (chdb).
     #              Like federated in every way a reader cares about, except
     #              that the SQL is a different dialect — see `sql_dialect`.
+    # "starrocks": read-only, scanned in place by a StarRocks server over the
+    #              MySQL wire protocol. Its own dialect again, and unlike
+    #              ClickHouse it is a *remote* engine with write privileges to
+    #              lose — see laurelin/core/starrocks.py.
     kind: str = "managed"
     source: dict[str, Any] = Field(default_factory=dict)
 
@@ -57,15 +85,19 @@ class DatasetInfo(BaseModel):
         return self.kind == "clickhouse"
 
     @property
+    def is_starrocks(self) -> bool:
+        return self.kind == "starrocks"
+
+    @property
     def scans_at_source(self) -> bool:
         """Read via the source expression rather than local Parquet parts.
 
         The distinction that matters to a *reader* is not who owns the table
-        but where the scan happens — so federated, Iceberg and ClickHouse share
-        every read path, and with it one implementation of how policy is
-        applied.
+        but where the scan happens — so federated, Iceberg, ClickHouse and
+        StarRocks share every read path, and with it one implementation of how
+        policy is applied.
         """
-        return self.kind in ("federated", "iceberg", "clickhouse")
+        return self.kind in _SCANNED_AT_SOURCE
 
     @property
     def sql_dialect(self) -> str:
@@ -76,8 +108,23 @@ class DatasetInfo(BaseModel):
         diverge here, and in a governance layer a derivation that drifts is a
         leak rather than a wrong number, so the second fact gets a name and one
         definition instead of N call sites re-deriving it.
+
+        Raises on an unknown kind rather than falling back to DuckDB. A
+        fallback is the wrong default in exactly one direction: the engine that
+        gets read with the wrong dialect is the *new* one, and the wrong
+        dialect is the one whose quoter and statement shape were never checked
+        against it.
         """
-        return "clickhouse" if self.kind == "clickhouse" else "duckdb"
+        try:
+            return _SQL_DIALECTS[self.kind]
+        except KeyError:
+            raise ValueError(
+                f"Dataset {self.name!r} has kind {self.kind!r}, which declares "
+                "no SQL dialect. Add it to _SQL_DIALECTS in "
+                "laurelin/core/models.py — reading it with another engine's "
+                "dialect would render its policy in a language it does not "
+                "speak."
+            ) from None
 
 
 class DatasetVersionInfo(BaseModel):
@@ -402,6 +449,9 @@ class ObjectEdit(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     actor: str = "anonymous"
     created_at: str = Field(default_factory=utcnow_iso)
+    # Gapless per-type position in the edit log, allocated at append. 0 means
+    # "not yet appended" — the value an in-memory edit carries before commit.
+    edit_seq: int = 0
 
 
 class AuditEvent(BaseModel):

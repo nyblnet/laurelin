@@ -1,13 +1,27 @@
 """OntologyService: materialize objects (base data + edit overlay), traverse
 links, and apply write-back actions.
 
-Objects are computed in memory per request: the backing dataset's latest
-version is read via duckdb, projected to declared properties, then the
-recorded ObjectEdits are replayed in order (create / update / delete).
+Three paths answer the same question, fastest first:
+
+1. the **operational object store** (``laurelin/ontology/store.py``) — a
+   materialization of current object state that an edit *upserts* rather than
+   invalidates, so a read costs a key lookup no matter how long the edit log is;
+2. **pushdown into DuckDB** — the edit log replayed as registered Arrow tables
+   and merged with the Parquet scan in SQL;
+3. **in-memory materialization** — base rows with the overlay applied in Python.
+
+(2) and (3) both read the edit log directly, so both are always correct. That
+is what makes (1) safe to skip: a store that cannot prove it has applied every
+committed edit returns nothing and the read falls through. Slower, never wrong.
+
+(3) also remains the oracle the other two are tested against: if the three ever
+disagree about which objects exist, that is the bug, and it is cheaper to catch
+in a test than in production.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import uuid
 from contextlib import contextmanager
@@ -32,6 +46,15 @@ from laurelin.core.models import (
     ObjectEdit,
     ObjectTypeDef,
     OntologyDef,
+)
+from laurelin.ontology.store import (
+    MetadataObjectStore,
+    ObjectRow,
+    canonical_props,
+    created_ord,
+    definition_fingerprint,
+    digest_hex,
+    digest_of_rows,
 )
 
 # Cap on objects returned for one link traversal (the in-memory path was
@@ -155,11 +178,16 @@ class OntologyService:
         policy=None,
         policy_for=None,
         plan_for=None,
+        object_store=None,
     ):
         self.workspace = workspace
         self.catalog = catalog
         self.store = store
         self.ontology = ontology
+        # Where current object state is materialized. Defaults to the metadata
+        # store, which needs no new dependency and puts the edit log and its
+        # materialization in one transaction; a StarRocks store swaps in here.
+        self.object_store = object_store or MetadataObjectStore(store)
         # Optional (dataset, pa.Table) -> pa.Table row-level-security / masking
         # transform, bound to the requesting user. Objects ARE dataset rows, so
         # applying it here keeps RLS from being bypassed via the ontology API.
@@ -194,7 +222,40 @@ class OntologyService:
 
     # -- materialization --------------------------------------------------------
 
+    # A read-consistent snapshot of one object type's inputs, or None.
+    #
+    # ``reindex`` reads three things — the ordinals, the watermark and the
+    # objects — and read each on its own connection. A create committing
+    # between the first read and the third appeared in the objects and not in
+    # the ordinals, and the rebuild died on `KeyError`. That endpoint is also
+    # called by ``writeback`` and by the post-build refresh, so an ordinary
+    # concurrent edit could fail a fold with an unhandled exception.
+    _pin: Optional[dict] = None
+
+    @contextmanager
+    def _pinned(self, ot: ObjectTypeDef):
+        """Pin this type's base rows and edit log for the block's duration."""
+        previous = self._pin
+        self._pin = {"type": ot.api_name, "base": self._read_base_rows(ot),
+                     "edits": self.store.list_object_edits(ot.api_name)}
+        try:
+            yield
+        finally:
+            self._pin = previous
+
+    def _live_edits(self, ot: ObjectTypeDef) -> list[ObjectEdit]:
+        if self._pin is not None and self._pin["type"] == ot.api_name:
+            return self._pin["edits"]
+        return self.store.list_object_edits(ot.api_name)
+
     def _base_rows(self, ot: ObjectTypeDef) -> list[dict]:
+        if self._pin is not None and self._pin["type"] == ot.api_name:
+            # Copied, because _materialize updates these dicts in place and a
+            # pinned snapshot is read more than once.
+            return [dict(row) for row in self._pin["base"]]
+        return self._read_base_rows(ot)
+
+    def _read_base_rows(self, ot: ObjectTypeDef) -> list[dict]:
         """Rows from the backing dataset's latest version, projected to the
         declared properties (plus the primary key). Row-level security / column
         masking (``self.policy``) is applied first. Empty if the dataset does not
@@ -214,62 +275,239 @@ class OntologyService:
             for row in self.catalog.table_to_rows(table)
         ]
 
+    def _declared_columns(self, ot: ObjectTypeDef) -> list[str]:
+        """Declared properties the backing dataset actually has, plus the key —
+        the exact projection the pushdown emits."""
+        version = self.catalog.store.get_version(ot.backing_dataset, None)
+        if version is None:
+            return []
+        declared = set(ot.properties) | {ot.primary_key}
+        return [c.name for c in version.schema_ if c.name in declared]
+
+    def _pad_declared(self, ot: ObjectTypeDef, props: dict) -> dict:
+        """A created object's properties with the declared-but-unset ones
+        present as nulls.
+
+        The pushdown emits every projected column for a created object, so it
+        already returned ``{'name': 'new', 'realm': 'n', 'pop': None}`` where
+        in-memory replay returned ``{'name': 'new', 'realm': 'n'}``. One object,
+        two JSON shapes, and which one a client saw depended on whether the
+        overlay had been folded into the dataset yet. This settles it on the
+        shape the dataset's own schema justifies, everywhere.
+        """
+        return {**{c: None for c in self._declared_columns(ot)}, **props}
+
     # -- index --------------------------------------------------------------------
 
     def index_state(self, ot: ObjectTypeDef) -> Optional[dict]:
-        """The index's record of what it was built from, if it exists."""
-        return self.store.object_index_state(ot.api_name)
-
-    def index_is_fresh(self, ot: ObjectTypeDef) -> bool:
-        """Whether the index still reflects the data.
-
-        Two things can invalidate it: a new dataset version, or a new edit in
-        the overlay. Both are cheap to check, and checking beats trusting —
-        a stale index is worse than no index, because it answers confidently.
-        """
+        """What the materialization says it was built from, if it exists."""
         state = self.store.object_index_state(ot.api_name)
         if state is None:
+            return None
+        return {**state, "lag": max(0, self.store.max_edit_seq(ot.api_name)
+                                    - int(state["applied_seq"]))}
+
+    def _system_view(self) -> "OntologyService":
+        """The same data with no policy bound.
+
+        A materialization is *shared*. Building it through the calling user's
+        policy would bake their narrowed view into everyone's index — and the
+        rebuild endpoint is only EDITOR-gated, so that is an ordinary editor
+        away. Policy is applied on read, by the reader, or not at all.
+        """
+        return OntologyService(
+            self.workspace, self.catalog, self.store, self.ontology,
+            object_store=self.object_store,
+        )
+
+    def store_is_caught_up(self, ot: ObjectTypeDef) -> bool:
+        """Whether the materialization has applied every committed edit.
+
+        The semantics here **inverted** in the operational-store change. This
+        used to mean "nothing has changed since the build", so a single write
+        made it False and the whole index was thrown away. It now means "the
+        materialization is level with the log" — a write advances both, and
+        only a *lagging* store is refused.
+
+        A new dataset version still invalidates outright, deliberately: it can
+        rewrite arbitrary base rows and renumbers every ordinal, so no
+        incremental delta expresses it. A build is now the only thing that
+        invalidates.
+        """
+        return self._state_is_current(ot, self.object_store.state(ot.api_name))
+
+    # The pre-rename name, kept because a build and the type detail endpoint
+    # both call it. Same question, older words.
+    index_is_fresh = store_is_caught_up
+
+    def _type_fingerprint(self, ot: ObjectTypeDef) -> str:
+        """Everything about the definition that changes what a row contains:
+        which properties are projected, their declared types (the search text
+        is built from the string ones), the key, and the title expression."""
+        return definition_fingerprint(
+            primary_key=ot.primary_key,
+            title_property=ot.title_property,
+            properties={name: prop.type for name, prop in ot.properties.items()},
+        )
+
+    def _state_is_current(self, ot: ObjectTypeDef, state) -> bool:
+        if state is None:
+            return False  # never built, or unreachable — same answer either way
+        if state.fingerprint != self._type_fingerprint(ot):
+            # Built from a *different* object-type definition. Every other read
+            # path projects to the declared properties on every read, so
+            # withdrawing a property takes effect there immediately; only the
+            # materialization kept serving it, and each subsequent write copied
+            # it forward. A definition change now invalidates exactly like a
+            # dataset version does — refuse, and let a rebuild republish.
             return False
         dataset = self.catalog.store.get_dataset(ot.backing_dataset)
         version = dataset.latest_version if dataset else None
-        if version is None or state["dataset_version"] != version:
+        if version is None or state.dataset_version != version:
             return False
-        return state["edit_count"] == self.store.count_object_edits(ot.api_name)
+        return state.applied_seq >= self.store.max_edit_seq(ot.api_name)
+
+    def _store_row(self, ot: ObjectTypeDef, obj: dict, ordinal: int,
+                   applied_seq: int = 0) -> ObjectRow:
+        """One object as the store holds it: key, position, title, the search
+        text, and the property bag."""
+        string_props = [
+            name for name, prop in ot.properties.items() if prop.type == "string"
+        ]
+        searchable = " ".join(
+            str(obj[p]) for p in string_props if isinstance(obj.get(p), str)
+        ).lower()
+        return ObjectRow(
+            pk=obj["__pk"], ord=ordinal, title=str(obj.get("__title", "")),
+            search_text=searchable, applied_seq=applied_seq,
+            props={k: v for k, v in obj.items() if not k.startswith("__")},
+        )
+
+    def verify_digest(self, ot: ObjectTypeDef) -> bool:
+        """Recompute the digest from the materialization's own rows.
+
+        A detector nobody runs is not a detector, so this is a real method with
+        a real caller (the rebuild endpoint) rather than a comment. It is the
+        only check that catches a row *nobody logged*: the watermark cannot,
+        because a store that has drifted can be perfectly caught up by position.
+        """
+        state = self.object_store.state(ot.api_name)
+        if state is None:
+            return False
+        page = self.object_store.page(ot.api_name, limit=SEARCH_TOTAL_CAP, offset=0)
+        if page is None:
+            return False
+        rows, _total, _state = page
+        computed = digest_hex(digest_of_rows([
+            {"pk": r["pk"], "applied_seq": r["applied_seq"],
+             "props_json": canonical_props(r["props"])}
+            for r in rows
+        ]))
+        return computed == state.digest
 
     def reindex(self, type_name: str) -> int:
-        """Materialize an object type into the index. Returns the count.
+        """Materialize an object type from scratch. Returns the count.
 
-        Indexing is only worthwhile for types small enough to hold in the
-        metadata store — which is exactly the modelling advice anyway: entities
-        in the ontology, high-volume events in datasets.
+        Materializing is only worthwhile for types small enough to hold in the
+        store — which is exactly the modelling advice anyway: entities in the
+        ontology, high-volume events in datasets.
         """
         ot = self._require_object_type(type_name)
         backing = self.catalog.store.get_dataset(ot.backing_dataset)
         if backing is None or backing.scans_at_source or backing.latest_version is None:
-            # Nothing stable to index against.
-            self.store.drop_object_index(type_name)
+            # Nothing stable to materialize against.
+            self.object_store.drop(type_name)
             return 0
 
-        string_props = [
-            name for name, prop in ot.properties.items() if prop.type == "string"
-        ]
-        rows = []
-        for obj in self._materialize(ot):
-            searchable = " ".join(
-                str(obj[p]) for p in string_props
-                if isinstance(obj.get(p), str)
-            ).lower()
-            rows.append({
-                "pk": obj["__pk"],
-                "title": str(obj.get("__title", "")),
-                "search_text": searchable,
-                "props": {k: v for k, v in obj.items() if not k.startswith("__")},
-            })
-        self.store.replace_object_index(
-            type_name, rows, backing.latest_version,
-            self.store.count_object_edits(type_name),
+        system = self._system_view()
+        # The watermark is read BEFORE the snapshot, deliberately. An edit that
+        # commits in between is either inside the snapshot — rows ahead of the
+        # watermark, which costs one redundant idempotent replay — or outside
+        # it, which is an ordinary lag. Reading it afterwards would let the
+        # watermark claim an edit the rows never included, which is the one
+        # direction this design must never allow.
+        applied_seq = self.store.max_edit_seq(type_name)
+        with system._pinned(ot):
+            # Ordinals come from the same rule the incremental path uses, never
+            # from enumerate(): base rows in file order, created objects at
+            # ORD_CREATED_BASE + edit_seq. Renumbering here would silently
+            # reshuffle page 1 on every rebuild — precisely the bug `ord` was
+            # added to fix. Both reads come off the pinned snapshot, so a
+            # create landing mid-rebuild can no longer be in one and not the
+            # other.
+            ordinals, positions = system._object_ordinals(ot)
+            rows = [
+                system._store_row(ot, obj, ordinals[obj["__pk"]],
+                                  positions.get(obj["__pk"], 0))
+                for obj in system._materialize(ot)
+            ]
+        digest = digest_hex(digest_of_rows([
+            {"pk": r.pk, "applied_seq": r.applied_seq,
+             "props_json": canonical_props(r.props)}
+            for r in rows
+        ]))
+        self.object_store.replace(
+            type_name, rows, dataset_version=backing.latest_version,
+            applied_seq=applied_seq, digest=digest,
+            fingerprint=self._type_fingerprint(ot),
         )
         return len(rows)
+
+    def _object_ordinals(self, ot: ObjectTypeDef) -> tuple[dict[str, int], dict[str, int]]:
+        """(pk -> ordinal, pk -> last edit position), by the rules every path
+        must agree on.
+
+        A create for a key that already exists keeps the base row's ordinal —
+        it is an in-place replacement, which is what ``_materialize`` does when
+        it assigns into a dict that already holds the key. And the positions
+        are the ones an incremental stream would have written, so a rebuild
+        lands on the same digest instead of a different-but-equally-valid one.
+        """
+        ordinals: dict[str, int] = {}
+        positions: dict[str, int] = {}
+        for i, row in enumerate(self._base_rows(ot)):
+            ordinals[str(row.get(ot.primary_key))] = i
+        for edit in self._live_edits(ot):
+            if edit.kind == EditKind.create:
+                pk = str(edit.payload.get(ot.primary_key, edit.pk_value))
+                ordinals.setdefault(pk, created_ord(edit.edit_seq))
+            elif edit.kind == EditKind.delete:
+                ordinals.pop(edit.pk_value, None)
+                positions.pop(edit.pk_value, None)
+                continue
+            else:
+                pk = edit.pk_value
+            positions[pk] = edit.edit_seq
+        return ordinals, positions
+
+    def catch_up(self, type_name: str) -> int:
+        """Replay everything the materialization still owes. Returns the count.
+
+        This is what makes a lag temporary rather than terminal. It runs on the
+        *write* path and on an explicit rebuild — never inside a read: a read
+        that writes breaks read-only replicas, races other readers, and buys
+        only latency on a path that is already correct.
+        """
+        ot = self._require_object_type(type_name)
+        state = self.object_store.state(type_name)
+        if state is None:
+            return 0
+        dataset = self.catalog.store.get_dataset(ot.backing_dataset)
+        version = dataset.latest_version if dataset else None
+        if version is None or state.dataset_version != version:
+            # A version bump is not a delta; only a rebuild expresses it.
+            return 0
+        pending = self.store.list_object_edits_since(type_name, state.applied_seq)
+        applied = 0
+        for edit in pending:
+            if not self._apply_to_store(ot, edit):
+                # Stop rather than skip. Applying N+1 would advance the
+                # watermark past N, and the store would then claim to have
+                # applied an edit it never did — the one direction this design
+                # must never allow. Leaving the lag in place costs a slow read.
+                break
+            applied += 1
+        return applied
 
     def _index_query(
         self,
@@ -279,11 +517,12 @@ class OntologyService:
         limit: int,
         offset: int,
     ) -> Optional[dict]:
-        """Answer from the index when it is fresh and safe to use.
+        """Answer from the materialization when it can prove it is level with
+        the log. ``None`` means "cannot", and every caller falls through.
 
-        Row-level security is not represented in the index — it is per-user,
-        and baking one user's view into a shared table would be a serious bug —
-        so a policied user always falls through to the scan.
+        Row-level security is not represented here — it is per-user, and baking
+        one user's view into a shared table would be a serious bug — so a
+        policied user always falls through to the scan.
         """
         if self._policy_for_dataset(ot.backing_dataset) is not None:
             return None
@@ -293,15 +532,26 @@ class OntologyService:
         filters = filters or {}
         if set(filters) - {ot.primary_key}:
             return None
-        if not self.index_is_fresh(ot):
-            return None
-        rows, total = self.store.search_object_index(
+        page = self.object_store.page(
             ot.api_name, search=search, pk=filters.get(ot.primary_key),
             limit=limit, offset=offset,
         )
+        if page is None:
+            return None
+        rows, total, state = page
+        # Validated *after* the read, against the state the page came from.
+        # Checking first and paging second leaves a window where a write lands
+        # in between and the answer comes from a state nobody validated.
+        if not self._state_is_current(ot, state):
+            return None
+        keep = set(ot.properties) | {ot.primary_key}
         objects = []
         for row in rows:
-            obj = dict(row["props"])
+            # Projected like every other path. The fingerprint check above
+            # should make this unreachable; it is here anyway because "should"
+            # is not a guarantee about a shared table that outlives a process,
+            # and this was the one path that returned a withdrawn property.
+            obj = {k: v for k, v in row["props"].items() if k in keep}
             obj["__pk"] = row["pk"]
             obj["__title"] = row["title"]
             objects.append(obj)
@@ -309,8 +559,9 @@ class OntologyService:
 
     # -- pushdown -----------------------------------------------------------------
 
-    def _overlay(self, ot: ObjectTypeDef) -> tuple[set[str], dict[str, dict], list[dict]]:
-        """Replay the edit log into (deleted pks, updates by pk, created rows).
+    def _overlay(self, ot: ObjectTypeDef):
+        """Replay the edit log into (deleted pks, updates by pk, created rows,
+        create ordinals).
 
         The overlay is a hand-edit log — thousands of entries at most, against
         datasets of millions of rows — so it is always cheap to load whole.
@@ -319,11 +570,23 @@ class OntologyService:
         deleted: set[str] = set()
         updates: dict[str, dict] = {}
         creates: dict[str, dict] = {}
-        for edit in self.store.list_object_edits(ot.api_name):
+        create_ord: dict[str, int] = {}
+        # Whether each create is a *new* object rather than a replacement. A
+        # create that follows a delete of the same key is new even though the
+        # base row is still in the file, and it takes a new position — which is
+        # what in-memory replay does when it pops the key and re-inserts it.
+        fresh: dict[str, bool] = {}
+        for edit in self._live_edits(ot):
             payload = {k: v for k, v in edit.payload.items() if k in keep}
             if edit.kind == EditKind.create:
                 pk = str(payload.get(ot.primary_key, edit.pk_value))
                 creates[pk] = payload
+                # The position a *new* object takes. A create replacing an
+                # existing base row keeps the base ordinal instead; that is
+                # resolved against the scan, which is the only thing that knows
+                # whether the key was already there.
+                create_ord.setdefault(pk, created_ord(edit.edit_seq))
+                fresh[pk] = fresh.get(pk, False) or pk in deleted
                 deleted.discard(pk)
                 updates.pop(pk, None)
             elif edit.kind == EditKind.update:
@@ -335,9 +598,63 @@ class OntologyService:
             elif edit.kind == EditKind.delete:
                 pk = edit.pk_value
                 creates.pop(pk, None)
+                create_ord.pop(pk, None)
+                fresh.pop(pk, None)
                 updates.pop(pk, None)
                 deleted.add(pk)
-        return deleted, updates, creates
+        creates = self._policy_admits(ot, creates)
+        create_ord = {pk: (o, fresh.get(pk, False))
+                      for pk, o in create_ord.items() if pk in creates}
+        return deleted, updates, creates, create_ord
+
+    def _policy_admits(self, ot: ObjectTypeDef, creates: dict[str, dict]) -> dict[str, dict]:
+        """Created objects this user's policy on the backing dataset allows.
+
+        A created object is a whole row that exists only in the overlay, so it
+        never passes through the policied scan the base rows do. Without this,
+        a create carrying ``realm='beleriand'`` is returned to a user restricted
+        to ``realm='valinor'`` — and materializing that overlay into a shared
+        store would make it a durable cross-tenant insert channel.
+
+        Fail closed twice over: a payload that omits the policy column is
+        excluded (a null is never "in" an allowlist), and a payload that cannot
+        be typed against the dataset's own schema is excluded rather than
+        guessed at.
+
+        This is the *read* half. The write half — a create for a key that
+        already exists being a replacement, and therefore a cross-tenant
+        destructive write when the existing row is hidden — is
+        ``_refuse_shadowing_create``.
+
+        NOT IMPLEMENTED: the same check for *updates*. An update cannot
+        introduce a row — it merges onto a base row that already survived the
+        policy — but an update writing over a masked column is still read back
+        in plaintext, and one that moves a row out of the allowed set still
+        shows it to its author. Both need the merged row re-checked, which
+        needs the unmasked base row the policy has already taken away.
+        """
+        policy = self._policy_for_dataset(ot.backing_dataset)
+        if policy is None or not creates:
+            return creates
+        version = self.catalog.store.get_version(ot.backing_dataset, None)
+        if version is None:
+            return {}
+        types = {c.name: c.type for c in version.schema_}
+        pks = list(creates)
+        arrays = {"__pk": pa.array(pks, type=pa.string())}
+        for col, alias in types.items():
+            try:
+                arrays[col] = pa.array(
+                    [creates[pk].get(col) for pk in pks], type=pa.type_for_alias(alias)
+                )
+            except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
+                return {}
+        try:
+            admitted = policy(pa.table(arrays))
+        except Exception:  # noqa: BLE001 - a policy that cannot run admits nothing
+            return {}
+        survivors = set(admitted.column("__pk").to_pylist())
+        return {pk: row for pk, row in creates.items() if pk in survivors}
 
     @contextmanager
     def _object_scan(
@@ -345,6 +662,7 @@ class OntologyService:
         ot: ObjectTypeDef,
         search: Optional[str],
         filters: Optional[dict[str, str]],
+        all_columns: bool = False,
     ):
         """Yield ``(con, sql, params, cols, pk)`` for one object type's rows,
         or ``(None, ...)`` when the pushdown can't be done faithfully.
@@ -398,9 +716,16 @@ class OntologyService:
             return
         # Project exactly what _materialize would keep: declared properties
         # that actually exist in the dataset, plus the primary key.
-        cols = [c for c in available if c in (set(ot.properties) | {pk})]
+        #
+        # ...unless the caller is folding the overlay back into the dataset, in
+        # which case it needs every column. An object type almost never declares
+        # every column of its backing dataset, and writing back the projection
+        # would delete the undeclared ones — silent data loss landing on
+        # downstream transforms rather than on the ontology.
+        cols = (list(available) if all_columns
+                else [c for c in available if c in (set(ot.properties) | {pk})])
 
-        deleted, updates, creates = self._overlay(ot)
+        deleted, updates, creates, create_ord = self._overlay(ot)
         con = duckdb.connect()
         try:
             # The base scan is a registered Arrow object, so this connection
@@ -411,7 +736,7 @@ class OntologyService:
             con.register("__base", base_scan)
             try:
                 base = self._register_overlay_tables(
-                    con, cols, available, updates, creates
+                    con, cols, available, updates, creates, create_ord
                 )
             except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
                 yield empty  # a payload we can't type faithfully; be exact instead
@@ -618,26 +943,45 @@ class OntologyService:
         available: dict[str, str],
         updates: dict[str, dict],
         creates: dict[str, dict],
+        create_ord: dict[str, int],
     ) -> dict[str, bool]:
         """Register the (small) update and create sets as typed Arrow tables so
         DuckDB can merge them with the base scan. Raises if a payload value
         can't be represented in the dataset's own column type."""
         registered = {"updates": False, "creates": False}
 
-        def build(by_pk: dict[str, dict]) -> pa.Table:
+        def build(by_pk: dict[str, dict], ordinals=None, mask: bool = False) -> pa.Table:
             arrays = {"__pk": pa.array(list(by_pk), type=pa.string())}
             for col in cols:
                 typ = pa.type_for_alias(available[col])
                 arrays[col] = pa.array(
                     [row.get(col) for row in by_pk.values()], type=typ
                 )
+                if mask:
+                    # Whether this update *assigned* the column, as distinct
+                    # from leaving it alone. COALESCE cannot tell those apart,
+                    # so an update clearing a property to NULL had no
+                    # expression at all: folding one silently restored the old
+                    # value, and — worse — once the create an update was
+                    # merging into had been folded into the base, a null
+                    # assignment that had been working stopped working.
+                    arrays[f"__set__{col}"] = pa.array(
+                        [col in row for row in by_pk.values()], type=pa.bool_()
+                    )
+            if ordinals is not None:
+                arrays["__cord"] = pa.array(
+                    [ordinals[pk][0] for pk in by_pk], type=pa.int64()
+                )
+                arrays["__fresh"] = pa.array(
+                    [ordinals[pk][1] for pk in by_pk], type=pa.bool_()
+                )
             return pa.table(arrays)
 
         if updates:
-            con.register("__ovl_updates", build(updates))
+            con.register("__ovl_updates", build(updates, mask=True))
             registered["updates"] = True
         if creates:
-            con.register("__ovl_creates", build(creates))
+            con.register("__ovl_creates", build(creates, create_ord))
             registered["creates"] = True
         return registered
 
@@ -653,6 +997,7 @@ class OntologyService:
     ) -> tuple[str, list]:
         q = lambda c: '"' + c.replace('"', '""') + '"'  # noqa: E731
         params: list = []
+        prefix = ""
         projection = ", ".join(q(c) for c in cols)
 
         # Base scan, de-duplicated last-wins on the primary key and kept in
@@ -685,8 +1030,15 @@ class OntologyService:
 
         if registered["updates"]:
             # Updates apply in place, so an updated object keeps its position.
+            # The per-column `__set__` flag, not COALESCE: an update that
+            # assigns NULL is an assignment, and COALESCE reads it as "no
+            # update" — which is how a null-clearing edit could be silently
+            # undone by a fold. A row with no matching update has the flag as
+            # NULL, so CASE falls to the base value.
             merged_cols = ", ".join(
-                f"COALESCE(u.{q(c)}, b.{q(c)}) AS {q(c)}" for c in cols
+                f"CASE WHEN u.{q('__set__' + c)} THEN u.{q(c)} "
+                f"ELSE b.{q(c)} END AS {q(c)}"
+                for c in cols
             )
             body = (
                 f"SELECT {merged_cols}, b.__ord FROM ({base}) b "
@@ -697,11 +1049,49 @@ class OntologyService:
             body = f"SELECT {projection}, __ord FROM ({base})"
 
         if registered["creates"]:
-            # Created objects are appended after the base rows, as in-memory
-            # materialization does.
+            # Two rules, both matching what in-memory materialization does when
+            # it assigns into a dict:
+            #
+            #   * a create for a key that is NOT in the base data is a new
+            #     object and sorts after every base row, by edit position —
+            #     not by a constant. Every create used to carry
+            #     9223372036854775807, which left them all tied under
+            #     ORDER BY __ord and made paging non-deterministic once there
+            #     was more than one.
+            #   * a create for a key that IS in the base data replaces that row
+            #     *in place* and keeps its ordinal, so the page someone is
+            #     looking at does not reshuffle. The base row is dropped below
+            #     rather than emitted alongside — otherwise the object appears
+            #     twice, which is exactly how the pushdown and the in-memory
+            #     path came to disagree on the object count.
+            #
+            # The merged base goes in a CTE so it is *written* once: repeating
+            # the subquery would repeat its bound parameters too, and the two
+            # copies would silently consume each other's values.
+            # A create assigns the *declared* properties absolutely and says
+            # nothing about any other column of the backing dataset. Taking
+            # `c.<col>` for an undeclared column wrote NULL over whatever the
+            # replaced base row held — the exact silent loss the all_columns
+            # projection exists to prevent, arriving through the create branch
+            # instead. A create that follows a delete inherits nothing, so it
+            # keeps the NULL.
+            declared = set(ot.properties) | {pk}
+            create_cols = ", ".join(
+                (f"c.{q(c)} AS {q(c)}" if c in declared
+                 else f"CASE WHEN c.__fresh THEN NULL ELSE m.{q(c)} END AS {q(c)}")
+                for c in cols
+            )
+            prefix = f"WITH __merged AS ({body}) "
             body = (
-                f"{body} UNION ALL SELECT {projection}, "
-                f"9223372036854775807 AS __ord FROM __ovl_creates"
+                f"SELECT {create_cols}, "
+                f"CASE WHEN c.__fresh THEN c.__cord "
+                f"ELSE COALESCE(m.__ord, c.__cord) END AS __ord "
+                f"FROM __ovl_creates c LEFT JOIN __merged m "
+                f"ON CAST(m.{q(pk)} AS VARCHAR) = c.__pk"
+                f" UNION ALL "
+                f"SELECT {projection}, __ord FROM __merged "
+                f"WHERE CAST({q(pk)} AS VARCHAR) NOT IN "
+                f"(SELECT __pk FROM __ovl_creates)"
             )
 
         where: list[str] = []
@@ -722,7 +1112,7 @@ class OntologyService:
             where.append(f"CAST({q(prop)} AS VARCHAR) = ?")
             params.append(str(value))
 
-        sql = f"SELECT * FROM ({body}) o"
+        sql = f"{prefix}SELECT * FROM ({body}) o"
         if where:
             sql += " WHERE " + " AND ".join(where)
         if search and ot.title_property and ot.title_property in cols:
@@ -743,16 +1133,29 @@ class OntologyService:
         return sql, params
 
     def _materialize(self, ot: ObjectTypeDef) -> list[dict]:
-        """Base rows with the edit overlay applied, in stable order."""
+        """Base rows with the edit overlay applied, in stable order.
+
+        The exact path, and the oracle: it replays the log directly, so it is
+        the definition the other two paths are checked against.
+        """
         keep = set(ot.properties) | {ot.primary_key}
         objects: dict[str, dict] = {}
         for row in self._base_rows(ot):
             objects[str(row.get(ot.primary_key))] = row
-        for edit in self.store.list_object_edits(ot.api_name):
+        # Created objects are subject to the same policy the base rows went
+        # through; see _policy_admits for why an unpoliced create is a
+        # cross-tenant insert channel rather than a cosmetic inconsistency.
+        admitted = self._overlay(ot)[2]
+        # Resolved once: a created object carries every declared column the
+        # dataset has, so its shape does not change when the overlay is folded.
+        pad = {c: None for c in self._declared_columns(ot)}
+        for edit in self._live_edits(ot):
             if edit.kind == EditKind.create:
                 payload = {k: v for k, v in edit.payload.items() if k in keep}
                 pk = str(payload.get(ot.primary_key, edit.pk_value))
-                objects[pk] = payload
+                if pk not in admitted:
+                    continue
+                objects[pk] = {**pad, **payload}
             elif edit.kind == EditKind.update:
                 target = objects.get(edit.pk_value)
                 if target is not None:
@@ -834,6 +1237,13 @@ class OntologyService:
     def get(self, type_name: str, pk: str) -> Optional[dict]:
         ot = self._require_object_type(type_name)
         pk = str(pk)
+        # Through the store first, for the same reason query() does: without
+        # this, apply_action's existence check still pays a full scan on every
+        # write and "writes are O(1)" is simply not true.
+        indexed = self._index_query(ot, None, {ot.primary_key: pk}, 1, 0)
+        if indexed is not None:
+            objects = indexed["objects"]
+            return objects[0] if objects else None
         # A point lookup shouldn't cost a full scan: filter on the primary key
         # in DuckDB when possible.
         pushed = self._sql_query(ot, None, {ot.primary_key: pk}, limit=1, offset=0)
@@ -887,10 +1297,329 @@ class OntologyService:
             if o.get(other_prop) is not None and str(o.get(other_prop)) == key
         ]
 
-    def edits(self, type_name: str) -> list[ObjectEdit]:
-        return self.store.list_object_edits(type_name)
+    def edits(self, type_name: str, live_only: bool = True) -> list[ObjectEdit]:
+        return self.store.list_object_edits(type_name, live_only=live_only)
+
+    # -- writeback ----------------------------------------------------------------
+
+    def backing_is_transform_produced(self, ot: ObjectTypeDef) -> Optional[str]:
+        """The transform that produces this object type's backing dataset, if any.
+
+        This is the hazard that actually matters for writeback, and it is not
+        federation. Today an edit survives a rebuild because it is replayed on
+        every read. Folding destroys that: fold into version 7, mark the edits
+        folded, and tonight's build writes version 8 from upstream with no trace
+        of them. Hand edits revert silently, hours later, with no error anywhere
+        — a regression worse than the problem being solved, because it is
+        invisible.
+        """
+        for edge in self.catalog.store.list_lineage():
+            if edge.downstream_dataset == ot.backing_dataset:
+                return edge.transform_name
+        # *Any* version, not just the latest. Writeback stamps its own version
+        # `source='writeback'` and compaction stamps `'compact'`, so asking only
+        # about the latest version made this guard erode itself: one deliberate
+        # override erased the evidence, and every fold after that proceeded with
+        # no warning that tonight's build would revert the edits. A dataset a
+        # transform has ever produced is a dataset a transform can produce again.
+        for version in self.catalog.store.list_versions(ot.backing_dataset):
+            if version.source == "transform":
+                return "a transform"
+        return None
+
+    @staticmethod
+    def _refuse_duplicate_keys(con, ot: ObjectTypeDef, pk: str) -> None:
+        """Refuse to fold a dataset whose primary key is not unique.
+
+        The object view de-duplicates last-wins in a window function, so it
+        never showed the extra rows; the fold *materializes* that dedup into
+        the dataset. One unrelated hand edit was therefore enough to delete
+        rows no edit ever referenced — measured, five rows to three — and they
+        are gone for ``catalog.read()``, every downstream transform, every
+        dashboard, and any other object type bound to the same dataset under a
+        different key. Nothing in the audit trail names them.
+
+        So: refuse, and say what to do about it. Deduplicating is a
+        transformation of the data and belongs in a transform, where it is
+        visible and reviewable, not as a side effect of saving an edit.
+        """
+        quoted = '"' + pk.replace('"', '""') + '"'
+        extra = con.execute(
+            f"SELECT COALESCE(sum(n), 0) - count(*) FROM ("
+            f"  SELECT count(*) AS n FROM __base "
+            f"  GROUP BY CAST({quoted} AS VARCHAR) HAVING count(*) > 1)"
+        ).fetchone()[0]
+        if extra:
+            raise ValueError(
+                f"Cannot fold object type {ot.api_name!r}: dataset "
+                f"{ot.backing_dataset!r} has {int(extra)} row(s) sharing a "
+                f"{pk!r} value with another row. The object view hides them by "
+                f"keeping the last of each key; folding would delete them from "
+                f"the dataset for every other reader. De-duplicate with a "
+                f"transform first."
+            )
+
+    def writeback(
+        self, type_name: str, actor: str = "anonymous", allow_transform_backed: bool = False
+    ) -> dict:
+        """Fold the edit overlay into a new dataset version, and shrink the log.
+
+        Nothing is mutated in place: this mints a version whose rows already
+        have the overlay applied, then marks those edits folded so the read
+        paths stop replaying them.
+
+        ``write``, not ``append``: an overlay *delete* has no expression as an
+        appended row, and an update expressed as one leaves both rows. The
+        last-wins dedup that would nearly rescue that lives only in the object
+        query's window function — ``catalog.read()``, dashboards and every
+        downstream transform see the raw parts — so folding via append would
+        make the dataset disagree with the object view about how many rows
+        exist.
+        """
+        ot = self._require_object_type(type_name)
+        backing = self.catalog.store.get_dataset(ot.backing_dataset)
+        if backing is None or backing.latest_version is None:
+            raise ValueError(f"Dataset {ot.backing_dataset!r} has no versions to fold into")
+        if backing.scans_at_source:
+            raise ValueError(
+                f"Object type {type_name!r} is backed by {backing.kind} dataset "
+                f"{ot.backing_dataset!r}, which is scanned at the source and has "
+                f"no version for Laurelin to write. Materialize the rows you need "
+                f"with a transform and bind the object type to that."
+            )
+        transform = self.backing_is_transform_produced(ot)
+        if transform and not allow_transform_backed:
+            raise ValueError(
+                f"Dataset {ot.backing_dataset!r} is produced by transform "
+                f"{transform!r}. Folding edits into it would hand them to the "
+                f"next build to overwrite, silently. Override deliberately if "
+                f"this is a one-shot import."
+            )
+
+        # T0 — capture the exact edits being folded, as an explicit id list.
+        # Never "all edits for this type", never `seq <= max_seq`: on Postgres
+        # a reader can see 42 without seeing 41, and marking a range would mark
+        # 41 folded when it never was, losing it unrecoverably.
+        system = self._system_view()
+        live = self.store.list_object_edits(type_name, live_only=True)
+        if not live:
+            return {"object_type": type_name, "folded": 0,
+                    "version": backing.latest_version, "objects": None}
+        edit_ids = [e.id for e in live]
+        base_version = backing.latest_version
+
+        # T1 — build the folded table. Policy is off by construction (system
+        # view): a fold run as one user would rewrite the dataset *as they see
+        # it*, deleting every row their RLS hides, for everyone.
+        with system._object_scan(ot, None, None, all_columns=True) as (con, sql, params, cols, pk):
+            if con is None:
+                raise ValueError(
+                    f"Cannot fold object type {type_name!r}: its overlay cannot be "
+                    f"applied to dataset {ot.backing_dataset!r} faithfully."
+                )
+            with limits.limited(con, limits.QueryLimits.build()):
+                # Inside the budget: it is a full aggregate over the base, and
+                # a fold is not a licence to run an unbounded one.
+                self._refuse_duplicate_keys(con, ot, pk)
+                folded = con.execute(sql, params).arrow()
+        if isinstance(folded, pa.RecordBatchReader):
+            folded = folded.read_all()
+        folded = folded.drop_columns(["__ord"]) if "__ord" in folded.column_names else folded
+
+        # T2 — publish, or fail, atomically against the base we read.
+        #
+        # This *was* a read-the-version-then-write check, and the gap between
+        # the two was reachable by anything: two operators, a double click, a
+        # client retry, a nightly build. `_commit_version` arbitrates version
+        # *numbers*, not content, so a writer that loses simply takes the next
+        # integer — publishing V+2 rebuilt from V and dropping V+1's rows
+        # entirely. Measured both ways round: a concurrent fold lost a
+        # committed edit that the other fold had already marked folded
+        # (unrecoverable — the live log was empty), and a concurrent transform
+        # build lost its whole version.
+        #
+        # `expect_version` is the same check with no gap: the row insert either
+        # takes exactly base+1 or nothing is registered. A fold is cheap to
+        # retry and there is no sound way to rebase one.
+        result = self.catalog.write(
+            ot.backing_dataset, folded, source="writeback",
+            expect_version=base_version,
+        )
+
+        # T3 — mark, after the write, never before. Crash between T2 and T3 and
+        # the folded edits replay on top of themselves: every edit kind is an
+        # absolute assignment, so the result is correct, merely not yet cheaper.
+        # Reversed, edits would be marked folded but never written — gone from
+        # the read path and from the dataset, unrecoverably.
+        marked = self.store.mark_edits_folded(edit_ids, result.version)
+        self.store.log_audit(
+            "object_edits_folded",
+            {"object_type": type_name, "dataset": ot.backing_dataset,
+             "version": result.version, "edits": marked, "rows": result.row_count},
+            actor=actor,
+        )
+        # T4 — the new version invalidates the materialization the same way a
+        # build does, so rebuild it now rather than leaving reads on the scan.
+        objects = self.reindex(type_name) if self.object_store.state(type_name) else None
+        return {"object_type": type_name, "folded": marked, "version": result.version,
+                "row_count": result.row_count, "objects": objects}
+
+    # -- the write path -----------------------------------------------------------
+
+    def _record_edit(self, ot: ObjectTypeDef, edit: ObjectEdit) -> int:
+        """Commit the edit and stamp the position it was given onto it, so the
+        caller holds the same identity the log does."""
+        edit.edit_seq = self._commit_edit(ot, edit)
+        return edit.edit_seq
+
+    def _commit_edit(self, ot: ObjectTypeDef, edit: ObjectEdit) -> int:
+        """Record one edit, and apply it to the materialization if there is one.
+
+        Three cases, and the third is the interesting one:
+
+        * not materialized — append to the log; nothing else exists to update.
+        * materialized and level with the log — one transaction that appends
+          the edit *and* upserts the affected rows. This is the whole feature:
+          a write no longer throws the materialization away.
+        * materialized but behind — catch up first, then commit. If catching up
+          is not possible (a new dataset version, an unreachable store), append
+          to the log alone and let the read path detect the lag. The write is
+          never failed for a materialization's sake: the edit log is the source
+          of truth and every read path can replay it.
+        """
+        state = self.object_store.state(ot.api_name)
+        if state is None:
+            return self.store.add_object_edit(edit)
+        if not self._state_is_current(ot, state):
+            self.catch_up(ot.api_name)
+            if not self.store_is_caught_up(ot):
+                return self.store.add_object_edit(edit)
+        try:
+            return self.object_store.commit_edit(
+                edit, pks=self._edit_pks(ot, edit),
+                build=lambda pre_image, seq: self._rows_for_edit(ot, edit, pre_image, seq),
+            )
+        except Exception:  # noqa: BLE001
+            # Safe *because* commit_edit is all-or-nothing (see
+            # ObjectStore.commit_edit): reaching here means nothing was logged,
+            # so appending is a recovery rather than a duplicate. A remote
+            # store being unreachable must not fail a user's write.
+            return self.store.add_object_edit(edit)
+
+    @staticmethod
+    def _edit_pks(ot: ObjectTypeDef, edit: ObjectEdit) -> list[str]:
+        """The keys one edit touches, from the edit alone.
+
+        The store needs these *before* the builder runs: it reads their current
+        rows inside the write transaction and hands them over, which is what
+        keeps the merge from being a read-modify-write across two connections.
+        """
+        if edit.kind == EditKind.create:
+            return [str(edit.payload.get(ot.primary_key, edit.pk_value))]
+        return [edit.pk_value]
+
+    def _apply_to_store(self, ot: ObjectTypeDef, edit: ObjectEdit) -> bool:
+        """Apply an already-logged edit to the materialization. True if applied.
+
+        Only a *store* failure returns False, and the caller must then stop.
+        """
+        try:
+            self.object_store.apply_edit(
+                edit, pks=self._edit_pks(ot, edit),
+                build=lambda pre_image, seq: self._rows_for_edit(ot, edit, pre_image, seq),
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def _rows_for_edit(
+        self, ot: ObjectTypeDef, edit: ObjectEdit, pre_image: dict[str, dict], seq: int
+    ) -> tuple[list[ObjectRow], list[str]]:
+        """The rows one edit writes, given the current rows for the keys it
+        touches and the log position it was actually given.
+
+        Both arguments come from the store, from inside the transaction that
+        will write the result. That is the whole point: this is a
+        read-modify-write, and it used to read on one connection and write on
+        another. Two concurrent updates to one object then merged onto the same
+        pre-image and one committed edit vanished; a delete racing an update
+        let the update re-insert the row the delete had removed. And ``seq``
+        used to be a guess at ``MAX(edit_seq) + 1``, so four concurrent creates
+        all took the same ordinal.
+
+        The pre-image is unpoliced by construction, so a policied editor's
+        masked, row-filtered view can never be written into a table everyone
+        shares. The *existence* check in ``apply_action`` stays on the policied
+        path, where it belongs — pointing it at an unfiltered store would turn
+        it into an enumeration oracle over other tenants' keys.
+        """
+        keep = set(ot.properties) | {ot.primary_key}
+        payload = {k: v for k, v in edit.payload.items() if k in keep}
+        if edit.kind == EditKind.delete:
+            return [], [edit.pk_value]
+        pk = (str(payload.get(ot.primary_key, edit.pk_value))
+              if edit.kind == EditKind.create else edit.pk_value)
+        existing = pre_image.get(pk)
+        if edit.kind == EditKind.create:
+            # A create is an absolute assignment: nothing is inherited from a
+            # deleted-and-recreated object, or from a row this key replaces.
+            props = self._pad_declared(ot, payload)
+            ordinal = int(existing["ord"]) if existing else created_ord(seq)
+        else:
+            if existing is None:
+                # No such object. In-memory replay makes this exact edit a
+                # no-op (`objects.get(pk)` is None, so nothing is updated), so
+                # writing nothing and advancing the watermark keeps the two
+                # paths saying the same thing. Declining instead would leave a
+                # permanent lag for an edit that has no effect anywhere.
+                return [], []
+            # The pre-image is projected too. Filtering only the payload let a
+            # property withdrawn from the ontology ride along in the stored
+            # bag forever, refreshed by every subsequent write.
+            props = {k: v for k, v in json.loads(existing["props_json"]).items()
+                     if k in keep}
+            props.update(payload)
+            ordinal = int(existing["ord"])
+        obj = {**props, "__pk": pk, "__title": ot.title_for(props)}
+        return [self._store_row(ot, obj, ordinal, seq)], []
 
     # -- actions ------------------------------------------------------------------
+
+    def _refuse_shadowing_create(self, ot: ObjectTypeDef, pk_value: str) -> None:
+        """A caller under a dataset policy may not create over an existing key.
+
+        A create for a key that already exists is a *replacement*: it takes
+        over that object's ordinal in the shared materialization, and a
+        writeback folds it over that row in the dataset itself. For a caller
+        whose row-level security hides the existing row, that is a cross-tenant
+        destructive write, and it was reachable with nothing more than EDITOR
+        on the object type — measured: an editor confined to one realm replaced
+        another realm's row, the store, the victim's scan and the attacker's
+        scan then gave three different answers for one key, and a fold made it
+        permanent and deleted the victim's data for everyone.
+
+        ``_policy_admits`` closed the half where a policied user *reads* an
+        overlay create. This is the half where they *write* one.
+
+        The check is unpoliced, because the policied view is exactly what
+        cannot see the row being clobbered, and it refuses for *any* existing
+        key rather than only a hidden one — so a refusal does not distinguish
+        "yours" from "someone else's". Callers with no policy on the backing
+        dataset keep create-as-replacement, which is the documented behaviour
+        and is not a cross-tenant operation for them.
+
+        Residual, stated rather than hidden: this remains an existence oracle
+        over the key space. A policied caller learns that *some* object holds
+        the key they just named. That is inherent to a shared unique key, and
+        no property of the hidden object is disclosed.
+        """
+        if self._policy_for_dataset(ot.backing_dataset) is None:
+            return
+        if self._system_view().get(ot.api_name, pk_value) is not None:
+            raise ValueError(
+                f"Cannot create {ot.api_name!r} object with primary key "
+                f"{pk_value!r}: an object with that key already exists."
+            )
 
     def apply_action(
         self,
@@ -942,6 +1671,7 @@ class OntologyService:
                     f"{ot.primary_key!r} in parameters"
                 )
             pk_value = str(payload[ot.primary_key])
+            self._refuse_shadowing_create(ot, pk_value)
         else:
             if pk is None:
                 raise ValueError(
@@ -961,7 +1691,7 @@ class OntologyService:
             payload=payload,
             actor=actor,
         )
-        self.store.add_object_edit(edit)
+        self._record_edit(ot, edit)
         self.store.log_audit(
             "action_applied",
             {

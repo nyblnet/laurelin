@@ -101,7 +101,56 @@ class Connection:
 
 
 def _split_statements(script: str) -> list[str]:
-    return [s.strip() for s in script.split(";") if s.strip()]
+    """Split a DDL script into statements, ignoring semicolons that aren't
+    separators.
+
+    A plain ``script.split(";")`` was wrong, and wrong in a way that only broke
+    PostgreSQL: SQLite runs the script through native ``executescript`` and
+    never sees this function. So a semicolon written inside a ``--`` comment cut
+    the enclosing CREATE TABLE in half and psycopg raised "syntax error at end
+    of input" — meaning a Postgres deployment could not build its schema at all,
+    from one character inside a sentence.
+
+    Semicolons inside single-quoted literals are skipped for the same reason:
+    the schema does not have one today, but the next DEFAULT that does would
+    fail identically, and the failure mode is a server that will not start.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    in_line_comment = False
+    in_string = False
+    i = 0
+    while i < len(script):
+        ch = script[i]
+        nxt = script[i + 1] if i + 1 < len(script) else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            current.append(ch)
+        elif in_string:
+            # '' is an escaped quote inside a literal, not the end of one.
+            if ch == "'" and nxt == "'":
+                current.append(ch)
+                current.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_string = False
+            current.append(ch)
+        elif ch == "-" and nxt == "-":
+            in_line_comment = True
+            current.append(ch)
+        elif ch == "'":
+            in_string = True
+            current.append(ch)
+        elif ch == ";":
+            statements.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    statements.append("".join(current))
+    return [s.strip() for s in statements if s.strip()]
 
 
 # --------------------------------------------------------------------------- backends
@@ -131,6 +180,18 @@ class Backend:
         """
         return None
 
+    def is_unique_violation(self, exc: BaseException) -> bool:
+        """Whether this error is "someone else already took that key".
+
+        Needed because the edit log allocates its own gapless position as
+        MAX+1 and lets a UNIQUE index arbitrate. That is the right design — it
+        is what makes the sequence gapless, which is what makes a catch-up
+        watermark a complete description of the lag — but it means the loser of
+        a race must *retry*, not fail. Distinguishing that one error from every
+        other integrity error is the whole job of this method.
+        """
+        return "IntegrityError" in {t.__name__ for t in type(exc).__mro__}
+
     # -- accelerated substring search ------------------------------------------
     #
     # Object search is a case-insensitive substring match, and that definition
@@ -150,8 +211,28 @@ class Backend:
 
     def sync_search_index(self, conn: Connection, object_type: str,
                           rows: list[tuple[str, str]]) -> None:
-        """Mirror ``(pk, search_text)`` for one object type. No-op when the
-        acceleration needs no separate storage."""
+        """Mirror ``(pk, search_text)`` for one object type, replacing whatever
+        was there. No-op when the acceleration needs no separate storage.
+
+        Whole-type replacement — right for a rebuild, catastrophic per edit.
+        See :meth:`upsert_search_rows`.
+        """
+        return None
+
+    def upsert_search_rows(self, conn: Connection, object_type: str,
+                           rows: list[tuple[str, str]]) -> None:
+        """Mirror *these* pks only, leaving every other row alone.
+
+        The whole-type sync above is O(objects). Calling it once per single-row
+        edit would make each write cost the entire type, which is exactly the
+        pathology the incremental store exists to remove — and it would be
+        invisible on Postgres, whose trigram index needs no mirror at all. So
+        the incremental write path has its own per-pk entry point.
+        """
+        return None
+
+    def delete_search_rows(self, conn: Connection, object_type: str,
+                           pks: list[str]) -> None:
         return None
 
     def clear_search_index(self, conn: Connection, object_type: str) -> None:
@@ -198,6 +279,9 @@ class SQLiteBackend(Backend):
     def insert_or_ignore(self, table: str, columns: str, placeholders: str) -> str:
         return f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})"
 
+    def is_unique_violation(self, exc: BaseException) -> bool:
+        return isinstance(exc, sqlite3.IntegrityError) and "UNIQUE" in str(exc).upper()
+
     # SQLite has no way to index a leading-wildcard LIKE on an ordinary column,
     # so the trigram tokenizer is exposed through an FTS5 virtual table that
     # mirrors (object_type, pk, search_text). It is written in the same
@@ -226,6 +310,28 @@ class SQLiteBackend(Backend):
         conn.executemany(
             "INSERT INTO object_search (object_type, pk, search_text) VALUES (?, ?, ?)",
             [(object_type, pk, text) for pk, text in rows],
+        )
+
+    def upsert_search_rows(self, conn: Connection, object_type: str,
+                           rows: list[tuple[str, str]]) -> None:
+        if not self.ensure_search_index(conn) or not rows:
+            return
+        # FTS5 external tables have no ON CONFLICT, so delete-then-insert the
+        # affected pks. Bounded by len(rows), not by the type's size.
+        self.delete_search_rows(conn, object_type, [pk for pk, _ in rows])
+        conn.executemany(
+            "INSERT INTO object_search (object_type, pk, search_text) VALUES (?, ?, ?)",
+            [(object_type, pk, text) for pk, text in rows],
+        )
+
+    def delete_search_rows(self, conn: Connection, object_type: str,
+                           pks: list[str]) -> None:
+        if not pks or not self.ensure_search_index(conn):
+            return
+        placeholders = ", ".join("?" for _ in pks)
+        conn.execute(
+            f"DELETE FROM object_search WHERE object_type = ? AND pk IN ({placeholders})",
+            (object_type, *pks),
         )
 
     def clear_search_index(self, conn: Connection, object_type: str) -> None:
@@ -326,6 +432,11 @@ class PostgresBackend(Backend):
             f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
             "ON CONFLICT DO NOTHING"
         )
+
+    def is_unique_violation(self, exc: BaseException) -> bool:
+        from psycopg import errors
+
+        return isinstance(exc, errors.UniqueViolation)
 
 
 def make_backend(path_or_url: Path | str, schema: Optional[str] = None) -> Backend:

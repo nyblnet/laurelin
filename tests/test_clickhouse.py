@@ -413,3 +413,81 @@ def test_the_dataset_list_no_longer_leaks_the_source(tmp_path):
 
     detail = admin.get("/api/v1/datasets/fed").json()
     assert "hunter2" not in str(detail)
+
+
+# -- the sandbox claim, checked rather than repeated ----------------------------
+
+def test_the_filesystem_exposure_is_the_same_as_the_federated_path(env, tmp_path):
+    """A review flagged chdb's missing sandbox as a step down from federation.
+    It is not, for the one source type this backend supports, and the docstring
+    used to imply otherwise.
+
+    ``federation.connect`` disables the local filesystem only when the source
+    is *not* local — object storage gets no local access, a local Parquet path
+    keeps what it needs to read itself. ClickHouse sources are local Parquet
+    paths by definition, so the federated reader of the same file is equally
+    unrestricted. Registering either is "may read any file this process can
+    read", which is why both are admin-only and behind the workbench gate.
+
+    Asserted because the alternative is two docstrings drifting apart on a
+    security property nobody re-measures.
+    """
+    from laurelin.core import federation
+
+    _, _, _, source = env
+    assert federation.is_local_source(source), "a parquet path is a local source"
+
+    outsider = tmp_path / "outside.parquet"
+    pq.write_table(pa.table({"secret": ["x"]}), outsider)
+
+    con = federation.connect(source)
+    try:
+        reached = con.execute(
+            f"SELECT count(*) FROM read_parquet('{outsider}')"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert reached == 1, (
+        "the federated reader reaches outside its own source too — so chdb's "
+        "lack of a sandbox is parity, not a regression"
+    )
+
+
+def test_a_genuinely_renamed_masked_column_is_still_served_in_the_clear(env):
+    """The limitation the confusable guard does *not* close, pinned so it stays
+    visible.
+
+    Laurelin does not own a ClickHouse source file, so its schema can change
+    with no Laurelin operation at all. A mask naming a column that is simply
+    gone is skipped by design — otherwise every dropped column would deny a
+    whole dataset — and a rename is indistinguishable from a drop plus an add.
+    ``ssn`` -> ``ssn_full`` therefore serves plaintext under the new name, with
+    no error and no audit entry.
+
+    What *is* closed: case, whitespace and unicode-form near-misses, which are
+    typos rather than schema evolution (see tests/test_dialects.py). If someone
+    ever closes the rest — a registered schema fingerprint, re-confirmed on
+    read — this test is the one to change.
+    """
+    catalog, store, perms, source = env
+    catalog.register_clickhouse("evolving", source)
+    store.set_dataset_policy("evolving", {
+        "dataset": "evolving",
+        "row_policy": None,
+        "column_masks": [{"column": "ssn", "mode": "redact", "exempt": []}],
+    })
+    viewer = User(id="9", username="vic", role=Role.viewer)
+    masked = catalog.source_table(
+        "evolving", sql_policy_for=perms.sql_policy_fn(viewer)
+    )
+    assert set(masked.column("ssn").to_pylist()) == {"***"}
+
+    # The source is rewritten under us with the column renamed.
+    renamed = events().rename_columns(
+        ["ssn_full" if n == "ssn" else n for n in events().column_names]
+    )
+    pq.write_table(renamed, source["path"])
+    served = catalog.source_table(
+        "evolving", sql_policy_for=perms.sql_policy_fn(viewer)
+    )
+    assert served.column("ssn_full").to_pylist() == events().column("ssn").to_pylist()

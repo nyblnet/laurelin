@@ -27,6 +27,22 @@ object_types:
     properties:
       name: {type: string}
       realm: {type: string}
+actions:
+  - api_name: rename
+    object_type: place
+    kind: update
+    parameters:
+      realm: {type: string, required: true}
+  - api_name: settle
+    object_type: place
+    kind: create
+    parameters:
+      name: {type: string, required: true}
+      realm: {type: string, required: true}
+  - api_name: abandon
+    object_type: place
+    kind: delete
+    parameters: {}
 """
 
 PLACES = ["Minas Tirith", "Minas Morgul", "Osgiliath", "Edoras", "minas-anor"]
@@ -104,6 +120,81 @@ def test_dropping_the_index_clears_the_search_mirror(svc):
             ).fetchone()["n"]
             assert left == 0, "a mirror outliving its index would answer for a ghost"
     assert svc.query("place", search="minas", limit=50)["total"] == 3
+
+
+def test_an_edit_syncs_only_its_own_row_in_the_mirror(tmp_path):
+    """The mirror is written per pk, not per object type.
+
+    The whole-type sync is right for a rebuild and catastrophic per edit: it
+    deletes and reinserts every row of the type, making a single-row write
+    O(objects) and silently handing back everything the incremental store buys.
+    Asserted on SQLite specifically, because Postgres has no mirror at all —
+    pg_trgm indexes the column in place — so a Postgres-only run would not
+    notice the regression.
+    """
+    svc = make(tmp_path, name="mirror")
+    assert svc.store.backend.dialect == "sqlite"
+    svc.reindex("place")
+
+    calls = {"whole_type": 0, "per_pk": []}
+    backend = svc.store.backend
+    original_sync, original_upsert = backend.sync_search_index, backend.upsert_search_rows
+
+    def counting_sync(conn, object_type, rows):
+        calls["whole_type"] += 1
+        return original_sync(conn, object_type, rows)
+
+    def counting_upsert(conn, object_type, rows):
+        calls["per_pk"].append([pk for pk, _ in rows])
+        return original_upsert(conn, object_type, rows)
+
+    backend.sync_search_index = counting_sync
+    backend.upsert_search_rows = counting_upsert
+    try:
+        svc.apply_action("rename", pk="Edoras", parameters={"realm": "rohan"})
+    finally:
+        backend.sync_search_index = original_sync
+        backend.upsert_search_rows = original_upsert
+
+    assert calls["whole_type"] == 0, "one edit must not rewrite the whole mirror"
+    assert calls["per_pk"] == [["Edoras"]]
+    # …and search still finds the object by its new text.
+    assert {o["__pk"] for o in svc.query("place", search="rohan", limit=10)["objects"]} == {
+        "Edoras"}
+
+
+def test_search_finds_everything_after_a_randomized_workload(tmp_path):
+    """After a mixed stream of creates, updates and deletes, every object in the
+    store is findable by a distinctive token and no hit names an absent key."""
+    import random
+
+    svc = make(tmp_path, name="workload")
+    svc.reindex("place")
+    rng = random.Random(7)
+    live = list(PLACES)
+    for i in range(30):
+        roll = rng.random()
+        if roll < 0.4 and live:
+            svc.apply_action("rename", pk=rng.choice(live),
+                             parameters={"realm": f"tokenz{i}"})
+        elif roll < 0.75:
+            pk = f"minted-{i}"
+            svc.apply_action("settle", pk=None,
+                             parameters={"name": pk, "realm": f"tokenz{i}"})
+            live.append(pk)
+        elif live:
+            pk = rng.choice(live)
+            svc.apply_action("abandon", pk=pk, parameters={})
+            live.remove(pk)
+
+    present = {o["__pk"] for o in svc.query("place", limit=100)["objects"]}
+    assert present == set(live)
+    for pk in present:
+        obj = svc.get("place", pk)
+        hits = {o["__pk"] for o in
+                svc.query("place", search=obj["realm"], limit=100)["objects"]}
+        assert pk in hits, f"{pk} is in the store but not findable"
+        assert hits <= present, "a hit named an object that no longer exists"
 
 
 # -- the saturating total ----------------------------------------------------

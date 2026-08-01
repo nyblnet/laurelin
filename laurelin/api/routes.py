@@ -514,6 +514,50 @@ def register_clickhouse_dataset(
     return out
 
 
+@router.put("/datasets/{name}/starrocks", dependencies=[ADMIN])
+def register_starrocks_dataset(
+    name: str,
+    body: FederatedDatasetRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    actor: ActorDep,
+) -> dict:
+    """Register a read-only table served by a StarRocks cluster.
+
+    Admin-only, and for a sharper reason than federation's: the source carries
+    a DSN with credentials for a *remote* engine on which stacked statements
+    execute (see laurelin/core/starrocks.py). The account those credentials name
+    should hold SELECT and nothing else; the set of people who may point the
+    server at one is deliberately the smallest.
+    """
+    from laurelin.core.starrocks import StarRocksError, available, redacted_source
+
+    if not available():
+        raise HTTPException(
+            status_code=501,
+            detail="StarRocks support needs a MySQL-protocol client: "
+                   "pip install 'laurelin[starrocks]'",
+        )
+    existing = store.get_dataset(name)
+    if existing is not None and not existing.is_starrocks:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {name!r} already exists as a {existing.kind} dataset",
+        )
+    try:
+        info = catalog.register_starrocks(name, body.source, body.description)
+    except StarRocksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    store.log_audit(
+        "starrocks_dataset_registered",
+        {"dataset": name, "table": body.source.get("table")},
+        actor=actor,
+    )
+    out = _dump(info)
+    out["source"] = redacted_source(info.source)
+    return out
+
+
 @router.post("/datasets/{name}/compact", dependencies=[EDITOR])
 def compact_dataset(
     name: str,
@@ -759,10 +803,21 @@ def get_object_type(name: str, service: OntologyDep, perms: PermDep, user: UserD
     # index is bypassed, so telling the user is the difference between "why is
     # this slow" and "oh, it needs a rebuild".
     state = service.index_state(ot)
+    # The materialization is shared and unpoliced, so its counters describe
+    # *every* tenant's objects. A user whose row-level security shows them two
+    # of four objects was told the type had four, and `applied_seq` adds a
+    # global write-volume signal beside it. Both are operator numbers: they go
+    # to callers the backing dataset's policy does not narrow.
+    unpoliced = service._policy_for_dataset(ot.backing_dataset) is None
     result["index"] = {
         "indexed": state is not None,
         "fresh": service.index_is_fresh(ot) if state is not None else False,
-        "objects": state["object_count"] if state else 0,
+        "objects": (state["object_count"] if state else 0) if unpoliced else None,
+        # "Stale, rebuild it" and "behind by 3, catching up" are different
+        # things to tell someone, and only one of them is a problem.
+        "lag": (state["lag"] if state else 0) if unpoliced else None,
+        "store": state["store"] if state else None,
+        "applied_seq": (state["applied_seq"] if state else 0) if unpoliced else None,
     }
     return result
 
@@ -908,10 +963,42 @@ def build_object_index(
     whenever it is stale.
     """
     count = service.reindex(name)
-    store.log_audit("object_index_built", {"object_type": name, "objects": count},
+    ot = service.ontology.object_type(name)
+    # Verify the digest of what we just built. A detector nobody reads is not a
+    # detector, and a rebuild is the one moment where recomputing it is free —
+    # every row is already in hand.
+    digest_ok = service.verify_digest(ot) if ot is not None and count else True
+    store.log_audit("object_index_built",
+                    {"object_type": name, "objects": count, "digest_ok": digest_ok},
                     actor=actor)
-    return {"object_type": name, "objects": count,
+    return {"object_type": name, "objects": count, "digest_ok": digest_ok,
             "state": store.object_index_state(name)}
+
+
+@router.post("/ontology/object-types/{name}/writeback", dependencies=[EDITOR])
+def writeback_object_type(
+    name: str,
+    service: OntologyDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+    allow_transform_backed: bool = False,
+) -> dict:
+    """Fold the edit overlay into a new version of the backing dataset.
+
+    Authorization is the subtle part: this rewrites a *dataset*, so EDITOR on
+    the object type is not enough. Someone with edit rights on an object type
+    but not its backing dataset can already record edits; letting them rewrite
+    the dataset is a different privilege, and dataset ACLs are what express it.
+    """
+    ot = service.ontology.object_type(name)
+    if ot is None:
+        raise KeyError(f"Unknown object type: {name!r}")
+    _require_ot_edit(perms, user, service, name)
+    _require_dataset_edit(perms, user, ot.backing_dataset)
+    # Runs unpoliced inside the service; see OntologyService.writeback.
+    return service.writeback(name, actor=actor,
+                             allow_transform_backed=allow_transform_backed)
 
 
 @router.delete("/ontology/object-types/{name}/index", dependencies=[EDITOR])

@@ -250,10 +250,13 @@ def test_admin_and_no_policy_render_to_passthrough(env):
 # equivalence suite above is the right home for the third renderer because the
 # reference it compares against — `apply_table_policy` — is the same one.
 #
-# Note the reference deliberately is NOT the DuckDB renderer: DuckDB is already
-# measurably different for Float64 policy columns (CAST(1.0 AS VARCHAR) is
-# '1.0' where Arrow and ClickHouse both render '1'). See
-# tests/test_clickhouse_governance.py for that divergence in full.
+# Note the reference deliberately is NOT the DuckDB renderer. DuckDB is
+# measurably different from Arrow for Float64 and timestamp policy columns
+# (CAST(1.0 AS VARCHAR) is '1.0' where the Arrow row key is '1'), so a suite
+# that used it as the reference would have certified the divergence. Both SQL
+# renderers now refuse the types they cannot spell identically; see
+# tests/test_text_agreement.py for the table and tests/test_clickhouse_
+# governance.py for what the divergence did before the refusal existed.
 
 clickhouse_only = pytest.mark.skipif(
     not _clickhouse.available(), reason="needs chdb: pip install 'laurelin[clickhouse]'"

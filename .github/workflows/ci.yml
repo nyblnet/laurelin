@@ -69,7 +69,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlsec1
 
       - name: Install
-        run: pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg,clickhouse]'
+        run: pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg,clickhouse,starrocks]'
 
       # Every optional extra is installed above, so this run exercises the
       # SAML, MCP, Flight SQL, croniter and prometheus paths rather than
@@ -125,6 +125,75 @@ jobs:
           curl -sf localhost:8799/ | grep -qi '<title' \
             || { echo "::error::UI did not render"; exit 1; }
           curl -sf localhost:8799/api/v1/datasets
+
+  # ---------------------------------------------------------------- starrocks
+  #
+  # Opt-in, not part of the matrix. The allin1 image is 3.18 GB, and a pull per
+  # matrix entry would dominate the cost of the whole workflow for a backend
+  # whose dialect unit tests already run everywhere. `workflow_dispatch` (or a
+  # `starrocks` label on a PR) is what turns it on.
+  #
+  # Locally this suite runs against a container started the same way, and cold
+  # start to a live BE measured ~15 s under rootless podman — no --privileged,
+  # no sysctl changes. **This job itself has not been executed on GitHub
+  # Actions**; it is written from the local container's behaviour, so treat the
+  # first run as the verification.
+  starrocks:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'starrocks')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev,starrocks]'
+
+      - name: Start StarRocks
+        run: |
+          docker run -d --name laurelin-sr \
+            -p 9030:9030 -p 8030:8030 -p 8040:8040 \
+            starrocks/allin1-ubuntu:latest
+          # The FE accepts connections before the BE has registered, and a
+          # query against a table with no live backend fails in a way that
+          # looks like a Laurelin bug. Wait for a query to succeed, not a port.
+          for i in $(seq 1 120); do
+            docker exec laurelin-sr mysql -h127.0.0.1 -P9030 -uroot \
+              -e "CREATE DATABASE IF NOT EXISTS lau" && break || sleep 5
+          done
+
+      # Three things learned by running this locally, each of which broke the
+      # suite before it was understood:
+      #
+      # 1. `root` MUST stay passwordless. The image's own supervisor uses that
+      #    account to register the BE with the FE; setting a password makes it
+      #    log "Password error, stop retrying!" and shut the container down
+      #    ~15 s later, after which every StarRocks test fails with a
+      #    connection reset that looks nothing like the actual cause.
+      # 2. So the suite connects as a SEPARATE password-bearing user. That is
+      #    not incidental: test_the_dsn_never_reaches_a_viewer asserts the
+      #    credential is redacted out of viewer-readable API responses, and a
+      #    passwordless DSN gives it nothing to assert against — it fails.
+      # 3. `GRANT ALL ON *.*` is NOT sufficient on StarRocks 3.x+. Without
+      #    db_admin and DEFAULT ROLE ALL, DDL fails with "Current role(s):
+      #    NONE" and every test that creates a table errors.
+      - name: Create the test user
+        run: |
+          docker exec laurelin-sr mysql -h127.0.0.1 -P9030 -uroot -e "
+            CREATE USER IF NOT EXISTS 'laurelin'@'%' IDENTIFIED BY 'srsecret';
+            GRANT db_admin TO USER 'laurelin'@'%';
+            GRANT ALL ON ALL DATABASES TO USER 'laurelin'@'%';
+            GRANT ALL ON ALL TABLES IN ALL DATABASES TO USER 'laurelin'@'%';
+            ALTER USER 'laurelin'@'%' DEFAULT ROLE ALL;
+          "
+
+      - name: Test
+        env:
+          LAURELIN_TEST_STARROCKS: starrocks://laurelin:srsecret@127.0.0.1:9030/lau
+        run: pytest -q -p no:warnings -rs tests/test_starrocks.py
+          tests/test_starrocks_governance.py tests/test_dialects.py
+          tests/test_text_agreement.py tests/test_ci_guards.py
 
   # ---------------------------------------------------------------- docs
   #

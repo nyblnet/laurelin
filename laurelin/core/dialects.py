@@ -9,12 +9,16 @@ cosmetic. A federator that gets a dialect wrong returns a wrong number. A
 So a dialect here owns **every** string it emits: its own identifier quoter,
 its own value escaper, its own mask expressions, and its own statement
 assembly. Nothing is shared between dialects, because the engines' rules are
-different rather than merely stricter. Three measured examples, each of which
+different rather than merely stricter. Four measured examples, each of which
 is a silent leak if you assume otherwise:
 
 * Reusing DuckDB's doubled-quote identifier rule on ClickHouse resolves a
   column named ``a\\`b`` to the *different* column ``a`b`` and returns its
   data, with no error (see :meth:`ClickHouseDialect.quote`).
+* Reusing it on StarRocks is worse: ``"s"`` is a *string literal* there, so
+  ``SELECT "s"`` returns the constant ``'s'`` for every row and a row filter
+  written that way admitted every row, NULLs included (see
+  :meth:`StarRocksDialect.quote`).
 * ``NULLIF(c, c)`` masks NaN on DuckDB and does **not** on ClickHouse, so the
   masked column ships a real value through (see ``null_mask``).
 * ClickHouse resolves ``WHERE`` against ``SELECT`` aliases and DuckDB does
@@ -41,6 +45,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pyarrow as pa
+
+# Decimal scales whose Arrow text form is plain fixed point.
+#
+# Not a style choice and not caution: Python's Decimal — which is what
+# pyarrow's cast-to-string produces — switches to scientific notation once the
+# adjusted exponent drops below -6. So decimal(38,7) renders zero as '0E-7'
+# where both DuckDB and StarRocks render '0.0000000'. Measured on both engines,
+# scales 0..6 agree value-for-value and 7 upward do not. Negative scales are
+# out for the same reason at the other end ('1E+2').
+#
+# Both dialects claimed the whole decimal family. The shipped corpus sampled
+# scales 0, 2 and 6 — one step below the boundary — which is why nothing caught
+# it. The guard exists precisely so a policy cannot mean two things on two
+# engines, so a guard that answers wrongly is worse than a narrow one.
+_MAX_PORTABLE_DECIMAL_SCALE = 6
+
+
+def _decimal_text_is_portable(t) -> bool:
+    return bool(pa.types.is_decimal(t) and 0 <= t.scale <= _MAX_PORTABLE_DECIMAL_SCALE)
 
 
 def _unwrap(arrow_type):
@@ -175,13 +198,13 @@ class DuckDbDialect(SqlDialect):
             or pa.types.is_boolean(t)
             or pa.types.is_integer(t)
             or pa.types.is_date(t)
-            or pa.types.is_decimal(t)
+            or _decimal_text_is_portable(t)
         )
 
     def hash_text_matches_arrow(self, arrow_type) -> bool:
-        # DOUBLE and DECIMAL are in because DuckDB's text form is Python's
-        # (shortest round-trip for doubles, scale-preserving for decimals) --
-        # measured across inf/nan/denormals and scales 0, 2 and 6. BOOLEAN is
+        # DOUBLE is in because DuckDB's text form is Python's shortest
+        # round-trip -- measured across inf/nan/denormals. DECIMAL is in only
+        # up to scale 6; see _MAX_PORTABLE_DECIMAL_SCALE. BOOLEAN is
         # out: DuckDB says 'true' and `str(True)` is 'True', which has been a
         # silent digest divergence since before dialects existed. FLOAT is out
         # too: float32 1e-07 widens to '1.0000000116860974e-07' in Python.
@@ -192,7 +215,7 @@ class DuckDbDialect(SqlDialect):
             or pa.types.is_integer(t)
             or pa.types.is_date(t)
             or pa.types.is_float64(t)
-            or pa.types.is_decimal(t)
+            or _decimal_text_is_portable(t)
         )
 
     def assemble(
@@ -347,7 +370,181 @@ class ClickHouseDialect(SqlDialect):
         return sql
 
 
+@dataclass(frozen=True)
+class StarRocksDialect(SqlDialect):
+    """StarRocks (a real server, reached over the MySQL wire protocol).
+
+    ``binds_values`` is **True**, and unlike DuckDB — where binding is merely
+    the natural thing — here it is load-bearing, so :meth:`literal` raises and
+    no escaper exists to fall back to. The reason was measured against a live
+    StarRocks 3.x rather than reasoned about:
+
+    * ``SELECT 1; INSERT INTO t VALUES (99)`` on one ``execute()`` **runs the
+      INSERT**. Asking the client for ``-ClientFlag.MULTI_STATEMENTS`` reports
+      the flag off and the INSERT still lands.
+    * Feeding the policy value ``us') OR 1=1; INSERT INTO t VALUES (77) --``
+      through naive concatenation returned every row *and* wrote a row. The
+      same value bound through ``?`` returned nothing and wrote nothing.
+
+    ClickHouse's escaper exists because that engine offers no byte-preserving
+    binding channel; the cost of a defect there is a read. This engine does
+    bind — ``length(?)`` equalled ``len(value.encode())`` for all 334 hostile
+    values fuzzed, including NUL, newlines, lone backslashes and 300 control
+    characters — and the cost of a defect here would be a remote *write*. So
+    the door is not merely unused, it is absent.
+    """
+
+    name: str = "starrocks"
+    binds_values: bool = True
+
+    def quote(self, ident: str) -> str:
+        # A backtick is unspellable in a StarRocks identifier, so this refuses
+        # rather than mangles. Measured: MySQL's doubling rule does not apply
+        # here -- CREATE TABLE with a column `a``b` produces a column literally
+        # named `ab`, proved by a later real `ab` column failing with
+        # "Duplicate column name". Every other escape is worse:
+        #   DuckDB's  "x"  is a *string literal* on StarRocks, so SELECT "s"
+        #             returns the constant 's' for every row and a row policy
+        #             whose allowlist happens to contain the column's own name
+        #             admitted 3 of 3 rows, the NULL row included. Fails OPEN.
+        #   ClickHouse's backslash escape does not resolve (error 1064). Fails
+        #             closed, but still wrong.
+        if "`" in ident:
+            raise ValueError(
+                f"Cannot address the column {ident!r} on StarRocks: a backtick "
+                "has no escape inside a quoted identifier (doubling it drops "
+                "the character rather than escaping it), so the name would "
+                "resolve to a different column. Refusing."
+            )
+        return "`" + ident + "`"
+
+    def literal(self, value: str) -> str:
+        raise NotImplementedError(
+            "StarRocks binds policy values as parameters. Turning one into SQL "
+            "text would be the only injection surface in the renderer, and on "
+            "this engine it is a write primitive: stacked statements execute "
+            "and the client's MULTI_STATEMENTS flag does not stop them."
+        )
+
+    def placeholder(self, index: int) -> str:
+        return "?"
+
+    def to_text(self, col_sql: str) -> str:
+        # Unlike ClickHouse -- where CAST(x AS String) raises on a NULL row --
+        # StarRocks returns NULL and the query succeeds, and `IN ('us')` then
+        # excludes that row (fail closed). Measured on a table holding NULL,
+        # '' and 'us': IN ('us') matched only 'us', and IN ('') matched only
+        # the empty string, never the NULL.
+        return f"CAST({col_sql} AS STRING)"
+
+    def null_mask(self, expr: str) -> str:
+        # `NULLIF(c, c)` also measured NULL for every row here, including the
+        # NaN case ClickHouse gets wrong -- but only because StarRocks has no
+        # NaN to test with: CAST('nan' AS DOUBLE) is itself NULL. The hazard is
+        # therefore unreproducible rather than proven absent, so this uses the
+        # form that masks unconditionally and needs no such argument.
+        # Type-preserving: the result column's protocol type is DOUBLE for a
+        # DOUBLE input, DECIMAL for a DECIMAL, DATETIME for a DATETIME.
+        return f"if(FALSE, {expr}, NULL)"
+
+    def redact_mask(self, expr: str) -> str:
+        return "'***'"
+
+    def hash_mask(self, expr: str) -> str:
+        # `sha2(x, 256)` already returns lowercase hex: measured
+        # sha2('us',256) = '79adb2a2...' , 64 characters, equal value-for-value
+        # to hashlib.sha256(b'us').hexdigest(). Porting ClickHouse's mandatory
+        # lower(hex(...)) wrapper would hex the hex -- 128 characters, measured
+        # -- and every hash mask would silently stop joining. Lowercase
+        # `sha256()` does not exist here at all (error 1064).
+        return (
+            f"CASE WHEN {expr} IS NULL THEN NULL ELSE "
+            f"substr(sha2(CAST({expr} AS STRING), 256), 1, 16) END"
+        )
+
+    def row_key_matches_arrow(self, arrow_type) -> bool:
+        # Measured by writing each type into a real StarRocks table and
+        # comparing CAST(c AS STRING) against pyarrow's cast, per value.
+        # Narrower than DuckDB's, and **boolean is the StarRocks-specific
+        # trap**: it is row-key portable on DuckDB *and* ClickHouse, and here
+        # CAST(b AS STRING) is '1'/'0' where Arrow says 'true'/'false'. A
+        # tenant policy on a boolean column would admit the wrong half of the
+        # table. Also out:
+        #   float32/float64  1e-7 -> '1e-07' where Arrow gives '1e-7', and
+        #                    DOUBLE 1e10 -> '10000000000' vs Arrow's '1e+10'.
+        #   timestamp        DATETIME '...03:04:05' drops the sub-second zeros
+        #                    Arrow keeps ('...05.000000').
+        # Decimal is IN up to scale 6 (matching DuckDB, unlike ClickHouse):
+        # trailing zeros stay intact, and the engine never uses an exponent
+        # where Arrow does. Above scale 6 Arrow does; see
+        # _MAX_PORTABLE_DECIMAL_SCALE, re-measured on a live server.
+        t = _unwrap(arrow_type)
+        return bool(
+            pa.types.is_string(t)
+            or pa.types.is_large_string(t)
+            or pa.types.is_integer(t)
+            or pa.types.is_date(t)
+            or _decimal_text_is_portable(t)
+        )
+
+    def hash_text_matches_arrow(self, arrow_type) -> bool:
+        # Same set, plus naive timestamps: DATETIME renders exactly as
+        # `str(datetime)` does at second, millisecond and microsecond
+        # precision, and the whole corpus was re-measured under two session
+        # time zones (UTC and America/New_York) with identical results --
+        # StarRocks DATETIME is timezone-naive, so the session variable does
+        # not reach the rendering. A *tz-aware* Arrow timestamp is excluded
+        # because StarRocks has no column type that could produce one, so
+        # there is nothing to have measured.
+        # Floats stay out for the same reason as above; boolean stays out
+        # because '1' is not `str(True)`, which is also why DuckDB excludes it.
+        t = _unwrap(arrow_type)
+        return bool(
+            pa.types.is_string(t)
+            or pa.types.is_large_string(t)
+            or pa.types.is_integer(t)
+            or pa.types.is_date(t)
+            or _decimal_text_is_portable(t)
+            or (pa.types.is_timestamp(t) and t.tz is None)
+        )
+
+    def assemble(
+        self,
+        select_list: str,
+        scan_expr: str,
+        where: str,
+        limit=None,
+        settings: str = "",
+    ) -> str:
+        # Nested, and the derived table **must** carry an alias: without one
+        # StarRocks refuses with error 1248, "Every derived table must have its
+        # own alias".
+        #
+        # The flat form is correct *today* -- measured, WHERE resolves against
+        # the base columns, so `SELECT '***' AS s ... WHERE CAST(s AS STRING)
+        # IN ('***')` returns 0 rows and IN ('us') returns the right ones. But
+        # ORDER BY does see SELECT aliases (measured: ordering by a column
+        # aliased to a constant leaves the input order untouched, where
+        # ordering by the base column reverses it), so the flat form's
+        # correctness depends on which clauses the renderer happens to emit.
+        # Nesting costs nothing and removes the dependency.
+        #
+        # `settings` is re-rendered as a hint rather than appended: there is no
+        # trailing SETTINGS clause here. StarRocks validates the variable names
+        # inside SET_VAR (error 1193, with a did-you-mean), so a typo in a
+        # resource pin fails loudly instead of being ignored.
+        hint = f"/*+ SET_VAR({settings}) */ " if settings else ""
+        sql = (
+            f"SELECT {hint}{select_list} "
+            f"FROM (SELECT * FROM {scan_expr} WHERE {where}) t"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return sql
+
+
 DUCKDB = DuckDbDialect()
 CLICKHOUSE = ClickHouseDialect()
+STARROCKS = StarRocksDialect()
 
-DIALECTS = {DUCKDB.name: DUCKDB, CLICKHOUSE.name: CLICKHOUSE}
+DIALECTS = {d.name: d for d in (DUCKDB, CLICKHOUSE, STARROCKS)}

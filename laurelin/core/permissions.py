@@ -151,6 +151,16 @@ def _reject_unportable_text(
     """
     if arrow_type is not None and portable(arrow_type):
         return
+    if arrow_type is not None and pa.types.is_nested(arrow_type):
+        # Worth its own sentence: this is not "engines disagree", it is "the
+        # reference cannot express this policy at all", so there is no correct
+        # answer for any renderer to be measured against. Same wording as the
+        # Arrow path's refusal so all three read alike.
+        raise PolicyRenderError(
+            f"Column {column!r} has type {arrow_type}, which has no text form, "
+            f"so a {role} on it cannot mean anything definite. Point the "
+            f"{role} at a scalar column."
+        )
     if arrow_type is None:
         detail = (
             f"the type of {column!r} is unknown to the renderer, so there is no "
@@ -573,9 +583,9 @@ class PermissionService:
                 # form, so there is nothing for the allowlist to mean. Caught
                 # here rather than as a cast failure deep inside the scan.
                 raise PolicyRenderError(
-                    f"Row policy column {decision.row_column!r} has type "
-                    f"{row_type}, which has no text form to compare an "
-                    "allowlist against. Point the row policy at a scalar column."
+                    f"Column {decision.row_column!r} has type {row_type}, which "
+                    "has no text form, so a row policy on it cannot mean "
+                    "anything definite. Point the row policy at a scalar column."
                 )
             if row_type != pa.string():
                 # Compare on the string rendering, exactly as the table path
@@ -663,10 +673,10 @@ class PermissionService:
             # unchecked. Refuse in the reference too, with a message that says
             # what is wrong instead of an Arrow cast error.
             raise PolicyRenderError(
-                f"Row policy column {rp.column!r} has type "
-                f"{table.schema.field(rp.column).type}, which has no text form "
-                "to compare an allowlist against. Point the row policy at a "
-                "scalar column."
+                f"Column {rp.column!r} has type "
+                f"{table.schema.field(rp.column).type}, which has no text form, "
+                "so a row policy on it cannot mean anything definite. Point the "
+                "row policy at a scalar column."
             ) from exc
         mask = pc.is_in(col_as_str, value_set=pa.array(sorted(allowed), pa.string()))
         # NULLs in the policy column are never "in" the set -> excluded (fail closed).

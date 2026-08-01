@@ -55,6 +55,12 @@ object_types:
       id: {type: integer}
       sku: {type: string}
       region: {type: string}
+actions:
+  - api_name: retag
+    object_type: item
+    kind: update
+    parameters:
+      region: {type: string, required: true}
 """
 
 
@@ -115,6 +121,80 @@ def claim_key_lookups_are_constant_time(root: Path) -> tuple[float, float, str]:
     return big / small, 3.0, "lookup(4n) / lookup(n) (lower is better, max 3.0)"
 
 
+def claim_object_reads_are_flat_as_edits_grow(root: Path) -> tuple[float, float, str]:
+    """SCALE.md: an edit updates the materialization instead of invalidating it,
+    so a read costs a key lookup no matter how long the edit log is.
+
+    This is the claim the operational object store exists to make true. Before
+    it, every write invalidated the whole index for its object type, so the
+    very next read fell back to a scan *and* replayed the entire edit log —
+    reads that got monotonically slower the more anyone used the system.
+
+    Measured as read(k edits) / read(0 edits), which is why it is a ratio: the
+    absolute number is a property of the runner, but "does it grow with the log"
+    is a property of the design. A regression to invalidate-on-write makes this
+    blow up rather than drift, because the fallback path is a different
+    complexity class, not a slower constant.
+    """
+    ws, store, cat = workspace(root, "edits")
+    cat.write("items", table(N))
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+    svc = OntologyService(ws, cat, store, load_ontology(ws.ontology_dir))
+    svc.reindex("item")
+
+    def read_ms() -> float:
+        return timed(lambda: svc.query("item", limit=25))
+
+    def edit(i: int) -> None:
+        svc.apply_action("retag", pk=str(i % N), parameters={"region": f"r{i}"},
+                         actor="bench")
+
+    baseline = read_ms()
+    ratios = []
+    done = 0
+    for target in (100, 1_000, 10_000):
+        while done < target:
+            edit(done)
+            done += 1
+        ratios.append(read_ms() / baseline)
+    # Report the worst of the three; a claim that only holds at 100 edits is
+    # not the claim.
+    return max(ratios), 3.0, (
+        f"read(10k edits) / read(0) — 100:{ratios[0]:.2f}x "
+        f"1k:{ratios[1]:.2f}x 10k:{ratios[2]:.2f}x (lower is better, max 3.0)"
+    )
+
+
+def claim_object_writes_do_not_grow_with_history(root: Path) -> tuple[float, float, str]:
+    """The same pathology from the write side.
+
+    Replaying the log on every read was only half of it: the index was rebuilt
+    from scratch whenever anyone rebuilt it, and the search mirror was rewritten
+    for the whole object type on every sync. Either one makes a single-row edit
+    cost O(objects). This measures write #1000 against write #1, on a type large
+    enough that a full rebuild would be obvious.
+    """
+    ws, store, cat = workspace(root, "writes")
+    cat.write("items", table(N))
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+    svc = OntologyService(ws, cat, store, load_ontology(ws.ontology_dir))
+    svc.reindex("item")
+
+    def write_ms(i: int) -> float:
+        # repeat=1: writes are not idempotent, so best-of-N would be measuring
+        # different edits. Noise is handled by the loose threshold instead.
+        return timed(lambda: svc.apply_action(
+            "retag", pk=str(i % N), parameters={"region": f"r{i}"}, actor="bench"
+        ), repeat=1)
+
+    first = min(write_ms(i) for i in range(5))
+    for i in range(5, 1_000):
+        svc.apply_action("retag", pk=str(i % N), parameters={"region": f"r{i}"},
+                         actor="bench")
+    later = min(write_ms(i) for i in range(1_000, 1_005))
+    return later / first, 3.0, "write #1000 / write #1 (lower is better, max 3.0)"
+
+
 def claim_object_queries_do_not_materialize(root: Path) -> tuple[float, float, str]:
     """SCALE.md: object queries push into DuckDB instead of building every row
     in Python.
@@ -171,6 +251,10 @@ CLAIMS = [
     ("appends cost the delta, not the dataset", claim_appends_cost_the_delta, "min"),
     ("indexed key lookups are constant time", claim_key_lookups_are_constant_time, "max"),
     ("object queries do not materialize", claim_object_queries_do_not_materialize, "min"),
+    ("object reads stay flat as the edit log grows",
+     claim_object_reads_are_flat_as_edits_grow, "max"),
+    ("object writes do not grow with history",
+     claim_object_writes_do_not_grow_with_history, "max"),
     ("row-level security is not a tax", claim_row_level_security_is_not_a_tax, "max"),
 ]
 

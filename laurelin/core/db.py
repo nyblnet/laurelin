@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from laurelin.core.backend import Connection, make_backend
 from laurelin.core.models import (
@@ -99,7 +99,19 @@ CREATE TABLE IF NOT EXISTS object_index (
     -- created objects appended). The scan path pages in this order, so the
     -- index must too — otherwise indexing a type silently changes which
     -- objects land on page 1.
-    ord INTEGER NOT NULL DEFAULT 0,
+    --
+    -- BIGINT, not INTEGER, and that is not cosmetic: created objects sort at
+    -- ORD_CREATED_BASE + edit_seq = 2**62 + n, which SQLite stores happily in
+    -- an INTEGER column (64-bit) and PostgreSQL rejects outright (int4). The
+    -- column was INTEGER, so a single object create on Postgres raised
+    -- "integer out of range" inside the write path, the write path swallowed
+    -- it, and the materialization was silently dead from then on.
+    ord BIGINT NOT NULL DEFAULT 0,
+    -- The edit position this row was last written at. Conflicts are resolved
+    -- by log position, never arrival order or wall clock: replicas do not
+    -- deliver in log order, and created_at is a TEXT timestamp from the
+    -- writing replica with sub-second collisions.
+    applied_seq BIGINT NOT NULL DEFAULT 0,
     title TEXT NOT NULL DEFAULT '',
     -- Lower-cased concatenation of the string properties, for substring search
     -- without scanning Parquet.
@@ -110,10 +122,28 @@ CREATE TABLE IF NOT EXISTS object_index (
 CREATE INDEX IF NOT EXISTS idx_object_index_type ON object_index (object_type);
 CREATE TABLE IF NOT EXISTS object_index_state (
     object_type TEXT PRIMARY KEY,
-    -- The dataset version this index was built from, plus the edit-log length.
-    -- Both must still match for the index to be trusted.
+    -- The dataset version this materialization was built from. A new version
+    -- rewrites arbitrary base rows and renumbers every `ord`, so no delta
+    -- expresses it: a bump still means a full rebuild.
     dataset_version INTEGER NOT NULL DEFAULT 0,
-    edit_count INTEGER NOT NULL DEFAULT 0,
+    -- The high-water mark of the edit log this materialization has applied.
+    -- This replaced `edit_count`, which was an *invalidation flag*: any write
+    -- changed the count, so one edit threw away the whole index. A watermark
+    -- says how far behind the materialization is, which is replayable.
+    applied_seq BIGINT NOT NULL DEFAULT 0,
+    -- XOR of per-row digests. A watermark cannot detect divergence — a store
+    -- that has drifted can be perfectly caught up by position — so content
+    -- gets its own check. Maintained incrementally (see ontology/store.py).
+    digest TEXT NOT NULL DEFAULT '',
+    -- Hash of the ObjectTypeDef this materialization was built from. The
+    -- watermark tracks the *data* and nothing tracked the *definition*, so
+    -- withdrawing a property from the ontology left the store serving it
+    -- forever (every other read path projects to the declared set). A
+    -- definition change now invalidates exactly like a dataset version does.
+    -- NB no semicolons in schema comments: the DDL is split naively on them.
+    type_fingerprint TEXT NOT NULL DEFAULT '',
+    -- Which pluggable store holds the rows ('metadata' or a StarRocks store).
+    store_name TEXT NOT NULL DEFAULT 'metadata',
     object_count INTEGER NOT NULL DEFAULT 0,
     built_at TEXT NOT NULL
 );
@@ -232,7 +262,19 @@ CREATE TABLE IF NOT EXISTS object_edits (
     kind TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
     actor TEXT NOT NULL DEFAULT 'anonymous',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- Gapless per-type position, allocated inside the append transaction and
+    -- made unique by an index. `seq`/`rowid` cannot serve: Postgres allocates
+    -- identity values *before* commit, so a transaction holding 5 can commit
+    -- after 6 and a cursor parked at 6 skips 5 permanently. Gapless is what
+    -- makes "replay everything above applied_seq" a complete description of
+    -- the lag rather than a hopeful one.
+    edit_seq BIGINT NOT NULL DEFAULT 0,
+    -- Writeback: when this edit was folded into a dataset version, and which.
+    -- Marked rather than deleted, so a folded version stays reproducible —
+    -- "version 7 differs from 6 because of these 12 edits by these 5 people".
+    folded_at TEXT,
+    folded_into_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_object_edits_type ON object_edits (object_type, created_at);
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -359,9 +401,15 @@ class MetadataStore:
 
     def _has_column(self, c: Connection, table: str, column: str) -> bool:
         if self.dialect == "postgres":
+            # Scoped to the schema this connection actually resolves names in.
+            # Without that, a schema-per-workspace store asks "does the column
+            # exist" and gets *another* workspace's answer — so the migration
+            # is skipped for a table that still needs it, and the next
+            # statement fails on the missing column.
             row = c.execute(
                 "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = ? AND column_name = ?",
+                "WHERE table_name = ? AND column_name = ? "
+                "AND table_schema = current_schema()",
                 (table, column),
             ).fetchone()
             return row is not None
@@ -400,6 +448,86 @@ class MetadataStore:
                 "ALTER TABLE build_tasks ADD COLUMN expectations_json "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        self._migrate_object_store(c)
+
+    def _migrate_object_store(self, c: Connection) -> None:
+        """Turn the invalidation flag into a catch-up watermark."""
+        if not self._has_column(c, "object_edits", "edit_seq"):
+            c.execute("ALTER TABLE object_edits ADD COLUMN edit_seq BIGINT NOT NULL DEFAULT 0")
+            # Backfill per type in insertion order. Edit logs are hand-edit
+            # sized, so a Python loop is cheaper to read than clever SQL.
+            rows = c.execute(
+                "SELECT id, object_type FROM object_edits "
+                f"ORDER BY object_type, {self.backend.order_col}"
+            ).fetchall()
+            counters: dict[str, int] = {}
+            for row in rows:
+                n = counters[row["object_type"]] = counters.get(row["object_type"], 0) + 1
+                c.execute("UPDATE object_edits SET edit_seq = ? WHERE id = ?", (n, row["id"]))
+        for col, ddl in (
+            ("folded_at", "TEXT"),
+            ("folded_into_version", "INTEGER"),
+        ):
+            if not self._has_column(c, "object_edits", col):
+                c.execute(f"ALTER TABLE object_edits ADD COLUMN {col} {ddl}")
+        # The constraint is what serializes concurrent appends per type, which
+        # is what makes the sequence gapless. Created here rather than in the
+        # schema DDL because on an existing database the column above must be
+        # added and backfilled first.
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_object_edits_seq "
+            "ON object_edits (object_type, edit_seq)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_object_edits_live "
+            "ON object_edits (object_type, folded_at)"
+        )
+        if not self._has_column(c, "object_index", "applied_seq"):
+            c.execute(
+                "ALTER TABLE object_index ADD COLUMN applied_seq BIGINT NOT NULL DEFAULT 0"
+            )
+        if not self._has_column(c, "object_index_state", "applied_seq"):
+            # An index built under the old scheme has an *unknowable* watermark:
+            # edit_count says how many edits existed, not which were applied.
+            # A materialization carrying a wrong watermark is the exact failure
+            # this design exists to prevent, so drop it. Rebuilding is cheap.
+            c.execute("DELETE FROM object_index")
+            c.execute("DELETE FROM object_index_state")
+            c.execute(
+                "ALTER TABLE object_index_state ADD COLUMN applied_seq BIGINT NOT NULL DEFAULT 0"
+            )
+        for col, ddl in (
+            ("digest", "TEXT NOT NULL DEFAULT ''"),
+            ("store_name", "TEXT NOT NULL DEFAULT 'metadata'"),
+            # Defaults to '', which matches no real fingerprint, so an index
+            # carried across this migration refuses to answer until rebuilt.
+            # That is the intended direction: it was built from a definition
+            # nobody recorded.
+            ("type_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if not self._has_column(c, "object_index_state", col):
+                c.execute(f"ALTER TABLE object_index_state ADD COLUMN {col} {ddl}")
+        self._widen_ord_column(c)
+
+    def _widen_ord_column(self, c: Connection) -> None:
+        """Make ``object_index.ord`` 64-bit on PostgreSQL.
+
+        ``INTEGER`` means int64 on SQLite and int32 on PostgreSQL, and created
+        objects sort at ``2**62 + edit_seq``. So on Postgres the very first
+        object create overflowed the column: the INSERT raised, the write path
+        caught it and fell back to a log-only append, and the materialization
+        was permanently behind with nothing surfaced to the user. A rebuild
+        could not repair it either — it hit the same overflow.
+        """
+        if self.dialect != "postgres":
+            return  # SQLite INTEGER is already 64-bit
+        row = c.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'object_index' AND column_name = 'ord' "
+            "AND table_schema = current_schema()"
+        ).fetchone()
+        if row is not None and row["data_type"] == "integer":
+            c.execute("ALTER TABLE object_index ALTER COLUMN ord TYPE BIGINT")
 
     # -- datasets -------------------------------------------------------------
 
@@ -515,20 +643,77 @@ class MetadataStore:
     #
     # See SEARCH_TOTAL_CAP below for why a search reports a saturating total.
 
+    _STATE_UPSERT = """INSERT INTO object_index_state
+             (object_type, dataset_version, applied_seq, digest, store_name,
+              type_fingerprint, object_count, built_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (object_type) DO UPDATE SET
+             dataset_version = excluded.dataset_version,
+             applied_seq = excluded.applied_seq,
+             digest = excluded.digest,
+             store_name = excluded.store_name,
+             type_fingerprint = excluded.type_fingerprint,
+             object_count = excluded.object_count,
+             built_at = excluded.built_at"""
+
+    def _lock_index_state(self, c: Connection, object_type: str):
+        """Read the state row with a write lock held for the rest of the
+        transaction, or raise if there is nothing to write into.
+
+        The UPDATE is a no-op by value and load-bearing by effect. Every writer
+        for one object type takes this lock *first*, so the read-modify-write
+        that follows — pre-image, merge, upsert, digest — is serialized rather
+        than merely arbitrated afterwards by the edit_seq index.
+
+        It has to be a write, not ``SELECT ... FOR UPDATE``: Python's sqlite3
+        driver only begins a transaction at the first DML statement, so on
+        SQLite a leading SELECT runs in autocommit and reads *outside* the very
+        transaction it was supposed to be protected by. That is precisely how
+        two concurrent updates to one object could each merge onto the same
+        stale pre-image and one committed edit vanish.
+        """
+        c.execute(
+            "UPDATE object_index_state SET built_at = built_at WHERE object_type = ?",
+            (object_type,),
+        )
+        return self._require_index_state(c, object_type)
+
     def replace_object_index(
-        self, object_type: str, rows: list[dict], dataset_version: int, edit_count: int
+        self,
+        object_type: str,
+        rows: list[dict],
+        dataset_version: int,
+        applied_seq: int,
+        digest: str = "",
+        fingerprint: str = "",
     ) -> None:
-        """Swap in a freshly built index for one object type, atomically."""
+        """Swap in a freshly built index for one object type, atomically.
+
+        ``rows`` carry their own ``ord``: the builder numbers base rows in file
+        order and gives created objects ``ORD_CREATED_BASE + edit_seq``, so a
+        rebuild reproduces the ordinals a stream of incremental writes would
+        have produced. ``enumerate`` here would silently reshuffle page 1 —
+        precisely the bug the column was added to fix.
+        """
         with self._conn() as c:
             self.backend.ensure_search_index(c)
+            # Same lock the incremental path takes, so a rebuild and a
+            # concurrent write serialize instead of interleaving their state
+            # rows. No-op when there is nothing to lock (the first build).
+            c.execute(
+                "UPDATE object_index_state SET built_at = built_at WHERE object_type = ?",
+                (object_type,),
+            )
             c.execute("DELETE FROM object_index WHERE object_type = ?", (object_type,))
-            for i, row in enumerate(rows):
+            for row in rows:
                 c.execute(
                     """INSERT INTO object_index
-                         (object_type, pk, ord, title, search_text, props_json)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (object_type, row["pk"], i, row["title"], row["search_text"],
-                     json.dumps(row["props"])),
+                         (object_type, pk, ord, applied_seq, title, search_text,
+                          props_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (object_type, row["pk"], int(row["ord"]),
+                     int(row.get("applied_seq", applied_seq)),
+                     row["title"], row["search_text"], row["props_json"]),
                 )
             # Same transaction as the rows above, so the search mirror can
             # never be left describing an index that no longer exists.
@@ -536,28 +721,27 @@ class MetadataStore:
                 c, object_type, [(r["pk"], r["search_text"]) for r in rows]
             )
             c.execute(
-                """INSERT INTO object_index_state
-                     (object_type, dataset_version, edit_count, object_count, built_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT (object_type) DO UPDATE SET
-                     dataset_version = excluded.dataset_version,
-                     edit_count = excluded.edit_count,
-                     object_count = excluded.object_count,
-                     built_at = excluded.built_at""",
-                (object_type, dataset_version, edit_count, len(rows), utcnow_iso()),
+                self._STATE_UPSERT,
+                (object_type, dataset_version, applied_seq, digest, "metadata",
+                 fingerprint, len(rows), utcnow_iso()),
             )
+
+    @staticmethod
+    def _state_dict(row) -> dict:
+        return {"dataset_version": row["dataset_version"],
+                "applied_seq": int(row["applied_seq"]),
+                "digest": row["digest"],
+                "store": row["store_name"],
+                "fingerprint": row["type_fingerprint"],
+                "object_count": row["object_count"],
+                "built_at": row["built_at"]}
 
     def object_index_state(self, object_type: str) -> Optional[dict]:
         with self._conn() as c:
             row = c.execute(
                 "SELECT * FROM object_index_state WHERE object_type = ?", (object_type,)
             ).fetchone()
-        if row is None:
-            return None
-        return {"dataset_version": row["dataset_version"],
-                "edit_count": row["edit_count"],
-                "object_count": row["object_count"],
-                "built_at": row["built_at"]}
+        return self._state_dict(row) if row is not None else None
 
     def drop_object_index(self, object_type: str) -> None:
         with self._conn() as c:
@@ -565,13 +749,198 @@ class MetadataStore:
             c.execute("DELETE FROM object_index_state WHERE object_type = ?", (object_type,))
             self.backend.clear_search_index(c, object_type)
 
-    def count_object_edits(self, object_type: str) -> int:
+    def max_edit_seq(self, object_type: str) -> int:
+        """The highest committed edit position for a type; 0 when there are none.
+
+        This is the number a materialization's ``applied_seq`` is compared
+        against, and the whole reason the sequence has to be gapless.
+        """
         with self._conn() as c:
             row = c.execute(
-                "SELECT count(*) AS n FROM object_edits WHERE object_type = ?",
+                "SELECT COALESCE(MAX(edit_seq), 0) AS n FROM object_edits "
+                "WHERE object_type = ?",
                 (object_type,),
             ).fetchone()
         return int(row["n"])
+
+    def commit_object_edit(
+        self,
+        edit: ObjectEdit,
+        *,
+        pks: list[str],
+        build: "Callable[[dict[str, dict], int], Optional[tuple[list[dict], list[str]]]]",
+        digest_of: "Callable[[str, list[dict], list[dict]], str]",
+    ) -> int:
+        """Append one edit to the log AND apply it to the materialization, in a
+        single transaction. Returns the allocated ``edit_seq``.
+
+        This is one method rather than a composition of two because
+        ``_conn()`` opens a connection per call: composing ``add_object_edit``
+        with a separate index write gives *two* transactions, and the window
+        between them is exactly where a reader sees "caught up" with the row
+        not yet there — the one direction the design must never allow.
+
+        **The caller does not hand over finished rows — it hands over
+        ``build``.** An edit's rows are a function of the *current* rows (an
+        update merges onto them, a create inherits their ordinal), so building
+        them outside this transaction is a read-modify-write with the read
+        unprotected. It was, and the consequences were exactly the textbook
+        ones: two concurrent updates to one object each merged onto the same
+        pre-image and one committed edit disappeared; a delete racing an update
+        let the update re-insert the deleted row. In both cases the watermark
+        advanced normally, so nothing detected it and nothing replayed it.
+
+        ``build(pre_image, seq)`` therefore runs *inside* the transaction, with
+        the pre-image read inside it too, and with the real allocated ``seq``
+        rather than a guess at what MAX+1 will be. Returning ``None`` means "I
+        cannot express this edit as rows": the edit is still logged (it is a
+        committed fact) and the watermark is left behind, so reads fall through
+        to the scan until something catches up. **No shipped builder returns it
+        today** — ``_rows_for_edit`` writes no rows rather than declining, and
+        anything genuinely impossible raises, which rolls this transaction back
+        so the caller can log the edit alone. It stays in the protocol because
+        the alternative for a third implementation is a store-specific
+        exception type crossing this seam.
+
+        ``digest_of(current, before, after)`` takes the digest read in this
+        transaction rather than closing over one read earlier — a closure over
+        a stale base is how routine concurrent writes produced a false
+        corruption alarm.
+        """
+        def once() -> int:
+            with self._conn() as c:
+                state = self._lock_index_state(c, edit.object_type)
+                seq = self._append_edit(c, edit)
+                rows = build(self._index_by_pk(c, edit.object_type, pks), seq)
+                if rows is not None:
+                    self._apply_index_delta(
+                        c, edit.object_type, seq, rows[0], rows[1], state, digest_of
+                    )
+            return seq
+
+        # Losing the race for a position rolls the whole thing back — log row,
+        # index rows and watermark together — so a retry re-does all four and
+        # the two can never be left disagreeing.
+        return self._retry_on_seq_conflict(once)
+
+    def apply_object_edit(
+        self,
+        object_type: str,
+        edit_seq: int,
+        *,
+        pks: list[str],
+        build: "Callable[[dict[str, dict], int], Optional[tuple[list[dict], list[str]]]]",
+        digest_of: "Callable[[str, list[dict], list[dict]], str]",
+    ) -> None:
+        """Apply an edit that is *already* in the log, advancing the watermark
+        to its position. This is catch-up: replaying it a second time is a
+        no-op, because every edit kind is an absolute assignment and the
+        position guard rejects anything not strictly newer.
+
+        Same rule as :meth:`commit_object_edit` about ``build``: the pre-image
+        is read under the state-row lock, in this transaction, because two
+        catch-ups racing each other are a read-modify-write like any other.
+        """
+        with self._conn() as c:
+            state = self._lock_index_state(c, object_type)
+            rows = build(self._index_by_pk(c, object_type, pks), int(edit_seq))
+            if rows is None:
+                return
+            self._apply_index_delta(
+                c, object_type, int(edit_seq), rows[0], rows[1], state, digest_of
+            )
+
+    @staticmethod
+    def _require_index_state(c: Connection, object_type: str):
+        state = c.execute(
+            "SELECT * FROM object_index_state WHERE object_type = ?", (object_type,)
+        ).fetchone()
+        if state is None:
+            raise ValueError(
+                f"Object type {object_type!r} has no materialization to commit "
+                "into; append to the log instead."
+            )
+        return state
+
+    def _apply_index_delta(
+        self, c: Connection, object_type: str, seq: int, upserts: list[dict],
+        deletes: list[str], state, digest_of,
+    ) -> None:
+        """Write the rows for one edit and advance the watermark to ``seq``.
+
+        Order inside the transaction is the whole point: rows first, watermark
+        last. A watermark behind its rows costs a redundant idempotent replay;
+        a watermark ahead of them is a silent permanent stale read.
+        """
+        self.backend.ensure_search_index(c)
+        pks = [r["pk"] for r in upserts] + list(deletes)
+        before = self._index_rows(c, object_type, pks)
+        for row in upserts:
+            c.execute(
+                """INSERT INTO object_index
+                     (object_type, pk, ord, applied_seq, title, search_text,
+                      props_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (object_type, pk) DO UPDATE SET
+                     -- ord is deliberately NOT updated: an object keeps the
+                     -- position it already had, so a write never reshuffles
+                     -- the page someone is looking at.
+                     applied_seq = excluded.applied_seq,
+                     title = excluded.title,
+                     search_text = excluded.search_text,
+                     props_json = excluded.props_json
+                   WHERE excluded.applied_seq > object_index.applied_seq""",
+                (object_type, row["pk"], int(row["ord"]), seq,
+                 row["title"], row["search_text"], row["props_json"]),
+            )
+        if deletes:
+            placeholders = ", ".join("?" for _ in deletes)
+            c.execute(
+                f"DELETE FROM object_index WHERE object_type = ? "
+                f"AND pk IN ({placeholders})",
+                (object_type, *deletes),
+            )
+        # Per-pk, not per-type: the whole-type sync is O(objects) and would
+        # hand back everything this design buys, invisibly on Postgres.
+        self.backend.upsert_search_rows(
+            c, object_type, [(r["pk"], r["search_text"]) for r in upserts]
+        )
+        self.backend.delete_search_rows(c, object_type, list(deletes))
+        after = self._index_rows(c, object_type, pks)
+        count = c.execute(
+            "SELECT count(*) AS n FROM object_index WHERE object_type = ?",
+            (object_type,),
+        ).fetchone()["n"]
+        c.execute(
+            self._STATE_UPSERT,
+            (object_type, state["dataset_version"], max(seq, int(state["applied_seq"])),
+             digest_of(state["digest"], before, after), state["store_name"],
+             state["type_fingerprint"], int(count), utcnow_iso()),
+        )
+
+    @staticmethod
+    def _index_by_pk(c: Connection, object_type: str, pks: list[str]) -> dict[str, dict]:
+        return {r["pk"]: r
+                for r in MetadataStore._index_rows(c, object_type, [str(p) for p in pks])}
+
+    @staticmethod
+    def _index_rows(c: Connection, object_type: str, pks: list[str]) -> list[dict]:
+        if not pks:
+            return []
+        placeholders = ", ".join("?" for _ in pks)
+        rows = c.execute(
+            f"SELECT pk, ord, applied_seq, title, search_text, props_json "
+            f"FROM object_index WHERE object_type = ? AND pk IN ({placeholders})",
+            (object_type, *pks),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def object_index_rows(self, object_type: str, pks: list[str]) -> list[dict]:
+        """Current materialized rows for these keys. The write path's pre-image
+        source: it is unpoliced by construction, so no user's view can leak
+        into a shared materialization through a read-modify-write."""
+        with self._conn() as c:
+            return self._index_rows(c, object_type, [str(p) for p in pks])
 
     def search_object_index(
         self,
@@ -580,8 +949,15 @@ class MetadataStore:
         pk: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> tuple[list[dict], int]:
-        """Page the index. Returns ``(rows, total)``.
+    ) -> tuple[list[dict], int, Optional[dict]]:
+        """Page the index. Returns ``(rows, total, state)``.
+
+        The state is read in the *same transaction* as the page, and returned
+        with it, so the caller validates the state the page actually came from.
+        Checking freshness on one connection and then paging on another leaves
+        a window where a write lands in between and the page is served from a
+        state nobody validated — a small hole under invalidation semantics, the
+        main race once writes are frequent.
 
         Only the primary key is filterable here, and deliberately: it is a real
         indexed column, so a lookup is a b-tree probe. Filtering on an
@@ -598,6 +974,10 @@ class MetadataStore:
             params.append(str(pk))
         clause = " AND ".join(where)
         with self._conn() as c:
+            state = c.execute(
+                "SELECT * FROM object_index_state WHERE object_type = ?",
+                (object_type,),
+            ).fetchone()
             total = c.execute(
                 count_sql(f"SELECT 1 FROM object_index WHERE {clause}", bool(search)),
                 tuple(params),
@@ -617,14 +997,17 @@ class MetadataStore:
                 order = f"CASE WHEN {pos} > 0 THEN {pos} ELSE {RANK_BODY_ONLY} END, ord"
                 rank_params = [search.lower(), search.lower()]
             rows = c.execute(
-                f"""SELECT pk, title, props_json FROM object_index WHERE {clause}
+                f"""SELECT pk, ord, applied_seq, title, props_json
+                    FROM object_index WHERE {clause}
                     ORDER BY {order} LIMIT ? OFFSET ?""",
                 tuple([*params, *rank_params, max(0, limit), max(0, offset)]),
             ).fetchall()
         return (
-            [{"pk": r["pk"], "title": r["title"], "props": json.loads(r["props_json"])}
+            [{"pk": r["pk"], "ord": int(r["ord"]), "applied_seq": int(r["applied_seq"]),
+              "title": r["title"], "props": json.loads(r["props_json"])}
              for r in rows],
             int(total),
+            self._state_dict(state) if state is not None else None,
         )
 
     # -- incremental transform state -----------------------------------------------
@@ -1184,44 +1567,145 @@ class MetadataStore:
 
     # -- object edits (write-back overlay) ----------------------------------------
 
-    def add_object_edit(self, edit: ObjectEdit) -> None:
-        with self._conn() as c:
-            c.execute(
-                """INSERT INTO object_edits
-                   (id, object_type, pk_value, kind, payload_json, actor, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    edit.id,
-                    edit.object_type,
-                    edit.pk_value,
-                    edit.kind.value,
-                    json.dumps(edit.payload),
-                    edit.actor,
-                    edit.created_at,
-                ),
-            )
+    def _append_edit(self, c: Connection, edit: ObjectEdit) -> int:
+        """Insert one edit, allocating its per-type position. Returns the seq.
 
-    def list_object_edits(self, object_type: str) -> list[ObjectEdit]:
+        The position is ``MAX(edit_seq) + 1`` for this type, read and written
+        inside the caller's transaction; the UNIQUE index serializes concurrent
+        appends, so two racing writers cannot both take the same number and the
+        sequence never gains a gap. Edits are hand-edits — a per-type
+        serialization point costs nothing real.
+        """
+        seq = int(c.execute(
+            "SELECT COALESCE(MAX(edit_seq), 0) + 1 AS n FROM object_edits "
+            "WHERE object_type = ?",
+            (edit.object_type,),
+        ).fetchone()["n"])
+        c.execute(
+            """INSERT INTO object_edits
+               (id, object_type, pk_value, kind, payload_json, actor, created_at,
+                edit_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                edit.id,
+                edit.object_type,
+                edit.pk_value,
+                edit.kind.value,
+                json.dumps(edit.payload),
+                edit.actor,
+                edit.created_at,
+                seq,
+            ),
+        )
+        return seq
+
+    # How many times a losing appender re-reads the position and tries again.
+    # Concurrency here is two people editing the same object type at the same
+    # moment, so the contention is tiny and a handful of attempts is plenty; a
+    # larger number would only make a genuine bug take longer to surface.
+    _SEQ_ATTEMPTS = 5
+
+    def _retry_on_seq_conflict(self, action):
+        """Run a whole transaction, retrying if it lost the race for a position.
+
+        The retry has to wrap the *transaction*, not the INSERT: on Postgres a
+        unique violation aborts the surrounding transaction, so there is nothing
+        left to retry inside it. The loser blocks on the index until the winner
+        commits, then re-reads MAX+1 and takes the next number — which is what
+        keeps the sequence gapless under concurrency instead of merely
+        rejecting one of the two writers.
+        """
+        for attempt in range(self._SEQ_ATTEMPTS):
+            try:
+                return action()
+            except Exception as exc:  # noqa: BLE001 - re-raised unless it is the race
+                if (attempt == self._SEQ_ATTEMPTS - 1
+                        or not self.backend.is_unique_violation(exc)):
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def add_object_edit(self, edit: ObjectEdit) -> int:
+        """Append to the log only, leaving any materialization behind.
+
+        Correct — the log is the source of truth and every read path can
+        replay it — but a footgun now that a materialization exists: the store
+        it leaves lagging will refuse to answer until something catches it up.
+        The public write is :meth:`commit_object_edit`.
+        """
+        def once() -> int:
+            with self._conn() as c:
+                return self._append_edit(c, edit)
+
+        return self._retry_on_seq_conflict(once)
+
+    _EDIT_COLUMNS = "id, object_type, pk_value, kind, payload_json, actor, created_at, edit_seq"
+
+    @staticmethod
+    def _row_to_edit(r) -> ObjectEdit:
+        return ObjectEdit(
+            id=r["id"],
+            object_type=r["object_type"],
+            pk_value=r["pk_value"],
+            kind=EditKind(r["kind"]),
+            payload=json.loads(r["payload_json"]),
+            actor=r["actor"],
+            created_at=r["created_at"],
+            edit_seq=int(r["edit_seq"]),
+        )
+
+    def list_object_edits(
+        self, object_type: str, live_only: bool = True
+    ) -> list[ObjectEdit]:
+        """Edits for a type in replay order.
+
+        ``live_only`` hides edits already folded into a dataset version by
+        writeback: those are part of the data now, so replaying them would
+        apply them twice. History still asks for everything.
+        """
+        where = "object_type = ?" + (" AND folded_at IS NULL" if live_only else "")
         with self._conn() as c:
             rows = c.execute(
-                # Insertion order (SQLite rowid / Postgres seq) — created_at has
-                # sub-second collisions and id is a random uuid, so neither gives
-                # a stable replay order.
-                f"SELECT * FROM object_edits WHERE object_type = ? ORDER BY {self.backend.order_col}",
+                # edit_seq, not rowid/seq: it is gapless and per type, which is
+                # what makes "everything above the watermark" a complete
+                # description of what a materialization still owes.
+                f"SELECT {self._EDIT_COLUMNS} FROM object_edits WHERE {where} "
+                f"ORDER BY edit_seq",
                 (object_type,),
             ).fetchall()
-        return [
-            ObjectEdit(
-                id=r["id"],
-                object_type=r["object_type"],
-                pk_value=r["pk_value"],
-                kind=EditKind(r["kind"]),
-                payload=json.loads(r["payload_json"]),
-                actor=r["actor"],
-                created_at=r["created_at"],
+        return [self._row_to_edit(r) for r in rows]
+
+    def list_object_edits_since(
+        self, object_type: str, applied_seq: int
+    ) -> list[ObjectEdit]:
+        """The edits a materialization at ``applied_seq`` still owes, in order."""
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT {self._EDIT_COLUMNS} FROM object_edits "
+                f"WHERE object_type = ? AND edit_seq > ? AND folded_at IS NULL "
+                f"ORDER BY edit_seq",
+                (object_type, int(applied_seq)),
+            ).fetchall()
+        return [self._row_to_edit(r) for r in rows]
+
+    def mark_edits_folded(self, edit_ids: list[str], version: int) -> int:
+        """Mark exactly these edits as folded into ``version``. Returns the count.
+
+        An explicit id list, never ``seq <= max_seq``: on Postgres the ordering
+        column is assigned at INSERT and made visible at COMMIT, so a reader can
+        see 42 without seeing 41. Marking a range would mark 41 folded when it
+        never was — losing an edit silently, in the one direction that cannot be
+        recovered. An edit we did not read is an edit we do not mark.
+        """
+        if not edit_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in edit_ids)
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE object_edits SET folded_at = ?, folded_into_version = ? "
+                f"WHERE id IN ({placeholders}) AND folded_at IS NULL",
+                (utcnow_iso(), int(version), *edit_ids),
             )
-            for r in rows
-        ]
+            return int(cur.rowcount)
 
     # -- audit ---------------------------------------------------------------------
 

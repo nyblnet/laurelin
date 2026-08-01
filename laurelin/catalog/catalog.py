@@ -31,10 +31,10 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
-from laurelin.core import clickhouse, federation, limits, metrics
+from laurelin.core import clickhouse, federation, limits, metrics, starrocks
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.dialects import CLICKHOUSE, DUCKDB
+from laurelin.core.dialects import CLICKHOUSE, DUCKDB, STARROCKS
 from laurelin.core.models import ColumnSchema, DatasetInfo, DatasetVersionInfo
 from laurelin.core.permissions import PolicyRenderError
 from laurelin.core.storage import storage_for
@@ -69,6 +69,14 @@ def suggest_dataset_name(filename: str) -> str:
 
 def _iceberg_path(location: str) -> str:
     return location[len("file://"):] if location.startswith("file://") else location
+
+
+class StaleBaseVersion(ValueError):
+    """A compare-and-set write lost: the dataset moved under the writer.
+
+    A ``ValueError`` so the API keeps mapping it to a client error, and its own
+    type so a caller can retry the *build* rather than guess from a string.
+    """
 
 
 def _is_duplicate_version(exc: BaseException) -> bool:
@@ -147,6 +155,7 @@ class DatasetCatalog:
         build_id: Optional[str],
         inherited: Optional[list[str]] = None,
         validate: Optional[Callable[[list[str]], None]] = None,
+        expect_version: Optional[int] = None,
     ) -> DatasetVersionInfo:
         """Register already-written parts as a new version.
 
@@ -155,6 +164,16 @@ class DatasetCatalog:
         metadata database does that via the (dataset, version) primary key. A
         writer that loses the race simply retries with the next number — its
         bytes are already safely written and don't move.
+
+        ``expect_version`` turns that into a compare-and-set: the new version
+        must be exactly ``expect_version + 1`` or nothing is registered. Taking
+        the next free number is right for a writer publishing *new* rows and
+        wrong for one publishing a *rewrite* of a base it already read —
+        writeback rebuilds the whole dataset from a version it read earlier, so
+        letting it take V+2 after someone else published V+1 silently discards
+        V+1's rows. Its own check-then-write cannot close that: the gap between
+        reading the version and inserting the row is where the other writer
+        lands. This is the same check with no gap.
 
         This replaces the old atomic directory rename, which had no equivalent
         on object storage. The invariant it protected — never register a
@@ -171,6 +190,12 @@ class DatasetCatalog:
             validate(files)
         columns = [ColumnSchema(name=f.name, type=str(f.type)) for f in schema]
         version = self.store.next_version(name)
+        if expect_version is not None and version != expect_version + 1:
+            raise StaleBaseVersion(
+                f"Dataset {name!r} moved from version {expect_version} to "
+                f"{version - 1} while this write was being built. Nothing was "
+                f"registered; retry."
+            )
         while True:
             info = DatasetVersionInfo(
                 dataset=name,
@@ -188,6 +213,12 @@ class DatasetCatalog:
             except Exception as exc:  # noqa: BLE001 - dialect-specific integrity errors
                 if not _is_duplicate_version(exc):
                     raise
+                if expect_version is not None:
+                    raise StaleBaseVersion(
+                        f"Dataset {name!r} version {version} was published by "
+                        f"another writer while this write was being built. "
+                        f"Nothing was registered; retry."
+                    ) from exc
                 version += 1  # another writer took this number; take the next
 
     def write(
@@ -198,12 +229,15 @@ class DatasetCatalog:
         build_id: Optional[str] = None,
         description: str = "",
         validate: Optional[Callable[[list[str]], None]] = None,
+        expect_version: Optional[int] = None,
     ) -> DatasetVersionInfo:
         """Write a new immutable version of a dataset.
 
         The parquet file is written to a temp dir inside data/ and renamed to
         its final version directory before the version is recorded, so a crash
         mid-write never leaves a registered-but-missing version.
+
+        ``expect_version`` makes it a compare-and-set; see ``_commit_version``.
         """
         _validate_name(name)
         self._refuse_write_at_source(name)
@@ -216,6 +250,7 @@ class DatasetCatalog:
                 name, [key],
                 row_count=table.num_rows, schema=table.schema,
                 source=source, build_id=build_id, validate=validate,
+                expect_version=expect_version,
             )
         except Exception:
             # Covers a failed write and a failed validation alike: in both
@@ -810,10 +845,78 @@ class DatasetCatalog:
         def close(self) -> None:
             pass
 
+    class _StarRocksSource:
+        """StarRocks over the MySQL wire protocol: a connection, and real binds.
+
+        Closest to ``_DuckDbSource`` of the three — it holds a connection and
+        binds every policy value — and unlike it, the budgets ride inside the
+        statement as a ``SET_VAR`` hint, because the work happens on a server
+        this process cannot interrupt.
+        """
+
+        dialect = STARROCKS
+
+        def __init__(self, source: dict):
+            self.source = source
+            self.con = starrocks.connect(source)
+            self._schema = None
+
+        def schema(self) -> pa.Schema:
+            if self._schema is None:
+                self._schema = starrocks.schema_of(self.source, self.con)
+            return self._schema
+
+        def run(self, select_list: str, where: str, params: list, limit) -> pa.Table:
+            budget = limits.QueryLimits.interactive()
+            sql = STARROCKS.assemble(
+                select_list,
+                starrocks.scan_expression(self.source),
+                where,
+                limit,
+                limits.starrocks_hint(budget),
+            )
+            with limits.starrocks_limited(budget):
+                # The declared schema types the result: the protocol cannot
+                # tell a BOOLEAN from a TINYINT (see laurelin/core/starrocks.py).
+                return starrocks.run(sql, params, self.con, schema=self.schema())
+
+        def close(self) -> None:
+            try:
+                self.con.close()
+            except Exception:  # noqa: BLE001 - closing a dead connection
+                pass
+
+    # Total, and with no fallback: a kind that is not here has no reader.
+    # `return self._DuckDbSource(...)` as an else-branch was the shape this
+    # replaced, and it fails in the one direction that matters — a new
+    # source-scanned kind would be read with DuckDB's quoter and DuckDB's flat
+    # statement, and the dialect-mismatch guard in `source_table` could not
+    # catch it because both sides would say "duckdb".
+    _SOURCE_READERS = {
+        "federated": _DuckDbSource,
+        "iceberg": _DuckDbSource,
+        "clickhouse": _ClickHouseSource,
+        "starrocks": _StarRocksSource,
+    }
+
     def _source_reader(self, info: DatasetInfo):
-        if info.is_clickhouse:
-            return self._ClickHouseSource(info.source)
-        return self._DuckDbSource(info.source)
+        try:
+            reader = self._SOURCE_READERS[info.kind]
+        except KeyError:
+            raise ValueError(
+                f"No source reader is registered for dataset kind "
+                f"{info.kind!r} ({info.name!r}). Add one to "
+                "DatasetCatalog._SOURCE_READERS — reading it with another "
+                "engine's reader would render its policy in the wrong dialect."
+            ) from None
+        # The reader's dialect and the dataset's declared one are derived
+        # independently; if they ever disagree, the policy would be compiled
+        # for one engine and executed by another.
+        assert reader.dialect.name == info.sql_dialect, (
+            f"{info.kind!r} reads with {reader.dialect.name} but declares "
+            f"{info.sql_dialect}"
+        )
+        return reader(info.source)
 
     def register_federated(
         self, name: str, source: dict, description: str = ""
@@ -842,6 +945,24 @@ class DatasetCatalog:
         clickhouse.columns_of(source)
         self.store.upsert_dataset(name, description)
         self.store.set_dataset_source(name, "clickhouse", source)
+        info = self.store.get_dataset(name)
+        assert info is not None
+        return info
+
+    def register_starrocks(
+        self, name: str, source: dict, description: str = ""
+    ) -> DatasetInfo:
+        """Register a read-only table served by a StarRocks cluster.
+
+        Probed before it is stored, so an unreachable table, an unreadable one
+        and one holding a column type Laurelin cannot render all fail here
+        rather than at first query.
+        """
+        _validate_name(name)
+        source = starrocks.validate_source(source)
+        starrocks.columns_of(source)
+        self.store.upsert_dataset(name, description)
+        self.store.set_dataset_source(name, "starrocks", source)
         info = self.store.get_dataset(name)
         assert info is not None
         return info
@@ -1018,11 +1139,15 @@ class DatasetCatalog:
                         self.source_table(ds.name, sql_policy_for=sql_policy_for),
                     )
                     continue
-                if ds.is_federated or ds.is_clickhouse:
-                    # ClickHouse joins the *federated* arm, never the Iceberg
-                    # one: the reader is external, and unlike Iceberg, Laurelin
+                if ds.scans_at_source:
+                    # Everything else read at the source joins the *federated*
+                    # arm, never the Iceberg one (which `continue`d above):
+                    # the reader is external, and unlike Iceberg, Laurelin
                     # neither owns the data nor has a filesystem sandbox to put
-                    # it behind (see laurelin/core/clickhouse.py). Both
+                    # it behind (see laurelin/core/clickhouse.py). Written as a
+                    # property rather than `is_federated or is_clickhouse` so a
+                    # new kind cannot fall through to the managed branch below
+                    # and be read as local Parquet parts it does not have. Both
                     # conditions below must hold, so an unpolicied registration
                     # is impossible.
                     if not federation.workbench_enabled() or sql_policy_for is None:

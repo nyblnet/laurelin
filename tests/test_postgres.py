@@ -70,6 +70,141 @@ def test_store_paths_that_differ_by_dialect_on_postgres(store):
     assert store.list_audit(1)[0].action == "second_action"
 
 
+def _edit(edit_id: str) -> ObjectEdit:
+    return ObjectEdit(id=edit_id, object_type="widget", pk_value="1",
+                      kind=EditKind.update, payload={},
+                      created_at="2026-01-01T00:00:00+00:00")
+
+
+def test_the_edit_watermark_survives_postgres_identity_visibility(store):
+    """The reason ``edit_seq`` exists instead of reusing the ordering column.
+
+    Postgres allocates an identity value at INSERT and makes it visible at
+    COMMIT, so a transaction holding seq=5 can commit *after* seq=6. A cursor
+    parked at "max seq I have seen" would then skip 5 permanently — the edit is
+    in the log, and no catch-up ever finds it.
+
+    ``edit_seq`` is allocated as MAX+1 inside the appending transaction and made
+    unique by an index, which serializes the two writers and leaves no gap. Here
+    T1 opens first and commits last, exactly the interleaving that breaks a
+    naive watermark.
+    """
+    import threading
+
+    import psycopg
+
+    store.add_object_edit(_edit("edit-0"))  # seq 1
+
+    # An open transaction holding seq 2, uncommitted and therefore invisible.
+    holder = psycopg.connect(PG_URL)
+    holder.autocommit = False
+    with holder.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(edit_seq), 0) + 1 FROM object_edits "
+            "WHERE object_type = %s", ("widget",),
+        )
+        assert cur.fetchone()[0] == 2
+        cur.execute(
+            "INSERT INTO object_edits (id, object_type, pk_value, kind,"
+            " payload_json, actor, created_at, edit_seq)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            ("edit-holder", "widget", "1", "update", "{}", "t",
+             "2026-01-01T00:00:00+00:00", 2),
+        )
+
+    # A second writer reads MAX+1 and computes 2 as well, because the holder's
+    # row is not visible. This is the exact interleaving that would corrupt a
+    # naive watermark.
+    result: dict = {}
+
+    def second_writer():
+        try:
+            result["seq"] = store.add_object_edit(_edit("edit-second"))
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(target=second_writer, daemon=True)
+    thread.start()
+    thread.join(timeout=3)
+    assert thread.is_alive(), (
+        "the UNIQUE index must make the second writer wait rather than let two "
+        "edits take the same position"
+    )
+
+    holder.commit()
+    holder.close()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert "error" not in result, (
+        f"losing the race must retry, not fail the user's write: {result.get('error')!r}"
+    )
+    assert result["seq"] == 3, "it re-read MAX+1 and took the next position"
+
+    seqs = sorted(e.edit_seq for e in store.list_object_edits("widget"))
+    assert seqs == [1, 2, 3], "gapless, so nothing above a watermark can be skipped"
+    # A catch-up cursor parked at 2 finds 3 — and, crucially, one parked at 1
+    # still finds 2, which is the edit a naive "max seq I have seen" would lose.
+    assert [e.edit_seq for e in store.list_object_edits_since("widget", 1)] == [2, 3]
+
+
+ONTOLOGY = """
+object_types:
+  - api_name: city
+    backing_dataset: cities
+    primary_key: name
+    title_property: name
+    properties:
+      name: {type: string}
+      realm: {type: string}
+actions:
+  - api_name: found_city
+    object_type: city
+    kind: create
+    parameters:
+      name: {type: string, required: true}
+      realm: {type: string, required: true}
+"""
+
+
+def test_creating_an_object_does_not_overflow_the_ordinal_column(store, tmp_path):
+    """``ord`` must be 64-bit, and only PostgreSQL can tell you it is not.
+
+    ``INTEGER`` is 64-bit on SQLite and 32-bit here, and a created object sorts
+    at ``ORD_CREATED_BASE + edit_seq = 2**62 + n``. So on the default
+    production control plane the very first object create overflowed the
+    column: the INSERT raised inside the write path, the write path swallowed
+    it and fell back to a log-only append, the user was told the write
+    succeeded, and the materialization was permanently behind from then on —
+    reads silently reverting to the full scan this whole feature exists to
+    remove. The advertised repair, a rebuild, hit the same overflow and 500ed.
+
+    Nothing caught it because no test created an ontology object against
+    Postgres. This one does.
+    """
+    import pyarrow as pa
+
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core.config import Workspace
+    from laurelin.ontology import OntologyService, load_ontology
+    from laurelin.ontology.store import ORD_CREATED_BASE
+
+    ws = Workspace.init(tmp_path / "pgord", name="pgord")
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", pa.table({"name": ["c0"], "realm": ["valinor"]}))
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+    svc = OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
+
+    assert svc.reindex("city") == 1
+    ot = svc.ontology.object_type("city")
+    svc.apply_action("found_city", pk=None, parameters={"name": "z0", "realm": "new"})
+
+    assert svc.store_is_caught_up(ot), "one create must not kill the materialization"
+    row = svc.object_store.rows_for("city", ["z0"])["z0"]
+    assert int(row["ord"]) == ORD_CREATED_BASE + 1
+    assert svc.reindex("city") == 2, "and a rebuild must not raise either"
+    assert svc.verify_digest(ot)
+
+
 def test_group_case_insensitivity_on_postgres(store):
     # groups were stored verbatim but read lowercased -> broken on PG
     store.create_group("Eng", "2026-01-01T00:00:00+00:00")
@@ -123,3 +258,50 @@ def test_multiworkspace_flow_on_postgres(app):
 
     # case-insensitive identity (Postgres has no COLLATE NOCASE)
     assert admin.post("/api/v1/auth/login", json={"username": "ED", "password": "password123"}).status_code == 200
+
+
+# -- DDL statement splitting --------------------------------------------------
+#
+# These need no server: they exercise the pure function that only the PostgreSQL
+# path uses. SQLite hands the script to native executescript and never reaches
+# it, which is exactly why a bug here stayed invisible until a Postgres run.
+
+@pytest.mark.parametrize("name, script, expected", [
+    ("two statements", "CREATE TABLE a (x INT); CREATE TABLE b (y INT);", 2),
+    # The regression. A semicolon inside a comment cut the enclosing CREATE
+    # TABLE in half; psycopg raised "syntax error at end of input" and a
+    # Postgres deployment could not create its schema at all.
+    ("semicolon inside a comment",
+     "CREATE TABLE a (\n  -- tracks the data; not the definition\n  x INT\n);", 1),
+    ("semicolon inside a string literal",
+     "CREATE TABLE a (x TEXT DEFAULT 'a;b');", 1),
+    ("escaped quote inside a literal",
+     "CREATE TABLE a (x TEXT DEFAULT 'it''s; fine');", 1),
+    ("no trailing semicolon", "CREATE TABLE a (x INT)", 1),
+])
+def test_ddl_splitting_ignores_semicolons_that_are_not_separators(name, script, expected):
+    from laurelin.core.backend import _split_statements
+
+    assert len(_split_statements(script)) == expected, name
+
+
+def test_the_real_schema_splits_into_runnable_statements():
+    """The shipped schema, not a toy string.
+
+    Every statement must be non-empty and look like DDL — a split that lands
+    mid-statement produces a fragment starting with a column name or a comment,
+    which is what the comment-semicolon bug did.
+    """
+    from laurelin.core.backend import SQLiteBackend, _split_statements
+    from laurelin.core.db import _SCHEMA
+
+    rendered = SQLiteBackend(":memory:").render_schema(_SCHEMA)
+    statements = _split_statements(rendered)
+    assert statements, "the schema produced no statements"
+    for stmt in statements:
+        head = "\n".join(
+            line for line in stmt.splitlines() if line.strip() and not line.strip().startswith("--")
+        ).lstrip().upper()
+        assert head.startswith(("CREATE", "INSERT", "ALTER", "DROP")), (
+            f"statement does not start with DDL — split landed mid-statement:\n{stmt[:200]}"
+        )

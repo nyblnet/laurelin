@@ -29,6 +29,12 @@ object_types:
       name: {type: string}
       realm: {type: string}
       pop: {type: integer}
+actions:
+  - api_name: set_realm
+    object_type: city
+    kind: update
+    parameters:
+      realm: {type: string, required: true}
 """
 
 
@@ -123,8 +129,19 @@ def test_a_new_dataset_version_invalidates_the_index(svc):
     assert svc.query("city", limit=20)["total"] == 7
 
 
-def test_an_edit_invalidates_the_index(svc):
-    """The overlay is part of the answer, so an edit makes the index stale."""
+def test_an_unapplied_edit_leaves_the_store_behind(svc):
+    """Was ``test_an_edit_invalidates_the_index``, and its meaning has flipped.
+
+    It used to assert the pathology: *any* edit invalidated the whole index, so
+    the very next read fell back to a scan. It now asserts the narrower, correct
+    thing — an edit written **straight to the log**, bypassing the
+    materialization, leaves that materialization behind, and a store that is
+    behind must refuse to answer.
+
+    Note what it does not test any more: this appends via ``add_object_edit``,
+    which is log-only. Going through ``apply_action`` (the real write path)
+    keeps the store caught up, and that is the counterpart below.
+    """
     svc.reindex("city")
     ot = svc.ontology.object_type("city")
     svc.store.add_object_edit(ObjectEdit(
@@ -132,11 +149,26 @@ def test_an_edit_invalidates_the_index(svc):
         kind=EditKind.update, payload={"realm": "changed"}, actor="t",
     ))
     assert not svc.index_is_fresh(ot)
+    assert svc._index_query(ot, None, None, 10, 0) is None, "behind means refuse"
     assert svc.query("city", filters={"name": "city-0"})["objects"][0]["realm"] == "changed"
 
     svc.reindex("city")
     assert svc.index_is_fresh(ot)
     assert svc.query("city", filters={"name": "city-0"})["objects"][0]["realm"] == "changed"
+
+
+def test_an_applied_edit_leaves_the_index_usable(svc):
+    """The counterpart, and without it nothing in this file proves the feature
+    exists: a write through the real path updates the index in place."""
+    svc.reindex("city")
+    ot = svc.ontology.object_type("city")
+    svc.apply_action("set_realm", pk="city-0", parameters={"realm": "changed"})
+
+    assert svc.index_is_fresh(ot), "one edit must not throw the index away"
+    served = svc._index_query(ot, None, {"name": "city-0"}, 10, 0)
+    assert served is not None, "and the index still answers"
+    assert served["objects"][0]["realm"] == "changed"
+    assert svc.query("city", limit=10)["total"] == 6
 
 
 def test_only_the_primary_key_is_served_from_the_index(svc):
@@ -157,7 +189,12 @@ def test_only_the_primary_key_is_served_from_the_index(svc):
 
 
 def test_rls_users_never_read_the_index(svc):
-    """The index is shared; a per-user view must never be served from it."""
+    """The index is shared; a per-user view must never be served from it.
+
+    Kept here under its original name, and extended in
+    ``tests/test_object_store_governance.py`` once the index became a write
+    target — that is where the property is exercised on all four paths.
+    """
     svc.reindex("city")
     svc.policy_for = lambda ds: (lambda t: t.slice(0, 2))
     ot = svc.ontology.object_type("city")

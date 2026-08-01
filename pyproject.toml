@@ -56,6 +56,19 @@ metrics = ["prometheus-client>=0.20"]
 # a large manylinux-only binary, so it is never a base dependency. Server mode
 # (clickhouse-connect) is deliberately absent: it is not implemented.
 clickhouse = ["chdb>=4.2"]
+# Read-only StarRocks-backed datasets, governed by the same policies as any
+# other. mysql-connector-python is the only MySQL-protocol client of the three
+# candidates that genuinely *binds* parameters — pymysql's `%s` is client-side
+# interpolation, which would put this codebase's only injection surface inside
+# a third-party library, and on StarRocks that is a remote write primitive
+# rather than a wrong read (see laurelin/core/starrocks.py).
+#
+# LICENSING, stated rather than discovered: mysql-connector-python is GPLv2
+# with the FOSS exception, and Laurelin is Apache-2.0. It is an *optional*
+# extra, imported only by the StarRocks backend, so nothing in a default
+# install links it — but anyone redistributing a build with this extra
+# installed should make that call deliberately.
+starrocks = ["mysql-connector-python>=8.0"]
 
 [project.scripts]
 laurelin = "laurelin.cli:main"

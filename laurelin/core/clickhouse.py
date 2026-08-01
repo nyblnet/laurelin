@@ -27,17 +27,21 @@ would have been a silent leak.
 * **No ontology object types.** Refused, exactly as for federated: every object
   page would be a full source scan with no stable row identity.
 
-**Sandbox — read this before enabling the workbench.** Federation's
-``connect()`` hardens DuckDB with ``disabled_filesystems`` and
-``lock_configuration``. **chdb has no equivalent.** Measured:
+**Sandbox — read this before enabling the workbench.** There is none. Measured:
 ``chdb.query("SELECT count(*) FROM file('/etc/passwd', LineAsString)")``
-succeeds, and ``readonly=1`` rejects the whole query rather than restricting
-the filesystem. The primary control still holds — only server-generated SQL
-ever reaches the engine, because callers receive an Arrow table and never a
-connection — but the defense in depth that federated sources get is *reduced*
-here. That is the reason ClickHouse datasets stay behind the same opt-in
-workbench gate (``LAURELIN_FEDERATION_WORKBENCH``) and are admin-only to
-register.
+succeeds, ``readonly=1`` rejects the whole query rather than restricting the
+filesystem, and ``validate_source`` lets through absolute paths, ``..``
+traversal and globs. Registering a source is therefore "may read any file this
+process can read", which is why it is admin-only and gated.
+
+That is **parity with the federated path, not a step down from it**, and the
+distinction matters because the opposite was previously written here.
+``federation.connect`` applies ``disabled_filesystems`` only when
+``is_local_source(source)`` is false — and a local Parquet path, the only
+source type this module supports, *is* a local source. So DuckDB reads the
+same paths with the same freedom. The primary control is identical on both:
+only server-generated SQL ever reaches the engine, because callers receive an
+Arrow table and never a connection.
 """
 
 from __future__ import annotations

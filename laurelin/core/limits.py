@@ -20,6 +20,7 @@ runs for two minutes is broken, whereas a build that does is just a build.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 from contextlib import contextmanager
@@ -259,6 +260,79 @@ def clickhouse_guard(limits: QueryLimits) -> Iterator[None]:
                 "Narrow it with a filter, an aggregate, or a smaller LIMIT."
             ) from exc
         raise
+
+
+def starrocks_hint(limits: QueryLimits) -> str:
+    """Query-level budget for a governed StarRocks statement, as a hint body.
+
+    StarRocks has no trailing ``SETTINGS`` clause; the equivalent is a
+    ``/*+ SET_VAR(...) */`` hint straight after ``SELECT``, which the dialect
+    wraps around this string. Two measured details:
+
+    * ``query_timeout`` is **seconds and integral**. ``SET_VAR(query_timeout
+      =7.5)`` is error 1232, "Incorrect argument type to variable" — so a
+      fractional budget is rounded up rather than silently dropped, because a
+      budget that fails to parse is a query with no budget at all.
+    * StarRocks validates the variable *names* in a hint (error 1193, with a
+      did-you-mean), so a typo here fails loudly instead of being ignored the
+      way an unknown DuckDB setting would be.
+
+    There is no semantic pin here of the kind ``transform_null_in=0`` is for
+    ClickHouse: nothing was measured on this engine that needed one, and
+    pinning a variable on a guess is a statement variation nothing tests.
+    """
+    parts = []
+    if limits.timeout_s and limits.timeout_s > 0:
+        parts.append(f"query_timeout={max(1, math.ceil(limits.timeout_s))}")
+    parts.append(f"query_mem_limit={_bytes_of(limits.memory_limit)}")
+    return ", ".join(parts)
+
+
+@contextmanager
+def starrocks_guard(limits: QueryLimits) -> Iterator[None]:
+    """Translate StarRocks' resource errors into Laurelin's.
+
+    Without this both flatten into the generic 400 at routes.py and lose the
+    408/413 distinction that route deliberately preserves.
+
+    The timeout is matched on its error number — 5024, measured — because that
+    one is specific. Memory exhaustion is **not**: it arrives as the catch-all
+    1064 whose text reads "Memory of Query<id> exceed limit. try consume:…", so
+    the message is the only discriminator available and is matched as such
+    rather than pretended to be a code.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - the driver raises several classes
+        text = str(exc)
+        errno = getattr(exc, "errno", None)
+        if errno == 5024 or "reached its timeout" in text:
+            metrics.query_rejections.labels(reason="timeout").inc()
+            raise QueryTimeout(
+                f"Query exceeded the {limits.timeout_s:g}s limit. Narrow it with "
+                "a filter, an aggregate, or a smaller LIMIT."
+            ) from exc
+        if "exceed limit" in text or "Memory limit exceeded" in text:
+            metrics.query_rejections.labels(reason="memory").inc()
+            raise QueryTooLarge(
+                f"Query needed more than the {limits.memory_limit} memory budget. "
+                "Narrow it with a filter, an aggregate, or a smaller LIMIT."
+            ) from exc
+        raise
+
+
+@contextmanager
+def starrocks_limited(limits: Optional[QueryLimits] = None) -> Iterator[None]:
+    """Admission control plus error translation for one StarRocks statement.
+
+    ``admit`` bounds how many queries this *process* has in flight, which is
+    still the right control even though the work now happens on someone else's
+    machine: it is what stops one replica opening unbounded connections to the
+    serving tier. The budgets themselves ride in the statement's hint.
+    """
+    limits = limits or QueryLimits.interactive()
+    with admit(limits), starrocks_guard(limits):
+        yield
 
 
 @contextmanager

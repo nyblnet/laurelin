@@ -91,7 +91,12 @@ def redacted_source(source: dict[str, Any]) -> dict[str, Any]:
         if _SECRET_KEY_RE.search(key):
             out[key] = "*****"
         elif key == "url" and isinstance(value, str):
-            out[key] = re.sub(r"//([^:/@]+):[^@]*@", r"//\1:*****@", value)
+            # `[^/]*` for the password, not `[^@]*`: a password containing an
+            # '@' would otherwise end the match at the *first* one and leave
+            # its tail in the "redacted" string — the StarRocks DSN made that
+            # reachable, and it was always wrong. The host section cannot
+            # contain a '/', so this still stops at the authority.
+            out[key] = re.sub(r"//([^:/@]+):[^/]*@", r"//\1:*****@", value)
         else:
             out[key] = value
     return out

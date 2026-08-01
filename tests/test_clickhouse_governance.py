@@ -2,9 +2,17 @@
 
 The claim this file defends is narrow and total: **for every (policy, user,
 dataset), the ClickHouse renderer returns the same rows and the same values as
-``PermissionService.apply_table_policy``.** That function is the reference, not
-the DuckDB renderer — DuckDB is already measurably different for Float64 policy
-columns (see the note at the bottom of the file).
+``PermissionService.apply_table_policy``, or refuses.** That function is the
+reference, not the DuckDB renderer — DuckDB is measurably different from it
+too, for Float64 and timestamp policy columns.
+
+"or refuses" is load-bearing and was added after the first version of this
+file claimed the equivalence outright. A row policy and a hash mask are both
+defined on the column's *text*, and the engines do not share a stringifier, so
+on Decimal, Float64 and temporal columns the same allowlist selects different
+rows on different engines — with the SQL side the permissive one. Where the
+renderer cannot prove it agrees, it refuses; ``tests/test_text_agreement.py``
+re-derives the proof from the live engines.
 
 Each test below corresponds to a way that claim was found to be false during
 investigation, on this exact chdb build:
@@ -17,13 +25,17 @@ investigation, on this exact chdb build:
 5. a case-typo'd mask silently masked nothing;
 6. ``denies_all`` had to survive limits, nesting and a column named ``FALSE``;
 7. profile settings could change ``IN`` semantics under the query;
-8. a policy value with a backslash in it matched the wrong rows.
+8. a policy value with a backslash in it matched the wrong rows;
+9. a Decimal, Float64 or timestamp policy column meant one thing on
+   ``/datasets/{name}/rows`` and another on ``/query``, for the same user.
 
 The fixture writes a local Parquet file and lets chdb read it through
 ``file(path, Parquet)``. That is the whole test rig: no ClickHouse server, no
 container, no service in CI.
 """
 
+import datetime
+import hashlib
 import math
 import re
 
@@ -510,3 +522,117 @@ def test_the_types_that_do_agree_still_work(env):
     got = governed(catalog, perms, VIEWER)
     assert got.column("id").to_pylist() == [1, 3]
     assert same(got, reference(catalog, perms, VIEWER))
+
+
+def test_a_timestamp_row_policy_cannot_mean_two_things_on_two_routes(tmp_path, monkeypatch):
+    """The leak that motivated the guard, asserted where a user stands.
+
+    Measured before the fix, one dataset, one viewer, one policy, and the most
+    ordinary policy value anyone would write for a ``timestamp[us]`` column:
+
+        GET  /api/v1/datasets/audit/rows  ->  200  []
+        POST /api/v1/query                ->  200  ['ACME-1', 'ACME-2']
+
+    The two routes take different renderers. ``/rows`` filters in Arrow, whose
+    key is ``pc.cast(col, string)``; chdb returns timestamps stamped
+    ``tz=UTC``, so that key carries a trailing ``Z``. ``/query`` filters in
+    ClickHouse, whose ``toString`` does not. Same allowlist string, two
+    meanings, and the SQL one was permissive.
+
+    Now the SQL route refuses. The row API is unchanged — it is the reference —
+    so the asymmetry runs the safe way: the path that cannot prove it agrees is
+    the path that stops.
+    """
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.core import federation
+
+    monkeypatch.setenv("LAURELIN_FEDERATION_WORKBENCH", "1")
+    assert federation.workbench_enabled(), "the leak needs the workbench reachable"
+
+    remote = tmp_path / "audit.parquet"
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2, 3, 4], pa.int64()),
+        "seen_at": pa.array(
+            [datetime.datetime(2024, 1, 2, 3, 4, 5)] * 2
+            + [datetime.datetime(2024, 6, 1)] * 2,
+            pa.timestamp("us"),
+        ),
+        "note": ["ACME-1", "ACME-2", "OTHER-1", "OTHER-2"],
+    }), remote)
+
+    ws = Workspace.init(tmp_path / "ws", name="audit")
+    app = create_app(ws)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin = TestClient(app)
+    admin.post("/api/v1/auth/setup", json=creds)
+    admin.post("/api/v1/auth/login", json=creds)
+    admin.put("/api/v1/datasets/audit/clickhouse",
+              json={"source": {"type": "parquet", "path": str(remote)}})
+    admin.post("/api/v1/users",
+               json={"username": "vic", "password": "password123", "role": "viewer"})
+    admin.put("/api/v1/datasets/audit/policy", json={
+        "row_policy": ROWS("seen_at", ["2024-01-02 03:04:05.000000"]),
+        "column_masks": [],
+    })
+
+    viewer = TestClient(app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vic", "password": "password123"})
+
+    rows = viewer.get("/api/v1/datasets/audit/rows?limit=100")
+    assert rows.status_code == 200
+    denied_by_the_row_api = [r["note"] for r in rows.json()["rows"]]
+
+    query = viewer.post("/api/v1/query", json={"sql": "SELECT note FROM audit"})
+    assert query.status_code >= 400, (
+        f"the SQL route served {query.json()} where the row API served "
+        f"{denied_by_the_row_api}"
+    )
+    assert "note" not in query.text or "ACME" not in query.text
+
+
+def test_a_list_typed_policy_column_is_refused_by_every_renderer(tmp_path):
+    """Three renderers used to give three answers and only one served data.
+
+    On a ``list<string>`` policy column with the allowlist ``["['a','b']"]``:
+    ClickHouse returned rows 1 and 3, DuckDB returned none, and Arrow — the
+    reference — raised ``ArrowNotImplementedError``. Where the reference cannot
+    express the policy there is no correct answer, so nothing validates what
+    ClickHouse is enforcing. All three must now refuse, and the Arrow one must
+    say why rather than surfacing a cast error.
+    """
+    remote = tmp_path / "tagged.parquet"
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "tags": pa.array([["a", "b"], ["c"], ["a", "b"]], pa.list_(pa.string())),
+        "secret": ["s1", "s2", "s3"],
+    }), remote)
+
+    ws = Workspace.init(tmp_path / "ws", name="tagged")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.register_clickhouse("tagged", {"type": "parquet", "path": str(remote)})
+    perms = PermissionService(store)
+    set_policy(store, row_policy=ROWS("tags", ["['a','b']"]), dataset="tagged")
+
+    with pytest.raises(PolicyRenderError, match="no text form"):
+        governed(catalog, perms, VIEWER, name="tagged")
+    with pytest.raises(PolicyRenderError, match="no text form"):
+        reference(catalog, perms, VIEWER, name="tagged")
+
+
+def test_two_masks_on_one_column_agree_with_the_reference(env):
+    """The composed form, executed rather than inspected: the SQL renderer used
+    to emit sha256 of the plaintext where the reference emits sha256('***')."""
+    catalog, store, perms = env
+    store.set_dataset_policy("sales", {
+        "dataset": "sales",
+        "row_policy": None,
+        "column_masks": [MASK("ssn", "redact"), MASK("ssn", "hash")],
+    })
+    got = governed(catalog, perms, VIEWER)
+    assert same(got, reference(catalog, perms, VIEWER))
+    digest = hashlib.sha256(b"***").hexdigest()[:16]
+    assert set(got.column("ssn").to_pylist()) == {digest}
