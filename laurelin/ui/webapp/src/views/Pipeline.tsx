@@ -25,6 +25,7 @@ import {
   fmtNum,
   fmtTime,
 } from "../ui";
+import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
 
 // ------------------------------------------------------------------ helpers
 
@@ -389,6 +390,8 @@ export function PipelineView() {
         subtitle="Transform DAG and build history."
         actions={actions}
       />
+
+      <ImportedPipelinesNotice />
 
       {runBuild.isError && <ErrorBox error={runBuild.error} />}
 

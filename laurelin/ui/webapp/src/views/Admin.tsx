@@ -27,6 +27,7 @@ import { DatasetAccessSection } from "./admin/DatasetAccessSection";
 import { DataSecuritySection } from "./admin/DataSecuritySection";
 import { MarkingsSection } from "./admin/MarkingsSection";
 import { EnginesSection } from "./admin/EnginesSection";
+import { PortabilitySection } from "./admin/PortabilitySection";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
 
@@ -447,7 +448,7 @@ export function AdminView() {
     <div>
       <PageHeader
         title="Admin"
-        subtitle="Users, roles and API tokens for this workspace."
+        subtitle="Users, roles, access control, and this workspace's portability."
       />
 
       {!auth.can("admin") ? (
@@ -462,6 +463,7 @@ export function AdminView() {
           <DataSecuritySection />
           <MarkingsSection />
           <EnginesSection />
+          <PortabilitySection />
         </>
       )}
     </div>

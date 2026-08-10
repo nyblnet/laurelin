@@ -82,6 +82,16 @@ def get_catalog(request: Request) -> DatasetCatalog:
 
 
 def get_registry(workspace: Annotated[Workspace, Depends(get_workspace)]) -> TransformRegistry:
+    # collect_transforms EXECs every .py in pipelines/, so a workspace whose
+    # pipelines arrived in an import stays empty until an admin acknowledges
+    # them. Empty rather than a 409: listing transforms, lineage and the build
+    # history are how an operator reviews what just landed, and 409-ing all of
+    # them would hide the workspace behind the very control meant to protect it.
+    # POST /builds refuses out loud instead — see run_build.
+    from laurelin.export import pipelines_acknowledged
+
+    if not pipelines_acknowledged(workspace):
+        return TransformRegistry()
     return collect_transforms(workspace.pipelines_dir)
 
 
@@ -697,12 +707,17 @@ def run_build(
     actor: ActorDep,
     body: Optional[BuildRequest] = None,
 ) -> dict:
+    from laurelin.export import require_pipelines_acknowledged
+
     targets = body.targets if body else None
     if targets is not None and len(targets) == 0:
         raise HTTPException(
             status_code=400,
             detail="targets must be non-empty when provided; omit it to build everything",
         )
+    # ImportRefused -> 409, with a message naming the acknowledgement route. A
+    # build is the moment imported pipeline code would actually run.
+    require_pipelines_acknowledged(workspace)
     store.log_audit("build_requested", {"targets": targets or []}, actor=actor)
     builder = Builder(workspace, catalog, store, registry)
     if body and body.wait:

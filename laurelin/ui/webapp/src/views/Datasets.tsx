@@ -37,6 +37,25 @@ import { IcebergManager } from "./IcebergManager";
 
 const PAGE_SIZE = 50;
 
+/**
+ * A dataset whose bytes did not survive an import.
+ *
+ * The import stamps this sentinel into `source` for anything it could not
+ * carry — a federated table's endpoint was withheld with the rest of the
+ * credentials, and a metadata-only archive carries no Parquet at all. Reads
+ * then fail with 409 rather than returning zero rows, because in a governance
+ * product an empty result is indistinguishable from a working row policy. The
+ * pill exists so that refusal is legible *before* someone clicks into it.
+ */
+function needsCredentials(d: { source?: Record<string, unknown> }): boolean {
+  return d.source?.__laurelin_needs_credentials === true;
+}
+
+function importedDataState(d: { source?: Record<string, unknown> }): string {
+  const state = d.source?.__laurelin_data_state;
+  return typeof state === "string" ? state : "elsewhere";
+}
+
 export function DatasetsView() {
   return (
     <Routes>
@@ -69,6 +88,7 @@ function DatasetList() {
               already carry, and gold is what this UI uses for the thing you
               are meant to notice. */}
           {d.kind === "starrocks" && <Badge tone="gold">starrocks</Badge>}
+          {needsCredentials(d) && <Badge tone="red">needs credentials</Badge>}
         </span>
       ),
     },
@@ -576,6 +596,8 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         }
       />
 
+      {needsCredentials(detail) && <NeedsCredentialsBanner detail={detail} />}
+
       {atSource ? (
         <FederatedSource source={detail.source} kind={detail.kind} />
       ) : auth.can("editor") ? (
@@ -602,12 +624,59 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         </>
       )}
 
-      <h3>Row preview</h3>
-      <RowPreview
-        name={detail.name}
-        schema={schemaVersion?.schema}
-        atSource={atSource}
-      />
+      {/* Not rendered when the sentinel is set: the request would 409, and a
+          red box under a heading called "Row preview" reads as a bug rather
+          than as the deliberate refusal it is. The banner above says it once,
+          in words, with the fix. */}
+      {!needsCredentials(detail) && (
+        <>
+          <h3>Row preview</h3>
+          <RowPreview
+            name={detail.name}
+            schema={schemaVersion?.schema}
+            atSource={atSource}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A dataset that arrived in an import without the bytes or the endpoint it
+ * needs.
+ *
+ * The server refuses to read it — 409, never an empty result set — and this is
+ * the sentence that turns that refusal into an instruction. Which instruction
+ * depends on why: a metadata-only archive is missing Parquet, while anything
+ * scanned at source is missing the connection details the export withheld on
+ * purpose.
+ */
+function NeedsCredentialsBanner({ detail }: { detail: DatasetDetail }) {
+  const metadataOnly = importedDataState(detail) === "metadata_only";
+  const missing = Object.entries(detail.source ?? {})
+    .filter(([k, v]) => v === null && !k.startsWith("__"))
+    .map(([k]) => k);
+  return (
+    <div className="error-box" style={{ marginBottom: 20 }}>
+      <div style={{ fontWeight: 600 }}>
+        This dataset was imported without {metadataOnly ? "its data" : "its endpoint"}.
+      </div>
+      <p style={{ fontSize: 12.5, marginTop: 6, marginBottom: 6 }}>
+        {metadataOnly
+          ? "Its governance, versions and schema arrived; the Parquet did not. Re-import from a full export, or upload a new version."
+          : "Its rows live in a remote system, and the export withheld the connection details rather than shipping a credential in a file. Re-supply them and this clears."}
+        {" "}Reads refuse with a 409 until then — returning zero rows would be
+        indistinguishable from a row policy that is working correctly.
+      </p>
+      {missing.length > 0 && (
+        <div className="mono" style={{ fontSize: 12 }}>
+          withheld: {missing.join(", ")}
+        </div>
+      )}
+      <div style={{ marginTop: 8, fontSize: 12 }}>
+        <a href="#/admin">Admin → Portability → Re-supply checklist</a>
+      </div>
     </div>
   );
 }

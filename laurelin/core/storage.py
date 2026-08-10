@@ -106,6 +106,33 @@ class Storage:
         info = self.fs.get_file_info(self.resolve(key))
         return info.type != pafs.FileType.NotFound
 
+    def size(self, key: str) -> int:
+        """Byte size of a part, or -1 when it is not there.
+
+        A tar member header needs the size *before* the bytes, and a workspace
+        export must not learn it by reading the part into memory first.
+        """
+        info = self.fs.get_file_info(self.resolve(key))
+        if info.type == pafs.FileType.NotFound:
+            return -1
+        return int(info.size or 0)
+
+    def open_input_stream(self, key: str):
+        """A raw byte stream over one part.
+
+        The export copies parts through this rather than ``read_table``: a
+        terabyte dataset then costs one buffer instead of a terabyte of RAM,
+        and the bytes that land in the archive are the bytes on disk rather
+        than a re-encoding of them.
+        """
+        return self.fs.open_input_stream(self.resolve(key))
+
+    def open_output_stream(self, key: str):
+        """A raw byte sink for one part, creating its parent."""
+        target = self.resolve(key)
+        self._ensure_parent(target)
+        return self.fs.open_output_stream(target)
+
     def list_keys(self, prefix: str) -> list[str]:
         """Workspace-relative keys directly under a prefix.
 

@@ -23,10 +23,35 @@ built entirely on open formats and open APIs, with no lock-in of any kind.
 | Pipelines | Platform-hosted code | Plain **Python** files; run them anywhere |
 | API | Partially documented | **REST + OpenAPI** (`/docs`), generated from source |
 | Deployment | SaaS / heavyweight | `pip install`, local-first, single process |
-| Exit cost | High | `cp -r` your workspace directory. That's it. |
+| Exit cost | High | `laurelin export` — one archive, and a governance fingerprint that **proves** the copy decides identically |
 
 Everything Laurelin knows lives in one **workspace directory** of ordinary files.
 Delete the tool and your data, lineage, and ontology are still readable.
+
+### Leaving is a command, and it is checkable
+
+```bash
+laurelin export workspace.tar --fingerprint   # data, governance, ontology, pipelines
+laurelin import workspace.tar -w new          # reconstruct it, on SQLite or PostgreSQL
+laurelin verify-governance --baseline workspace.tar -w new
+```
+
+The third line is the point. It recomputes, per `(principal, dataset)`, the rows
+that principal sees and the cells they see unmasked — through all three
+enforcement paths — and diffs it against the archive. "It still governs
+identically" is something you check, not something we assert.
+
+The export **withholds every credential** rather than redacting it (Laurelin's
+own API redactors were attacked with nine DSN shapes and eight leaked), and the
+import **binds no principal**: rules land verbatim, users, group memberships and
+clearances do not, so a reconstruction can narrow access and never widen it. The
+manifest is a checklist of exactly what has to be re-supplied.
+
+It does not carry everything, and [docs/PORTABILITY.md](docs/PORTABILITY.md)
+says what: federated, ClickHouse and StarRocks datasets are pointers whose rows
+live elsewhere, Iceberg tables must be re-registered against a reachable
+warehouse, object-store data planes are unverified, and there is no incremental
+or resumable export.
 
 ## Concepts
 

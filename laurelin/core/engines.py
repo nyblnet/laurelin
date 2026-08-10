@@ -134,6 +134,17 @@ class FlightSQLClient:
 
 
 def connect(config: EngineConfig, timeout_s: float = 300.0) -> EngineClient:
+    # An imported engine carries its option *keys* and no values, which is a
+    # shape awaiting a credential rather than a registration that failed. Said
+    # here so it is one message instead of whatever ADBC reports about an empty
+    # DSN.
+    from laurelin.export.manifest import NEEDS_CREDENTIALS_KEY, NeedsCredentials
+
+    if (config.options or {}).get(NEEDS_CREDENTIALS_KEY):
+        raise NeedsCredentials(
+            f"Engine {config.name!r} was imported without its URI. Re-supply it "
+            "(PUT /api/v1/engines/{name} or Admin -> Engines) before using it."
+        )
     if config.type == "flightsql":
         return FlightSQLClient(config, timeout_s=timeout_s)
     raise ValueError(f"Unknown engine type {config.type!r}")

@@ -87,14 +87,19 @@ export interface Dataset {
   created_at: string;
   latest_version: number | null;
   kind?: DatasetKind;
+  /**
+   * The (redacted) source Laurelin scans, for anything it does not hold itself.
+   * On the *list* too, not only the detail: an imported dataset carries the
+   * `__laurelin_needs_credentials` sentinel here, and the list is where an
+   * operator first notices that a migrated table cannot be read yet.
+   */
+  source?: Record<string, unknown>;
   // Present on permission-aware responses (dataset list/detail): the current
   // user's effective access to this dataset.
   permissions?: ObjectTypePermission;
 }
 
 export interface DatasetDetail extends Dataset {
-  /** Federated/iceberg only: the (redacted) source Laurelin scans. */
-  source?: Record<string, unknown>;
   versions: DatasetVersion[];
 }
 
@@ -491,4 +496,184 @@ export interface Group {
   name: string;
   members: string[];
   created_at?: string;
+}
+
+// -- Portability: workspace export / import ---------------------------------
+//
+// Mirrors laurelin/export/manifest.py and laurelin/export/reader.py. The shapes
+// are wide because the manifest's job is to be *read*: an archive that omits a
+// credential or a dataset's rows has to say so somewhere a person will look,
+// and this is that somewhere.
+
+/** Whether a dataset's bytes are in the archive — and if not, why not. */
+export type DataState =
+  | "included"
+  | "elsewhere"
+  | "elsewhere_absolute_path"
+  | "metadata_only";
+
+/** One secret the export refused to carry, and the route that puts it back. */
+export interface Withheld {
+  table: string;
+  /** The row's primary key, or "*" when the field is withheld from every row. */
+  row: string;
+  /** A column, or a dotted path inside a JSON column. */
+  field: string;
+  reason: string;
+  required_for: string;
+  resupply: string;
+}
+
+export interface NotExportedTable {
+  table: string;
+  cls: string;
+  reason: string;
+  rebuild: string;
+}
+
+export interface DatasetPlan {
+  name: string;
+  kind: string;
+  data_state: DataState;
+  versions: number;
+  parts: number;
+  bytes: number;
+  reason: string;
+  note: string;
+}
+
+/** A principal the imported rules name but the archive cannot create. */
+export interface PrincipalRef {
+  kind: "user" | "group";
+  name: string;
+  referenced_by: string[];
+}
+
+export interface PipelineWarning {
+  file: string;
+  line: number;
+  pattern: string;
+  preview: string;
+}
+
+export interface ExportTableStat {
+  rows: number;
+  columns: string[];
+}
+
+export interface ExportOrigin {
+  workspace_name: string;
+  workspace_dir: string;
+  origin_id: string;
+  origin_slug: string;
+  metadata_dialect: string;
+  mode: string;
+  multi_slug: string | null;
+  data_plane: string;
+}
+
+export interface ExportScope {
+  data: boolean;
+  audit: boolean;
+  membership: boolean;
+  datasets: string[] | null;
+}
+
+export interface ExportManifest {
+  format_version: number;
+  laurelin_version: string;
+  created_at: string;
+  created_by: string;
+  origin: ExportOrigin;
+  scope: ExportScope;
+  tables: Record<string, ExportTableStat>;
+  datasets: DatasetPlan[];
+  withheld: Withheld[];
+  not_exported: NotExportedTable[];
+  environment_resupply: string[];
+  principals: PrincipalRef[];
+  content_warnings: PipelineWarning[];
+  nulled_error_fields: Record<string, number>;
+  governance_fingerprint: GovernanceFingerprint | Record<string, never>;
+  /** Preview only: the part set the manifest implies, before anything streams. */
+  estimated_parts?: number;
+  estimated_part_bytes?: number;
+}
+
+export interface Collision {
+  kind: "dataset" | "group" | "marking" | "user";
+  name: string;
+  severity: "refusal" | "widening-risk" | "note";
+  detail: string;
+  resolution: string;
+}
+
+export interface QuarantinedClearance {
+  username: string;
+  marking: string;
+  marking_at_source: string;
+}
+
+export interface ImportReport {
+  applied: boolean;
+  dry_run: boolean;
+  merge: boolean;
+  manifest: ExportManifest | null;
+  target_not_pristine: Record<string, number>;
+  collisions: Collision[];
+  rows_imported: Record<string, number>;
+  /** Rows that travelled and were deliberately not written — the bindings. */
+  rows_quarantined: Record<string, number>;
+  principals: PrincipalRef[];
+  withheld: Withheld[];
+  datasets: DatasetPlan[];
+  marking_renames: Record<string, string>;
+  quarantined_clearances: QuarantinedClearance[];
+  dataset_renames: Record<string, string>;
+  parts_written: number;
+  bytes_written: number;
+  files_written: string[];
+  import_state: string;
+  warnings: string[];
+  /** The digest a `merge` must quote back, so a stale report cannot be applied. */
+  report_sha256: string;
+}
+
+export interface ImportState {
+  imported: boolean;
+  import_state: string | null;
+  pipelines_acknowledged: boolean;
+  origin_id: string | null;
+  imported_at: string | null;
+  content_warnings: PipelineWarning[];
+}
+
+/** One (principal, dataset) answer, captured through every enforcement path. */
+export interface GovernanceCell {
+  can_view: boolean;
+  can_edit: boolean;
+  effective_markings: string[];
+  decision: string;
+  sql: string;
+  table?: string;
+  arrow?: string;
+  duckdb?: string;
+  rows?: Record<string, string[] | string>;
+  visible?: Record<string, string[] | string>;
+}
+
+export interface GovernanceFingerprint {
+  principals: string[];
+  datasets: string[];
+  /** Keyed "principal|dataset". */
+  cells: Record<string, GovernanceCell>;
+  /** Keyed "principal|api_name" -> [can_view, can_edit]. */
+  object_types: Record<string, [boolean, boolean]>;
+}
+
+export interface FingerprintResponse {
+  fingerprint: GovernanceFingerprint;
+  /** Named principals the workspace could not resolve — after an inert import,
+   *  this is every one of them, and that absence is the point. */
+  unresolved_principals: string[];
 }

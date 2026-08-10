@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -151,7 +152,17 @@ def build(
 ) -> None:
     """Run pipeline transforms and materialize their output datasets."""
     ws = _find_workspace(workspace)
+    from laurelin.export import ImportRefused, require_pipelines_acknowledged
     from laurelin.transforms import Builder, collect_transforms
+
+    # collect_transforms EXECs every .py in pipelines/. If they arrived in an
+    # import, an admin has to say they read them first — the CLI is the same
+    # front door as the API here, not a way around it.
+    try:
+        require_pipelines_acknowledged(ws)
+    except ImportRefused as exc:
+        typer.echo(f"Refused: {exc}", err=True)
+        raise typer.Exit(2)
 
     store, catalog = _open_engine(ws)
     registry = collect_transforms(ws.pipelines_dir)
@@ -335,6 +346,415 @@ def demo(
     if build:
         typer.echo("Pipeline built: clean_aircraft, clean_flights, flight_stats")
     typer.echo(f"Next: laurelin serve --workspace {workspace.root}")
+
+
+# -- portability: export / import / verify-governance -------------------------
+#
+# Three top-level verbs rather than a sub-app, matching build/upload/demo: a
+# `laurelin portability export` would bury the one command whose existence is
+# the product claim.
+#
+# Exit codes are load-bearing and differ from the rest of the CLI:
+#   0  it worked
+#   1  it failed
+#   2  it REFUSED, and the message names the flag that overrides the refusal
+# A refusal is not an error — it is the tool declining to write something
+# misleading — and a runbook that cannot tell the two apart will retry the
+# wrong one.
+
+
+def _refused(exc: Exception) -> None:
+    typer.echo(f"Refused: {exc}", err=True)
+    raise typer.Exit(2)
+
+
+def _detect_mode(ws: Workspace):
+    """Whether this workspace belongs to a multi-workspace server, and its members.
+
+    Worth detecting rather than asking about: in multi mode a user's effective
+    role for the workspace lives in ``control.db::workspace_members``
+    (auth_routes.py:126) and admin bypasses every gate, so an export taken
+    without it cannot reproduce a single access decision. If the CLI assumed
+    "single" it would produce that governance-incomplete archive silently,
+    which is the failure this whole feature exists to prevent.
+    """
+    from laurelin.core.control import ControlStore
+
+    url = os.environ.get("LAURELIN_CONTROL_DATABASE_URL")
+    if url:
+        control = ControlStore(url)
+    else:
+        candidate = ws.root.parent / "control.db"
+        if not candidate.exists():
+            return "single", None, None
+        control = ControlStore(candidate)
+    slug = ws.root.name
+    try:
+        if control.get_workspace(slug) is None:
+            return "single", None, None
+    except Exception:  # noqa: BLE001 - an unreachable control plane is not this workspace's
+        return "single", None, None
+    return "multi", control, slug
+
+
+def _fingerprint_now(ws: Workspace, store, catalog, principals=None) -> dict:
+    """The decision matrix for every account in the workspace, plus anonymous."""
+    from laurelin.core.auth import AuthService
+    from laurelin.export import governance_fingerprint
+    from laurelin.ontology import load_ontology
+
+    if principals is None:
+        principals = [*AuthService(store).list_users(), None]
+    try:
+        ontology = load_ontology(ws.ontology_dir)
+        object_types = {o.api_name: o.backing_dataset for o in ontology.object_types}
+    except ValueError:
+        object_types = {}
+    return governance_fingerprint(store, catalog, principals, object_types=object_types)
+
+
+def _export_summary(manifest) -> None:
+    """One line per outcome, on stderr so `laurelin export -` stays pipeable.
+
+    Incompleteness is announced in four places (manifest, this line, the
+    import-time 409, and the UI) because any single one of them is skippable,
+    and a migration that quietly left three datasets behind is exactly the kind
+    of subtly-broken outcome that only surfaces months later.
+    """
+    by_state: dict[str, list] = {}
+    for plan in manifest.datasets:
+        by_state.setdefault(plan.data_state, []).append(plan)
+    parts = []
+    for state in sorted(by_state):
+        plans = by_state[state]
+        size = sum(p.bytes for p in plans)
+        kinds = ",".join(sorted({p.kind for p in plans}))
+        suffix = f" ({size / 1e6:.1f} MB)" if size else ""
+        parts.append(f"{kinds}: {len(plans)} {state}{suffix}")
+    typer.echo(" | ".join(parts) or "no datasets", err=True)
+    typer.echo(
+        f"withheld secrets: {len(manifest.withheld)} "
+        f"(listed in manifest.json; re-supply each one at the destination)",
+        err=True,
+    )
+    if manifest.content_warnings:
+        typer.echo(
+            f"credential-shaped content carried as-is: "
+            f"{len(manifest.content_warnings)} place(s)",
+            err=True,
+        )
+
+
+@app.command("export")
+def export_cmd(
+    output: Optional[str] = typer.Argument(
+        None, help="Archive path, or '-' for stdout (pipe it into `laurelin import -`)."
+    ),
+    workspace: Optional[Path] = WORKSPACE_OPTION,
+    metadata_only: bool = typer.Option(
+        False,
+        "--metadata-only",
+        help="Omit data/** — governance, ontology and pipelines only.",
+    ),
+    audit: bool = typer.Option(
+        True, "--audit/--no-audit", help="Carry the audit log (default: carried)."
+    ),
+    gzip: Optional[bool] = typer.Option(
+        None,
+        "--gzip/--no-gzip",
+        help="Default: on for --metadata-only, off otherwise (Parquet is already "
+        "compressed; gzip over it buys ~2% for real CPU).",
+    ),
+    include_membership: Optional[bool] = typer.Option(
+        None,
+        "--include-membership/--no-membership",
+        help="Multi-workspace mode only: carry workspace_members for this slug. "
+        "One of the two is REQUIRED there.",
+    ),
+    allow_content_warnings: bool = typer.Option(
+        False,
+        "--allow-content-warnings",
+        help="Carry pipelines, ontology YAML and authored config that look "
+        "like they hold a credential.",
+    ),
+    allow_remote_data_plane: bool = typer.Option(
+        False,
+        "--allow-remote-data-plane",
+        help="Attempt a full export when the data plane is an object store "
+        "(unverified end to end).",
+    ),
+    fingerprint: bool = typer.Option(
+        False,
+        "--fingerprint",
+        help="Compute the governance decision matrix and embed it in the "
+        "manifest, so the destination can be proven to govern identically "
+        "(`laurelin verify-governance --baseline <archive>`).",
+    ),
+    dataset: Optional[list[str]] = typer.Option(
+        None,
+        "--dataset",
+        help="Repeatable. Restricts which datasets' DATA travels; governance is "
+        "a closure and always travels whole.",
+    ),
+) -> None:
+    """Export this workspace to a tar archive you can reconstruct elsewhere."""
+    import sys
+
+    from laurelin.export import ExportOptions, ExportRefused, export_workspace, stream_export
+
+    ws = _find_workspace(workspace)
+    store, catalog = _open_engine(ws)
+    mode, control, slug = _detect_mode(ws)
+    rows: tuple = ()
+    if mode == "multi" and include_membership and control is not None and slug:
+        rows = tuple({"slug": slug, **m} for m in control.list_members(slug))
+
+    options = ExportOptions(
+        metadata_only=metadata_only,
+        include_audit=audit,
+        gzip=gzip,
+        allow_content_warnings=allow_content_warnings,
+        datasets=tuple(dataset) if dataset else None,
+        created_by=os.environ.get("USER", "cli"),
+        mode=mode,
+        multi_slug=slug,
+        include_membership=include_membership,
+        membership_rows=rows,
+        allow_remote_data_plane=allow_remote_data_plane,
+    )
+    if fingerprint:
+        options.governance_fingerprint = _fingerprint_now(ws, store, catalog)
+
+    try:
+        if output is None or output == "-":
+            manifest = stream_export(ws, store, sys.stdout.buffer, options)
+        else:
+            manifest = export_workspace(ws, store, Path(output), options)
+    except ExportRefused as exc:
+        _refused(exc)
+    except (OSError, ValueError) as exc:
+        _cli_fail(exc)
+
+    store.log_audit(
+        "workspace_exported",
+        {
+            "metadata_only": metadata_only,
+            "audit": audit,
+            "membership": manifest.scope.membership,
+            "datasets": len(manifest.datasets),
+            "withheld": len(manifest.withheld),
+            "destination": output or "-",
+        },
+        actor=options.created_by,
+    )
+    if output and output != "-":
+        typer.echo(f"Wrote {output} (mode 0600)", err=True)
+    _export_summary(manifest)
+
+
+@app.command("import")
+def import_cmd(
+    archive: str = typer.Argument(..., help="Archive path, or '-' for stdin."),
+    workspace: Optional[Path] = WORKSPACE_OPTION,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the report and write nothing."
+    ),
+    merge: bool = typer.Option(
+        False, "--merge", help="Allow a non-empty target (two-phase; see --confirm)."
+    ),
+    confirm: Optional[str] = typer.Option(
+        None, "--confirm", help="The sha256 of the report you read (phase 2)."
+    ),
+    rename_prefix: Optional[str] = typer.Option(
+        None, "--rename-prefix", help="Prefix imported dataset names on collision."
+    ),
+    metadata_only: bool = typer.Option(
+        False, "--metadata-only", help="Skip data/** even in a full archive."
+    ),
+    report: Optional[Path] = typer.Option(
+        None, "--report", help="Where to write the report (default: <workspace>/import_report.json)."
+    ),
+) -> None:
+    """Reconstruct a workspace from an archive. Binds no principal."""
+    import sys
+
+    from laurelin.export import ImportOptions, ImportRefused, import_workspace
+
+    ws = _find_workspace(workspace)
+    store, _ = _open_engine(ws)
+    options = ImportOptions(
+        dry_run=dry_run,
+        merge=merge,
+        confirm=confirm,
+        rename_prefix=rename_prefix,
+        metadata_only=metadata_only,
+        actor=os.environ.get("USER", "cli"),
+    )
+    source = sys.stdin.buffer if archive == "-" else Path(archive)
+    try:
+        result = import_workspace(source, ws, store, options)
+    except ImportRefused as exc:
+        _refused(exc)
+    except (OSError, ValueError) as exc:
+        _cli_fail(exc)
+
+    destination = report or (ws.root / "import_report.json")
+    _write_private(destination, json.dumps(result.model_dump(mode="json"), indent=2))
+    _print_import_report(result, destination)
+
+
+def _write_private(path: Path, text: str) -> None:
+    """0600 from creation, never open()-then-chmod.
+
+    The report names every principal the archive references and every place a
+    credential has to be re-supplied; a 0644 window is a window.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.partial")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _print_import_report(result, destination: Path) -> None:
+    verb = "Would import" if not result.applied else "Imported"
+    typer.echo(f"{verb} from origin {result.manifest.origin.origin_id[:19]}…")
+    if result.rows_imported:
+        _print_table(
+            ["TABLE", "ROWS"],
+            [[t, str(n)] for t, n in sorted(result.rows_imported.items())],
+        )
+    if result.rows_quarantined:
+        typer.echo(
+            "\nCarried but NOT applied — binding a principal is an explicit, "
+            "audited admin act:"
+        )
+        _print_table(
+            ["TABLE", "ROWS"],
+            [[t, str(n)] for t, n in sorted(result.rows_quarantined.items())],
+        )
+    if result.principals:
+        typer.echo("\nPrincipals the imported rules name (none were created):")
+        _print_table(
+            ["KIND", "NAME", "REFERENCED BY"],
+            [
+                [p.kind, p.name, ", ".join(p.referenced_by[:3])]
+                for p in result.principals
+            ],
+        )
+    if result.withheld:
+        typer.echo("\nSecrets the export withheld — re-supply each one:")
+        _print_table(
+            ["TABLE", "ROW", "FIELD", "WHERE"],
+            [[w.table, w.row, w.field, w.resupply] for w in result.withheld],
+        )
+    for collision in result.collisions:
+        typer.echo(f"\n[{collision.severity}] {collision.kind} {collision.name}: "
+                   f"{collision.detail}")
+    if not result.applied:
+        typer.echo(f"\nNothing was written. To apply: --merge --confirm {result.report_sha256}")
+    else:
+        typer.echo(
+            "\nImported pipelines are parked: they are exec'd unsandboxed on "
+            "every build, so an admin must acknowledge them before a build "
+            "will run (POST /api/v1/workspace/import/acknowledge-pipelines)."
+        )
+    typer.echo(f"Report: {destination}")
+
+
+@app.command("verify-governance")
+def verify_governance(
+    baseline: Path = typer.Option(
+        ...,
+        "--baseline",
+        help="An archive exported with --fingerprint, or a fingerprint JSON file.",
+    ),
+    workspace: Optional[Path] = WORKSPACE_OPTION,
+    principals: Optional[str] = typer.Option(
+        None,
+        "--principals",
+        help="Comma-separated usernames to check (default: the baseline's own list).",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write this workspace's recomputed fingerprint here."
+    ),
+) -> None:
+    """Prove this workspace governs identically to the one in a baseline.
+
+    The proof is the product: a tarball helper has a download button, a
+    portability guarantee has a matrix you can diff.
+    """
+    from laurelin.core.auth import AuthService
+    from laurelin.export import ImportRefused, diff_fingerprints, read_manifest
+
+    ws = _find_workspace(workspace)
+    store, catalog = _open_engine(ws)
+
+    raw = baseline.read_bytes() if baseline.exists() else b""
+    if not raw:
+        _cli_fail(FileNotFoundError(f"No such baseline: {baseline}"))
+    if raw.lstrip()[:1] == b"{":
+        loaded = json.loads(raw)
+        source = loaded.get("governance_fingerprint", loaded)
+    else:
+        try:
+            source = read_manifest(baseline).governance_fingerprint
+        except ImportRefused as exc:
+            _refused(exc)
+    if not source.get("cells"):
+        _cli_fail(
+            ValueError(
+                f"{baseline} carries no governance fingerprint. Re-export the "
+                "source with `laurelin export --fingerprint`."
+            )
+        )
+
+    auth = AuthService(store)
+    wanted = (
+        [p.strip() for p in principals.split(",") if p.strip()]
+        if principals
+        else list(source.get("principals", []))
+    )
+    resolved, missing = [], []
+    for name in wanted:
+        if name == "anonymous":
+            resolved.append(None)
+            continue
+        user = auth.get_user(name)
+        if user is None:
+            missing.append(name)
+        else:
+            resolved.append(user)
+
+    current = _fingerprint_now(ws, store, catalog, principals=resolved)
+    if out is not None:
+        _write_private(out, json.dumps(current, indent=2, sort_keys=True))
+
+    if missing:
+        typer.echo(
+            "Principals in the baseline that do not exist here (an unbound "
+            "import creates none — this is expected until you rebind):"
+        )
+        for name in missing:
+            typer.echo(f"  - {name}")
+        typer.echo("")
+
+    differences = diff_fingerprints(source, current)
+    if not differences:
+        typer.echo(
+            f"Identical: {len(source.get('cells', {}))} (principal, dataset) "
+            f"cells answer the same on both sides."
+        )
+        return
+    typer.echo(f"{len(differences)} cell(s) differ:")
+    for entry in differences:
+        key = entry.get("cell") or entry.get("object_type")
+        detail = entry.get("changes") or [f"{entry.get('source')} -> {entry.get('target')}"]
+        typer.echo(f"  {key}: {'; '.join(str(d) for d in detail)}")
+    raise typer.Exit(1)
 
 
 # -- users & tokens -----------------------------------------------------------

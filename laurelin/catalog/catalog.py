@@ -49,6 +49,38 @@ def _validate_name(name: str) -> None:
         )
 
 
+def _refuse_if_needs_credentials(info) -> None:
+    """Refuse to read a dataset whose bytes did not survive an import.
+
+    Loudly, and never as an empty result set: in a governance product zero rows
+    is indistinguishable from a working row policy, so a silent empty read of a
+    migrated federated table looks exactly like correct enforcement. The
+    exception is mapped to HTTP 409 and its message names what to re-supply.
+    """
+    from laurelin.export.manifest import (
+        DATA_STATE_KEY,
+        NEEDS_CREDENTIALS_KEY,
+        NeedsCredentials,
+    )
+
+    source = getattr(info, "source", None) or {}
+    if not source.get(NEEDS_CREDENTIALS_KEY):
+        return
+    state = source.get(DATA_STATE_KEY, "elsewhere")
+    if state == "metadata_only":
+        detail = (
+            "its metadata was imported without its data. Re-import from a full "
+            "export, or re-upload it."
+        )
+    else:
+        detail = (
+            "it points at a system this workspace has no endpoint for. The "
+            "export withheld the connection details; re-supply them and the "
+            "sentinel clears."
+        )
+    raise NeedsCredentials(f"Dataset {info.name!r} cannot be read: {detail}")
+
+
 def suggest_dataset_name(filename: str) -> str:
     """A valid dataset name derived from an uploaded file's name.
 
@@ -481,8 +513,10 @@ class DatasetCatalog:
     # -- reading --------------------------------------------------------------
 
     def _version_info(self, name: str, version: Optional[int]) -> DatasetVersionInfo:
-        if self.store.get_dataset(name) is None:
+        dataset = self.store.get_dataset(name)
+        if dataset is None:
             raise KeyError(f"Dataset not found: {name!r}")
+        _refuse_if_needs_credentials(dataset)
         info = self.store.get_version(name, version)
         if info is None:
             if version is None:
@@ -900,6 +934,7 @@ class DatasetCatalog:
     }
 
     def _source_reader(self, info: DatasetInfo):
+        _refuse_if_needs_credentials(info)
         try:
             reader = self._SOURCE_READERS[info.kind]
         except KeyError:

@@ -286,6 +286,7 @@ def sync_source(
     the stored high-water mark are pulled — so a recurring sync moves just the
     new data, in both directions.
     """
+    _refuse_without_credentials(source)
     mode = source.config.get("mode", "replace")
     cursor_column = source.config.get("cursor_column")
     try:
@@ -340,3 +341,20 @@ def sync_source(
         actor=actor,
     )
     return info
+
+
+def _refuse_without_credentials(source: SourceInfo) -> None:
+    """A source whose endpoint the export withheld is not a broken connector.
+
+    Without this the first sync after an import fails inside a driver, with
+    whatever that driver says about ``url=None`` — which reads as a bug in
+    Laurelin rather than as the re-supply step the manifest already listed.
+    """
+    from laurelin.export.manifest import NEEDS_CREDENTIALS_KEY, NeedsCredentials
+
+    if source.config.get(NEEDS_CREDENTIALS_KEY):
+        raise NeedsCredentials(
+            f"Source {source.name!r} was imported without its endpoint. "
+            "Re-supply it (PUT /api/v1/sources/{name} or Admin -> Sources) "
+            "before syncing; the manifest's withheld list says what is missing."
+        )

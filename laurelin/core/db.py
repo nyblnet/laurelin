@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from laurelin.core.backend import Connection, make_backend
 from laurelin.core.models import (
@@ -68,6 +68,50 @@ def count_sql(inner_select: str, capped: bool, alias: str = "n") -> str:
 def _iso_in(seconds: int) -> str:
     """An ISO timestamp `seconds` from now — lease expiry math in one place."""
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def propagate_markings(
+    datasets: Iterable[str],
+    edges: Iterable[tuple[str, str]],
+    explicit: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Effective markings per dataset: explicit ∪ every upstream's effective.
+
+    A single topological pass (Kahn), cycle-safe: nodes in a cycle are
+    processed last, best-effort.
+
+    Pure, and separate from the store, because the workspace importer has to
+    run the identical closure inside its own open transaction — it cannot call
+    ``recompute_all_markings`` on a second connection that has not seen its
+    uncommitted rows. Two implementations of *which markings apply* is the one
+    kind of duplication a governance layer cannot afford, so there is one.
+    """
+    upstreams: dict[str, set[str]] = {d: set() for d in datasets}
+    for upstream, downstream_name in edges:
+        upstreams.setdefault(downstream_name, set()).add(upstream)
+        upstreams.setdefault(upstream, set())
+    indeg = {d: len(ups) for d, ups in upstreams.items()}
+    ready = [d for d, n in indeg.items() if n == 0]
+    downstream: dict[str, set[str]] = {d: set() for d in upstreams}
+    for d, ups in upstreams.items():
+        for u in ups:
+            downstream[u].add(d)
+    order: list[str] = []
+    while ready:
+        d = ready.pop()
+        order.append(d)
+        for child in downstream[d]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                ready.append(child)
+    order += [d for d in upstreams if d not in order]  # any cycle leftovers
+    effective: dict[str, set[str]] = {}
+    for d in order:
+        eff = set(explicit.get(d, set()))
+        for u in upstreams.get(d, set()):
+            eff |= effective.get(u, set())
+        effective[d] = eff
+    return effective
 
 
 _SCHEMA = """
@@ -2252,37 +2296,12 @@ class MetadataStore:
         """Recompute every dataset's *effective* markings as its explicit markings
         plus the union of its lineage upstreams' effective markings. This is the
         propagation: a derived dataset inherits its inputs' classifications, so
-        classified data can't be laundered through a transform. Runs a single
-        topological pass over the dataset-level lineage graph (cycle-safe)."""
+        classified data can't be laundered through a transform."""
         datasets = [d.name for d in self.list_datasets()]
-        # dataset-level edges: upstream_dataset -> downstream_dataset
-        upstreams: dict[str, set[str]] = {d: set() for d in datasets}
-        for e in self.list_lineage():
-            upstreams.setdefault(e.downstream_dataset, set()).add(e.upstream_dataset)
-            upstreams.setdefault(e.upstream_dataset, set())
-        explicit = {d: set(self.get_explicit_markings(d)) for d in upstreams}
-        # Topological order (Kahn); nodes in a cycle are processed last, best-effort.
-        indeg = {d: len(ups) for d, ups in upstreams.items()}
-        ready = [d for d, n in indeg.items() if n == 0]
-        downstream: dict[str, set[str]] = {d: set() for d in upstreams}
-        for d, ups in upstreams.items():
-            for u in ups:
-                downstream[u].add(d)
-        order: list[str] = []
-        while ready:
-            d = ready.pop()
-            order.append(d)
-            for c in downstream[d]:
-                indeg[c] -= 1
-                if indeg[c] == 0:
-                    ready.append(c)
-        order += [d for d in upstreams if d not in order]  # any cycle leftovers
-        effective: dict[str, set[str]] = {}
-        for d in order:
-            eff = set(explicit.get(d, set()))
-            for u in upstreams.get(d, set()):
-                eff |= effective.get(u, set())
-            effective[d] = eff
+        edges = [(e.upstream_dataset, e.downstream_dataset) for e in self.list_lineage()]
+        nodes = set(datasets) | {u for u, _ in edges} | {d for _, d in edges}
+        explicit = {d: set(self.get_explicit_markings(d)) for d in nodes}
+        effective = propagate_markings(datasets, edges, explicit)
         with self._conn() as c:
             for d, eff in effective.items():
                 self._set_effective_markings(c, d, eff)

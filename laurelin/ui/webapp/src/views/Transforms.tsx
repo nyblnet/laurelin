@@ -13,6 +13,7 @@ import { ApiError, api, API } from "../api";
 import type { PipelineFileContent, PipelineFileInfo, PipelineWriteResult } from "../types";
 import { useAuth } from "../auth";
 import { ErrorBox, PageHeader, Spinner } from "../ui";
+import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
 
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -178,6 +179,8 @@ export function TransformsView() {
           ) : undefined
         }
       />
+
+      <ImportedPipelinesNotice />
 
       {!canEdit && (
         <div className="dim" style={{ fontSize: 12.5, marginBottom: 12 }}>

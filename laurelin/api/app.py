@@ -36,6 +36,7 @@ from laurelin.api.auth_routes import (
     workspaces_router,
 )
 from laurelin.api.engine_routes import engines_router
+from laurelin.api.export_routes import export_router
 from laurelin.api.routes import router
 from laurelin.api.schedule_routes import schedules_router
 from laurelin.api.scim_routes import scim_router
@@ -48,6 +49,12 @@ from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
+from laurelin.export import (
+    ExportRefused,
+    ImportRefused,
+    NeedsCredentials,
+    require_pipelines_acknowledged,
+)
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "ui" / "static"
 
@@ -79,6 +86,11 @@ def _scheduler_targets(app: FastAPI) -> list:
 
             from laurelin.transforms import Builder, collect_transforms
 
+            # Imported schedules land disabled, but nothing stops an admin
+            # enabling one before reading the pipelines that arrived with it —
+            # and collect_transforms execs every file it finds. The guard belongs
+            # on this path too, or the acknowledgement is only a UI convention.
+            require_pipelines_acknowledged(workspace)
             builder = Builder(
                 workspace, catalog, store, collect_transforms(workspace.pipelines_dir)
             )
@@ -265,6 +277,25 @@ def _finalize(app: FastAPI) -> FastAPI:
             headers={"Retry-After": "2"},
         )
 
+    # Portability refusals. Every one of these is a deliberate stop rather than
+    # a fault, and each message names the flag or the act that clears it — so
+    # 409 (the state of the thing is wrong) rather than 400 (you typed it
+    # wrong) or 500 (we broke). NeedsCredentials is the load-bearing one: a
+    # dataset whose bytes did not survive the migration must refuse loudly,
+    # because zero rows in a governance product is indistinguishable from a
+    # working row policy.
+    @app.exception_handler(ExportRefused)
+    async def export_refused_handler(request: Request, exc: ExportRefused):
+        return JSONResponse(status_code=409, content={"detail": _exc_message(exc)})
+
+    @app.exception_handler(ImportRefused)
+    async def import_refused_handler(request: Request, exc: ImportRefused):
+        return JSONResponse(status_code=409, content={"detail": _exc_message(exc)})
+
+    @app.exception_handler(NeedsCredentials)
+    async def needs_credentials_handler(request: Request, exc: NeedsCredentials):
+        return JSONResponse(status_code=409, content={"detail": _exc_message(exc)})
+
     @app.get("/health")
     def health() -> dict:
         """Liveness: the process is up."""
@@ -312,6 +343,7 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.include_router(schedules_router, prefix="/api/v1")
     app.include_router(engines_router, prefix="/api/v1")
     app.include_router(apps_router, prefix="/api/v1")
+    app.include_router(export_router, prefix="/api/v1")
     app.include_router(router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():

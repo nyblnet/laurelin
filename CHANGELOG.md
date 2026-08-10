@@ -7,6 +7,107 @@ minor releases may break things.
 
 ## Unreleased
 
+### Workspace export/import — the anti-lock-in claim became a command
+
+Until now "you can leave" was a claim about file formats. There was no export
+verb, no export route, no backup anywhere in the tree. A Foundry refugee could
+read the Parquet and would still have to hand-reassemble datasets, versions,
+ontology bindings, policies and markings out of a directory tree — which is the
+work they were trying to escape.
+
+- **`laurelin export` / `laurelin import` / `laurelin verify-governance`**, the
+  same three verbs over HTTP under `/api/v1/workspace/`, and an
+  **Admin → Portability** page that previews, downloads, imports, lists what has
+  to be re-supplied, and diffs the governance fingerprint cell by cell.
+- **A POSIX tar stream**, manifest first and trailer last, readable with
+  `tar tvf` on a machine that has never heard of Laurelin, and pipeable:
+  `laurelin export - | ssh host laurelin import -`. Rows travel as JSONL through
+  the store rather than as a copy of `metadata.db`, which is what lets an archive
+  taken from SQLite restore onto PostgreSQL.
+- **The proof is the product.** `verify-governance` recomputes a per-
+  `(principal, dataset)` decision matrix — sha256 over Arrow IPC bytes, through
+  all three enforcement paths — so "it governs identically after the move" is
+  something an operator checks, not something the release notes assert.
+- **Import binds no principal.** Every rule imports verbatim (dropping an
+  unresolvable grant would *widen* — measured: an empty grant list flips a
+  dataset from allowlist to readable-by-every-viewer), while users, group
+  memberships and clearances travel and are never written. Schedules land
+  disabled, connectors land needing credentials, and imported pipelines do not
+  execute until an admin says they read them.
+
+Limitations are in [docs/PORTABILITY.md](docs/PORTABILITY.md) and are real:
+federated/ClickHouse/StarRocks datasets carry no data, Iceberg tables are not
+moved, object-store data planes are unverified, and there is no incremental or
+resumable export.
+
+### Export/import — the credential and archive-integrity fixes on the above
+
+Everything here was reproduced against the code as first written, most of it
+through the real HTTP front door, before it was fixed. Each has a regression
+test that was watched failing without its fix.
+
+- **Fixed: six kinds of credential travelled in the clear.** The secret posture
+  was a *denylist* over key names anchored to exactly `url`/`host`/`user`, so a
+  source configured with `base_url`, `endpoint_url`, `hosts`,
+  `bootstrap_servers`, `connection` or `path` shipped all six verbatim with
+  their passwords — while `manifest.withheld` positively certified that the
+  row's endpoint had been withheld. `SourceUpsertRequest.config` is
+  `dict[str, Any]`, so the key vocabulary belongs to the caller;
+  `datasets.source_json.path` is *required* by three of federation's four source
+  types and is exactly where a presigned S3 signature lives.
+  **`datasets.source_json` and `sources.config_json` are now an allowlist over
+  shape keys** — anything else is nulled, whatever it is called, and named in the
+  manifest.
+- **Fixed: `audit_log.details_json` used a narrower matcher with no endpoint
+  keys**, and production logs free-form failure text under `reason` — so an OIDC
+  error carrying `?client_secret=` in a token-endpoint URL travelled verbatim.
+  Endpoint and free-text keys are nulled now (subjects like `username` still
+  travel, because an audit trail without them is not one), and a row whose
+  surviving values still look like a credential is withheld whole.
+- **Fixed: the credential scanner walked past `Authorization: Bearer`,
+  `passwd=`, `jdbc:`, `mongodb+srv://` and `rediss://`**, reporting zero warnings
+  while shipping them. It also never looked at `ontology/*.yml`,
+  `dashboards.panels_json`, `object_apps.config_json` or
+  `schedules.targets_json` — all of which travel near-verbatim, and a dashboard
+  panel's SQL is documented as arbitrary. All of it is scanned now, the flag is
+  `--allow-content-warnings`, and the warning preview stops at the match
+  (measured: it used to reproduce the credential inside `manifest.json`).
+- **Fixed: `dataset_versions.files_json` was imported unvalidated**, so an
+  archive naming `../tenant_b.parquet` — together with governance the same
+  archive authored — served a sibling workspace directory's Parquet through
+  `GET /datasets/{name}/rows`.
+- **Fixed: `TRAILER.json`'s per-member digests were parsed and never compared.**
+  A repacked archive with a byte-identical trailer stripped a marking and
+  widened a grant to `everyone can_view can_edit`, imported clean, and logged a
+  successful `workspace_imported`. (The trailer still detects corruption and
+  partial rewrites, not tampering — there is no signature.)
+- **Fixed: import committed metadata before landing files.** Any failure in that
+  window left attacker pipelines on disk with the acknowledgement gate *off*
+  (it reads "acknowledged" when the state file is absent), reachable by a single
+  viewer-gated `GET /transforms` — and the failure handler then deleted the
+  Parquet of versions that were already committed. The commit is now the last
+  thing that happens and the handler checks.
+- **Fixed: a merge could widen, overwrite or crash.** Imported `ontology_grants`
+  were unioned onto the destination's same-named object type (a viewer went from
+  403 to reading a dataset the archive never contained); workspace files were
+  overwritten by `shutil.move` after the commit, destroying an ontology file or
+  bricking every ontology route with a duplicate `api_name`; and a destination
+  sharing one dashboard, app, schedule, source, engine, group or marking name
+  aborted with a raw `IntegrityError` — an HTTP 500, on the only two resolutions
+  the collision report printed. All of these are now named collisions.
+- **Fixed: a 514 KiB archive could take 4.6 GiB of RSS** by declaring a 512 MiB
+  JSONL member, and still report success. Member sizes are checked from the tar
+  header.
+- **Also fixed:** duplicate members silently last-wins; `ontology/.` chmod'ing
+  the ontology directory to 0600; a member nested inside another member; a
+  `format_version` of 0 or -1 read as 1; `data_state` trusted over what actually
+  arrived (a dataset with no parts read as a bare `FileNotFoundError` instead of
+  the promised 409); dataset names, kinds, marking names and version numbers no
+  other code path could have written; malformed rows escaping as driver errors
+  instead of refusals; imported sources and engines carrying no
+  needs-credentials marker; and a namespaced marking leaving the archive's own
+  clearance checklist naming a marking that no longer exists.
+
 ### Ontology — the object store stopped being thrown away on every write
 
 The complaint this answers: "the ontology is slow as an application database."
