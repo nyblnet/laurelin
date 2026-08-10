@@ -790,3 +790,155 @@ def test_the_starrocks_ddl_defaults_every_non_key_column(sr):
     for col in ("ord", "applied_seq", "title", "search_text", "props_json"):
         line = next(ln for ln in ddl.splitlines() if ln.strip().startswith(col))
         assert "NULL" in line and "NOT NULL" not in line, col
+
+
+# -- which kind of behind ------------------------------------------------------
+#
+# `fresh: false` conflated three states with three different remedies, and
+# `lag` could not tell them apart: a store that is a dataset-version behind
+# accumulates lag exactly like one that is merely behind by edits, because
+# `catch_up` bails on the version mismatch before replaying anything. So the
+# number climbed 1, 2, 3 with every write and no write ever cleared it, while
+# the only true remedy — a rebuild — was the one nothing named.
+
+def test_lag_from_edits_alone_is_the_self_healing_kind(svc):
+    """The baseline the other tests are read against: unapplied edits, same
+    dataset version, same definition. This one really does clear itself."""
+    import uuid
+
+    from laurelin.core.models import EditKind, ObjectEdit
+
+    ot = svc.ontology.object_type("city")
+    svc.store.add_object_edit(ObjectEdit(
+        id=uuid.uuid4().hex, object_type="city", pk_value="city-0",
+        kind=EditKind.update, payload={"realm": "later"}, actor="t",
+    ))
+    state = svc.index_state(ot)
+    assert state["lag"] == 1
+    assert state["stale_version"] is False
+    assert state["stale_definition"] is False
+    assert svc.catch_up("city") == 1, "a delta the store can actually apply"
+    assert svc.index_state(ot)["lag"] == 0
+
+
+def test_a_stale_version_says_so_even_while_the_lag_climbs(svc):
+    """The defect. Before this, the payload carried no built-at dataset
+    version, so "behind by 3 edits" was the only thing anyone could be told —
+    and it is the one reading that promises a fix which never arrives."""
+    ot = svc.ontology.object_type("city")
+    svc.catalog.append("cities", pa.table({
+        "name": ["new-city"], "realm": ["valinor"],
+        "pop": pa.array([999], type=pa.int64()),
+    }))
+    built_at = svc.index_state(ot)["dataset_version"]
+
+    for i in range(3):
+        svc.apply_action("rename_realm", pk=f"city-{i}", parameters={"realm": "x"})
+
+    state = svc.index_state(ot)
+    assert state["lag"] == 3, "the climb the operator sees"
+    assert svc.catch_up("city") == 0, "and no write will ever clear it"
+    assert state["stale_version"] is True, "which the payload now says"
+    assert state["dataset_version"] == built_at
+    assert state["current_dataset_version"] == built_at + 1
+    assert state["stale_definition"] is False, "the definition is not the problem"
+
+
+def test_a_rebuild_clears_the_stale_version(svc):
+    """The remedy the flag points at has to actually work, or the message is
+    just a better-worded dead end."""
+    ot = svc.ontology.object_type("city")
+    svc.catalog.append("cities", pa.table({
+        "name": ["new-city"], "realm": ["valinor"],
+        "pop": pa.array([999], type=pa.int64()),
+    }))
+    svc.apply_action("rename_realm", pk="city-0", parameters={"realm": "x"})
+    assert svc.index_state(ot)["stale_version"] is True
+
+    svc.reindex("city")
+    state = svc.index_state(ot)
+    assert state["stale_version"] is False and state["lag"] == 0
+    assert svc.store_is_caught_up(ot)
+    assert served(svc) == replay(svc)
+
+
+def test_a_changed_definition_is_a_third_thing(svc):
+    """Withdrawing a property invalidates for the same reason a version does,
+    and it is neither of the other two states. Three remedies, three flags."""
+    ot = svc.ontology.object_type("city")
+    ot.properties.pop("pop")
+    state = svc.index_state(ot)
+    assert state["stale_definition"] is True
+    assert state["stale_version"] is False and state["lag"] == 0
+    assert not svc.store_is_caught_up(ot)
+
+
+def test_the_api_says_which_kind_of_behind(svc):
+    """Through the route, because a field the UI cannot read is not exposed.
+    The three flags are what let the hint text name a remedy instead of being
+    worded to be true in either case."""
+    from laurelin.api.routes import get_object_type
+    from laurelin.core.models import Role, User
+    from laurelin.core.permissions import PermissionService
+
+    perms = PermissionService(svc.store)
+    root = User(id="r", username="root", role=Role.admin)
+
+    fresh = get_object_type("city", svc, perms, root)["index"]
+    assert fresh["fresh"] is True and fresh["stale_version"] is False
+    assert fresh["dataset_version"] == fresh["current_dataset_version"]
+
+    svc.catalog.append("cities", pa.table({
+        "name": ["new-city"], "realm": ["valinor"],
+        "pop": pa.array([999], type=pa.int64()),
+    }))
+    svc.apply_action("rename_realm", pk="city-0", parameters={"realm": "x"})
+
+    stale = get_object_type("city", svc, perms, root)["index"]
+    assert stale["fresh"] is False and stale["lag"] == 1
+    assert stale["stale_version"] is True
+    assert stale["current_dataset_version"] == stale["dataset_version"] + 1
+
+
+def test_repointing_a_type_at_another_dataset_is_not_reported_as_fresh(svc):
+    """**The fourth kind of not-current, and the only one that served wrong
+    rows rather than stale ones.**
+
+    ``_type_fingerprint`` covered the key, the title and the property map — not
+    ``backing_dataset``. And the version comparison asks whichever dataset the
+    type *currently* names for its latest version, so pointing ``city`` at a
+    second dataset that happens to also be at v1 left every field in the
+    payload saying fresh: ``stale_version: false``, ``stale_definition: false``,
+    ``lag: 0``. ``query()`` went on answering out of a materialization built
+    from the old dataset.
+
+    There is no delta from one dataset to another, so this is a rebuild-only
+    state like the other two, and it reports as one.
+    """
+    from laurelin.ontology import load_ontology as _load
+
+    svc.catalog.write("towns", pa.table({
+        "name": ["town-a", "town-b"],
+        "realm": ["valinor", "beleriand"],
+        "pop": pa.array([1, 2], type=pa.int64()),
+    }))
+    ontology_file = svc.workspace.ontology_dir / "o.yml"
+    ontology_file.write_text(
+        ontology_file.read_text().replace("backing_dataset: cities",
+                                          "backing_dataset: towns")
+    )
+    rebound = OntologyService(
+        svc.workspace, svc.catalog, svc.store, _load(svc.workspace.ontology_dir)
+    )
+    ot = rebound.ontology.object_type("city")
+
+    state = rebound.index_state(ot)
+    assert state["stale_definition"] is True, "the binding is part of the definition"
+    assert not rebound.store_is_caught_up(ot), "so the store must not be served"
+    # And the rows that come back are the new dataset's, not the old one's.
+    assert {o["__pk"] for o in rebound.query("city", limit=10)["objects"]} == {
+        "town-a", "town-b"}
+
+    rebound.reindex("city")
+    assert rebound.index_state(ot)["stale_definition"] is False
+    assert rebound.store_is_caught_up(ot)

@@ -28,6 +28,7 @@ import { DataSecuritySection } from "./admin/DataSecuritySection";
 import { MarkingsSection } from "./admin/MarkingsSection";
 import { EnginesSection } from "./admin/EnginesSection";
 import { PortabilitySection } from "./admin/PortabilitySection";
+import { FileSecuritySection } from "./admin/FileSecuritySection";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
 
@@ -463,6 +464,7 @@ export function AdminView() {
           <DataSecuritySection />
           <MarkingsSection />
           <EnginesSection />
+          <FileSecuritySection />
           <PortabilitySection />
         </>
       )}

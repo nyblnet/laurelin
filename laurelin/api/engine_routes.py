@@ -12,15 +12,17 @@ response.
 
 from __future__ import annotations
 
+import logging
 import re
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from laurelin.api.routes import ADMIN, ActorDep, StoreDep
-from laurelin.core import engines
+from laurelin.core import engines, redaction
 
 engines_router = APIRouter(tags=["engines"])
+_log = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
@@ -98,8 +100,19 @@ def test_engine(name: str, store: StoreDep) -> dict:
         finally:
             client.close()
     except Exception as exc:  # noqa: BLE001 - report any failure to the operator
-        # Redact, because the exception text can echo the URI with its password.
-        return {"ok": False, "detail": engines._redact_uri(str(exc))}
+        # `_redact_uri` used to run over this whole string, which only ever
+        # worked by accident: it is a driver's prose, not a URI. `redact_text`
+        # masks the DSNs it can parse and withholds the message whole when the
+        # rest of it still looks like a credential — a Flight SQL
+        # "unauthenticated: invalid token <token>" is exactly that shape.
+        #
+        # The unredacted exception goes to the server log, because withholding
+        # it from the browser is a disclosure decision, not a decision to
+        # destroy the operator's only diagnostic.
+        _log.warning("engine %r failed its connectivity test: %s", name, exc)
+        detail = redaction.redact_text(str(exc))
+        return {"ok": False, "detail": detail,
+                "withheld": detail == redaction.WITHHELD}
     return {"ok": True}
 
 

@@ -57,10 +57,23 @@ archive taken from SQLite restores onto PostgreSQL and back.
 
 The reason is measured, not theoretical. Laurelin's three API redactors were
 attacked with nine credential shapes and eight of them leaked — including
-`postgresql://alice:p/w@db.internal:5432/prod`, which passes through the
+`postgresql://alice:p/w@db.internal:5432/prod`, which passed through the
 production dataset redactor completely untouched. Every miss produced output
 that *looked* redacted. A denylist over free-form values fails invisibly; an
 allowlist fails as loud absence, which is what an operator can act on.
+
+Those particular leaks are fixed (see `laurelin/core/redaction.py`, and the
+CHANGELOG entry that lists all ten), and the argument is unchanged: the fix
+holds because it *withholds* every value whose shape it cannot read, not
+because a better denylist was found. It is worth saying that a second round of
+attacks on that module found seven more disclosures — a password containing a
+character that ends a URL in prose, an `@` in a URL path, and a driver's
+exception text stored and served verbatim among them. Those are fixed too, and
+they are the reason this export does not simply call the API's redactor. The API still shows more than this export
+does — a masked DSN keeps `user@host:port/db` — because a response an admin
+reads on a system they can already reach is not a file that leaves the
+building. The two policies are allowed to disagree, and
+`laurelin/export/secrets.py` says why at length.
 
 So, concretely:
 
@@ -73,7 +86,7 @@ So, concretely:
 | `sessions`, `oidc_flows` | The tables are not exported at all. |
 | `api_tokens` | `(id, name, user_id, created_at)` unless `--no-audit`; never `token_hash`. |
 | `audit_log.details_json` | Subjects (`username`, `dataset`, …) travel; credential-shaped keys, endpoint keys and free-form error text do not, and a row whose remaining values still look like a credential is withheld whole. |
-| `sources.last_sync_error`, `builds.error`, `build_tasks.error` | Nulled, with a count in the manifest — driver error text is a documented credential channel and no redactor in this tree covers prose. |
+| `sources.last_sync_error`, `builds.error`, `build_tasks.error` | Nulled, with a count in the manifest. The API now redacts this text before storing it (substituting the credentials the config says we issued, then withholding whole if any survives), but the export stays stricter: an archive leaves the building, and a redactor that depends on knowing the secret cannot vouch for a message produced by a driver we did not configure. |
 
 **The export is deliberately stricter than the API.** `GET /sources` keeps
 `user@host:port/db`, and a test enforces that: an admin reading a live system

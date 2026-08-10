@@ -23,13 +23,13 @@ it. Results arrive as Arrow, which is what the catalog already wants.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
 import pyarrow as pa
 
-_SECRET_KEY_RE = re.compile(r"password|secret|token|key|credential", re.I)
+from laurelin.core import redaction
+
 ENGINE_TYPES = ("flightsql",)
 
 
@@ -59,16 +59,30 @@ class EngineConfig:
     options: dict[str, Any] = None  # type: ignore[assignment]
 
     def redacted(self) -> dict:
-        opts = {
-            k: ("*****" if _SECRET_KEY_RE.search(k) else v)
-            for k, v in (self.options or {}).items()
-        }
+        """This config as an API response may carry it.
+
+        Every option *value* goes, not just the secret-named ones. These
+        options are handed to the driver as ``db_kwargs`` (see
+        ``FlightSQLClient``), so the key vocabulary is ADBC's, not ours, and
+        matching names over somebody else's namespace is measurably a guess:
+        ``adbc.flight.sql.rpc.call_header.authorization`` contains none of
+        ``password|secret|token|key|credential`` and shipped ``Bearer SEKRET``
+        verbatim from ``GET /api/v1/engines``. The option names survive so the
+        operator can see which knobs are set.
+        """
         return {"name": self.name, "type": self.type,
-                "uri": _redact_uri(self.uri), "options": opts}
+                "uri": _redact_uri(self.uri),
+                "options": redaction.withhold_values(self.options or {})}
 
 
 def _redact_uri(uri: str) -> str:
-    return re.sub(r"//([^:/@]+):[^@]*@", r"//\1:*****@", uri or "")
+    """A URI as a response may carry it — masked, or withheld whole.
+
+    The regex this replaced required a username before the ':' and stopped the
+    password at the first '@', so ``grpc+tls://:hunter2@trino:443`` and
+    ``?api_key=SEKRET`` both came back untouched. See ``core/redaction.py``.
+    """
+    return redaction.redact_dsn(uri or "")
 
 
 def validate_engine(config: dict) -> None:

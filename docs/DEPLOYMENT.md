@@ -206,6 +206,7 @@ it is the metadata database.
 | `LAURELIN_SCHEDULER=0` | Stop this replica running the scheduler (default on; leases make firing exactly-once, so every replica can) |
 | `LAURELIN_METRICS=0` | Disable `/metrics` (default on when `laurelin[metrics]` is installed) |
 | `LAURELIN_METRICS_PUBLIC=1` | Allow unauthenticated scraping — only when the port isn't reachable by users |
+| `LAURELIN_STRICT_FILE_MODE=1` | Also strip *group* access when opening an inherited `metadata.db` / `control.db`. World access is always stripped; group access is kept by default because a group can be a set of principals you provisioned (a backup agent, an operator with read but not write) |
 | `LAURELIN_LOG_FORMAT=json` | One JSON object per log line, with request id / workspace / actor |
 | `LAURELIN_LOG_LEVEL` | Log level when JSON logging is on (default `INFO`) |
 | `LAURELIN_SCHEDULER_POLL` | Seconds between scheduler polls (default `15`) |

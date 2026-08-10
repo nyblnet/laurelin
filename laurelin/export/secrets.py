@@ -123,7 +123,14 @@ RESUPPLY = {
 # The free-text keys are nulled for the same reason `sources.last_sync_error`
 # is dropped wholesale: `auth_routes.py:340` logs `{"reason": str(exc)}` from
 # an OIDC failure, and a token-endpoint URL with a client_secret in it lands
-# there verbatim. No redactor in this tree covers free-form driver text.
+# there verbatim.
+#
+# `core/redaction.redact_driver_text` now covers free-form driver text on the
+# API side, and the export stays stricter anyway. It works by substituting the
+# credentials the *caller's own config* says were handed to the driver; on this
+# path there is no such config in hand — an audit row is a bag of strings from
+# any writer — so the thing that makes it reliable is exactly what is missing
+# here. Nulling needs no such input.
 AUDIT_KEY_RE = re.compile(
     r"password|secret|token|key|credential|authorization|api_?key|"
     r"^url$|^uri$|^dsn$|^host$|^hostname$|^endpoint$|^conn(ection)?_?str|"

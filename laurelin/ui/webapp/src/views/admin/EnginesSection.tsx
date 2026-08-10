@@ -9,7 +9,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
-import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
+import { Badge, EmptyState, ErrorBox, RedactedValue, Spinner } from "../../ui";
 import { InlineError } from "./shared";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -95,7 +95,11 @@ function TestButton({ name }: { name: string }) {
   // job is to be reachable, and the alternative to testing it is finding out
   // when a 2am build fails.
   const test = useMutation({
-    mutationFn: () => api.post<{ ok: boolean; detail?: string }>(`${API}/engines/${name}/test`, {}),
+    mutationFn: () =>
+      api.post<{ ok: boolean; detail?: string; withheld?: boolean }>(
+        `${API}/engines/${name}/test`,
+        {},
+      ),
   });
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -104,8 +108,19 @@ function TestButton({ name }: { name: string }) {
       </button>
       {test.data?.ok && <Badge tone="green">reachable</Badge>}
       {test.data && !test.data.ok && (
-        <span title={test.data.detail} className="mono" style={{ color: "var(--red)", fontSize: 12 }}>
-          unreachable
+        <span
+          // The driver's own words when they were safe to repeat. When they
+          // were not, the server says so rather than showing a half-read
+          // message — the full text is in the server log.
+          title={
+            test.data.withheld
+              ? "The engine's error text was withheld: it could not be redacted safely, so none of it was sent. The full message is in the server log."
+              : test.data.detail
+          }
+          className="mono"
+          style={{ color: "var(--red)", fontSize: 12 }}
+        >
+          unreachable{test.data.withheld ? " (details withheld)" : ""}
         </span>
       )}
     </span>
@@ -154,7 +169,12 @@ export function EnginesSection() {
                 {q.data.map((e) => (
                   <tr key={e.name}>
                     <td className="mono">{e.name}</td>
-                    <td className="mono dim">{e.uri}</td>
+                    <td className="mono dim">
+                      {/* The URI is redacted server-side, and when its shape
+                          could not be parsed it is withheld entirely — which
+                          has to look different from an engine with no URI. */}
+                      <RedactedValue value={e.uri} />
+                    </td>
                     <td>
                       <span className="toolbar" style={{ gap: 8, justifyContent: "flex-end" }}>
                         <TestButton name={e.name} />

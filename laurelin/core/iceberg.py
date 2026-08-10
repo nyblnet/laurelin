@@ -41,6 +41,8 @@ from typing import Any, Optional
 
 import pyarrow as pa
 
+from laurelin.core.fileperms import ensure_private_file
+
 # Table identifiers are `<namespace>.<name>`; a dataset name is already
 # validated as ^[a-z][a-z0-9_]*$, but the namespace comes from config.
 _NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -113,9 +115,18 @@ class IcebergTables:
         if self._catalog is None:
             from pyiceberg.catalog.sql import SqlCatalog
 
+            uri = catalog_uri(self.workspace)
+            # SQLAlchemy creates a missing SQLite file at 0666 & ~umask, same
+            # as sqlite3 did before laurelin/core/fileperms.py. This catalog is
+            # not the metadata database, but it is a database Laurelin causes
+            # to exist in the workspace root, and a warehouse URI recorded in
+            # it can carry a credential. Pre-created 0600 for the same reason
+            # and by the same route; a no-op once it exists and is private.
+            if uri.startswith("sqlite:///"):
+                ensure_private_file(uri[len("sqlite:///"):], what="Iceberg catalog")
             self._catalog = SqlCatalog(
                 "laurelin",
-                uri=catalog_uri(self.workspace),
+                uri=uri,
                 warehouse=warehouse_uri(self.workspace),
             )
             # A local warehouse must exist before the first write; an object

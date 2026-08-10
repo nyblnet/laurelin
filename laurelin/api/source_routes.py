@@ -26,6 +26,7 @@ from laurelin.api.routes import (
     _require_dataset_edit,
 )
 from laurelin.connectors import redacted_config, sync_source, validate_source
+from laurelin.core import redaction
 from laurelin.core.models import SourceInfo, utcnow_iso
 
 sources_router = APIRouter(tags=["sources"])
@@ -119,7 +120,12 @@ def sync_source_route(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # connection/parse failures from the external system
-        raise HTTPException(
-            status_code=502, detail=f"Sync failed: {type(exc).__name__}: {exc}"
+        # `sync_source` has already redacted and stored the same text; this is
+        # the second copy of it, and it reached the browser directly. The
+        # driver quotes back what it was given, so the source's own config is
+        # what makes the credential findable — see `redaction.secrets_in_config`.
+        detail = redaction.redact_driver_text(
+            f"{type(exc).__name__}: {exc}", redaction.secrets_in_config(source.config)
         )
+        raise HTTPException(status_code=502, detail=f"Sync failed: {detail}")
     return _dump(info)

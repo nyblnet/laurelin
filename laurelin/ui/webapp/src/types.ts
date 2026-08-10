@@ -312,17 +312,34 @@ export interface ObjectIndexStatus {
    */
   objects: number | null;
   /**
-   * Edits recorded since the materialization last caught up. It splits the one
-   * thing `fresh: false` conflates: lag > 0 means "behind by N edits", which the
-   * next write catches up incrementally; lag === 0 with fresh false means the
-   * backing dataset moved to a new version, and only a full rebuild expresses
-   * that. Same badge colour, different remedy.
+   * Edits recorded since the materialization last caught up. On its own it
+   * cannot say whether the next write will clear it — a store that is a
+   * dataset-version behind accumulates lag exactly like one that is merely
+   * behind by edits, because catch-up bails on the version mismatch before it
+   * replays anything. `stale_version` and `stale_definition` are what settle
+   * that; read them first.
    */
   lag: number | null;
   /** Where the materialized objects live — "metadata" or "starrocks". */
   store: string | null;
   /** Last edit-log position the materialization has applied. */
   applied_seq: number | null;
+  /** The backing dataset's version the store was built from. */
+  dataset_version: number | null;
+  /** The backing dataset's version now. */
+  current_dataset_version: number | null;
+  /**
+   * The store was built from an older dataset version. A version can rewrite
+   * any row and renumbers every ordinal, so no incremental delta expresses it:
+   * lag will keep climbing and only a rebuild clears it.
+   *
+   * Unlike the counters above this is *not* withheld from a policied caller —
+   * a version number counts versions, not rows — so it is null only when the
+   * type has no store at all.
+   */
+  stale_version: boolean | null;
+  /** The store was built from an older object-type definition. Same remedy. */
+  stale_definition: boolean | null;
 }
 
 export interface ObjectTypeDetail extends ObjectTypeDef {
@@ -676,4 +693,24 @@ export interface FingerprintResponse {
   /** Named principals the workspace could not resolve — after an inert import,
    *  this is every one of them, and that absence is the point. */
   unresolved_principals: string[];
+}
+
+/** On-disk permissions of one path in the workspace. Name only, never a path:
+ *  the store's "path" on Postgres is a DSN. */
+export interface FileSecurityEntry {
+  name: string;
+  exists: boolean;
+  mode: string | null;
+  world_accessible: boolean;
+  group_accessible: boolean;
+}
+
+export interface WorkspaceFileSecurity {
+  dialect: string;
+  file_backed: boolean;
+  store_is_remote: boolean;
+  strict_mode: boolean;
+  directory: FileSecurityEntry;
+  files: FileSecurityEntry[];
+  note: string | null;
 }

@@ -27,6 +27,7 @@ import {
   EmptyState,
   ErrorBox,
   PageHeader,
+  RedactedValue,
   Spinner,
   fmtNum,
   fmtTime,
@@ -728,7 +729,7 @@ function FederatedSource({
           </div>
           {url && (
             <div className="mono faint" style={{ fontSize: 12, marginTop: 4 }}>
-              {url}
+              <RedactedValue value={url} />
             </div>
           )}
           <p className="hint" style={{ marginBottom: 0 }}>
@@ -739,7 +740,11 @@ function FederatedSource({
       ) : (
         <div className="mono" style={{ fontSize: 13 }}>
           <Badge tone="blue">{type}</Badge>{" "}
-          {location && <span className="dim">{location}</span>}
+          {location && (
+            <span className="dim">
+              <RedactedValue value={location} />
+            </span>
+          )}
         </div>
       )}
     </div>

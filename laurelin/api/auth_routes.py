@@ -22,6 +22,7 @@ from laurelin.api.context import (
     identity_store,
     is_multi,
 )
+from laurelin.core import redaction
 from laurelin.core.auth import THROTTLED, AuthService
 from laurelin.core.models import Role, User, utcnow_iso
 
@@ -337,7 +338,15 @@ def oidc_callback(request: Request, response: Response):
             raise OIDCError("No id_token in token response")
         claims = provider.validate_id_token(id_token, flow["nonce"])
     except OIDCError as exc:
-        store.log_audit("oidc_login_failed", {"reason": str(exc)}, actor="oidc")
+        # The provider's own words. A token endpoint that rejects the request
+        # tends to quote the request back, and the request carries
+        # `client_secret` — so the trail gets the shape of the failure and the
+        # server log gets the rest.
+        store.log_audit(
+            "oidc_login_failed",
+            {"reason": str(redaction.redact_text(str(exc)))},
+            actor="oidc",
+        )
         raise HTTPException(status_code=400, detail=str(exc))
 
     username = cfg.username_for(claims)

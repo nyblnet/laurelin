@@ -7,6 +7,218 @@ minor releases may break things.
 
 ## Unreleased
 
+## Security
+
+Laurelin is a governance product, so the entries below are the ones that matter
+most: each was a live disclosure or a live bypass on a running server, each was
+reproduced before it was fixed, and each fix was reverted and watched to fail
+before being restored.
+
+### Fixed: three DSN redactors that disclosed live credentials on admin routes
+
+`federation.redacted_source`, `engines._redact_uri` and
+`connectors.redacted_config` each had their own regex, each regex was a
+different guess about where a credential lives, and ten inputs got past them —
+into responses an admin reads in a browser, and (via `_dump`, which redacts
+every dataset's `source`) into responses a *viewer* reads:
+
+- a password containing `/`, `?`, `#` or `//`;
+- a DSN with no username, `postgresql://:hunter2@db/prod`;
+- a secret in a query parameter, `?api_key=…`, and a bearer token in a bare
+  userinfo, `https://ghp_…@github.com/…`;
+- an ODBC/JDBC keyword string, `Server=db;Uid=alice;Pwd=hunter2;`;
+- ADBC driver options carrying `Bearer …` under
+  `adbc.flight.sql.rpc.call_header.authorization`;
+- and, in connectors, every nested value: `{"auth": {"password": …}}` and
+  `{"headers": {"X-Api-Key": …}}` were not redacted at all.
+
+The three regexes are replaced by one module, `laurelin/core/redaction.py`,
+which decides *whether* a value may be shown before it decides how. A
+`scheme://user:password@host` DSN has its credential masked and everything
+else disclosed — **unchanged from before, deliberately**: whether a viewer
+should see `user@host:port/db` at all is an open product question, and this fix
+does not answer it. Anything whose shape cannot be read — a keyword string, a
+URL carrying a query, an option namespace that belongs to a driver, a nested
+config object — is **withheld whole** rather than guessed at, and the UI renders
+a withheld value as "withheld" with an explanation instead of a blank field.
+
+Two behaviours narrowed as a result and are called out in their tests: every
+HTTP header value is withheld (the name denylist missed `X-Api-Key`), and every
+engine option value is withheld (it missed the ADBC call header). The residual
+disclosure — usernames and endpoints, a secret in a URL *path*, a credential
+pasted into a free-form value — is stated in the module docstring rather than
+left implicit.
+
+### Fixed: seven more credential disclosures, found by attacking the redactor above
+
+The module above was then attacked, and these got through it. All were
+reproduced on a running server before being fixed.
+
+- **A driver's exception text was stored and served verbatim.** A failed
+  connector sync put the raw message in `sources.last_sync_error` — the same
+  JSON object whose `config.url` it masks — and in an audit row. A password
+  containing a space came back as ``unexpected spaces found in "SUPER SEKRET"``
+  to any **editor** on `GET /sources`, and to any **viewer** on `GET /audit`,
+  who is 403 on the source itself. No redactor can find a credential in a third
+  party's prose; this one does not try. It substitutes the credentials the
+  source's own config says we handed the driver, then applies the shape rules,
+  then withholds the message whole if a known secret survived both. The
+  unredacted exception goes to the server log.
+- **`PUT /datasets/{name}/federated` and `/clickhouse` returned the whole DSN in
+  the 502 body** — DuckDB's postgres extension prefixes its IO error with the
+  connection string, one line above a success path that redacts the same dict.
+  Admin-only, so not a privilege crossing, but a live credential in a response
+  body, a proxy log and the UI's error box.
+- **A password containing `,` `;` `'` `"` `(` `)` `[` `]` `<` `>` or a space
+  survived in full inside any free-form value**, because the embedded-URL regex
+  ends a match at exactly those characters and the truncated fragment had no
+  `@` left in it to mask. Reached through a source's `query`, which is
+  editor-readable and printed in the Sources "From" column. A match is now
+  trusted only when its authority is complete and credential-free; otherwise the
+  value is withheld.
+- **A URL with an `@` in its path was given a fabricated hostname.** Taking the
+  last `@` read the whole authority and path as userinfo, so
+  `reports.prod.example.com` and `reports.stage.example.com` both rendered as
+  `https://*****@2024.csv` — not over-masked, *replaced*, with nothing on screen
+  saying so. Ambiguous parses are now withheld. This narrows two cases that
+  previously rendered as masked DSNs (a password containing `/`, and an `@` in a
+  path); the credential was never disclosed in either, and is not now.
+- **A password equal to its username** was disclosed by the username slot, which
+  the endpoint policy shows. Both slots are now masked in that one case.
+- **Dashboard panel SQL and schedule targets carried DSNs to lower-privileged
+  readers** — `GET /dashboards` is viewer-gated — and are now **refused at
+  write time**. They cannot be redacted on read: a panel's SQL is executed and
+  round-trips through the editor's textarea, so a mask returned would be saved
+  over the real query. **This does not retroactively redact values already
+  stored**; it stops new ones.
+
+The residual disclosure is unchanged and still stated in the module docstring:
+usernames and endpoints on a parseable DSN, a secret in a URL *path*, and a
+credential pasted into a free-form value that is not URL-shaped.
+
+### Fixed: ontology updates wrote through column masks and out of the row policy
+
+Creates were checked against the backing dataset's policy. Updates were not,
+and the gap was documented in the code rather than closed, because re-checking
+the merged row needs the unmasked base row the policy has already withheld from
+the caller. Both halves were reachable with EDITOR on the object type alone:
+
+- **An update over a masked column** was read back in plaintext by its author —
+  the overlay is applied *after* the policied scan, so the mask on that cell was
+  defeated by writing through it. It is also a blind overwrite of a value the
+  author was never shown, and a writeback makes it the dataset's value for
+  everyone.
+- **An update that moved a row out of the allowed set** still showed that row to
+  its author, because the row filter runs on the *base* value. The mirror image
+  of the create channel closed earlier, except the row is pushed into another
+  tenant's partition rather than pulled out of it.
+
+Both are now **refused**, not silently dropped — reporting success for a write
+that did not happen is the one outcome worse than either bug — and the message
+names the offending properties and what the caller can do instead. The merged
+row is evaluated under the policy through a system view (the same device
+`reindex` uses), so the check never hands the caller the base values it needed;
+a regression test asserts no refusal quotes them.
+
+### Fixed: three ways around that update guard, found by attacking it
+
+The guard above holds. What it did not cover was every other way to reach the
+same outcome, and the first of these made it ineffective on its own.
+
+- **Delete, then create.** `_refuse_shadowing_create` asked the *overlaid* view
+  whether the key existed, and the overlay includes the caller's own pending
+  delete — so `raze city-0` followed by `found city-0` was accepted. An editor
+  whose update was correctly refused reached exactly the refused state instead:
+  the row moved into another tenant's realm, both masked columns overwritten
+  with values of their choosing, durably, in the shared materialization, for
+  every reader. A delete is a pending edit and does not free the key; the check
+  now asks the base dataset plus live creates.
+- **Creates were never policy-checked on the write side at all.**
+  `_policy_admits` hides a create that lands outside the caller's rows *from the
+  caller*, which is not the same as not writing it: the edit is recorded and
+  materialized under a system identity into the shared store, where the tenant
+  it landed on reads it. A create is now refused if the policy would not return
+  it to its author. Masks are deliberately **not** checked on a create — writing
+  a masked column of a new object overwrites nothing, and refusing it would stop
+  a policied editor creating anything on a dataset carrying any mask.
+- **An update could rewrite the primary key.** The probe sees nothing wrong (the
+  key is unmasked, the row filter is on another column), so an editor could move
+  an object onto a key held by a row they cannot see. After a writeback the
+  dataset held two rows with that key; the object view dedups last-wins, so a
+  later delete removed both — six objects to four, with nothing in the audit
+  trail naming the loss. **Primary-key-changing updates are now refused for
+  every caller**, policied or not. This removes a capability that previously
+  appeared to work; delete-and-create expresses the same intent through two
+  operations that each have a guard.
+
+Related, and defence in depth rather than a reachable bug now: `writeback`'s
+duplicate-key guard counted duplicates in the fold's *input*, so a fold could
+create the duplicate the guard exists to prevent and then permanently block
+every later writeback. It now also checks the fold's output, before publishing.
+
+### Fixed: object-store lag that no write could ever clear
+
+A store that was a dataset-version behind *and* held unapplied edits reported
+"behind by N edits" and nothing else, while `catch_up` bailed on the version
+mismatch before replaying anything — so N climbed 1, 2, 3 with every edit and
+only a rebuild cleared it. The index payload carried no built-at dataset
+version, so neither the API nor the UI could tell the self-healing state from
+the one that needs a rebuild, and the hint text was deliberately worded to be
+true in either case.
+
+`GET /ontology/object-types/{name}` now carries `dataset_version`,
+`current_dataset_version`, `stale_version` and `stale_definition`, and the
+Object store panel names the actual remedy for each of the three states instead
+of hedging. The version fields are not withheld from a policied caller — a
+version number counts versions, not rows — unlike the object and lag counters
+beside them.
+
+A fourth kind of not-current was found afterwards and is the only one that
+served *wrong* rows rather than stale ones: the definition fingerprint did not
+cover `backing_dataset`, so repointing an object type at a different dataset
+left every field reporting fresh while queries answered out of a
+materialization of the old one. The binding is now part of the fingerprint, so
+a rebind invalidates like any other definition change. Existing
+materializations will report `stale_definition` once and need one rebuild.
+
+### Fixed: five gaps in the workspace file-permission repair
+
+Found by attacking the fix that made `metadata.db` 0600.
+
+- **`control.db` was invisible to the admin file-security report**, which was
+  built from the per-workspace store alone. It holds every user, session token
+  and API token for *every* workspace on the server, so on an upgraded
+  deployment the file with the widest blast radius got a warning in a log and
+  nothing else. It is now in the report.
+- **`harden_existing` never re-stat'd after `chmod`**, and reported the mode it
+  had *asked for*. On a filesystem that accepts chmod and ignores it (vfat,
+  exfat, ntfs-3g, some CIFS and FUSE mounts) the advisory note — the field the
+  docs tell operators to act on — asserted a tightening that had not happened.
+  It now reports what the file has, and says so explicitly when a chmod did not
+  take.
+- **`Workspace.init` created `data/`, `pipelines/` and `ontology/` with no mode
+  at all.** Inside a 0700 root Laurelin made, that is invisible; under a root
+  the operator provisioned (an upgraded workspace, or the Dockerfile's
+  `RUN mkdir -p /data`) they inherited `0777 & ~umask` — every dataset Parquet
+  readable by any local user at umask 022, and a world-writable `pipelines/` at
+  umask 000, whose contents are `exec`'d on every build. They are created 0700
+  now. Existing directories are still left alone, deliberately.
+- **The import-state file was written then chmod'd**, and was caught at 0644
+  with its content on disk. Both call sites now use the same atomic
+  create-private-and-rename primitive `cli.py` already had.
+- **`SQLiteBackend("")` chmod'd the process's working directory**, because the
+  "no file" check ran on `str(Path(""))`, which is `"."`. No product path
+  reaches it; the guard now tests the string it was given.
+
+**Still true and still deliberate:** a workspace upgraded from an older release
+keeps its metadata database group-readable at 0640. World access is removed
+without asking; group access is preserved because a group can be a set of
+principals somebody provisioned, and silently breaking a backup agent is a worse
+failure than the one being fixed. On the upgrade population that premise is
+often wrong — the group bit and the world bit are the same artefact of umask 022
+— which is why the residual is on the admin screen in gold rather than only in a
+log. `LAURELIN_STRICT_FILE_MODE=1` strips it.
+
 ### Workspace export/import — the anti-lock-in claim became a command
 
 Until now "you can leave" was a claim about file formats. There was no export
@@ -107,6 +319,54 @@ test that was watched failing without its fix.
   instead of refusals; imported sources and engines carrying no
   needs-credentials marker; and a namespaced marking leaving the archive's own
   clearance checklist naming a marking that no longer exists.
+
+### Security — the workspace stopped being world-readable
+
+Measured before the fix: `<root>/metadata.db` and `<root>/laurelin.yml` were
+both mode 0644, and nothing in the tree had ever passed a mode to `open` or
+`mkdir` — every file came out at `0666 & ~umask`. That database is not a cache:
+it holds unexpired session tokens, in-flight PKCE verifiers, scrypt password
+hashes and every connector DSN in the clear. Any local user on a shared host
+could read a bearer token and replay it. The export hardening in the previous
+release made this sharper — the archive you carried off the box was better
+protected than the workspace it came from.
+
+- **Created private, not created and then repaired.**
+  `os.open(..., O_CREAT | O_EXCL | O_WRONLY, 0o600)` for `metadata.db`,
+  `control.db`, `laurelin.yml` and the SQLite `iceberg-catalog.db`;
+  `mkdir(mode=0o700)` for a workspace or
+  server root Laurelin creates. `chmod` after `open` leaves a window in which
+  SQLite writes the header, the schema and the first session row — and an
+  attacker who opened an fd inside it keeps reading afterwards, because
+  permission is checked at open and never again. A regression test sabotages
+  `os.chmod` outright and still requires 0600.
+- **`-wal` and `-shm` need no separate handling, and must not get any.**
+  Measured: SQLite creates both by copying the main database file's mode, so a
+  0600 `metadata.db` yields 0600 siblings. Chasing the siblings would have
+  fixed the copies, left the original, and raced the checkpoint that deletes
+  them. On PostgreSQL there is no local file at all, and the admin API says
+  `store_is_remote` rather than reporting a comforting mode for a file that
+  does not exist.
+- **An inherited workspace is repaired in one direction only.** Opening a
+  database from an older release strips world access silently — 0644 grants
+  read to others and write to nobody but the owner, while every process that
+  opens this database opens it read-write, so no working component was reaching
+  it through the `other` bits and there is no configuration to break. Group
+  access *survives*, because a group is a set of principals somebody had to
+  provision (a backup agent, an operator with read but not write), and turning
+  a security fix into a silently broken backup is a worse failure than the one
+  being fixed. `LAURELIN_STRICT_FILE_MODE=1` strips it too.
+- **Directories are never retro-tightened, and a chmod we are refused is not
+  fatal.** A directory the operator made is a directory whose mode the operator
+  chose, and narrowing a tree reaches backup agents and log shippers that one
+  file's mode never touches. Refusing to start is a real option for a
+  governance product but not one earned by a defect the product shipped, so an
+  EPERM (root owns the file, the service runs as someone else) is reported and
+  the server serves.
+- **Admin → Workspace files on disk** shows the mode each file actually has,
+  read back from the filesystem, because a partial repair is only defensible if
+  the operator can see the residual — and a WARNING in a log nobody tails is not
+  how anyone makes that decision. Names only, never paths or DSNs.
 
 ### Ontology — the object store stopped being thrown away on every write
 

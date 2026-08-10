@@ -13,7 +13,7 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
-from laurelin.core import engines
+from laurelin.core import engines, redaction
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.transforms import Builder, collect_transforms
@@ -92,8 +92,14 @@ def test_engine_credentials_are_redacted():
     )
     red = cfg.redacted()
     assert "hunter2" not in red["uri"] and "user" in red["uri"]
-    assert red["options"]["authorization_token"] == "*****"
-    assert red["options"]["region"] == "eu"
+    # Every option value goes, not just the secret-named ones — `region: eu`
+    # included, which this test used to require be shown. These options are
+    # ADBC's `db_kwargs` namespace, and matching names over it is measurably a
+    # guess: `adbc.flight.sql.rpc.call_header.authorization` matches none of
+    # `password|secret|token|key|credential` and served `Bearer <token>`
+    # verbatim from GET /api/v1/engines. See tests/test_redaction.py.
+    assert red["options"]["authorization_token"] == redaction.WITHHELD
+    assert red["options"]["region"] == redaction.WITHHELD
 
 
 def test_engine_registry_roundtrip(env):
@@ -222,12 +228,13 @@ def test_engine_crud_over_http(tmp_path):
         "options": {"username": "svc", "password": "hunter2"},
     })
     assert ok.status_code == 200, ok.text
-    # Credentials never come back.
-    assert ok.json()["options"]["password"] == "*****"
+    # Credentials never come back — nor does any other option value.
+    assert ok.json()["options"]["password"] == redaction.WITHHELD
+    assert "hunter2" not in ok.text
 
     listed = admin.get("/api/v1/engines").json()
     assert [e["name"] for e in listed] == ["trino"]
-    assert listed[0]["options"]["password"] == "*****"
+    assert listed[0]["options"]["password"] == redaction.WITHHELD
 
     assert admin.delete("/api/v1/engines/trino").status_code == 200
     assert admin.get("/api/v1/engines").json() == []

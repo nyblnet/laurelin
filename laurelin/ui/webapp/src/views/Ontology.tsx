@@ -93,22 +93,21 @@ function ObjectTypePage() {
  * that isn't current is silently bypassed in favour of a full scan: without
  * this, "why did this get slow again" has no visible answer.
  *
- * The two ways of not being current are different problems with different
- * remedies, so they get different words. Behind by N edits usually catches up
- * on the next write (catch-up runs on the write path and on an explicit
- * rebuild, never on a read — a read that writes breaks read-only replicas). A
- * new dataset version can rewrite any row, so no incremental delta expresses it
- * and only a rebuild does.
+ * There are three ways of not being current, with three different remedies, so
+ * they get three different sentences. Behind by N edits catches up on the next
+ * write (catch-up runs on the write path and on an explicit rebuild, never on a
+ * read — a read that writes breaks read-only replicas). A new dataset version
+ * can rewrite any row and renumbers every ordinal, so no incremental delta
+ * expresses it and only a rebuild does; a changed object-type definition is the
+ * same story for the same reason.
  *
- * "Usually" because the two states overlap and the API cannot currently tell
- * them apart: a store that is a version behind *and* holds unapplied edits
- * reports lag > 0, and `catch_up` bails out on the version mismatch before it
- * replays anything — so the lag climbs with every edit and no write will ever
- * clear it. Verified by hand: upload a new version under an indexed type, then
- * apply edits, and lag goes 1, 2, 3. The response carries no built-at dataset
- * version to compare against, so the lag hint below is worded to be true in
- * both cases and points at a rebuild rather than promising catch-up. Exposing
- * `dataset_version` in the index payload would let this say which one it is.
+ * The lag hint here used to be worded to be true in either case, because it had
+ * to be: a store that was a version behind *and* held unapplied edits reported
+ * lag > 0 and nothing else, while catch-up bailed on the version mismatch
+ * before replaying anything — so the number climbed 1, 2, 3 with every edit and
+ * no write ever cleared it. The payload now carries the built-at dataset
+ * version alongside the current one, and `stale_version` / `stale_definition`
+ * are the verdict, so each state can name its own remedy instead of hedging.
  */
 function ObjectStoreControl({
   type,
@@ -127,6 +126,10 @@ function ObjectStoreControl({
     lag: 0,
     store: null,
     applied_seq: 0,
+    dataset_version: null,
+    current_dataset_version: null,
+    stale_version: null,
+    stale_definition: null,
   };
 
   const invalidate = () =>
@@ -151,6 +154,10 @@ function ObjectStoreControl({
   // badge drops the number rather than inventing one.
   const objects = index.objects;
   const lag = index.lag ?? 0;
+  // Order matters: a stale version *also* accumulates lag, and "behind by 3
+  // edits" is the one reading that promises a fix which never arrives. The
+  // rebuild-only states are checked first so the number never speaks over them.
+  const needsRebuild = index.stale_version || index.stale_definition;
   const status = !index.indexed
     ? { tone: "neutral" as const, text: "Not built" }
     : index.fresh
@@ -158,15 +165,22 @@ function ObjectStoreControl({
           tone: "green" as const,
           text: objects === null ? "Live" : `Live · ${objects.toLocaleString()} objects`,
         }
-      : lag > 0
+      : needsRebuild
         ? {
             tone: "gold" as const,
-            text: `Behind by ${lag} edit${lag === 1 ? "" : "s"}`,
+            text: index.stale_version
+              ? "Stale — the dataset changed, rebuild to use it"
+              : "Stale — the object type changed, rebuild to use it",
           }
-        : {
-            tone: "gold" as const,
-            text: "Stale — the dataset changed, rebuild to use it",
-          };
+        : lag > 0
+          ? {
+              tone: "gold" as const,
+              text: `Behind by ${lag} edit${lag === 1 ? "" : "s"}`,
+            }
+          : {
+              tone: "gold" as const,
+              text: "Stale — rebuild to use it",
+            };
 
   return (
     <div className="card" style={{ marginBottom: 16 }}>
@@ -210,9 +224,19 @@ function ObjectStoreControl({
       </div>
       {index.indexed && !index.fresh && (
         <p className="hint" style={{ marginBottom: 0 }}>
-          {lag > 0
-            ? "Reads fall back to a full scan until it catches up. Catch-up runs on the next write — but only while the backing dataset is unchanged, so if this number keeps climbing, the dataset moved underneath the store and a rebuild is the only fix."
-            : "A new dataset version can rewrite any row, so no incremental delta expresses it — a rebuild is the only fix. Until then reads fall back to a full scan."}
+          {index.stale_version
+            ? // `current_dataset_version` is null when the backing dataset has
+              // no versions at all — it was dropped or replaced under the type.
+              // Naming a version that does not exist would send the operator
+              // looking for it, so that case gets its own sentence.
+              index.current_dataset_version === null
+              ? `${type.backing_dataset} has no versions, so there is nothing for this store to be current with. Reads fall back to a full scan.`
+              : `Built from ${type.backing_dataset} v${index.dataset_version}, which is now at v${index.current_dataset_version}. A new version can rewrite any row, so no incremental delta expresses it: catch-up will not run${lag > 0 ? ` and those ${lag} edit${lag === 1 ? "" : "s"} will keep accumulating` : ""}. Rebuild is the only fix. Until then reads fall back to a full scan.`
+            : index.stale_definition
+              ? `Built from an older definition of ${type.api_name}. The properties, key, title or backing dataset changed, so the stored rows no longer match what a read projects — if the binding moved, they are a different dataset's rows entirely. Rebuild is the only fix. Until then reads fall back to a full scan.`
+              : lag > 0
+                ? `Behind by ${lag} edit${lag === 1 ? "" : "s"}. Reads fall back to a full scan until it catches up, which happens on the next write — no rebuild needed.`
+                : "Reads fall back to a full scan until this is rebuilt."}
         </p>
       )}
       {/* The build endpoint answers 200 with zero objects and no state when the

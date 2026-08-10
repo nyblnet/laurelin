@@ -27,6 +27,7 @@ config values are redacted in every API response (see ``redacted_config``).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -39,9 +40,11 @@ import duckdb
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
-from laurelin.core import metrics
+from laurelin.core import metrics, redaction
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import DatasetVersionInfo, SourceInfo
+
+log = logging.getLogger("laurelin.connectors")
 
 CONNECTOR_TYPES = ("postgres", "http", "file")
 
@@ -49,7 +52,6 @@ _DEFAULT_BATCH_SIZE = 50_000
 _MAX_BATCH_SIZE = 1_000_000
 # PostgreSQL identifier or schema-qualified identifier, e.g. public.orders.
 _PG_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
-_SECRET_KEY_RE = re.compile(r"password|secret|token|authorization|api_?key", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -111,33 +113,25 @@ def validate_source(type_: str, config: dict[str, Any]) -> None:
 
 
 def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Config safe to return from the API: secret-named keys and URL passwords
-    replaced with ``*****``."""
-    out: dict[str, Any] = {}
-    for key, value in config.items():
-        if _SECRET_KEY_RE.search(key):
-            out[key] = "*****"
-        elif key == "headers" and isinstance(value, dict):
-            out[key] = {
-                k: ("*****" if _SECRET_KEY_RE.search(k) else v)
-                for k, v in value.items()
-            }
-        elif key == "url" and isinstance(value, str):
-            out[key] = _redact_url_password(value)
-        else:
-            out[key] = value
-    return out
+    """Config safe to return from the API.
 
+    Two things changed here, both because the previous version walked the top
+    level plus ``headers`` and trusted key names for the rest:
 
-def _redact_url_password(url: str) -> str:
-    parts = urllib.parse.urlsplit(url)
-    if parts.password is None:
-        return url
-    host = parts.hostname or ""
-    if parts.port is not None:
-        host += f":{parts.port}"
-    netloc = f"{parts.username}:*****@{host}" if parts.username else f":*****@{host}"
-    return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
+    * ``{"auth": {"password": "SEKRET"}}`` came back verbatim — nothing below
+      the top level was redacted at all. Nested values are now withheld, names
+      kept.
+    * ``{"headers": {"X-Api-Key": "SEKRET"}}`` came back verbatim, because
+      ``api_?key`` does not match ``Api-Key``. Header *values* are now withheld
+      wholesale rather than by name, which also withholds an innocent
+      ``Accept: text/csv``. That is the trade: a header name list is a list of
+      the names we happened to think of, and this one was already short by at
+      least ``X-Api-Key``, ``Cookie`` and ``Proxy-Authorization``.
+
+    ``urlsplit`` is gone too — it ends the authority at the first '/', so a
+    password containing '/' survived it. See ``core/redaction.py``.
+    """
+    return redaction.redact_mapping(config)
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +307,30 @@ def sync_source(
         info = writer(source.dataset, chunks, source=f"sync:{source.type}")
     except Exception as exc:
         metrics.syncs.labels(type=source.type, status="failed").inc()
-        store.record_source_sync(
-            source.name, "failed", error=f"{type(exc).__name__}: {exc}"
+        # The driver's own words, with this source's own credentials taken out
+        # of them. Storing the raw string was a live disclosure: the same
+        # response object that masks `config.url` carried
+        # `last_sync_error: 'unexpected spaces found in "SUPER SEKRET"'` to
+        # every editor, and `log_audit` put it on the VIEWER-gated /audit
+        # route, where a user who is 403 on /sources read the password.
+        #
+        # Redacted at the point of *record*, not at the point of display: it is
+        # written to two places read by two routes at two privilege levels, and
+        # a redactor bolted onto one of them is a redactor the next route to
+        # read this column will not have. The unredacted exception goes to the
+        # log, and is re-raised for the caller who is about to log it too.
+        detail = redaction.redact_driver_text(
+            f"{type(exc).__name__}: {exc}", redaction.secrets_in_config(source.config)
         )
+        log.warning(
+            "sync of source %r failed: %s", source.name, exc,
+            extra={"source": source.name, "dataset": source.dataset},
+        )
+        store.record_source_sync(source.name, "failed", error=str(detail))
         store.log_audit(
             "source_sync_failed",
-            {"source": source.name, "dataset": source.dataset, "error": str(exc)[:500]},
+            {"source": source.name, "dataset": source.dataset,
+             "error": str(detail)[:500]},
             actor=actor,
         )
         raise

@@ -9,6 +9,7 @@ from typing import Optional
 
 import typer
 
+from laurelin.core import fileperms
 from laurelin.core.config import Workspace, WorkspaceNotFound
 
 app = typer.Typer(
@@ -608,15 +609,12 @@ def _write_private(path: Path, text: str) -> None:
 
     The report names every principal the archive references and every place a
     credential has to be re-supplied; a 0644 window is a window.
+
+    The implementation moved to ``core/fileperms.py`` so the export reader's
+    two import-state writes could stop being an open()-then-chmod — they were
+    the copies of this that never got the fix.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.partial")
-    if tmp.exists():
-        tmp.unlink()
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    fileperms.write_private(path, text)
 
 
 def _print_import_report(result, destination: Path) -> None:

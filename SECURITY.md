@@ -81,9 +81,44 @@ the sandbox with `SET` are all blocked, and there are regression tests for
 each. A dataset you can't see is an *unknown table*, not a permission error —
 no existence oracle.
 
-**Secrets aren't echoed.** Connector configs redact passwords, tokens, and
-auth headers in every API response; API tokens are shown exactly once, at
-creation.
+**Secrets aren't echoed.** Connector configs, federated dataset sources and
+engine URIs go through one redactor (`laurelin/core/redaction.py`) in every API
+response; API tokens are shown exactly once, at creation. The rule is *shape
+first*: a `scheme://user:password@host` DSN has its credential masked, and any
+value whose shape cannot be read — an ODBC keyword string, a URL carrying a
+query, a driver's option namespace, a nested config object — is withheld whole
+rather than guessed at. Three redactors with three regexes preceded this and
+leaked ten different credential forms between them; guessing where a secret
+sits is what failed, so the replacement does not guess.
+
+What a masked DSN still shows is the endpoint: `user@host:port/db`. Whether
+that belongs in a viewer-readable response is an open question we have not
+answered, and it is stated in the redactor's docstring alongside the rest of the
+residual (a secret in a URL *path*, or pasted into a free-form value, is not
+detectable and is not removed). The workspace export answers it the strict way
+and withholds the endpoint too — see docs/PORTABILITY.md.
+
+**A third party's error text is treated as credential-bearing.** A driver
+quotes back the connection string it was handed, in prose with no shape a
+redactor can find — a password containing a space came back from psycopg as
+``unexpected spaces found in "SUPER SEKRET"``, and that string was stored on the
+source row and served. So a failed sync, a failed federated-source probe and a
+failed engine test all have the credentials the config says we issued
+*substituted out by value* first, then the shape rules applied, then the whole
+message withheld if a known secret survived both.
+
+One consequence to plan for: whenever a message is redacted or withheld from the
+browser, the unredacted exception is written to the **server log** so the
+operator can still diagnose it. Treat server logs as credential-bearing and give
+them the same protection as `metadata.db`.
+
+**Free-form fields that are executed are gated on write, not on read.** A
+dashboard panel's SQL and a schedule's targets are stored and returned verbatim,
+and a panel's SQL round-trips through the editor's textarea — redacting on read
+would let a mask be saved over the real query. A value embedding a
+`user:password@host` connection string is therefore refused at `PUT` with a
+message pointing at registered sources. Values stored before this are not
+retroactively redacted; `laurelin export` scans for them and refuses.
 
 **Mutations are audited** with actor, action, and details.
 
@@ -108,9 +143,20 @@ Be clear-eyed about these. They are design consequences, not oversights:
    administrator. It exists for local development and the demo. Never expose
    a `--no-auth` server to a network you don't control.
 
-4. **Workspace files are not protected from the OS.** Anyone with read access
-   to the workspace directory reads the Parquet directly. Access control is
-   enforced at the API, not the filesystem. Protect the volume accordingly.
+4. **Dataset files are not protected from the OS.** Anyone with read access to
+   the workspace directory reads the Parquet under `data/` directly, with no
+   row policy and no column masks — access control is enforced at the API, not
+   the filesystem. Protect the volume accordingly. The *credential*-bearing
+   files are a separate matter and are handled: `metadata.db` (with its
+   `-wal`/`-shm` siblings), `control.db` and `laurelin.yml` are created `0600`,
+   and a workspace root Laurelin creates is `0700`, as are the `data/`,
+   `pipelines/` and `ontology/` directories inside it. See the deployment
+   checklist below for what happens to a workspace created before that.
+
+   `pipelines/` matters more than the other two: its contents are `exec`'d on
+   every build, so a directory anyone can write to is code execution. Laurelin
+   creates it `0700`; a directory that already exists keeps the mode it has, and
+   **Admin → Workspace files on disk** shows the workspace root's actual mode.
 
 5. **No encryption at rest.** Use encrypted volumes or an encrypted Postgres.
 
@@ -129,8 +175,17 @@ A short checklist; details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
       execution.
 - [ ] Use PostgreSQL for the control plane in any multi-replica deployment,
       and back it up together with the data volume.
-- [ ] Give the server process its own OS user; restrict the workspace
-      directory to it.
+- [ ] Give the server process its own OS user. Laurelin creates `metadata.db`
+      (with its `-wal`/`-shm` siblings), `control.db` and `laurelin.yml` at
+      `0600`, and a workspace or server root it creates at `0700` — but a
+      workspace from before that, or a directory you made yourself, keeps the
+      mode it has. Opening an inherited database strips world access and
+      leaves group access alone — so **an upgraded workspace ends up `0640`,
+      not `0600`**, and that is the default outcome of every upgrade, not an
+      edge case. **Admin → Workspace files on disk** shows the mode each file
+      actually has, re-stat'd on every request and including `control.db`, and
+      `LAURELIN_STRICT_FILE_MODE=1` forces `0600` on every open. Data under
+      `data/` is not re-moded at all.
 - [ ] Set `LAURELIN_MAX_UPLOAD_MB` to something sane for your box (it also
       caps HTTP-connector downloads).
 - [ ] Rotate `LAURELIN_SCIM_TOKEN` and SSO client secrets like any other

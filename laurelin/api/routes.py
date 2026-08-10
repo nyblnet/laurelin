@@ -7,6 +7,7 @@ transform registry and ontology are rebuilt per request so edits to
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -34,6 +35,7 @@ from laurelin.api.auth_routes import (
 from laurelin.api.context import active_catalog, active_store, active_workspace
 from laurelin.catalog import DatasetCatalog
 from laurelin.catalog.catalog import suggest_dataset_name
+from laurelin.core import fileperms, redaction
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
@@ -56,6 +58,8 @@ from laurelin.transforms import (
     TransformRegistry,
     collect_transforms,
 )
+
+log = logging.getLogger("laurelin.api")
 
 router = APIRouter()
 
@@ -207,6 +211,44 @@ def _dump(model: BaseModel) -> dict:
     return out
 
 
+def _driver_failure(exc: Exception, source: Any) -> str:
+    """A remote system's failure, as a 502 body may carry it.
+
+    Every registration route probes the remote source before accepting it, and
+    every driver under those routes quotes the connection string it was handed
+    back into its error. The probe is the point of the route, so the message
+    has to come back; what may not come back is the credential inside it.
+    """
+    log.warning("federated source probe failed: %s", exc)
+    return str(redaction.redact_driver_text(str(exc), redaction.secrets_in_config(source)))
+
+
+def _redacted_audit_details(details: Any) -> Any:
+    """An audit row's ``details`` bag, as ``GET /audit`` may carry it.
+
+    ``/audit`` is VIEWER-gated while ``/sources`` is editor-gated, so anything
+    a writer puts in here is disclosed one full level below where the same fact
+    lives elsewhere — measured, a viewer read a connector password out of
+    ``source_sync_failed`` while getting 403 on the source itself.
+
+    Writers redact at the point of record, which is the fix; this is the
+    backstop, because ``log_audit`` takes an open ``dict`` and the next caller
+    to drop a driver's exception in it will not remember. ``export/secrets.py``
+    nulls these keys outright for the export path — that is the right answer
+    for a file that leaves the building and the wrong one here, where the
+    operator reading the trail needs to know *what* failed.
+    """
+    if isinstance(details, dict):
+        return {key: (redaction.MASK if redaction.API_SECRET_KEY_RE.search(str(key))
+                      else _redacted_audit_details(value))
+                for key, value in details.items()}
+    if isinstance(details, list):
+        return [_redacted_audit_details(v) for v in details]
+    if isinstance(details, str):
+        return redaction.redact_text(details)
+    return details
+
+
 def _version_info(
     store: MetadataStore, name: str, version: Optional[int]
 ) -> DatasetVersionInfo:
@@ -256,6 +298,79 @@ def get_workspace_info(workspace: WorkspaceDep) -> dict:
         "name": workspace.name,
         "description": workspace.description,
         "root": str(workspace.root),
+    }
+
+
+@router.get("/workspace/file-security", dependencies=[ADMIN])
+def get_workspace_file_security(
+    request: Request, workspace: WorkspaceDep, store: StoreDep
+) -> dict:
+    """On-disk permissions of the files that hold this workspace's secrets.
+
+    Exists because the repair is deliberately partial: Laurelin strips world
+    access from a metadata database it inherits, but leaves group access alone
+    (``laurelin/core/fileperms.py`` argues why). That leaves a residual the
+    operator has to decide about, and a WARNING in a log nobody tails is not a
+    decision anybody makes. So the mode is a number on the admin screen.
+
+    The structured fields carry file *names*, never the store's path: on a
+    PostgreSQL store that "path" is a DSN with a password in it, and no field
+    here should be one refactor away from printing it. ``note`` does name a
+    local file, because an operator cannot run ``chmod`` on a basename — and it
+    is only ever produced by the SQLite backend, so it cannot be a DSN. The
+    workspace root is not a secret in any case; ``GET /workspace`` returns it
+    to every viewer, while this route is admin-only.
+    """
+    backend = store.backend
+    entries: list[dict] = []
+
+    def add_db(db_backend, path, label: str) -> Optional[str]:
+        if not db_backend.is_file_backed:
+            return None
+        db = Path(str(path))
+        # -wal and -shm exist only between a write and a checkpoint. They are
+        # reported when present because they hold the same rows as the database
+        # and the same secrets; they are not an error when absent.
+        for suffix in ("", "-wal", "-shm"):
+            entry = fileperms.describe(db.with_name(db.name + suffix))
+            if entry["exists"]:
+                entry["name"] = label + suffix
+                entries.append(entry)
+        return db_backend.permission_note
+
+    note = add_db(backend, store.path, "metadata.db")
+    # control.db too, and it is the more serious of the two: it holds every
+    # user, session token and API token for *every* workspace on the server
+    # (see `create_server_app`). It was invisible here — the report was built
+    # from the per-workspace store alone — so on an upgraded multi-workspace
+    # deployment the file left group-readable at 0640 got a WARNING in the log
+    # and nothing else, which is exactly the outcome `fileperms.py` argues is
+    # not a decision anyone makes. Reported under the workspace's admin route
+    # because there is no other admin surface, and a server admin is a
+    # workspace admin.
+    control = getattr(request.app.state, "control", None)
+    if control is not None:
+        note = add_db(control.backend, control.path, "control.db") or note
+    entries.append(fileperms.describe(workspace.marker_path))
+    directory = fileperms.describe(workspace.root, name=".")
+    # The note was written once, when the store was opened. The modes above
+    # were read just now. An operator who acts on the advice — runs the chmod
+    # the note asked for — must not be told off by a stale sentence sitting
+    # next to a table that already shows 0600; a warning that outlives its
+    # cause is how operators learn to ignore warnings. So the live stat has the
+    # last word: no file still exposed, no note.
+    if note and not any(e["world_accessible"] or e["group_accessible"] for e in entries):
+        note = None
+    return {
+        "dialect": backend.dialect,
+        "file_backed": backend.is_file_backed,
+        # A PostgreSQL store keeps nothing on this host. Saying so is the point:
+        # a green "0600" for a file that does not exist would be a lie.
+        "store_is_remote": not backend.is_file_backed,
+        "strict_mode": fileperms.strict_mode(),
+        "directory": directory,
+        "files": entries,
+        "note": note,
     }
 
 
@@ -414,6 +529,26 @@ def upsert_dashboard(
         )
     if len(body.panels) > 50:
         raise HTTPException(status_code=400, detail="A dashboard is limited to 50 panels")
+    for panel in body.panels:
+        # A panel's SQL is free-form and is *executed*, so it cannot be
+        # redacted on the way out: the editor loads it into a textarea and PUTs
+        # it back, and a mask returned here would be saved over the real query.
+        # Measured: an editor stored
+        # `postgres_scan('postgresql://alice:DASHSEKRET@db/prod', ...)` and a
+        # plain VIEWER read the password from GET /dashboards — one privilege
+        # level below where the same DSN is redacted on a source. So the
+        # credential is stopped at the door instead.
+        if redaction.credential_in_free_text(panel.sql):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Panel {panel.id!r} embeds a connection string with a "
+                    f"credential in it. Dashboards are readable by viewers and "
+                    f"this SQL is stored and displayed verbatim, so the password "
+                    f"would be too. Register the remote table as a federated "
+                    f"dataset and select from that instead."
+                ),
+            )
     existing = store.get_dashboard(name)
     info = DashboardInfo(
         name=name,
@@ -471,7 +606,13 @@ def register_federated_dataset(
     try:
         info = catalog.register_federated(name, body.source, body.description)
     except FederationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        # DuckDB's postgres extension prefixes its IO Error with the whole
+        # connection string, so this 502 body carried a live password into the
+        # browser, the reverse proxy's access log and the UI's error box — the
+        # line directly below this one calls `redacted_source` on the success
+        # path for the same dict. Admin-only, so not a privilege crossing, but
+        # the operator never asked for their credential to be echoed back.
+        raise HTTPException(status_code=502, detail=_driver_failure(exc, body.source))
     store.log_audit(
         "federated_dataset_registered",
         {"dataset": name, "type": body.source.get("type")},
@@ -513,7 +654,11 @@ def register_clickhouse_dataset(
     try:
         info = catalog.register_clickhouse(name, body.source, body.description)
     except ClickHouseError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        # chdb rewrites `s3://k:pw@bucket/x` to `s3:/k:pw@bucket/x` in its error
+        # text, which removes the `://` every shape rule in `redaction` keys on
+        # — so this one is caught by substituting the credentials the config
+        # says we handed over, not by recognising a URL.
+        raise HTTPException(status_code=502, detail=_driver_failure(exc, body.source))
     store.log_audit(
         "clickhouse_dataset_registered",
         {"dataset": name, "type": body.source.get("type")},
@@ -833,6 +978,21 @@ def get_object_type(name: str, service: OntologyDep, perms: PermDep, user: UserD
         "lag": (state["lag"] if state else 0) if unpoliced else None,
         "store": state["store"] if state else None,
         "applied_seq": (state["applied_seq"] if state else 0) if unpoliced else None,
+        # Which *kind* of not-fresh, which lag alone could never say. A store
+        # that is a version behind and also holds unapplied edits reported
+        # "behind by 3" and climbing, while `catch_up` bailed on the version
+        # mismatch before replaying anything — so the only true remedy, a
+        # rebuild, was the one the UI did not name.
+        #
+        # Deliberately *not* withheld from a policied caller, unlike the
+        # counters above. A dataset version number counts versions, not rows:
+        # it says nothing about how many objects exist or who owns them, and
+        # viewing this object type already requires view on the backing
+        # dataset, whose version list is on its own page.
+        "dataset_version": state["dataset_version"] if state else None,
+        "current_dataset_version": state["current_dataset_version"] if state else None,
+        "stale_version": state["stale_version"] if state else None,
+        "stale_definition": state["stale_definition"] if state else None,
     }
     return result
 
@@ -1247,7 +1407,12 @@ def set_clearances(
 
 @router.get("/audit", dependencies=[VIEWER])
 def list_audit(store: StoreDep, limit: int = Query(100, ge=0, le=10_000)) -> list[dict]:
-    return [_dump(e) for e in store.list_audit(limit)]
+    out = []
+    for entry in store.list_audit(limit):
+        row = _dump(entry)
+        row["details"] = _redacted_audit_details(row.get("details"))
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------

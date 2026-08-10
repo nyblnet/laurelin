@@ -18,7 +18,7 @@ from laurelin.api.routes import (
     StoreDep,
     _dump,
 )
-from laurelin.core import scheduler
+from laurelin.core import redaction, scheduler
 from laurelin.core.models import ScheduleInfo, utcnow_iso
 
 schedules_router = APIRouter(tags=["schedules"])
@@ -58,6 +58,22 @@ def upsert_schedule(
             status_code=400,
             detail=f"Invalid schedule name {name!r}: must match ^[a-z][a-z0-9_-]{{0,63}}$",
         )
+    for target in body.targets:
+        # Same reason as a dashboard panel's SQL: a target is stored and
+        # returned verbatim, and the schedules editor writes it back. A target
+        # of `s3://key:SCHEDSEKRET@bucket/t` came back in full from
+        # GET /schedules — `export/secrets.py` cites this exact string as a
+        # measured case, and the export path drops it while the API did not.
+        if redaction.credential_in_free_text(target):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A schedule target may not embed a credential: this one is "
+                    "stored and returned verbatim by GET /schedules. Put the "
+                    "credential in a registered source or an object-store "
+                    "profile and name that here."
+                ),
+            )
     existing = store.get_schedule(name)
     info = ScheduleInfo(
         name=name,

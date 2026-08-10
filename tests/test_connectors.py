@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.connectors import redacted_config, validate_source
+from laurelin.core import redaction
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 
@@ -58,9 +59,15 @@ def test_redacted_config_hides_secrets():
     assert "hunter2" not in red["url"]
     assert "alice" in red["url"] and "db.internal" in red["url"]
     assert red["api_key"] == "*****"
-    assert red["headers"]["Authorization"] == "*****"
-    assert red["headers"]["Accept"] == "text/csv"
     assert red["table"] == "orders"
+    # Header *values* are withheld wholesale now, including this innocent
+    # `Accept: text/csv`, which this test used to require be shown. The name
+    # denylist that allowed that also allowed `{"X-Api-Key": "SEKRET"}` through
+    # verbatim — `api_?key` does not match `Api-Key` — and it would equally
+    # allow `Cookie` and `Proxy-Authorization`. Names survive so the operator
+    # can still see which headers are set. See tests/test_redaction.py.
+    assert red["headers"]["Authorization"] == redaction.WITHHELD
+    assert red["headers"]["Accept"] == redaction.WITHHELD
 
 
 # -- unit: streaming write ----------------------------------------------------

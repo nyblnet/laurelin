@@ -300,12 +300,39 @@ class OntologyService:
     # -- index --------------------------------------------------------------------
 
     def index_state(self, ot: ObjectTypeDef) -> Optional[dict]:
-        """What the materialization says it was built from, if it exists."""
+        """What the materialization says it was built from, if it exists.
+
+        ``lag`` alone could not name the problem. There are three ways to be
+        not-current and only one of them is self-healing:
+
+        * behind by N edits — ``catch_up`` replays them on the next write;
+        * built from an older dataset *version* — a version bump rewrites
+          arbitrary rows and renumbers every ordinal, so no delta expresses it
+          and ``catch_up`` returns 0 without replaying anything;
+        * built from an older object-type *definition* — same, and for the
+          same reason.
+
+        The last two also accumulate lag, because edits keep landing in the log
+        that the store will never apply. So a store that was a version behind
+        *and* held unapplied edits reported "behind by 3" and climbing, the
+        next write never cleared it, and only a rebuild did — with nothing in
+        the payload to say so. The two booleans below are what make those
+        states distinguishable from the outside; ``store_is_caught_up`` is the
+        same three tests, collapsed to one answer.
+        """
         state = self.store.object_index_state(ot.api_name)
         if state is None:
             return None
-        return {**state, "lag": max(0, self.store.max_edit_seq(ot.api_name)
-                                    - int(state["applied_seq"]))}
+        dataset = self.catalog.store.get_dataset(ot.backing_dataset)
+        current = dataset.latest_version if dataset else None
+        return {
+            **state,
+            "lag": max(0, self.store.max_edit_seq(ot.api_name)
+                       - int(state["applied_seq"])),
+            "current_dataset_version": current,
+            "stale_version": current is None or int(state["dataset_version"]) != current,
+            "stale_definition": state["fingerprint"] != self._type_fingerprint(ot),
+        }
 
     def _system_view(self) -> "OntologyService":
         """The same data with no policy bound.
@@ -343,10 +370,24 @@ class OntologyService:
     def _type_fingerprint(self, ot: ObjectTypeDef) -> str:
         """Everything about the definition that changes what a row contains:
         which properties are projected, their declared types (the search text
-        is built from the string ones), the key, and the title expression."""
+        is built from the string ones), the key, the title expression — and
+        **which dataset the rows come from**.
+
+        The backing dataset was missing, and it is the one whose absence made
+        the store serve wrong rows rather than stale ones. Measured: build
+        ``city`` against ``cities`` (v1), point the YAML at ``towns`` (also at
+        v1), reload. The fingerprint is unchanged and the version comparison
+        passes because it asks the *new* dataset for its latest version, so
+        ``index_state`` reported ``stale_version: false``, ``stale_definition:
+        false`` and ``lag: 0`` — fresh, by every field it has — while
+        ``query()`` answered from a materialization of ``cities``. There is no
+        delta from one dataset to another, so this is a rebuild-only state like
+        the other two, and it now reports as one.
+        """
         return definition_fingerprint(
             primary_key=ot.primary_key,
             title_property=ot.title_property,
+            backing_dataset=ot.backing_dataset,
             properties={name: prop.type for name, prop in ot.properties.items()},
         )
 
@@ -621,17 +662,11 @@ class OntologyService:
         be typed against the dataset's own schema is excluded rather than
         guessed at.
 
-        This is the *read* half. The write half — a create for a key that
-        already exists being a replacement, and therefore a cross-tenant
-        destructive write when the existing row is hidden — is
-        ``_refuse_shadowing_create``.
-
-        NOT IMPLEMENTED: the same check for *updates*. An update cannot
-        introduce a row — it merges onto a base row that already survived the
-        policy — but an update writing over a masked column is still read back
-        in plaintext, and one that moves a row out of the allowed set still
-        shows it to its author. Both need the merged row re-checked, which
-        needs the unmasked base row the policy has already taken away.
+        This is the *read* half for creates. The write half — a create for a
+        key that already exists being a replacement, and therefore a
+        cross-tenant destructive write when the existing row is hidden — is
+        ``_refuse_shadowing_create``. The same two halves for *updates* are
+        ``_refuse_policy_escaping_update``.
         """
         policy = self._policy_for_dataset(ot.backing_dataset)
         if policy is None or not creates:
@@ -649,12 +684,30 @@ class OntologyService:
                 )
             except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
                 return {}
-        try:
-            admitted = policy(pa.table(arrays))
-        except Exception:  # noqa: BLE001 - a policy that cannot run admits nothing
+        rendered = self._under_policy(policy, pa.table(arrays))
+        if rendered is None:
             return {}
-        survivors = set(admitted.column("__pk").to_pylist())
-        return {pk: row for pk, row in creates.items() if pk in survivors}
+        return {pk: row for pk, row in creates.items() if pk in rendered}
+
+    @staticmethod
+    def _under_policy(policy, table: pa.Table) -> Optional[dict[str, dict]]:
+        """``table`` as this user's policy renders it: row-filtered and column
+        masked, keyed by the ``__pk`` tag column the caller attached.
+
+        A key that is absent from the result was filtered out by the row
+        policy; a value that differs from the one handed in was masked. Those
+        are the only two questions anything here asks of a policy, and asking
+        them through the policy's own output is what keeps this from becoming a
+        second, drifting interpretation of the rules.
+
+        ``None`` means the policy could not be run at all, and every caller
+        must treat that as admitting nothing.
+        """
+        try:
+            rendered = policy(table)
+        except Exception:  # noqa: BLE001 - a policy that cannot run admits nothing
+            return None
+        return {row["__pk"]: row for row in rendered.to_pylist()}
 
     @contextmanager
     def _object_scan(
@@ -1328,6 +1381,38 @@ class OntologyService:
         return None
 
     @staticmethod
+    def _refuse_duplicate_keys_in_result(folded: pa.Table, ot: ObjectTypeDef, pk: str) -> None:
+        """Refuse to publish a fold that would *introduce* a duplicate key.
+
+        ``_refuse_duplicate_keys`` asks the same question of ``__base`` — the
+        dataset as it stands *before* the overlay. That is the right question
+        for a dataset that already had duplicates, and the wrong one for a fold
+        that creates them: the overlay is what introduces the duplicate, so the
+        input was clean, the guard passed, and the fold published a dataset
+        whose primary key is not unique. Every later writeback then failed the
+        input check for a duplicate this code had written itself, with the
+        docstring's own remedy ("de-duplicate with a transform") as the only
+        way out of a state no operator caused.
+
+        ``_refuse_primary_key_rewrite`` closes the route that was measured
+        reaching here. This is the invariant rather than the route: a fold
+        publishes a dataset, and the dataset it publishes has to satisfy the
+        property the fold demands of the one it read.
+        """
+        if pk not in folded.column_names:
+            return
+        keys = folded.column(pk).cast(pa.string()).to_pylist()
+        extra = len(keys) - len(set(keys))
+        if extra:
+            raise ValueError(
+                f"Cannot fold object type {ot.api_name!r}: applying the edit "
+                f"overlay would produce {extra} row(s) sharing a {pk!r} value "
+                f"with another row, so dataset {ot.backing_dataset!r} would "
+                f"come out with a primary key that is not unique. Nothing has "
+                f"been written. Review the pending edits for this object type."
+            )
+
+    @staticmethod
     def _refuse_duplicate_keys(con, ot: ObjectTypeDef, pk: str) -> None:
         """Refuse to fold a dataset whose primary key is not unique.
 
@@ -1425,6 +1510,9 @@ class OntologyService:
         if isinstance(folded, pa.RecordBatchReader):
             folded = folded.read_all()
         folded = folded.drop_columns(["__ord"]) if "__ord" in folded.column_names else folded
+        # Before T2, so a fold that would publish a non-unique key publishes
+        # nothing at all.
+        self._refuse_duplicate_keys_in_result(folded, ot, pk)
 
         # T2 — publish, or fail, atomically against the base we read.
         #
@@ -1585,6 +1673,138 @@ class OntologyService:
 
     # -- actions ------------------------------------------------------------------
 
+    def _system_row(self, ot: ObjectTypeDef, pk_value: str) -> Optional[pa.Table]:
+        """One object as the *dataset* holds it — every column, no policy, no
+        masks — as a one-row Arrow table, or None if there is no such object.
+
+        The same trick ``reindex`` uses for the same reason (see
+        ``_system_view``): the thing that has to be checked is a value the
+        caller is not allowed to see, so it is read under a system identity and
+        never handed back. Nothing in this table reaches a response; only the
+        verdict computed from it does.
+
+        Arrow, not ``get()``'s JSON-safe dicts, and deliberately: the row goes
+        straight back into a policy that expects the dataset's own types, and a
+        timestamp round-tripped through an ISO string would fail to rebuild and
+        turn a legitimate edit into a refusal.
+        """
+        system = self._system_view()
+        with system._object_scan(
+            ot, None, {ot.primary_key: pk_value}, all_columns=True
+        ) as (con, sql, params, _cols, _pk):
+            if con is None:
+                return None
+            with limits.limited(con, limits.QueryLimits.interactive()):
+                table = con.execute(f"{sql} LIMIT 1", params).arrow()
+            if isinstance(table, pa.RecordBatchReader):
+                table = table.read_all()
+        if table.num_rows == 0:
+            return None
+        if "__ord" in table.column_names:
+            table = table.drop_columns(["__ord"])
+        return table
+
+    def _refuse_policy_escaping_update(
+        self, ot: ObjectTypeDef, pk_value: str, payload: dict
+    ) -> None:
+        """A caller under a dataset policy may not write through it.
+
+        An update cannot introduce a row — it merges onto a base row that
+        already survived the policy — which is why this was left out for so
+        long and documented as not implemented. Two things still got through:
+
+        * **Writing over a masked column.** The overlay is applied *after* the
+          policied scan, so an update to a masked property is read straight
+          back in plaintext by its author, and the mask on that cell is gone
+          for as long as the edit lives. Worse than the disclosure: the value
+          is a blind overwrite of data the author was never allowed to read,
+          and a writeback makes it the dataset's value for everyone.
+        * **Moving a row out of the allowed set.** The row filter runs on the
+          *base* value, so an editor confined to ``realm='valinor'`` could set
+          ``realm='beleriand'`` and keep seeing the object — the mirror image
+          of the create channel ``_policy_admits`` closed, except the row is
+          pushed into another tenant's partition rather than pulled out of it.
+
+        Both need the merged row re-checked under the policy, which needs the
+        unmasked base row the policy has already withheld from the caller —
+        hence ``_system_row``.
+
+        **Refuse, never drop.** Silently discarding the offending properties
+        would report success for a write that did not happen, which is the one
+        outcome worse than either bug: an operator who is told their correction
+        landed stops looking. Refusing costs an error message, and the message
+        names the properties and the remedy, so the caller can retry without
+        them or ask for an exemption.
+
+        A ``delete`` is not checked. It removes a row the caller can already
+        see, in full, and produces no merged row to re-check.
+        """
+        policy = self._policy_for_dataset(ot.backing_dataset)
+        if policy is None or not payload:
+            return
+        refusal = (
+            f"Cannot update {ot.api_name!r} object {pk_value!r}: it is governed by "
+            f"a policy on dataset {ot.backing_dataset!r} that cannot be evaluated "
+            f"against this edit. Ask an administrator to check the dataset policy."
+        )
+        before = self._system_row(ot, pk_value)
+        if before is None:
+            raise ValueError(refusal)
+        after = before
+        for col, value in payload.items():
+            if col not in after.column_names:
+                continue  # a declared property the dataset doesn't have
+            # The *field*, not the name: set_column with a bare name mints a
+            # fresh nullable field, and the two probe rows would then have
+            # schemas that differ only in nullability — enough for
+            # concat_tables to refuse, on a path whose failure mode is
+            # refusing a legitimate edit.
+            field = after.schema.field(col)
+            try:
+                column = pa.array([value], type=field.type)
+            except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
+                raise ValueError(refusal) from None
+            after = after.set_column(after.column_names.index(col), field, column)
+        probe = pa.concat_tables([before, after]).append_column(
+            "__pk", pa.array(["__before", "__after"], type=pa.string())
+        )
+        rendered = self._under_policy(policy, probe)
+        if rendered is None:
+            raise ValueError(refusal)
+        given = {row["__pk"]: row for row in probe.to_pylist()}
+        # A column is masked when the policy renders it as something other than
+        # what went in. Comparing the policy's own output against the exact
+        # table handed to it is the only definition that stays true for every
+        # mask kind: redact turns an integer column into the string "***",
+        # null empties it, and hash rewrites it in place. Both probe rows are
+        # tested because a mask over an already-null cell is invisible in the
+        # before row and shows up only where the edit writes a value.
+        masked = sorted(
+            col for col in payload
+            if col in given["__before"]
+            and any(given[tag].get(col) != row.get(col) for tag, row in rendered.items())
+        )
+        if masked:
+            raise ValueError(
+                f"Cannot update {ot.api_name!r} object {pk_value!r}: "
+                f"{', '.join(repr(c) for c in masked)} "
+                f"{'is' if len(masked) == 1 else 'are'} masked for you on dataset "
+                f"{ot.backing_dataset!r}. Writing a value you are not permitted to "
+                f"read would overwrite the real one for everyone. Retry without "
+                f"{'that property' if len(masked) == 1 else 'those properties'}, or "
+                f"ask an administrator for a mask exemption on "
+                f"{'that column' if len(masked) == 1 else 'those columns'}."
+            )
+        if "__after" not in rendered:
+            changed = ", ".join(repr(c) for c in sorted(payload))
+            raise ValueError(
+                f"Cannot update {ot.api_name!r} object {pk_value!r}: setting "
+                f"{changed} would move it outside the rows dataset "
+                f"{ot.backing_dataset!r} lets you see. An object you can no longer "
+                f"read is one you cannot correct afterwards. Choose a value inside "
+                f"your access, or ask an administrator to widen it."
+            )
+
     def _refuse_shadowing_create(self, ot: ObjectTypeDef, pk_value: str) -> None:
         """A caller under a dataset policy may not create over an existing key.
 
@@ -1615,11 +1835,167 @@ class OntologyService:
         """
         if self._policy_for_dataset(ot.backing_dataset) is None:
             return
-        if self._system_view().get(ot.api_name, pk_value) is not None:
+        if self._key_is_taken(ot, pk_value):
             raise ValueError(
                 f"Cannot create {ot.api_name!r} object with primary key "
-                f"{pk_value!r}: an object with that key already exists."
+                f"{pk_value!r}: an object with that key already exists. A "
+                f"pending delete does not free the key — the row is still in "
+                f"dataset {ot.backing_dataset!r} until the edits are written "
+                f"back, and creating over it would replace that row rather "
+                f"than add one."
             )
+
+    def _key_is_taken(self, ot: ObjectTypeDef, pk_value: str) -> bool:
+        """Whether `pk_value` names a row a create would replace.
+
+        Asked of the **base dataset plus live creates**, deliberately not of
+        the overlaid view. ``_system_view().get()`` applies the overlay, which
+        includes the caller's own pending *delete* — so ``delete X`` then
+        ``create X`` found nothing, the shadowing check passed, and the whole
+        policy guard was walked around by spending one extra edit. Measured
+        end to end through HTTP: an editor confined to ``realm='valinor'``
+        whose ``rename`` to ``beleriand`` was correctly refused issued
+        ``raze`` + ``found`` instead, got 200 on both, and moved the object
+        into another tenant's partition with the masked ``founder`` and ``pop``
+        columns overwritten with values of their choosing — durably, in the
+        shared materialization, for every reader.
+
+        A delete is a pending edit, not a fact. The base row is still there,
+        the fold applies last-wins, and the create therefore replaces it —
+        including every column the creator never named, which become null, and
+        every column their masks hid from them.
+        """
+        try:
+            version = self.catalog.store.get_version(ot.backing_dataset, None)
+            base_scan = self.catalog.scan_for(ot.backing_dataset, plan_for=None)
+        except KeyError:
+            return False
+        if version is None or ot.primary_key not in {c.name for c in version.schema_}:
+            return False
+        quoted = '"' + ot.primary_key.replace('"', '""') + '"'
+        con = duckdb.connect()
+        try:
+            con.execute("SET enable_external_access=false")
+            con.register("__base", base_scan)
+            with limits.limited(con, limits.QueryLimits.interactive()):
+                row = con.execute(
+                    f"SELECT 1 FROM __base WHERE CAST({quoted} AS VARCHAR) = ? LIMIT 1",
+                    [pk_value],
+                ).fetchone()
+        finally:
+            con.close()
+        if row is not None:
+            return True
+        # Not in the dataset, but another live create may already hold it. Read
+        # unpoliced: the key this create would collide with is exactly the one
+        # the caller's policy hides.
+        _deleted, _updates, creates, _order = self._system_view()._overlay(ot)
+        return pk_value in creates
+
+    def _refuse_policy_escaping_create(
+        self, ot: ObjectTypeDef, pk_value: str, payload: dict
+    ) -> None:
+        """A caller under a dataset policy may not create outside it.
+
+        ``_policy_admits`` is the *read* half of this and was doing its job:
+        a create landing outside the caller's rows is hidden from the caller.
+        Hidden from the caller is not the same as not written. The edit is
+        recorded, ``reindex`` materializes it under a system identity into the
+        **shared** store, and every other reader — including the tenant whose
+        partition it landed in — sees it. Measured with a three-tenant fixture:
+        an editor restricted to ``valinor`` created a ``beleriand`` object,
+        could not see it themselves, and the ``beleriand`` editor's object list
+        grew by one.
+
+        So the same question the read half asks is now asked before the write,
+        and a create the policy would not return to its author is refused
+        instead of being quietly filed under somebody else.
+
+        Masks are **not** checked here, unlike on the update path. Writing a
+        masked column of a *new* object overwrites nothing and discloses
+        nothing — the value is the author's own. Refusing it would stop a
+        policied editor from ever creating an object on a dataset with any mask
+        on it, which is a large cost for no gain. The destructive case, a
+        create landing on a key that already exists, is
+        ``_refuse_shadowing_create``.
+        """
+        policy = self._policy_for_dataset(ot.backing_dataset)
+        if policy is None:
+            return
+        refusal = (
+            f"Cannot create {ot.api_name!r} object {pk_value!r}: it is governed "
+            f"by a policy on dataset {ot.backing_dataset!r} that cannot be "
+            f"evaluated against this edit. Ask an administrator to check the "
+            f"dataset policy."
+        )
+        version = self.catalog.store.get_version(ot.backing_dataset, None)
+        if version is None:
+            raise ValueError(refusal)
+        arrays = {"__pk": pa.array([pk_value], type=pa.string())}
+        for column in version.schema_:
+            try:
+                arrays[column.name] = pa.array(
+                    [payload.get(column.name)], type=pa.type_for_alias(column.type)
+                )
+            except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError, TypeError):
+                raise ValueError(refusal) from None
+        rendered = self._under_policy(policy, pa.table(arrays))
+        if rendered is None:
+            raise ValueError(refusal)
+        if pk_value not in rendered:
+            raise ValueError(
+                f"Cannot create {ot.api_name!r} object {pk_value!r}: it would "
+                f"land outside the rows dataset {ot.backing_dataset!r} lets you "
+                f"see. An object you cannot read is one you cannot correct "
+                f"afterwards, and it is visible to whoever the policy does let "
+                f"see those rows. Set the properties your access covers, or ask "
+                f"an administrator to widen it."
+            )
+
+    def _refuse_primary_key_rewrite(
+        self, ot: ObjectTypeDef, pk_value: str, payload: dict
+    ) -> None:
+        """An update may not move an object to a different primary key.
+
+        The key is the object's identity: it is what the overlay files the edit
+        under, what the materialization stores, and what ``writeback`` folds on.
+        Rewriting it makes those three disagree, and the disagreement is not
+        cosmetic.
+
+        * **It walks straight through the policy guard.** ``rekey`` the pk to a
+          key held by a row the caller cannot see: the merged row still renders
+          identically (the key is unmasked) and still passes the row filter (it
+          filters on a different column), so ``_refuse_policy_escaping_update``
+          sees nothing wrong. ``_refuse_shadowing_create`` refuses exactly this
+          collision on the create path; the update path had no equivalent.
+        * **The collision destroys the other row.** Measured: after
+          ``rekey city-0 -> city-1`` and a writeback, the dataset held two rows
+          named ``city-1``; the object view dedups last-wins by key, so a
+          subsequent delete of ``city-1`` removed *both*, taking a hidden
+          tenant's row with it — six objects to four, with nothing in the audit
+          trail naming the loss.
+        * **Uncollided, it orphans the object.** ``rekey city-0 -> city-0b``
+          leaves an edit filed under ``city-0`` that produces an object named
+          ``city-0b``; the editor can then address it under neither key.
+
+        Refused for every caller, not only policied ones: the writeback
+        corruption needs no policy at all. Delete-and-create expresses the same
+        intent through two operations that each have a guard.
+        """
+        if ot.primary_key not in payload:
+            return
+        new_key = payload[ot.primary_key]
+        if new_key is None or str(new_key) == pk_value:
+            return  # restating the key is not a rewrite
+        raise ValueError(
+            f"Cannot update {ot.api_name!r} object {pk_value!r}: "
+            f"{ot.primary_key!r} is its primary key, and an update may not "
+            f"change it to {str(new_key)!r}. The key is what the edit log, the "
+            f"object store and the dataset all identify this object by, and "
+            f"moving it makes them disagree — a colliding key silently deletes "
+            f"the other object on the next writeback. Delete this object and "
+            f"create the one you want instead."
+        )
 
     def apply_action(
         self,
@@ -1672,6 +2048,7 @@ class OntologyService:
                 )
             pk_value = str(payload[ot.primary_key])
             self._refuse_shadowing_create(ot, pk_value)
+            self._refuse_policy_escaping_create(ot, pk_value, payload)
         else:
             if pk is None:
                 raise ValueError(
@@ -1682,6 +2059,18 @@ class OntologyService:
                 raise ValueError(
                     f"No {ot.api_name!r} object with primary key {pk_value!r}"
                 )
+            if kind == EditKind.update:
+                # After the existence check, never before: these read the row
+                # under a system identity, so running them first would answer
+                # for objects the caller cannot see and turn the policy check
+                # itself into the enumeration oracle the check above avoids.
+                #
+                # The key rewrite is refused before the policy probe because it
+                # is a structural rule that binds every caller, and because the
+                # probe cannot see anything wrong with it — the merged row
+                # renders identically and passes the same row filter.
+                self._refuse_primary_key_rewrite(ot, pk_value, payload)
+                self._refuse_policy_escaping_update(ot, pk_value, payload)
 
         edit = ObjectEdit(
             id=uuid.uuid4().hex,

@@ -20,6 +20,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from laurelin.core.fileperms import ensure_private_file
+
 
 def is_postgres_url(s: str) -> bool:
     return isinstance(s, str) and s.startswith(("postgres://", "postgresql://"))
@@ -157,6 +159,17 @@ def _split_statements(script: str) -> list[str]:
 
 class Backend:
     dialect: str
+
+    #: A local file whose permissions this backend is responsible for. False
+    #: for PostgreSQL, which keeps nothing on this host — the store's secrets
+    #: are the server's problem there, and pretending to protect a file that
+    #: does not exist would be worse than saying so.
+    is_file_backed: bool = False
+
+    #: Set when a file-backed store was found at a mode that could not be
+    #: fully repaired (see ``fileperms.harden_existing``).
+    permission_note: Optional[str] = None
+
     # Column giving stable insertion order. SQLite has the implicit ``rowid``;
     # Postgres has no rowid, so tables that need insertion order carry an
     # explicit ``seq`` identity column (see the ``{{SEQ_COL}}`` schema token).
@@ -256,10 +269,45 @@ class Backend:
 class SQLiteBackend(Backend):
     dialect = "sqlite"
 
+    # An in-memory or URI database has no file to protect, and creating one
+    # named ":memory:" would be worse than doing nothing.
+    _NO_FILE = (":memory:", "")
+
     def __init__(self, path: Path | str):
+        # The no-file test runs on what the caller passed, before Path() gets
+        # near it: `str(Path("")) == "."`, so wrapping first turned the empty
+        # string — one of the two values `_NO_FILE` exists to catch — into the
+        # current working directory. Measured: SQLiteBackend("") reported
+        # is_file_backed=True, O_EXCL failed with EEXIST because the cwd is
+        # already there, and harden_existing chmod'd the process's working
+        # directory from 0755 to 0750 and advised `chmod 600 .`.
+        self._raw_path = str(path)
         self.path = Path(path)
+        #: Populated when the file was inherited from an older Laurelin at a
+        #: mode this process could not fully repair. Surfaced by the admin API.
+        self.permission_note: Optional[str] = None
+        if not self.is_file_backed:
+            return
+        # Before sqlite3 ever opens it. sqlite3.connect() creates a missing
+        # database at 0666 & ~umask and offers no way to say otherwise, so the
+        # file is pre-created empty at 0600 — a zero-byte file is a valid
+        # SQLite database, so SQLite simply adopts it and never takes the
+        # creating branch. That removes the open()-then-chmod window entirely
+        # rather than shrinking it.
+        self.permission_note = ensure_private_file(self.path, what="metadata database")
+
+    @property
+    def is_file_backed(self) -> bool:
+        text = self._raw_path
+        return text not in self._NO_FILE and not text.startswith("file:")
 
     def connect(self) -> Connection:
+        # -wal and -shm need no separate handling, and must not get any:
+        # measured, SQLite creates both by copying the main database file's
+        # mode (findCreateFileMode), so a 0600 metadata.db yields 0600
+        # siblings, while a 0644 one yields 0644 siblings. Chasing the
+        # siblings instead of the parent would fix the copies and leave the
+        # original — and would race the checkpoint that deletes them.
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")

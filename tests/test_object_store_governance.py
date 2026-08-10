@@ -309,3 +309,595 @@ def test_the_existence_check_does_not_leak_hidden_keys(env):
     assert hidden is not None and absent is not None
     assert hidden.replace("city-1", "K") == absent.replace("does-not-exist", "K")
     assert admin.store.max_edit_seq("city") == 0, "no edit was recorded either way"
+
+
+# -- writing through the policy ------------------------------------------------
+#
+# `_policy_admits` and `_refuse_shadowing_create` are both about *creates*. An
+# update looked safe by comparison: it cannot introduce a row, it merges onto a
+# base row that already survived the policy. Two things still got through, and
+# both are here.
+
+MASKED_ONTOLOGY = """
+object_types:
+  - api_name: city
+    backing_dataset: cities
+    primary_key: name
+    title_property: name
+    properties:
+      name: {type: string}
+      realm: {type: string}
+      pop: {type: integer}
+      founder: {type: string}
+actions:
+  - api_name: rename
+    object_type: city
+    kind: update
+    parameters:
+      realm: {type: string, required: true}
+  - api_name: recount
+    object_type: city
+    kind: update
+    parameters:
+      pop: {type: integer, required: true}
+  - api_name: appoint
+    object_type: city
+    kind: update
+    parameters:
+      founder: {type: string, required: true}
+  - api_name: refound
+    object_type: city
+    kind: update
+    parameters:
+      founder: {type: string, required: true}
+      pop: {type: integer, required: true}
+  - api_name: rekey
+    object_type: city
+    kind: update
+    parameters:
+      name: {type: string, required: true}
+  - api_name: raze
+    object_type: city
+    kind: delete
+    parameters: {}
+  - api_name: found
+    object_type: city
+    kind: create
+    parameters:
+      name: {type: string, required: true}
+      realm: {type: string, required: true}
+      pop: {type: integer}
+      founder: {type: string}
+"""
+
+
+def founded_cities() -> pa.Table:
+    return pa.table({
+        "name": [f"city-{i}" for i in range(6)],
+        "realm": [["valinor", "beleriand"][i % 2] for i in range(6)],
+        "pop": pa.array([100 + i for i in range(6)], type=pa.int64()),
+        "founder": [f"founder-{i}" for i in range(6)],
+    })
+
+
+@pytest.fixture()
+def masked(tmp_path):
+    """An editor confined to ``valinor``, with two masks over columns they may
+    still name in an action: ``founder`` redacted (which changes the column's
+    Arrow type) and ``pop`` nulled (which does not). Both kinds, because the
+    check compares the policy's own output and a mask that preserves the type
+    is the one a value comparison could miss."""
+    ws = Workspace.init(tmp_path / "masked", name="masked")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", founded_cities())
+    (ws.ontology_dir / "o.yml").write_text(MASKED_ONTOLOGY)
+    ontology = load_ontology(ws.ontology_dir)
+
+    store.set_dataset_policy("cities", {
+        "dataset": "cities",
+        "row_policy": {"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]},
+        ]},
+        "column_masks": [
+            {"column": "founder", "mode": "redact", "exempt": []},
+            {"column": "pop", "mode": "null", "exempt": []},
+        ],
+    })
+    perms = PermissionService(store)
+    elf = User(id="e", username="elf", role=Role.editor)
+
+    admin_svc = OntologyService(ws, catalog, store, ontology)
+    elf_svc = OntologyService(
+        ws, catalog, store, ontology,
+        policy=perms.query_policy_fn(elf),
+        policy_for=perms.per_dataset_policy_fn(elf),
+        plan_for=perms.arrow_policy_fn(elf),
+    )
+    return admin_svc, elf_svc
+
+
+def test_the_masks_are_actually_on(masked):
+    """The premise every test below rests on. If this ever stops holding, the
+    refusals become assertions about nothing."""
+    _admin, elf = masked
+    city = elf.get("city", "city-0")
+    assert city["founder"] == "***" and city["pop"] is None
+
+
+def test_an_update_cannot_write_through_a_column_mask(masked):
+    """The mask said "you may not read this cell". Writing it was still
+    allowed, and the overlay is applied *after* the policied scan — so the
+    author read their own value back in plaintext and the cell was unmasked for
+    as long as the edit lived. It is also a blind overwrite: a writeback folds
+    it over a value the author was never shown, for everyone."""
+    admin, elf = masked
+    admin.reindex("city")
+
+    with pytest.raises(ValueError, match="masked for you"):
+        elf.apply_action("appoint", pk="city-0", parameters={"founder": "me"})
+
+    assert admin.store.max_edit_seq("city") == 0, "refused, not silently dropped"
+    assert admin.get("city", "city-0")["founder"] == "founder-0"
+    assert elf.get("city", "city-0")["founder"] == "***", "still masked"
+
+
+def test_a_type_preserving_mask_is_caught_too(masked):
+    """``null`` masking keeps the column's Arrow type, so nothing about the
+    schema betrays it — only the value does."""
+    admin, elf = masked
+    with pytest.raises(ValueError, match="masked for you"):
+        elf.apply_action("recount", pk="city-0", parameters={"pop": 999})
+    assert admin.get("city", "city-0")["pop"] == 100
+    assert admin.store.max_edit_seq("city") == 0
+
+
+def test_the_refusal_names_every_masked_property_and_a_remedy(masked):
+    """"Denied" is not a message anyone can act on. The caller has to learn
+    which properties are the problem and what they can do instead."""
+    _admin, elf = masked
+    with pytest.raises(ValueError) as exc:
+        elf.apply_action("refound", pk="city-0",
+                         parameters={"founder": "me", "pop": 5})
+    message = str(exc.value)
+    assert "'founder'" in message and "'pop'" in message
+    assert "are masked for you" in message
+    assert "mask exemption" in message
+
+
+def test_an_update_cannot_move_a_row_out_of_the_policy(masked):
+    """The mirror image of the create channel: the row filter runs on the
+    *base* value, so the merged row was never re-checked. An editor confined to
+    valinor could push an object into beleriand — another tenant's partition —
+    and keep reading it, and a fold made that the dataset's own truth."""
+    admin, elf = masked
+    admin.reindex("city")
+
+    with pytest.raises(ValueError, match="outside the rows"):
+        elf.apply_action("rename", pk="city-0", parameters={"realm": "beleriand"})
+
+    assert admin.store.max_edit_seq("city") == 0
+    assert admin.get("city", "city-0")["realm"] == "valinor"
+
+
+def test_the_escape_was_visible_to_its_author_before_the_fix(masked):
+    """Names the second consequence separately from the first, so a partial
+    fix cannot pass: even if the write were somehow acceptable, the object must
+    not still be readable by the person who moved it out of their own set."""
+    admin, elf = masked
+    try:
+        elf.apply_action("rename", pk="city-0", parameters={"realm": "beleriand"})
+    except ValueError:
+        pass
+    assert elf.get("city", "city-0")["realm"] == "valinor"
+    assert {o["__pk"] for o in elf.query("city", limit=20)["objects"]} == {
+        "city-0", "city-2", "city-4"}
+    assert admin.query("city", limit=20)["total"] == 6
+
+
+def test_a_legitimate_update_still_works(masked):
+    """Fail closed, not fail useless. An unmasked property, set to a value
+    inside the caller's own partition, is exactly what the feature is for."""
+    admin, elf = masked
+    admin.reindex("city")
+    elf.apply_action("rename", pk="city-0", parameters={"realm": "valinor"})
+    assert admin.store.max_edit_seq("city") == 1
+    assert elf.get("city", "city-0")["realm"] == "valinor"
+
+
+def test_a_policied_delete_is_not_refused(masked):
+    """A delete removes a row the caller can already see in full and produces
+    no merged row to re-check. Refusing it would be a feature removal wearing a
+    security fix's clothes."""
+    admin, elf = masked
+    admin.reindex("city")
+    elf.apply_action("raze", pk="city-0", parameters={})
+    assert elf.get("city", "city-0") is None
+    assert admin.get("city", "city-0") is None
+
+
+def test_an_unpoliced_update_writes_every_column(masked):
+    """The refusal is scoped to callers a dataset policy narrows. An admin has
+    no mask to write through and no row set to fall out of."""
+    admin, _elf = masked
+    admin.reindex("city")
+    admin.apply_action("refound", pk="city-1",
+                       parameters={"founder": "admin", "pop": 7})
+    admin.apply_action("rename", pk="city-1", parameters={"realm": "anywhere"})
+    city = admin.get("city", "city-1")
+    assert city["founder"] == "admin" and city["pop"] == 7
+    assert city["realm"] == "anywhere"
+
+
+def test_the_check_never_hands_the_caller_the_unmasked_row(masked):
+    """The whole difficulty of this fix: it needs the base row the policy has
+    already withheld. It reads it under a system identity — the same trick
+    `reindex` uses — so the value has to stay inside the check. If a refusal
+    ever quoted it, the fix would *be* the disclosure."""
+    admin, elf = masked
+    admin.reindex("city")
+    messages = []
+    for action, params in [("appoint", {"founder": "me"}),
+                           ("recount", {"pop": 5}),
+                           ("rename", {"realm": "beleriand"})]:
+        try:
+            elf.apply_action(action, pk="city-0", parameters=params)
+        except ValueError as exc:
+            messages.append(str(exc))
+    assert len(messages) == 3
+    for message in messages:
+        assert "founder-0" not in message, "the masked value leaked in an error"
+        assert "100" not in message, "the masked population leaked in an error"
+
+
+def test_the_store_never_holds_a_value_the_author_could_not_read(masked):
+    """The durable half. The materialization is shared, so a value written
+    through a mask does not merely mislead its author — it replaces the real
+    one for every reader of the store and, after a fold, of the dataset."""
+    admin, elf = masked
+    admin.reindex("city")
+    for action, params in [("appoint", {"founder": "me"}), ("recount", {"pop": 1})]:
+        with pytest.raises(ValueError):
+            elf.apply_action(action, pk="city-0", parameters=params)
+    row = admin.store.object_index_rows("city", ["city-0"])[0]
+    import json
+    props = json.loads(row["props_json"])
+    assert props["founder"] == "founder-0" and props["pop"] == 100
+
+
+def test_the_refusal_reaches_the_front_door_as_a_400_with_its_message(tmp_path):
+    """Through HTTP, because a check the real dependency graph does not wire up
+    is not a check. It also proves the message survives to the UI: the action
+    form renders the response detail in an ErrorBox, so this string is what an
+    editor actually reads."""
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+
+    ws = Workspace.init(tmp_path / "http", name="http")
+    store = MetadataStore(ws.metadata_path)
+    DatasetCatalog(ws, store).write("cities", founded_cities())
+    (ws.ontology_dir / "o.yml").write_text(MASKED_ONTOLOGY)
+
+    app = create_app(ws)
+    admin = TestClient(app)
+    creds = {"username": "root", "password": "trustno1!"}
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    assert admin.post("/api/v1/users", json={
+        "username": "elf", "password": "password123", "role": "editor"}).status_code == 200
+    assert admin.put("/api/v1/datasets/cities/policy", json={
+        "row_policy": {"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]}]},
+        "column_masks": [{"column": "founder", "mode": "redact", "exempt": []}],
+    }).status_code == 200
+
+    elf = TestClient(app)
+    assert elf.post("/api/v1/auth/login", json={
+        "username": "elf", "password": "password123"}).status_code == 200
+
+    masked = elf.post("/api/v1/ontology/actions/appoint/apply",
+                      json={"pk": "city-0", "parameters": {"founder": "me"}})
+    assert masked.status_code == 400
+    detail = masked.json()["detail"]
+    assert "masked for you" in detail and "mask exemption" in detail
+    assert "founder-0" not in detail, "the value the mask hides must not be in the error"
+
+    escaping = elf.post("/api/v1/ontology/actions/rename/apply",
+                        json={"pk": "city-0", "parameters": {"realm": "beleriand"}})
+    assert escaping.status_code == 400
+    assert "outside the rows" in escaping.json()["detail"]
+
+    # …and the object is untouched, for the editor and for everyone else.
+    assert elf.get("/api/v1/ontology/objects/city/city-0").json()["realm"] == "valinor"
+    assert admin.get("/api/v1/ontology/objects/city/city-0").json()["founder"] == "founder-0"
+
+    # The legitimate edit through the same door still lands.
+    assert elf.post("/api/v1/ontology/actions/rename/apply",
+                    json={"pk": "city-0", "parameters": {"realm": "valinor"}}
+                    ).status_code == 200
+
+
+# ------------------------------------------- second round: around the update guard
+#
+# `_refuse_policy_escaping_update` above was attacked. It holds; what it does
+# not cover is every other way to reach the same outcome.
+
+def test_a_delete_does_not_free_a_key_for_a_policied_create(masked):
+    """**The whole update guard, walked around for the price of one edit.**
+
+    ``_refuse_shadowing_create`` asked ``_system_view().get()``, which applies
+    the overlay — including the caller's own pending delete. So ``raze city-0``
+    then ``found city-0`` found no existing object and was accepted.
+
+    A delete is a pending edit, not a fact: the base row is still in the
+    dataset, the fold applies last-wins, and the create therefore *replaces*
+    it. Measured end to end: an editor whose ``rename`` to ``beleriand`` was
+    correctly refused reached exactly that state with ``raze`` + ``found``.
+    """
+    admin, elf = masked
+    admin.reindex("city")
+    with pytest.raises(ValueError, match="outside the rows"):
+        elf.apply_action("rename", pk="city-0", parameters={"realm": "beleriand"})
+
+    elf.apply_action("raze", pk="city-0", parameters={})
+    with pytest.raises(ValueError, match="already exists"):
+        elf.apply_action("found", pk=None, parameters={
+            "name": "city-0", "realm": "beleriand", "pop": 999, "founder": "me"})
+
+    # The delete stands — it removes a row the caller could already see in
+    # full, which is why deletes are not policy-checked. What must not have
+    # happened is the *replacement*: the elf's values for the two masked
+    # columns must exist nowhere, and the base row they would have overwritten
+    # is still intact behind the pending delete.
+    assert admin.get("city", "city-0") is None, "the elf's own delete is legitimate"
+    assert not any(o.get("founder") == "me"
+                   for o in admin.query("city", limit=50)["objects"])
+    base = admin.catalog.read("cities").to_pylist()
+    row = next(r for r in base if r["name"] == "city-0")
+    assert row == {"name": "city-0", "realm": "valinor", "pop": 100,
+                   "founder": "founder-0"}
+
+
+def test_the_delete_then_create_refusal_says_why_the_key_is_still_taken(masked):
+    """A refusal an operator reads as "but I just deleted it" is a bug report.
+    The message has to name the pending delete and the writeback."""
+    _admin, elf = masked
+    elf.apply_action("raze", pk="city-0", parameters={})
+    with pytest.raises(ValueError) as caught:
+        elf.apply_action("found", pk=None, parameters={
+            "name": "city-0", "realm": "valinor"})
+    message = str(caught.value)
+    assert "pending delete" in message and "written back" in message
+
+
+def test_a_create_may_not_land_outside_the_rows_the_policy_allows(masked):
+    """``_policy_admits`` is the *read* half and was doing its job: the create
+    is hidden from its author. Hidden from the author is not unwritten — the
+    edit is recorded and ``reindex`` materializes it into the **shared** store
+    under a system identity, where the tenant it landed on reads it.
+
+    So the question the read half asks is now asked before the write.
+    """
+    admin, elf = masked
+    with pytest.raises(ValueError, match="outside the rows"):
+        elf.apply_action("found", pk=None, parameters={
+            "name": "city-new", "realm": "beleriand", "pop": 1, "founder": "me"})
+
+    admin.reindex("city")
+    assert admin.get("city", "city-new") is None
+    assert "city-new" not in {o["__pk"] for o in admin.query("city", limit=50)["objects"]}
+
+
+def test_a_create_inside_the_policy_is_still_accepted(masked):
+    """The cost of the rule above, bounded: a policied editor must still be
+    able to create. Masks are deliberately *not* checked on a create — writing
+    ``founder`` on a brand new object overwrites nothing and discloses nothing,
+    and refusing it would stop a policied editor creating anything at all on a
+    dataset carrying any mask."""
+    admin, elf = masked
+    elf.apply_action("found", pk=None, parameters={
+        "name": "city-new", "realm": "valinor", "pop": 7, "founder": "me"})
+
+    admin.reindex("city")
+    assert admin.get("city", "city-new")["realm"] == "valinor"
+    assert elf.get("city", "city-new") is not None
+
+
+def test_an_update_may_not_move_an_object_to_a_different_primary_key(masked):
+    """``rekey`` walks straight through ``_refuse_policy_escaping_update``: the
+    key is unmasked so nothing renders differently, and the row filter is on a
+    different column so the merged row still passes. The create path refuses
+    this exact collision; the update path had no equivalent.
+
+    Refused for *every* caller, not only policied ones — the writeback
+    corruption below needs no policy at all.
+    """
+    admin, elf = masked
+    with pytest.raises(ValueError, match="primary key"):
+        elf.apply_action("rekey", pk="city-0", parameters={"name": "city-1"})
+    # city-1 is a beleriand row the elf cannot see, and it is untouched.
+    assert admin.get("city", "city-1")["realm"] == "beleriand"
+    assert admin.get("city", "city-0")["realm"] == "valinor"
+    # Even onto a key nobody holds: an edit filed under one key producing an
+    # object under another orphans it — the editor can then address it by
+    # neither name.
+    with pytest.raises(ValueError, match="primary key"):
+        elf.apply_action("rekey", pk="city-0", parameters={"name": "city-0b"})
+    # And for an unpoliced admin too.
+    with pytest.raises(ValueError, match="primary key"):
+        admin.apply_action("rekey", pk="city-2", parameters={"name": "city-zzz"})
+
+
+def test_restating_an_objects_own_primary_key_is_not_a_rewrite(masked):
+    """The boundary. An action that names the key column and sets it to what it
+    already is has changed nothing, and refusing it would be a rule about
+    spelling rather than about identity."""
+    _admin, elf = masked
+    elf.apply_action("rekey", pk="city-0", parameters={"name": "city-0"})
+    assert elf.get("city", "city-0") is not None
+
+
+def test_a_writeback_never_publishes_a_dataset_whose_key_is_not_unique(tmp_path):
+    """``_refuse_duplicate_keys`` counts duplicates in ``__base`` — the dataset
+    *before* the fold. The overlay is what introduces one, so the guard passed,
+    the fold published a dataset with a non-unique primary key, and every later
+    writeback then failed the input check on a duplicate this code had written
+    itself. The docstring's own remedy was the only way out of a state no
+    operator caused.
+
+    Checked on the fold's *output*, which is the invariant rather than the
+    route: a fold publishes a dataset, and it must demand of what it writes
+    what it demands of what it read.
+    """
+    ws = Workspace.init(tmp_path / "dupes", name="dupes")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", founded_cities())
+    (ws.ontology_dir / "o.yml").write_text(MASKED_ONTOLOGY)
+    service = OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
+
+    ot = service.ontology.object_type("city")
+    duplicated = pa.table({
+        "name": ["city-1", "city-1"],
+        "realm": ["valinor", "beleriand"],
+        "pop": pa.array([1, 2], type=pa.int64()),
+        "founder": ["a", "b"],
+    })
+    with pytest.raises(ValueError, match="not unique"):
+        service._refuse_duplicate_keys_in_result(duplicated, ot, "name")
+
+    # And it is wired into the fold, before anything is published.
+    #
+    # Stated plainly: with `_refuse_primary_key_rewrite` in place there is no
+    # longer a reachable way to make the overlay produce a duplicate, so this
+    # half is defence in depth and is asserted as such — the guard runs on the
+    # fold's *output*, and it runs before `catalog.write`. Asserting it through
+    # an exploit would mean keeping the exploit open.
+    seen = {}
+    original = type(service)._refuse_duplicate_keys_in_result
+
+    def spy(table, object_type, pk):
+        seen["rows"] = table.num_rows
+        seen["version_at_call"] = store.get_dataset("cities").latest_version
+        return original(table, object_type, pk)
+
+    service._refuse_duplicate_keys_in_result = spy
+    service.apply_action("found", pk=None, parameters={
+        "name": "city-6", "realm": "valinor", "pop": 6, "founder": "f"})
+    result = service.writeback("city", actor="admin")
+
+    assert seen, "the fold must run the output guard"
+    assert seen["rows"] == 7, "on the folded table, not on the base"
+    assert seen["version_at_call"] == 1, "before the new version is published"
+    # A clean fold still publishes, so the guard is not simply refusing.
+    assert result["folded"] == 1
+    names = catalog.read("cities").column("name").to_pylist()
+    assert len(names) == len(set(names))
+
+
+def test_a_policied_editor_cannot_insert_into_another_tenants_partition(tmp_path):
+    """The outcome all of the above is about, asserted from the victim's side.
+
+    Two editors, disjoint realms. Whatever the first one does — create over a
+    key they cannot see, create outside their rows, delete then create — the
+    second one's object list must not grow, and no object of theirs may change.
+    """
+    ws = Workspace.init(tmp_path / "tenants", name="tenants")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", founded_cities())
+    (ws.ontology_dir / "o.yml").write_text(MASKED_ONTOLOGY)
+    ontology = load_ontology(ws.ontology_dir)
+    store.set_dataset_policy("cities", {
+        "dataset": "cities",
+        "row_policy": {"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]},
+            {"subject_kind": "user", "subject": "man", "values": ["beleriand"]},
+        ]},
+        "column_masks": [{"column": "founder", "mode": "redact", "exempt": []}],
+    })
+    perms = PermissionService(store)
+
+    def view(username):
+        user = User(id=username, username=username, role=Role.editor)
+        return OntologyService(
+            ws, catalog, store, ontology,
+            policy=perms.query_policy_fn(user),
+            policy_for=perms.per_dataset_policy_fn(user),
+            plan_for=perms.arrow_policy_fn(user),
+        )
+
+    elf, man = view("elf"), view("man")
+    before = sorted(o["__pk"] for o in man.query("city", limit=50)["objects"])
+
+    for attempt in (
+        lambda: elf.apply_action("found", pk=None, parameters={
+            "name": "city-9", "realm": "beleriand", "pop": 9, "founder": "me"}),
+        lambda: elf.apply_action("rekey", pk="city-0", parameters={"name": "city-1"}),
+    ):
+        with pytest.raises(ValueError):
+            attempt()
+
+    elf.apply_action("raze", pk="city-0", parameters={})
+    with pytest.raises(ValueError):
+        elf.apply_action("found", pk=None, parameters={
+            "name": "city-0", "realm": "beleriand", "pop": 999, "founder": "me"})
+
+    assert sorted(o["__pk"] for o in man.query("city", limit=50)["objects"]) == before
+    assert man.get("city", "city-1")["realm"] == "beleriand"
+
+
+def test_the_create_refusals_reach_the_front_door_as_400s(tmp_path):
+    """Through HTTP, for the same reason the update refusals are: a guard the
+    real dependency graph does not wire up is not a guard, and the message is
+    what the editor reads in the action form's ErrorBox."""
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+
+    ws = Workspace.init(tmp_path / "httpc", name="httpc")
+    store = MetadataStore(ws.metadata_path)
+    DatasetCatalog(ws, store).write("cities", founded_cities())
+    (ws.ontology_dir / "o.yml").write_text(MASKED_ONTOLOGY)
+
+    app = create_app(ws)
+    admin = TestClient(app)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin.post("/api/v1/auth/setup", json=creds)
+    admin.post("/api/v1/auth/login", json=creds)
+    admin.post("/api/v1/users", json={
+        "username": "elf", "password": "password123", "role": "editor"})
+    assert admin.put("/api/v1/datasets/cities/policy", json={
+        "row_policy": {"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]}]},
+        "column_masks": [{"column": "founder", "mode": "redact", "exempt": []}],
+    }).status_code == 200
+
+    elf = TestClient(app)
+    elf.post("/api/v1/auth/login", json={"username": "elf", "password": "password123"})
+
+    assert elf.post("/api/v1/ontology/actions/raze/apply",
+                    json={"pk": "city-0", "parameters": {}}).status_code == 200
+    recreated = elf.post("/api/v1/ontology/actions/found/apply", json={
+        "parameters": {"name": "city-0", "realm": "beleriand", "pop": 999,
+                       "founder": "me"}})
+    assert recreated.status_code == 400
+    assert "already exists" in recreated.json()["detail"]
+
+    escaping = elf.post("/api/v1/ontology/actions/found/apply", json={
+        "parameters": {"name": "city-new", "realm": "beleriand", "pop": 1}})
+    assert escaping.status_code == 400
+    assert "outside the rows" in escaping.json()["detail"]
+
+    rekeyed = elf.post("/api/v1/ontology/actions/rekey/apply",
+                       json={"pk": "city-2", "parameters": {"name": "city-1"}})
+    assert rekeyed.status_code == 400
+    assert "primary key" in rekeyed.json()["detail"]
+
+    # The object the elf may not see is untouched by any of it.
+    assert admin.get("/api/v1/ontology/objects/city/city-1").json()["realm"] == "beleriand"
+    # And a legitimate create through the same door still lands.
+    assert elf.post("/api/v1/ontology/actions/found/apply", json={
+        "parameters": {"name": "city-ok", "realm": "valinor", "pop": 1}}
+    ).status_code == 200

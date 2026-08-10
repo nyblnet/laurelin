@@ -15,6 +15,7 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  RedactedValue,
   Spinner,
   fmtNum,
   fmtTime,
@@ -288,7 +289,13 @@ export function SourcesSection() {
       label: "Type",
       render: (s) => <Badge tone={typeTone(s.type)}>{s.type}</Badge>,
     },
-    { label: "From", className: "mono dim", render: (s) => configSummary(s) },
+    {
+      label: "From",
+      className: "mono dim",
+      // A config value the API could not redact safely comes back withheld;
+      // blank here would read as "no source configured".
+      render: (s) => <RedactedValue value={configSummary(s)} />,
+    },
     { label: "Dataset", className: "mono", render: (s) => s.dataset },
     {
       label: "Last sync",

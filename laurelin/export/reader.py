@@ -59,6 +59,7 @@ from typing import IO, Any, Optional
 
 from pydantic import BaseModel, Field
 
+from laurelin.core import fileperms
 from laurelin.core.config import MARKER as MARKER_FILE
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore, propagate_markings
@@ -1575,8 +1576,7 @@ def _write_import_state(workspace: Workspace, manifest: ExportManifest,
     }
     path = workspace.root / _IMPORT_STATE_FILE
     previous = path.read_bytes() if path.exists() else None
-    path.write_text(json.dumps(state, indent=2))
-    os.chmod(path, 0o600)
+    fileperms.write_private(path, json.dumps(state, indent=2))
     report.import_state = PIPELINES_UNACKNOWLEDGED
     return path, previous
 
@@ -1603,8 +1603,7 @@ def acknowledge_pipelines(workspace: Workspace, store: Optional[MetadataStore] =
     state["import_state"] = "acknowledged"
     state["acknowledged_by"] = actor
     path = workspace.root / _IMPORT_STATE_FILE
-    path.write_text(json.dumps(state, indent=2))
-    os.chmod(path, 0o600)
+    fileperms.write_private(path, json.dumps(state, indent=2))
     if store is not None:
         store.log_audit("import_pipelines_acknowledged", {"actor": actor}, actor=actor)
 

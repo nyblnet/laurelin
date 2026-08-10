@@ -48,6 +48,7 @@ from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
+from laurelin.core.fileperms import mkdir_private
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 from laurelin.export import (
     ExportRefused,
@@ -406,7 +407,11 @@ def create_server_app(
     its own data and ACLs. The active workspace is selected per request via the
     X-Laurelin-Workspace header or laurelin_workspace cookie."""
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
+    # control.db holds *global* identity — every session token and API token on
+    # the server, not one workspace's. It is created 0600 by the SQLite
+    # backend; the root that contains it is 0700 when we are the ones creating
+    # it, and left alone when it already exists.
+    mkdir_private(root)
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
     control_url = control_url or os.environ.get("LAURELIN_CONTROL_DATABASE_URL")

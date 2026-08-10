@@ -25,6 +25,31 @@ export function ErrorBox({ error }: { error: unknown }) {
   return <div className="error-box">{msg}</div>;
 }
 
+// The marker the API sends instead of a value it could not redact safely — an
+// ODBC keyword string, a URL carrying a query, anything nested in a config.
+// Kept byte-identical to `laurelin/core/redaction.py:WITHHELD`.
+export const WITHHELD = "***** (withheld)";
+
+/**
+ * A config value that may have been withheld.
+ *
+ * Rendering the marker raw would be readable but wrong-shaped in a table, and
+ * rendering it as an empty cell would be worse: "nothing configured" is what an
+ * operator reads from a blank field, and their next move is to type the
+ * credential in again. So a withheld value says so, and says why.
+ */
+export function RedactedValue({ value }: { value: string }) {
+  if (value !== WITHHELD) return <>{value}</>;
+  return (
+    <span
+      className="faint"
+      title="Withheld by the server: this value could not be redacted safely, so none of it was sent. Laurelin masks a credential only where it can locate it exactly — in a scheme://user:password@host URL. An ODBC keyword string, or a URL with a query, could hide a secret anywhere in it."
+    >
+      withheld
+    </span>
+  );
+}
+
 export function Badge({
   children,
   tone = "neutral",

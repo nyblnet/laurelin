@@ -761,10 +761,18 @@ def test_a_member_name_that_is_not_in_normal_form_is_refused(source, target, tmp
     archive = tmp_path / "good.tar"
     export_workspace(src_ws, src_store, archive, ExportOptions())
 
+    before = dst_ws.ontology_dir.stat().st_mode & 0o777
     hostile = _repack(archive, tmp_path, extra=[("ontology/.", b"x\n")])
     with pytest.raises(ImportRefused, match="normal form"):
         import_workspace(hostile, dst_ws, dst_store, ImportOptions())
-    assert oct(dst_ws.ontology_dir.stat().st_mode & 0o777) == "0o755"
+    # Compared against the mode the directory had, not against a literal:
+    # `Workspace.init` now creates its subdirectories 0700 (see
+    # `core/fileperms.py` — they were inheriting `0777 & ~umask` under any root
+    # Laurelin did not create), and this test is about the import not touching
+    # the mode, whatever it is.
+    after = dst_ws.ontology_dir.stat().st_mode & 0o777
+    assert after == before
+    assert after & 0o100, "the owner traverse bit is what the attack stripped"
 
 
 def test_a_member_inside_another_member_is_refused(source, target, tmp_path):

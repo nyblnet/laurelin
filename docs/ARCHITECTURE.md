@@ -472,6 +472,15 @@ on every read) and not on the materialization, which kept serving it — and eac
 subsequent write copied it forward, because the write merges onto the stored
 bag. A build or a definition change are the only things that invalidate.
 
+Those two states also *accumulate lag*, because edits keep landing in a log the
+store will never replay — which made "behind by N edits" a reading that promised
+a catch-up that could never happen. `GET /ontology/object-types/{name}` therefore
+reports the built-at `dataset_version` beside the dataset's current one, plus
+`stale_version` and `stale_definition`, so an operator is told which of the three
+they have and only the self-healing one says "the next write fixes this". The
+version numbers are not withheld from a policied caller the way the object and
+lag counters are: a version number counts versions, not rows.
+
 **The rows an edit writes are built inside the transaction that writes them.**
 `commit_edit` takes a `build(pre_image, seq)` callback rather than finished
 rows, and the implementation reads the pre-image and allocates `seq` before
@@ -557,10 +566,25 @@ uniform over existing keys, visible or hidden, so it does not distinguish
 caller already named, which is inherent to a shared unique key and is stated
 rather than papered over. Unpoliced callers keep create-as-replacement.
 
+An **update is re-checked as the merged row**, for the same reasons one step
+later. The overlay is applied *after* the policied scan, so an update to a
+masked property was read straight back in plaintext by its author — and was a
+blind overwrite of a value they were never shown. And the row filter runs on the
+*base* value, so an update could push a row into another tenant's partition and
+keep showing it to the editor who moved it. `_refuse_policy_escaping_update`
+rebuilds the row the edit would produce, runs it back through the caller's own
+policy, and **refuses** if any written column comes back masked or the merged
+row comes back filtered out. Refuses, rather than dropping the offending
+properties: reporting success for a write that did not happen is worse than
+either bug. The base row it needs is read through the system view (as `reindex`
+does) and never reaches the caller — not even in the error message.
+
 The `index` block of `GET /ontology/object-types/{name}` reports `objects`,
 `lag` and `applied_seq` as `null` to callers the backing dataset's policy
 narrows: those counters describe the shared, unpoliced materialization, so a
-tenant seeing three of six objects was being told there were six.
+tenant seeing three of six objects was being told there were six. The
+`dataset_version` / `stale_version` / `stale_definition` fields beside them are
+*not* narrowed — see the store section above for why.
 
 ### Writeback (manual only)
 

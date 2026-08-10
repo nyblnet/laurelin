@@ -42,7 +42,8 @@ enforcement paths — and diffs it against the archive. "It still governs
 identically" is something you check, not something we assert.
 
 The export **withholds every credential** rather than redacting it (Laurelin's
-own API redactors were attacked with nine DSN shapes and eight leaked), and the
+own API redactors were attacked with nine DSN shapes and eight leaked — those
+are fixed, by withholding rather than by a better regex), and the
 import **binds no principal**: rules land verbatim, users, group memberships and
 clearances do not, so a reconstruction can narrow access and never widen it. The
 manifest is a checklist of exactly what has to be re-supplied.

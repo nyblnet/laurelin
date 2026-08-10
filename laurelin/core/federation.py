@@ -33,13 +33,14 @@ from typing import Any, Optional
 import duckdb
 import pyarrow as pa  # noqa: F401 - schema_of's return annotation
 
+from laurelin.core import redaction
+
 SOURCE_TYPES = ("parquet", "iceberg", "delta", "postgres")
 
 # Remote URI schemes that need the httpfs extension.
 _REMOTE_PREFIXES = ("s3://", "gs://", "gcs://", "r2://", "az://", "abfs://", "abfss://",
                     "http://", "https://")
 _PG_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
-_SECRET_KEY_RE = re.compile(r"password|secret|token|key", re.I)
 
 
 class FederationError(RuntimeError):
@@ -85,21 +86,16 @@ def validate_source(source: dict[str, Any]) -> None:
 
 
 def redacted_source(source: dict[str, Any]) -> dict[str, Any]:
-    """Source config safe to return from the API."""
-    out: dict[str, Any] = {}
-    for key, value in source.items():
-        if _SECRET_KEY_RE.search(key):
-            out[key] = "*****"
-        elif key == "url" and isinstance(value, str):
-            # `[^/]*` for the password, not `[^@]*`: a password containing an
-            # '@' would otherwise end the match at the *first* one and leave
-            # its tail in the "redacted" string — the StarRocks DSN made that
-            # reachable, and it was always wrong. The host section cannot
-            # contain a '/', so this still stops at the authority.
-            out[key] = re.sub(r"//([^:/@]+):[^/]*@", r"//\1:*****@", value)
-        else:
-            out[key] = value
-    return out
+    """Source config safe to return from the API.
+
+    The regex that used to live here matched ``//user:pass@`` and nothing else,
+    so a password containing '/', a DSN with no username, a secret in a query
+    parameter and an ODBC keyword string all travelled verbatim to anyone who
+    could read the dataset. It is gone; ``core/redaction.py`` decides *whether*
+    a value may be shown before it decides how, and its docstring carries the
+    measurements and the disclosure policy this route still follows.
+    """
+    return redaction.redact_mapping(source)
 
 
 # ---------------------------------------------------------------------------
