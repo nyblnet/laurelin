@@ -21,6 +21,7 @@ in a test than in production.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import uuid
@@ -43,6 +44,7 @@ from laurelin.core.db import (
 )
 from laurelin.core.models import (
     EditKind,
+    MaskMode,
     ObjectEdit,
     ObjectTypeDef,
     OntologyDef,
@@ -178,6 +180,7 @@ class OntologyService:
         policy=None,
         policy_for=None,
         plan_for=None,
+        decide_for=None,
         object_store=None,
     ):
         self.workspace = workspace
@@ -201,6 +204,88 @@ class OntologyService:
         # be pushed into the Parquet scan, so object queries stay fast for
         # users who have row-level security on the backing dataset.
         self.plan_for = plan_for
+        # Optional (dataset, columns) -> PolicyDecision: *what* the policy does,
+        # as data, rather than a callable that applies it to a table.
+        #
+        # The edit overlay needs this and the two above cannot answer it. An
+        # overlay row is not a table the policy has been run over — it is a
+        # partial payload merged onto a base row *after* the policied scan, so
+        # the two questions it raises are "does this assignment move the row
+        # out of my allowlist" and "is this column masked for me", and both are
+        # about the policy's *shape*. Asked any other way they become a second
+        # interpretation of the rules; `PolicyDecision` is the one the SQL and
+        # Arrow renderers are already pure translations of.
+        self.decide_for = decide_for
+
+    def _decision_for(self, dataset: str):
+        """What the backing dataset's policy does for this user, or None."""
+        if self.decide_for is None:
+            return None
+        try:
+            version = self.catalog.store.get_version(dataset, None)
+        except KeyError:
+            return None
+        columns = {c.name for c in version.schema_} if version is not None else set()
+        return self.decide_for(dataset, columns)
+
+    def _policed_payload(self, decision, payload: dict) -> dict:
+        """`payload` with every column this user's masks cover rendered masked.
+
+        The overlay is merged *after* the policied scan, so a value it carries
+        is a value the policy never saw. Measured end to end: a mask-exempt
+        editor applied an update action setting ``ssn``; a second, non-exempt
+        editor then read the plaintext SSN from ``GET /ontology/objects/...``,
+        from ``POST .../aggregate`` grouped by ``ssn``, and by ``?search=``ing
+        a fragment of it — while the same column in the same dataset still read
+        ``***``. The write half of this guard
+        (``_refuse_policy_escaping_update``) was present and correct; the read
+        half did not exist.
+
+        Rendered exactly as ``PermissionService._mask_column`` renders it, and
+        for the same reason the SQL renderer copies it: two spellings of one
+        mask is two policies.
+        """
+        if decision is None or not decision.masks or not payload:
+            return payload
+        out = dict(payload)
+        for column, mode in decision.masks:
+            if column not in out:
+                continue
+            value = out[column]
+            if mode == MaskMode.null:
+                out[column] = None
+            elif mode == MaskMode.redact:
+                out[column] = "***"
+            else:  # hash — the same digest the table path produces
+                out[column] = (
+                    None if value is None
+                    else hashlib.sha256(str(value).encode()).hexdigest()[:16]
+                )
+        return out
+
+    @staticmethod
+    def _update_escapes_row_policy(decision, payload: dict) -> bool:
+        """Whether applying `payload` puts the row outside this user's rows.
+
+        Only an assignment to the policy column can: the base row reached the
+        overlay through the policied scan, so every column the payload leaves
+        alone is a value the filter already admitted.
+
+        Measured: a user restricted to ``realm='valinor'`` kept reading an
+        object after an admin's update action moved it to ``'beleriand'`` —
+        and could filter for it by that value. The row filter had run on the
+        base value and the overlay rewrote the column afterwards. It vanished
+        only once the edit was folded, i.e. exactly for the lifetime of the
+        hand edit.
+        """
+        if decision is None or decision.row_column is None:
+            return False
+        if decision.row_column not in payload:
+            return False
+        value = payload[decision.row_column]
+        # NULL is never in an allowlist — the same fail-closed rule
+        # `_filter_rows` and the SQL renderer both apply.
+        return value is None or str(value) not in set(decision.allowed_values or [])
 
     def _policy_for_dataset(self, dataset: str):
         """The row/column transform to apply to ``dataset`` for this user, or
@@ -644,6 +729,37 @@ class OntologyService:
                 updates.pop(pk, None)
                 deleted.add(pk)
         creates = self._policy_admits(ot, creates)
+        # Updates get the same treatment, and used to get none at all. They are
+        # merged onto the base rows *after* the policied scan (`_build_sql`
+        # LEFT JOINs `__ovl_updates` onto it), so until here nothing had asked
+        # the policy about them: a masked column read back in plaintext and a
+        # row moved out of the reader's allowlist stayed visible. See
+        # `_policed_payload` and `_update_escapes_row_policy` for the measured
+        # cases. The write half of both guards already existed
+        # (`_refuse_policy_escaping_update`) — this is the read half.
+        decision = self._decision_for(ot.backing_dataset)
+        if decision is None and updates and self._policy_for_dataset(ot.backing_dataset):
+            # Fail closed, and loudly. A service built with a policy but no way
+            # to resolve it against the overlay is exactly the configuration
+            # that produced the disclosure; serving the overlay unpoliced
+            # because the resolver is missing would make the fix optional.
+            raise ValueError(
+                f"Cannot serve {ot.api_name!r} objects: dataset "
+                f"{ot.backing_dataset!r} has a policy for this caller, and "
+                f"there are pending object edits, but this OntologyService was "
+                f"built without `decide_for` — so the overlay cannot be held to "
+                f"the same masks and row filter as the rows it merges onto."
+            )
+        if decision is not None and decision.applies:
+            for pk in list(updates):
+                if self._update_escapes_row_policy(decision, updates[pk]):
+                    # Not merely hidden: `deleted` also drops the base row,
+                    # because the object's current value is outside this
+                    # reader's rows and the stale base value is not an answer.
+                    deleted.add(pk)
+                    updates.pop(pk)
+                else:
+                    updates[pk] = self._policed_payload(decision, updates[pk])
         create_ord = {pk: (o, fresh.get(pk, False))
                       for pk, o in create_ord.items() if pk in creates}
         return deleted, updates, creates, create_ord
@@ -687,7 +803,21 @@ class OntologyService:
         rendered = self._under_policy(policy, pa.table(arrays))
         if rendered is None:
             return {}
-        return {pk: row for pk, row in creates.items() if pk in rendered}
+        # The *rendered* value for every column the policy rewrote, not the raw
+        # payload. This returned `creates.items()` verbatim, so the row filter
+        # was honoured and the column masks were not: an admin-created object's
+        # masked columns came back in plaintext to a masked reader, through the
+        # same overlay merge that leaked them for updates.
+        admitted = {}
+        for pk, row in creates.items():
+            if pk not in rendered:
+                continue
+            masked = rendered[pk]
+            admitted[pk] = {
+                key: (masked[key] if key in masked else value)
+                for key, value in row.items()
+            }
+        return admitted
 
     @staticmethod
     def _under_policy(policy, table: pa.Table) -> Optional[dict[str, dict]]:
@@ -1199,6 +1329,13 @@ class OntologyService:
         # through; see _policy_admits for why an unpoliced create is a
         # cross-tenant insert channel rather than a cosmetic inconsistency.
         admitted = self._overlay(ot)[2]
+        # The same policy the SQL path applies to the overlay, applied here.
+        # This path replays the log directly — that is what makes it the oracle
+        # the other two are checked against — and a guard the oracle does not
+        # have is a guard the fallback silently drops.
+        decision = self._decision_for(ot.backing_dataset)
+        if decision is not None and not decision.applies:
+            decision = None
         # Resolved once: a created object carries every declared column the
         # dataset has, so its shape does not change when the overlay is folded.
         pad = {c: None for c in self._declared_columns(ot)}
@@ -1208,13 +1345,18 @@ class OntologyService:
                 pk = str(payload.get(ot.primary_key, edit.pk_value))
                 if pk not in admitted:
                     continue
-                objects[pk] = {**pad, **payload}
+                # `admitted` carries the policy's own rendering of the payload,
+                # so the masked columns of a created object stay masked.
+                objects[pk] = {**pad, **payload, **admitted[pk]}
             elif edit.kind == EditKind.update:
                 target = objects.get(edit.pk_value)
-                if target is not None:
-                    target.update(
-                        {k: v for k, v in edit.payload.items() if k in keep}
-                    )
+                if target is None:
+                    continue
+                payload = {k: v for k, v in edit.payload.items() if k in keep}
+                if self._update_escapes_row_policy(decision, payload):
+                    objects.pop(edit.pk_value, None)
+                    continue
+                target.update(self._policed_payload(decision, payload))
             elif edit.kind == EditKind.delete:
                 objects.pop(edit.pk_value, None)
         result = []
@@ -1985,8 +2127,30 @@ class OntologyService:
         if ot.primary_key not in payload:
             return
         new_key = payload[ot.primary_key]
-        if new_key is None or str(new_key) == pk_value:
+        if new_key is not None and str(new_key) == pk_value:
             return  # restating the key is not a rewrite
+        if new_key is None:
+            # `new_key is None` used to short-circuit here as "restating the
+            # key", which it is not: the key is *present in the payload* and
+            # set to nothing. It is the uncollided orphan this docstring
+            # already names, in its worst form. Measured through the live
+            # route: a policied editor set the key to null, got 200, and the
+            # object rendered with `__pk` of the string ``'None'`` — findable
+            # under neither its old key (the edit no longer produces it) nor
+            # ``'None'`` (the SQL compares `CAST(name AS VARCHAR) = 'None'`
+            # against a NULL column, which is never true). There is no API to
+            # revoke a live object edit, so it is unaddressable permanently.
+            # A second null on another row then wedged writeback for the whole
+            # object type — two NULL keys are duplicate keys — with a 400 that
+            # no operator action could clear.
+            raise ValueError(
+                f"Cannot update {ot.api_name!r} object {pk_value!r}: "
+                f"{ot.primary_key!r} is its primary key and an update may not "
+                f"clear it. An object with no key cannot be addressed, deleted "
+                f"or written back, and a second one would make the fold refuse "
+                f"for every object of this type. Delete this object instead, or "
+                f"retry without {ot.primary_key!r}."
+            )
         raise ValueError(
             f"Cannot update {ot.api_name!r} object {pk_value!r}: "
             f"{ot.primary_key!r} is its primary key, and an update may not "

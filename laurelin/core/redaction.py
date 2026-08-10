@@ -136,6 +136,62 @@ API_SECRET_KEY_RE = re.compile(
 _URL_KEY_RE = re.compile(r"(^|_)(url|uri)$", re.I)
 
 
+# A credential written as `keyword=value` instead of as a URL. Nothing above
+# can see one: every shape rule in this module keys on `://`, and a libpq
+# conninfo, an ODBC keyword string and a DuckDB `CREATE SECRET` have no scheme
+# at all. They are not exotic formats — DuckDB's postgres and mysql extensions
+# take a conninfo *verbatim* in `ATTACH` and `postgres_scan`, which is a
+# dashboard panel's SQL, and ODBC takes `Driver={..};Pwd=..`, which is what an
+# operator pastes into a source's `path`. Measured: five of these went through
+# `credential_in_free_text` untouched and a plain VIEWER read the password out
+# of `GET /dashboards`.
+#
+# **Why two regexes and not one.** Matching `password=` alone is the vocabulary
+# test this module refuses elsewhere, and for a gate that returns 400 it would
+# reject `WHERE password = :p`. A credential *string* is a password keyword
+# **beside a connection keyword** — a host, a driver, a database. Both halves
+# are required, and neither half matches a value that is quoted, because SQL
+# quotes its literals and conninfo does not: `password = 'x'` in a WHERE clause
+# has a `'` where these need a value character.
+_KEYWORD_SECRET_RE = re.compile(
+    r"(?:^|[\s;'\"(,{&?])(?:secret[_-]?key|api[_-]?key|access[_-]?key|"
+    r"password|passwd|pwd|passphrase|secret|token|credential|auth)"
+    r"\s*=\s*[^\s;'\"),]",
+    re.I,
+)
+_KEYWORD_ENDPOINT_RE = re.compile(
+    r"(?:^|[\s;'\"(,{&?])(?:hostaddr|hostname|host|server|driver|data\s?source|"
+    r"dsn|dbname|database|catalog|account|endpoint|port|uid|username|user|"
+    r"service_name)\s*=\s*[^\s;'\"),]",
+    re.I,
+)
+
+# DuckDB's own secret syntax, which uses no `=` at all:
+# `CREATE SECRET s (TYPE S3, KEY_ID 'AKIA...', SECRET '...')`. A statement that
+# names a secret *is* a credential; there is nothing to weigh.
+_SQL_SECRET_STMT_RE = re.compile(
+    r"\bcreate\s+(?:or\s+replace\s+)?(?:persistent\s+|temporary\s+|temp\s+)?secret\b",
+    re.I,
+)
+
+
+def keyword_credential(value: Any) -> bool:
+    """Whether `value` carries a credential in a ``keyword=value`` DSN format.
+
+    See the regexes above for what counts and why both halves are required.
+    This is the one place in the module that reads vocabulary rather than
+    shape, and it is bounded to the case where the shape rules are structurally
+    blind: a connection string with no ``://`` in it.
+    """
+    if not isinstance(value, str) or value == "":
+        return False
+    if _SQL_SECRET_STMT_RE.search(value):
+        return True
+    return bool(
+        _KEYWORD_SECRET_RE.search(value) and _KEYWORD_ENDPOINT_RE.search(value)
+    )
+
+
 def redact_dsn(value: Any) -> Any:
     """Mask the credential in a DSN, or withhold the value whole.
 
@@ -234,28 +290,55 @@ def _free_form_is_truncated(text: str) -> bool:
       ``alice:pa`` does not, because ``pa`` is not a port; it is the beginning
       of a userinfo whose ``@`` lies beyond the cut.
 
-    A match that already contains its ``@`` needs neither test: the authority
-    is inside the match and :func:`redact_dsn` handles it.
+    **A match that already contains an ``@`` is not exempt**, and assuming it
+    was is the defect this paragraph replaces. The old code short-circuited on
+    ``"@" in run`` — "the authority is inside the match, `redact_dsn` handles
+    it" — which is only true if that ``@`` is the *last* one. A password may
+    hold a terminator too: ``postgres://alice:p@ss word@db/prod`` matches only
+    as far as ``postgres://alice:p@ss``, and ``redact_dsn`` dutifully masks to
+    the ``@`` inside the fragment and ships ``ss word`` — most of the password,
+    under a ``*****`` that positively asserts the credential was removed.
+    Measured on every terminator in the regex class. So a match carrying a
+    userinfo gets the same question as one that carries none: could the
+    credential continue past the cut?
 
-    When an untrusted match is followed by an ``@`` anywhere in the string, the
-    caller withholds the whole value. The false positive that buys — a string
-    holding both a truncated-looking URL and an unrelated ``@`` — costs a
-    display value the operator can still read from their own config. Under-
-    masking costs them the password.
+    An ``@`` that sits inside *another* matched run is not evidence of that —
+    it belongs to that URL, not to this one — so the lookahead skips them. A
+    message naming two DSNs still has both masked rather than being withheld
+    whole.
+
+    When an untrusted match is followed by a stray ``@``, the caller withholds
+    the whole value. The false positive that buys — a string holding both a
+    truncated-looking URL and an unrelated ``@`` — costs a display value the
+    operator can still read from their own config. Under-masking costs them the
+    password.
     """
-    for match in _EMBEDDED_URL_RE.finditer(text):
+    matches = list(_EMBEDDED_URL_RE.finditer(text))
+    spans = [(m.start(), m.end()) for m in matches]
+
+    def stray_at_after(start: int) -> bool:
+        return any(
+            char == "@"
+            and not any(begin <= index < end for begin, end in spans)
+            for index, char in enumerate(text[start:], start)
+        )
+
+    for match in matches:
         run = match.group(0)
-        if "@" in run:
-            continue
         scheme = _SCHEME_RE.match(run)
         if scheme is None:  # pragma: no cover - the regex guarantees one
             continue
         after_scheme = run[scheme.end():]
-        complete = "/" in after_scheme or match.end() == len(text)
         authority = after_scheme.split("/", 1)[0]
+        if "@" in authority:
+            # A userinfo is inside the match, but it may not be all of one.
+            if stray_at_after(match.end()):
+                return True
+            continue
+        complete = "/" in after_scheme or match.end() == len(text)
         if complete and _HOST_RE.fullmatch(authority):
             continue
-        if "@" in text[match.end():]:
+        if stray_at_after(match.end()):
             return True
     return False
 
@@ -407,7 +490,14 @@ def redact_value(value: Any) -> Any:
     ``postgres_scan('postgres://a:p@h/db')`` leaked in full from every one of
     the three redactors, because none of them looked at a value whose key was
     not spelled ``url``.
+
+    A string that is a ``keyword=value`` connection string is withheld whole.
+    It has no ``://`` for any rule here to key on, and masking one means
+    knowing a driver's quoting rules — which is what :func:`redact_dsn` refuses
+    to do for the same format under a ``url`` key.
     """
+    if keyword_credential(value):
+        return WITHHELD
     if isinstance(value, str) and _SCHEME_RE.match(value):
         return redact_dsn(value)
     if isinstance(value, str) and "://" in value:
@@ -423,12 +513,63 @@ def credential_in_free_text(value: Any) -> bool:
     Deliberately *not* ``pipeline_scan.looks_like_a_credential``: that one
     matches the word, which is right for a warning an operator reads and wrong
     for a gate that returns 400 — it would reject a panel selecting a column
-    named ``password_hash``. This asks the narrower question the redactors
-    already answer: does the string contain a URL with a userinfo in it, or one
-    truncated in a way that hides one? A false positive here blocks a save, so
-    the test has to be about shape, not vocabulary.
+    named ``password_hash``.
+
+    **Also deliberately not ``value != redact_value(value)``**, which is what
+    this was, and which asked the wrong question in both directions.
+
+    * It said *no* to every credential format that is not a URL, because
+      ``redact_value`` only acts on ``://`` strings. A libpq conninfo in a
+      dashboard panel's ``ATTACH`` passed the gate and a VIEWER read the
+      password — the exact leak this gate exists to stop, one syntax over.
+    * It said *yes* to every value ``redact_dsn`` withholds *because it is
+      ambiguous*, which is not the same claim as "a credential is in here". A
+      public CSV with ``?format=csv`` and an S3 prefix keyed by an email
+      address were both refused with a 400 saying they embed a credential,
+      with no override and no way to author the panel at all.
+
+    So this asks its own question, and it has three answers:
+
+    * a ``keyword=value`` connection string (:func:`keyword_credential`);
+    * a URL whose authority holds a userinfo — including the ``/``-in-password
+      case, where the ``@`` falls after the first ``/`` and the first segment
+      is therefore not a hostname;
+    * a URL whose query names a parameter from :data:`API_SECRET_KEY_RE`, or
+      one truncated in a way that hides a userinfo.
+
+    An ``@`` after a first segment that *does* parse as ``host[:port]`` is a
+    path, not a credential: ``s3://reports/exports/alice@example.com/x.parquet``
+    is authorable, and ``postgresql://alice:pa/ss@db/prod`` is not.
     """
-    return isinstance(value, str) and value != redact_value(value)
+    if not isinstance(value, str) or value == "":
+        return False
+    if keyword_credential(value):
+        return True
+    if _free_form_is_truncated(value):
+        return True
+    for match in _EMBEDDED_URL_RE.finditer(value):
+        scheme = _SCHEME_RE.match(match.group(0))
+        if scheme is None:  # pragma: no cover - the regex guarantees one
+            continue
+        rest = match.group(0)[scheme.end():]
+        head, _, query = _split_query(rest)
+        first = head.split("/", 1)[0]
+        if "@" in first:
+            return True
+        if "@" in head and not _HOST_RE.fullmatch(first):
+            return True
+        for pair in re.split(r"[&;#]", query):
+            if pair and API_SECRET_KEY_RE.search(pair.split("=", 1)[0]):
+                return True
+    return False
+
+
+def _split_query(rest: str) -> tuple[str, str, str]:
+    """`rest` split at the first ``?`` or ``#``, whichever comes first."""
+    match = re.search(r"[?#]", rest)
+    if match is None:
+        return rest, "", ""
+    return rest[: match.start()], match.group(0), rest[match.end():]
 
 
 def withhold_values(value: Any) -> Any:

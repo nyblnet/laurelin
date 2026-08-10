@@ -703,6 +703,9 @@ export interface FileSecurityEntry {
   mode: string | null;
   world_accessible: boolean;
   group_accessible: boolean;
+  /** Group *write*, reported apart from group read: it is an admin grant on
+   *  metadata.db, not a share. */
+  group_writable: boolean;
 }
 
 export interface WorkspaceFileSecurity {

@@ -36,6 +36,9 @@ PRIVATE_DIR = 0o700
 
 OTHER_BITS = 0o007
 GROUP_BITS = 0o070
+#: Group *write*, which is a different grant from group read and is never
+#: preserved. See :func:`harden_existing`.
+GROUP_WRITE = 0o020
 
 #: Set to "1" to also strip group access from files Laurelin did not create.
 #: Off by default because a group *can* be a deliberately provisioned set of
@@ -89,15 +92,35 @@ def harden_existing(path: Path | str, *, what: str = "file") -> Optional[str]:
     close. And "others" on a shared host is precisely the unbounded set this
     task is about.
 
-    **Group access is preserved, and complained about.** The same argument does
+    **Group READ is preserved, and complained about.** The same argument does
     not hold: a group is a bounded, named set of principals that somebody had
     to provision, and a group-readable database is exactly how a backup agent
     or an on-call operator legitimately reads one without write access. Ripping
     that out on upgrade would turn a security fix into a silently broken
     backup, which is a worse failure than the one being fixed because nobody
-    notices it. So the group bits survive and the operator is told, in one line
-    with the command to finish the job. ``LAURELIN_STRICT_FILE_MODE=1`` strips
-    them too, for deployments that want 0600 exactly.
+    notices it. So the group read bit survives and the operator is told, in one
+    line with the command to finish the job. ``LAURELIN_STRICT_FILE_MODE=1``
+    strips it too, for deployments that want 0600 exactly.
+
+    **Group WRITE is removed, always, like world access.** Every sentence of
+    the paragraph above is about *read* — a backup agent, an operator reading
+    without write access — and this function used to preserve the whole of
+    ``0o070`` on the strength of it. It is not the same grant. ``metadata.db``
+    is not a file whose contents are merely sensitive; it is the file that says
+    who is an admin. Measured: at ``umask 002`` (the Debian/Ubuntu login
+    default under ``USERGROUPS_ENAB``, and what a systemd unit with
+    ``UMask=0002`` sets), a pre-``fileperms`` release left the database 0664;
+    the repair took it to 0660; a member of the group — not a Laurelin user at
+    all — opened it with plain ``sqlite3``, ran
+    ``update users set role='admin'``, and logged in to the ADMIN-only routes.
+    Nothing on any surface could have shown the operator this: ``describe``
+    exposed one ``group_accessible`` flag for r, w and x alike, and the note
+    and the UI badge both said "readable by its group".
+
+    There is no legitimate deployment this breaks that the world case does not
+    already cover: a second *writer* reaching this database through group bits
+    is a second process with unmediated admin over the workspace, which is not
+    a topology this product supports. A backup that only reads is untouched.
 
     A chmod we are not permitted to make (root created the file, the service
     runs as someone else) is reported, never raised: refusing to start is a
@@ -107,7 +130,7 @@ def harden_existing(path: Path | str, *, what: str = "file") -> Optional[str]:
     current = mode_of(path)
     if current < 0:
         return None
-    target = current & ~OTHER_BITS
+    target = current & ~OTHER_BITS & ~GROUP_WRITE
     if strict_mode():
         target &= ~GROUP_BITS
     if target != current:
@@ -150,11 +173,24 @@ def harden_existing(path: Path | str, *, what: str = "file") -> Optional[str]:
         )
         log.warning(note)
         return note
+    if actual & GROUP_WRITE:
+        # Only reachable when the chmod above was refused or ignored, and it is
+        # the most serious residual this function can report: a group member
+        # can rewrite the users table. It must not be reported in the same
+        # words as a group-*readable* file.
+        note = (
+            f"{what} {path} is mode {actual:04o}: WRITABLE by its group, and "
+            f"the chmod meant to fix that did not take. A member of that group "
+            f"can edit the users table directly and make themselves an admin. "
+            f"Run: chmod 600 {path}"
+        )
+        log.warning(note)
+        return note
     if actual & GROUP_BITS:
         note = (
             f"{what} {path} is mode {actual:04o}: readable by its group. World "
-            f"access was removed. If the group is not a set of principals you "
-            f"chose, run: chmod 600 {path}"
+            f"access and group write were removed. If the group is not a set "
+            f"of principals you chose, run: chmod 600 {path}"
         )
         log.warning(note)
         return note
@@ -166,9 +202,31 @@ def ensure_private_file(path: Path | str, *, what: str = "file") -> Optional[str
 
     The single entry point for a credential-bearing file, so the create path
     and the inherited path can never drift apart.
+
+    **The dangling-symlink case, which used to fall between both branches.**
+    Relocating the database to another volume before first start —
+    ``ln -s /mnt/fastvol/ws1.db <ws>/metadata.db`` — is an ordinary thing to
+    do, and the target does not exist yet. ``O_EXCL`` deliberately refuses to
+    follow a symlink, so :func:`create_private` failed with ``EEXIST``; then
+    :func:`harden_existing` stat'd the link, got ``-1`` from the dangling
+    target, and returned ``None`` *without doing anything*. sqlite3 then opened
+    the same path, followed the link, and created the real file at
+    ``0666 & ~umask`` — 0644, holding the scrypt hashes, session tokens and
+    connector DSNs written during the bootstrap run, with ``permission_note``
+    ``None``, so neither the log nor ``GET /workspace/file-security`` said a
+    word. It self-repaired on the *next* start, which is the run after the one
+    that mattered.
+
+    So the link is resolved and the target created with the same ``O_EXCL``
+    0600 open. ``O_EXCL`` is kept, not dropped: creating through the link would
+    make this the symlink-following write the flag exists to prevent.
     """
     if create_private(path):
         return None
+    target = Path(path)
+    if target.is_symlink() and mode_of(target) < 0:
+        if create_private(Path(os.path.realpath(target))):
+            return None
     return harden_existing(path, what=what)
 
 
@@ -235,11 +293,17 @@ def describe(path: Path | str, name: Optional[str] = None) -> dict:
         "mode": f"{mode:04o}" if mode >= 0 else None,
         "world_accessible": mode >= 0 and bool(mode & OTHER_BITS),
         "group_accessible": mode >= 0 and bool(mode & GROUP_BITS),
+        # Reported separately because it is a different grant and the screen
+        # said otherwise: one `group_accessible` flag covering r, w and x was
+        # rendered as "readable by its group" while the file was 0660, and a
+        # group member used the write bit to make themselves a Laurelin admin.
+        "group_writable": mode >= 0 and bool(mode & GROUP_WRITE),
     }
 
 
 __all__ = [
     "GROUP_BITS",
+    "GROUP_WRITE",
     "OTHER_BITS",
     "PRIVATE_DIR",
     "PRIVATE_FILE",

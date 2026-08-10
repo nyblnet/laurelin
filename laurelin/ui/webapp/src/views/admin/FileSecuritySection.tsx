@@ -3,9 +3,9 @@
 //
 // This panel exists because the server's repair is deliberately partial.
 // Laurelin creates metadata.db, its -wal/-shm siblings and laurelin.yml at
-// 0600, and strips world access from a database it inherited from an older
-// version — but it leaves *group* access alone, because a group can be a set
-// of principals somebody provisioned on purpose (see
+// 0600, and strips world access and group write from a database it inherited
+// from an older version — but it leaves group *read* alone, because a group
+// can be a set of principals somebody provisioned on purpose (see
 // laurelin/core/fileperms.py). That residual is a judgement only the operator
 // can make, and a WARNING in a log nobody tails is not how a judgement gets
 // made. So the number is on the screen.
@@ -15,14 +15,19 @@ import { API, api } from "../../api";
 import type { FileSecurityEntry, WorkspaceFileSecurity } from "../../types";
 import { Badge, DataTable, ErrorBox, Spinner, type Column } from "../../ui";
 
+// Group WRITE is red, not gold, and it does not say "readable". A group member
+// with write on metadata.db can edit the users table and make themselves an
+// admin — that is not a share, it is an admin grant. This badge said "readable
+// by its group" over a 0660 file while exactly that happened.
 function toneFor(e: FileSecurityEntry): "green" | "gold" | "red" {
-  if (e.world_accessible) return "red";
+  if (e.world_accessible || e.group_writable) return "red";
   if (e.group_accessible) return "gold";
   return "green";
 }
 
 function verdictFor(e: FileSecurityEntry): string {
   if (e.world_accessible) return "readable by every local user";
+  if (e.group_writable) return "WRITABLE by its group";
   if (e.group_accessible) return "readable by its group";
   return "owner only";
 }
@@ -41,7 +46,8 @@ export function FileSecuritySection() {
   const exposed = rows.some((r) => r.world_accessible || r.group_accessible);
   // World access surviving a repair means the chmod itself failed. Group
   // access surviving is the documented, deliberate outcome.
-  const advisoryOnly = exposed && !rows.some((r) => r.world_accessible);
+  const advisoryOnly =
+    exposed && !rows.some((r) => r.world_accessible || r.group_writable);
 
   const columns: Column<FileSecurityEntry>[] = [
     {

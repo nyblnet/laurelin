@@ -572,3 +572,236 @@ def test_an_empty_database_path_is_not_a_file_and_never_chmods_a_directory(tmp_p
     finally:
         os.chdir(previous)
     assert mode(directory) == 0o755
+
+
+# --------------------------------------------- third round: what was found next
+
+def test_an_inherited_group_writable_database_loses_the_write_bit(ws):
+    """``harden_existing`` computed ``current & ~OTHER_BITS`` and preserved the
+    whole of ``0o070`` on the argument that a group may be a provisioned set of
+    principals — an argument whose every sentence is about *read*.
+
+    ``metadata.db`` is the file that says who is an admin. At ``umask 002``
+    (the Debian/Ubuntu login default under ``USERGROUPS_ENAB``, and what a
+    systemd unit with ``UMask=0002`` sets) a pre-``fileperms`` release left it
+    0664; the repair took it to 0660 and called that "readable by its group" on
+    the admin screen, in the note and in the UI badge. A member of that group,
+    not a Laurelin user at all, opened it with ``sqlite3``, ran
+    ``update users set role='admin'``, and reached the ADMIN-only routes.
+    """
+    MetadataStore(ws.metadata_path)
+    for legacy, expected in ((0o664, 0o640), (0o660, 0o640), (0o666, 0o640),
+                             (0o620, 0o600), (0o640, 0o640)):
+        os.chmod(ws.metadata_path, legacy)
+        store = MetadataStore(ws.metadata_path)
+        assert mode(ws.metadata_path) == expected, f"{legacy:04o}"
+        assert not mode(ws.metadata_path) & fileperms.GROUP_WRITE
+        # Group *read* still survives, which is the case the residual is for.
+        if expected & fileperms.GROUP_BITS:
+            note = store.backend.permission_note
+            assert note and "chmod 600" in note
+
+
+def test_the_admin_report_distinguishes_group_write_from_group_read(ws):
+    """One ``group_accessible`` flag covering r, w and x is what let a 0660
+    database be rendered as "readable by its group". The screen has to be able
+    to say which grant it is looking at."""
+    MetadataStore(ws.metadata_path)
+    os.chmod(ws.metadata_path, 0o640)
+    assert fileperms.describe(ws.metadata_path)["group_writable"] is False
+    os.chmod(ws.metadata_path, 0o660)
+    described = fileperms.describe(ws.metadata_path)
+    assert described["group_writable"] is True
+    assert described["group_accessible"] is True
+    # And on a filesystem that accepts chmod and ignores it — vfat, several
+    # CIFS mounts, FUSE object-store gateways — the note for a surviving write
+    # bit does not say "readable". A group member with write on this file can
+    # make themselves an admin, and the sentence has to say so.
+    real = os.chmod
+    try:
+        os.chmod = lambda *a, **k: None
+        note = fileperms.harden_existing(ws.metadata_path, what="metadata database")
+    finally:
+        os.chmod = real
+    assert note and "WRITABLE" in note and "admin" in note
+
+
+def test_a_relocation_symlink_gets_a_private_file_from_the_first_byte(tmp_path):
+    """Relocating the database to another volume before first start —
+    ``ln -s /mnt/fastvol/ws1.db <ws>/metadata.db`` — is ordinary, and the
+    target does not exist yet.
+
+    ``O_EXCL`` refuses to follow a symlink, so ``create_private`` failed with
+    ``EEXIST``; ``harden_existing`` then stat'd through the dangling link, got
+    ``-1``, and returned ``None`` having done nothing. sqlite3 followed the
+    link and created the real file at ``0666 & ~umask`` — 0644, holding the
+    scrypt hashes, session tokens and connector DSNs of the bootstrap run —
+    with ``permission_note`` ``None``, so nothing on any surface said so. It
+    self-repaired on the *next* start, i.e. the run after the one that
+    mattered.
+    """
+    root = tmp_path / "ws"
+    workspace = Workspace.init(root, name="relocated")
+    volume = tmp_path / "fastvol"
+    volume.mkdir()
+    target = volume / "ws1.db"
+    workspace.metadata_path.unlink(missing_ok=True)
+    os.symlink(target, workspace.metadata_path)
+    assert not target.exists()
+
+    store = MetadataStore(workspace.metadata_path)
+    AuthService(store).create_user("root", "trustno1!", role="admin")
+
+    assert mode(target) == 0o600
+    assert store.backend.permission_note is None
+    assert fileperms.describe(workspace.metadata_path)["mode"] == "0600"
+
+
+def test_strict_mode_reaches_the_marker_and_the_directory_it_names_on_screen(
+    tmp_path, monkeypatch
+):
+    """``LAURELIN_STRICT_FILE_MODE=1`` is the remedy the admin screen and
+    ``docs/DEPLOYMENT.md`` advertise, and on an inherited workspace it touched
+    neither ``laurelin.yml`` nor the workspace directory — both of which that
+    same screen renders in the same table, tagged red. The operator was left
+    with two permanently red rows and two remedies that provably do nothing:
+    ``chmod 600 metadata.db`` names a file already 0600, and the variable was
+    already set.
+
+    A restart is what the card asks for, and a restart calls ``find``, not
+    ``init`` — so the repair has to run there too.
+    """
+    monkeypatch.setenv(fileperms.STRICT_ENV, "1")
+    root = tmp_path / "inherited"
+    root.mkdir(mode=0o755)
+    for name in ("data", "pipelines", "ontology"):
+        (root / name).mkdir(mode=0o755)
+    (root / "laurelin.yml").write_text("name: legacy\ndescription: ''\n")
+    os.chmod(root / "laurelin.yml", 0o644)
+    os.chmod(root, 0o755)
+
+    workspace = Workspace.find(root)  # the restart
+
+    assert mode(root / "laurelin.yml") == 0o600
+    assert mode(root) == 0o700
+    assert mode(root / "data") == 0o700
+    report = _client(workspace).get("/api/v1/workspace/file-security").json()
+    assert not any(e["world_accessible"] for e in report["files"])
+    assert report["directory"]["world_accessible"] is False
+
+
+def test_the_iceberg_warehouse_is_private_under_a_root_we_did_not_create(tmp_path):
+    """``data/``, ``pipelines/`` and ``ontology/`` are created 0700 because the
+    workspace root is only 0700 when *Laurelin* made it, and the documented
+    Docker shape (``RUN mkdir -p /data``, or any bind-mounted volume) leaves it
+    0755. ``iceberg/`` arrived later and never joined that list: a bare
+    ``mkdir`` gave it ``0777 & ~umask``, pyiceberg wrote its data and metadata
+    at 0644 inside it, and the whole chain came out world-readable — governed
+    dataset Parquet with no row policy and no column masks, reachable by every
+    local user."""
+    import pyarrow as pa
+
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core import iceberg
+
+    if not iceberg.available():
+        pytest.skip("needs pyiceberg: pip install 'laurelin[iceberg]'")
+
+    root = tmp_path / "preexisting"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
+    workspace = Workspace.init(root, name="ice")
+    store = MetadataStore(workspace.metadata_path)
+    catalog = DatasetCatalog(workspace, store)
+    catalog.write_iceberg("payroll", pa.table({"ssn": ["111-22-3333"]}))
+
+    warehouse = root / "iceberg"
+    assert warehouse.is_dir()
+    assert mode(warehouse) == 0o700, "the whole tree below this is 0755/0644"
+    # And the catalog database it sits beside is on the admin screen, which is
+    # the only place the residual it deliberately leaves behind can be seen.
+    report = _client(workspace).get("/api/v1/workspace/file-security").json()
+    assert any(e["name"] == "iceberg-catalog.db" for e in report["files"]), report
+
+
+def test_a_local_data_uri_does_not_take_the_data_plane_out_of_its_private_root(
+    tmp_path, monkeypatch
+):
+    """``LAURELIN_DATA_URI`` pointing at a local path put every governed
+    Parquet outside the 0700 workspace, in a tree built by a bare
+    ``root.mkdir(parents=True)``: 0755 directories, 0644 files."""
+    import pyarrow as pa
+
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core.storage import Storage
+
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("LAURELIN_DATA_URI", str(shared))
+    workspace = Workspace.init(tmp_path / "ws", name="w")
+    store = MetadataStore(workspace.metadata_path)
+    storage = Storage.for_workspace(workspace)
+    DatasetCatalog(workspace, store, storage=storage).write(
+        "payroll", pa.table({"ssn": ["111-22-3333"]})
+    )
+    assert mode(Path(storage.uri)) == 0o700
+
+
+UNSUPPORTED_URIS = ["S3://bucket/prefix", "s3:/bucket/prefix", "s3a://bucket/p",
+                    "wasb://c@a/p", "hdfs://nn/p"]
+
+
+@pytest.mark.parametrize("uri", UNSUPPORTED_URIS)
+def test_a_data_uri_this_build_cannot_address_is_refused_not_made_a_directory(
+    tmp_path, monkeypatch, uri
+):
+    """``is_remote_uri`` was a case-sensitive exact-prefix match against a fixed
+    tuple, so ``S3://``, ``s3:/`` and ``s3a://`` were all judged *local* and
+    became directories literally named ``S3:/bucket/prefix`` under the process
+    CWD — 0755, 0644 Parquet inside, on the container's ephemeral disk, while
+    the operator believed the governed data was in a bucket behind a bucket
+    policy. Nothing logged, warned or failed.
+
+    ``S3://`` is now recognised as the object store it is; the rest fail
+    loudly, because a misconfiguration that silently relocates the data plane
+    is not one an operator can be expected to notice.
+    """
+    from laurelin.core.storage import Storage, UnsupportedDataURI, is_remote_uri
+
+    monkeypatch.chdir(tmp_path)
+    if uri == "S3://bucket/prefix":
+        assert is_remote_uri(uri) is True
+        return
+    assert is_remote_uri(uri) is False
+    with pytest.raises(UnsupportedDataURI) as caught:
+        Storage.for_uri(uri)
+    assert uri in str(caught.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_two_processes_initialising_one_workspace_do_not_race_on_the_marker(
+    tmp_path,
+):
+    """``if not ws.marker_path.exists(): ws._write_marker(...)`` is a
+    check-then-``O_EXCL``-create, and 17 of 40 six-process trials had a loser
+    die on an unhandled ``FileExistsError``. It is reachable from the front
+    door: ``api/context._bundle`` calls ``Workspace.init`` lazily for a
+    registered-but-unmaterialised workspace and FastAPI runs sync endpoints on
+    a threadpool, so two simultaneous requests for one slug both enter and the
+    second gets a 500 instead of a workspace. ``fileperms.create_private``
+    handles the identical race by catching ``OSError``; this is the copy that
+    did not."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = tmp_path / "contended"
+    barrier = __import__("threading").Barrier(8)
+
+    def go():
+        barrier.wait()
+        return Workspace.init(root, name="shared").root
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        # .result() re-raises; a FileExistsError in any thread fails here.
+        roots = [f.result() for f in [pool.submit(go) for _ in range(8)]]
+    assert roots == [root.resolve()] * 8
+    assert mode(root / "laurelin.yml") == 0o600
+    assert Workspace.find(root).name == "shared"

@@ -183,19 +183,58 @@ class Scheduler:
                 actor="scheduler",
             )
         except Exception as exc:  # noqa: BLE001 - any action failure
+            detail = _redacted_failure(store, schedule, exc)
             store.record_schedule_run(
                 schedule.name, "failed", next_run_at=next_at,
-                error=f"{type(exc).__name__}: {exc}"[:500], watermark=watermark,
+                error=detail[:500], watermark=watermark,
             )
             metrics.schedule_fires.labels(
                 trigger=schedule.trigger, status="failed"
             ).inc()
             store.log_audit(
                 "schedule_failed",
-                {"schedule": schedule.name, "error": str(exc)[:300]},
+                {"schedule": schedule.name, "error": detail[:300]},
                 actor="scheduler",
             )
             log.warning("schedule %r failed: %s", schedule.name, exc)
+
+
+def _redacted_failure(store, schedule: ScheduleInfo, exc: BaseException) -> str:
+    """A failed action's message, with this schedule's credentials taken out.
+
+    ``connectors.sync_source`` redacts, records the redacted copy, and then
+    ``raise``s the **original** exception for the caller that is about to log
+    it. That is right for the log and wrong for here: the scheduler is a
+    *recorder*, not a logger — it writes what it caught into
+    ``schedules.last_error`` (EDITOR-readable) and into ``audit_log.details``,
+    which is the VIEWER-gated ``GET /api/v1/audit``.
+
+    Measured, and it is the same leak `connectors` documents as fixed, one path
+    over: a source whose password held a space produced ``unexpected spaces
+    found in "SUPER SEKRET"`` and a plain viewer — 403 on ``/sources``, 403 on
+    ``/schedules`` — read it out of the audit trail. The ``/audit`` backstop in
+    ``routes._redacted_audit_details`` cannot catch it: that sentence has no
+    ``://`` and no credential *word*, so every shape rule and the export
+    scanner agree it is innocent prose. What defeats it is knowing which string
+    is this source's password, which only the source's config says.
+
+    So the config is loaded here rather than hoped for downstream, and the raw
+    exception stays in the process log where the operator can reach it and a
+    browser cannot.
+    """
+    from laurelin.core import redaction
+
+    secrets: list[str] = []
+    if schedule.source:
+        try:
+            source = store.get_source(schedule.source)
+        except Exception:  # noqa: BLE001 - a lookup failure must not lose the redaction
+            source = None
+        if source is not None:
+            secrets = redaction.secrets_in_config(getattr(source, "config", None))
+    return str(
+        redaction.redact_driver_text(f"{type(exc).__name__}: {exc}", secrets)
+    )
 
 
 def enabled() -> bool:

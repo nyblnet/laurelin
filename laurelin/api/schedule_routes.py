@@ -58,19 +58,24 @@ def upsert_schedule(
             status_code=400,
             detail=f"Invalid schedule name {name!r}: must match ^[a-z][a-z0-9_-]{{0,63}}$",
         )
-    for target in body.targets:
-        # Same reason as a dashboard panel's SQL: a target is stored and
-        # returned verbatim, and the schedules editor writes it back. A target
-        # of `s3://key:SCHEDSEKRET@bucket/t` came back in full from
-        # GET /schedules — `export/secrets.py` cites this exact string as a
-        # measured case, and the export path drops it while the API did not.
-        if redaction.credential_in_free_text(target):
+    # Every free-form field, not just `targets`. A target is stored and
+    # returned verbatim and the schedules editor writes it back, which is why
+    # this gate exists — and `source` and `upstream_dataset` sit beside it in
+    # the same row, are dumped by the same `_dump`, and had no gate at all.
+    # Measured: the exact string this gate was written to stop,
+    # `s3://key:SCHEDSEKRET@bucket/t`, was refused as a target and accepted as
+    # a `source`, then handed back in full by GET /schedules. A guard on one
+    # field of a record is a guard on none of it.
+    checked = [("target", target) for target in body.targets]
+    checked += [("source", body.source), ("upstream dataset", body.upstream_dataset)]
+    for label, value in checked:
+        if redaction.credential_in_free_text(value):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "A schedule target may not embed a credential: this one is "
-                    "stored and returned verbatim by GET /schedules. Put the "
-                    "credential in a registered source or an object-store "
+                    f"A schedule {label} may not embed a credential: this one "
+                    "is stored and returned verbatim by GET /schedules. Put "
+                    "the credential in a registered source or an object-store "
                     "profile and name that here."
                 ),
             )

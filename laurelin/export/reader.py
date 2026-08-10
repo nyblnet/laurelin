@@ -979,6 +979,9 @@ def import_workspace(
         data_states = _reconcile_data_states(
             manifest, tables, {name for name, _ in data_members}, options, report
         )
+        # An archive's part key is not allowed to name a part the destination
+        # already has. See `_relocate_colliding_parts`.
+        key_map = _relocate_colliding_parts(storage, tables, data_members, report)
 
         if resolution.refusals:
             first = resolution.refusals[0]
@@ -1009,8 +1012,9 @@ def import_workspace(
         if not options.metadata_only:
             for name, member in data_members:
                 key = name[len("data/"):] if name.startswith("data/") else name
-                report.bytes_written += _write_part(storage, f"data/{key}", member)
-                written_parts.append(f"data/{key}")
+                key = key_map.get(f"data/{key}", f"data/{key}")
+                report.bytes_written += _write_part(storage, key, member)
+                written_parts.append(key)
             report.parts_written = len(written_parts)
 
         # The gate goes on BEFORE the first pipeline file exists on disk, not
@@ -1269,6 +1273,72 @@ def _spill(name: str, payload, target: Path, observed: _Observed) -> None:
             total += len(chunk)
             out.write(chunk)
     observed.record(name, digest.hexdigest(), total)
+
+
+def _relocate_colliding_parts(
+    storage: Storage, tables: dict, data_members: list, report: "ImportReport"
+) -> dict[str, str]:
+    """Give every arriving part a key the destination is not already using.
+
+    **The defect this closes, measured end to end.** ``_write_part`` calls
+    ``storage.open_output_stream``, which truncates — there is no ``O_EXCL``
+    anywhere on this path — and the part-write loop used the archive member
+    name *verbatim* as the destination key. ``--rename-prefix`` renames only
+    the metadata (``datasets.name`` and the dataset columns of the rows that
+    reference it); it never touched ``files_json`` or the member keys. So on
+    the documented safe resolution for a name collision — "imported as
+    'imported_salaries'", a ``note``, not a refusal — an archive's
+    ``data/salaries/parts/<uuid>.parquet`` landed **on top of** the
+    destination's live part of that exact key, which the destination's own
+    ``salaries`` still references. The operator was told the import had been
+    safely renamed; ``GET /datasets/salaries/rows`` then returned the
+    archive's rows.
+
+    It is not a theoretical collision. Every archive exported from a workspace
+    keeps that workspace's part keys, so a round trip — export, edit, re-import
+    with ``--merge`` — collides on every part by construction, and the archive
+    is unsigned (``docs/PORTABILITY.md`` says so), so its Parquet is whatever
+    the person holding the tar wanted.
+
+    The sibling this also closes: the pre-commit rollback deletes
+    ``written_parts``. When those keys were the destination's own, a merge that
+    failed after the part write **deleted the destination's live data**.
+
+    Relocating rather than refusing, because refusing would break the one
+    workflow ``--rename-prefix`` exists for: the imported dataset is a new
+    dataset here and its parts are new parts. The version rows that reference
+    the key are rewritten with it, in the same pass, so nothing is left
+    pointing at a key that was not written.
+    """
+    arriving = [
+        (name if name.startswith("data/") else f"data/{name}")
+        for name, _ in data_members
+    ]
+    key_map: dict[str, str] = {}
+    for key in arriving:
+        if not storage.exists(key):
+            continue
+        parts = key.split("/")
+        dataset = parts[1] if len(parts) > 2 else "imported"
+        suffix = key.rsplit(".", 1)[-1] if "." in parts[-1] else "parquet"
+        key_map[key] = Storage.new_part_key(dataset, suffix)
+    if not key_map:
+        return key_map
+    for row in tables.get("dataset_versions", []):
+        keys = _version_keys(row)
+        if keys:
+            row["files_json"] = json.dumps(
+                [key_map.get(k, k) for k in keys], separators=(",", ":")
+            )
+        path = row.get("path")
+        if path and str(path) in key_map:
+            row["path"] = key_map[str(path)]
+    report.warnings.append(
+        f"{len(key_map)} arriving data part(s) named a storage key this "
+        f"workspace already uses and were written to fresh keys instead. The "
+        f"destination's existing parts were not overwritten."
+    )
+    return key_map
 
 
 def _write_part(storage: Storage, key: str, spilled: Path) -> int:

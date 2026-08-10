@@ -91,6 +91,13 @@ rather than guessed at. Three redactors with three regexes preceded this and
 leaked ten different credential forms between them; guessing where a secret
 sits is what failed, so the replacement does not guess.
 
+One narrow exception, because the shape rules are structurally blind to it: a
+credential written as `keyword=value` with no `://` anywhere — a libpq
+conninfo, an ODBC keyword string, a DuckDB `CREATE SECRET`. A password keyword
+*beside* a connection keyword withholds the value whatever key it sits under.
+That is a vocabulary test rather than a shape test, and it is bounded to the
+one case where there is no shape to read.
+
 What a masked DSN still shows is the endpoint: `user@host:port/db`. Whether
 that belongs in a viewer-readable response is an open question we have not
 answered, and it is stated in the redactor's docstring alongside the rest of the
@@ -117,8 +124,20 @@ dashboard panel's SQL and a schedule's targets are stored and returned verbatim,
 and a panel's SQL round-trips through the editor's textarea — redacting on read
 would let a mask be saved over the real query. A value embedding a
 `user:password@host` connection string is therefore refused at `PUT` with a
-message pointing at registered sources. Values stored before this are not
-retroactively redacted; `laurelin export` scans for them and refuses.
+message pointing at registered sources — as is a `keyword=value` connection
+string, and a URL whose query names a secret-ish parameter. Every free-form
+field of a schedule is gated, not only its targets.
+
+The gate is deliberately narrower than the *display* redactor, and the residual
+follows from that: `redact_dsn` withholds a URL carrying a query because it
+cannot tell which parameter is the secret, but a gate that refused every such
+URL made a public CSV with `?format=csv` — and an S3 prefix keyed by an email
+address — impossible to author at all, with a 400 that said it embedded a
+credential. So the gate refuses a query parameter whose *name* is
+credential-shaped and admits the rest; a secret in a query parameter named
+something else, or in a URL path, reaches a viewer verbatim. Values stored
+before this are not retroactively redacted; `laurelin export` scans for them
+and refuses.
 
 **Mutations are audited** with actor, action, and details.
 
@@ -148,10 +167,17 @@ Be clear-eyed about these. They are design consequences, not oversights:
    row policy and no column masks — access control is enforced at the API, not
    the filesystem. Protect the volume accordingly. The *credential*-bearing
    files are a separate matter and are handled: `metadata.db` (with its
-   `-wal`/`-shm` siblings), `control.db` and `laurelin.yml` are created `0600`,
-   and a workspace root Laurelin creates is `0700`, as are the `data/`,
-   `pipelines/` and `ontology/` directories inside it. See the deployment
-   checklist below for what happens to a workspace created before that.
+   `-wal`/`-shm` siblings), `control.db`, `iceberg-catalog.db` and
+   `laurelin.yml` are created `0600`, and a workspace root Laurelin creates is
+   `0700`, as are the `data/`, `pipelines/`, `ontology/` and `iceberg/`
+   directories inside it. See the deployment checklist below for what happens
+   to a workspace created before that.
+
+   `LAURELIN_DATA_URI` pointing at a local path creates that directory `0700`
+   too; pointing it at a scheme this build cannot address (`s3a://`, a
+   mistyped `s3:/`) is a **startup error**, because the alternative was a
+   local directory of that literal name holding every governed Parquet while
+   the operator believed the data was in a bucket.
 
    `pipelines/` matters more than the other two: its contents are `exec`'d on
    every build, so a directory anyone can write to is code execution. Laurelin
@@ -179,17 +205,29 @@ A short checklist; details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
       (with its `-wal`/`-shm` siblings), `control.db` and `laurelin.yml` at
       `0600`, and a workspace or server root it creates at `0700` — but a
       workspace from before that, or a directory you made yourself, keeps the
-      mode it has. Opening an inherited database strips world access and
-      leaves group access alone — so **an upgraded workspace ends up `0640`,
-      not `0600`**, and that is the default outcome of every upgrade, not an
-      edge case. **Admin → Workspace files on disk** shows the mode each file
-      actually has, re-stat'd on every request and including `control.db`, and
-      `LAURELIN_STRICT_FILE_MODE=1` forces `0600` on every open. Data under
-      `data/` is not re-moded at all.
+      mode it has. Opening an inherited database strips world access **and
+      group write**, and leaves group *read* alone — so **an upgraded
+      workspace ends up `0640`, not `0600`**, and that is the default outcome
+      of every upgrade, not an edge case. Group write is not treated as a
+      share: `metadata.db` is the file that says who is an admin, and at
+      `umask 002` a legacy `0664` database let any member of the group make
+      themselves one with `sqlite3`. **Admin → Workspace files on disk** shows
+      the mode each file actually has, re-stat'd on every request, including
+      `control.db` and `iceberg-catalog.db`, and distinguishes group *write*
+      from group read. `LAURELIN_STRICT_FILE_MODE=1` forces `0600` on every
+      open, and also takes `laurelin.yml` and the workspace directory itself.
+      Data under `data/` is not re-moded at all.
 - [ ] Set `LAURELIN_MAX_UPLOAD_MB` to something sane for your box (it also
       caps HTTP-connector downloads).
 - [ ] Rotate `LAURELIN_SCIM_TOKEN` and SSO client secrets like any other
       credential; keep them in a Secret, not in `values.yaml`.
+- [ ] Treat a workspace archive as untrusted input. `laurelin import` is not
+      signature-checked (see [docs/PORTABILITY.md](docs/PORTABILITY.md)): the
+      trailer proves the archive is internally consistent, not that it came
+      from anyone in particular. An archive whose data parts collide with the
+      destination's is now relocated to fresh keys rather than written over
+      them, and the relocation is reported in the import warnings — but the
+      *rows* it brings are still whatever the archive said.
 - [ ] Review the audit log periodically — it only helps if someone reads it.
 
 ## Scope

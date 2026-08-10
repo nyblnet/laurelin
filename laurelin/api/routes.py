@@ -118,6 +118,11 @@ def get_ontology_service(
         # …and lets a policy that *does* apply be pushed into the scan, so
         # row-level security doesn't force full materialization.
         plan_for=perms.arrow_policy_fn(user),
+        # The policy as *data*, which is what the edit overlay needs: an
+        # overlay row never passes through the policied scan, so the questions
+        # about it are "which columns are masked for this user" and "does this
+        # assignment leave their allowlist", not "run this table through".
+        decide_for=lambda dataset, columns: perms.decide(dataset, columns, user),
     )
 
 
@@ -352,6 +357,20 @@ def get_workspace_file_security(
     if control is not None:
         note = add_db(control.backend, control.path, "control.db") or note
     entries.append(fileperms.describe(workspace.marker_path))
+    # The Iceberg catalog, which is credential-bearing by `core/iceberg.py`'s
+    # own argument — it pre-creates the file 0600 because "a warehouse URI
+    # recorded in it can carry a credential" — and was absent from this report
+    # entirely. `ensure_private_file` does repair an inherited one to 0640, and
+    # the residual group access it deliberately leaves behind is the number
+    # this route exists to put on a screen. On a PostgreSQL store the omission
+    # was starker: the report listed one file while a SQLite catalog sat beside
+    # it on disk, under a card reading "the metadata store is postgres, so it
+    # keeps no file on this host".
+    catalog_db = workspace.root / "iceberg-catalog.db"
+    for suffix in ("", "-wal", "-shm"):
+        entry = fileperms.describe(catalog_db.with_name(catalog_db.name + suffix))
+        if entry["exists"]:
+            entries.append(entry)
     directory = fileperms.describe(workspace.root, name=".")
     # The note was written once, when the store was opened. The modes above
     # were read just now. An operator who acts on the advice — runs the chmod
@@ -1128,7 +1147,12 @@ class GrantsRequest(BaseModel):
 
 @router.post("/ontology/object-types/{name}/index", dependencies=[EDITOR])
 def build_object_index(
-    name: str, service: OntologyDep, store: StoreDep, actor: ActorDep
+    name: str,
+    service: OntologyDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
 ) -> dict:
     """Materialize an object type into the index.
 
@@ -1136,18 +1160,38 @@ def build_object_index(
     which is worth it for entities and wasteful for high-volume events. Once
     built, the index is refreshed automatically after each build and bypassed
     whenever it is stale.
+
+    Gated per object type, like every other ``/ontology`` route. The global
+    EDITOR role alone was the whole check here, and it let two things through
+    that the routes on either side of it refuse. A global editor with *no*
+    grant on this type — 403 on ``GET /ontology/object-types/{name}`` and 403
+    on its objects — got a 200 here carrying the global object count and the
+    whole state block. And a caller with view but a row policy showing them
+    three of six objects got ``objects: 6``, the exact number
+    ``get_object_type`` deliberately withholds from a policied caller two
+    hundred lines above ("operator numbers: they go to callers the backing
+    dataset's policy does not narrow"). Rebuilding is a write to the shared
+    materialization, so the requirement is *edit*, not view.
     """
-    count = service.reindex(name)
     ot = service.ontology.object_type(name)
+    if ot is None:
+        raise KeyError(f"Unknown object type: {name!r}")
+    _require_ot_edit(perms, user, service, name)
+    count = service.reindex(name)
     # Verify the digest of what we just built. A detector nobody reads is not a
     # detector, and a rebuild is the one moment where recomputing it is free —
     # every row is already in hand.
-    digest_ok = service.verify_digest(ot) if ot is not None and count else True
+    digest_ok = service.verify_digest(ot) if count else True
     store.log_audit("object_index_built",
                     {"object_type": name, "objects": count, "digest_ok": digest_ok},
                     actor=actor)
-    return {"object_type": name, "objects": count, "digest_ok": digest_ok,
-            "state": store.object_index_state(name)}
+    # The counters are the ones `get_object_type` guards: a policied caller is
+    # told the rebuild happened, not how many rows everyone else has.
+    unpoliced = service._policy_for_dataset(ot.backing_dataset) is None
+    return {"object_type": name,
+            "objects": count if unpoliced else None,
+            "digest_ok": digest_ok,
+            "state": store.object_index_state(name) if unpoliced else None}
 
 
 @router.post("/ontology/object-types/{name}/writeback", dependencies=[EDITOR])
@@ -1177,7 +1221,23 @@ def writeback_object_type(
 
 
 @router.delete("/ontology/object-types/{name}/index", dependencies=[EDITOR])
-def drop_object_index(name: str, store: StoreDep, actor: ActorDep) -> dict:
+def drop_object_index(
+    name: str,
+    service: OntologyDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+) -> dict:
+    """Drop one object type's index.
+
+    Same gate as building it, and it needs one more than build does: a caller
+    with no grant on this type could delete the index of a type they cannot
+    read, and the owner's next query silently fell back to a full scan.
+    """
+    if service.ontology.object_type(name) is None:
+        raise KeyError(f"Unknown object type: {name!r}")
+    _require_ot_edit(perms, user, service, name)
     store.drop_object_index(name)
     store.log_audit("object_index_dropped", {"object_type": name}, actor=actor)
     return {"dropped": name}

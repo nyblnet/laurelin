@@ -90,6 +90,7 @@ def env(tmp_path):
         policy=perms.query_policy_fn(elf),
         policy_for=perms.per_dataset_policy_fn(elf),
         plan_for=perms.arrow_policy_fn(elf),
+        decide_for=lambda ds, cols, _u=elf: perms.decide(ds, cols, _u),
     )
     return admin_svc, elf_svc
 
@@ -413,6 +414,7 @@ def masked(tmp_path):
         policy=perms.query_policy_fn(elf),
         policy_for=perms.per_dataset_policy_fn(elf),
         plan_for=perms.arrow_policy_fn(elf),
+        decide_for=lambda ds, cols, _u=elf: perms.decide(ds, cols, _u),
     )
     return admin_svc, elf_svc
 
@@ -826,6 +828,7 @@ def test_a_policied_editor_cannot_insert_into_another_tenants_partition(tmp_path
             policy=perms.query_policy_fn(user),
             policy_for=perms.per_dataset_policy_fn(user),
             plan_for=perms.arrow_policy_fn(user),
+            decide_for=lambda ds, cols, _u=user: perms.decide(ds, cols, _u),
         )
 
     elf, man = view("elf"), view("man")
@@ -901,3 +904,286 @@ def test_the_create_refusals_reach_the_front_door_as_400s(tmp_path):
     assert elf.post("/api/v1/ontology/actions/found/apply", json={
         "parameters": {"name": "city-ok", "realm": "valinor", "pop": 1}}
     ).status_code == 200
+
+
+# -- the overlay is read through the policy too, not only written through it ---
+#
+# `_refuse_policy_escaping_update` is the *write* half and was present and
+# correct: an editor cannot themselves write a masked column or move a row out
+# of their allowlist. These are the *read* half, which did not exist. The
+# overlay is merged onto the base rows AFTER the policied scan, so until it is
+# policed here, any live edit — including one made by a legitimately exempt
+# user or an admin — is read back unpoliced by everybody.
+
+OVERLAY_ONTOLOGY = """
+object_types:
+  - api_name: city
+    backing_dataset: cities
+    primary_key: name
+    title_property: name
+    properties:
+      name: {type: string}
+      realm: {type: string}
+      ssn: {type: string}
+actions:
+  - api_name: rename
+    object_type: city
+    kind: update
+    parameters:
+      realm: {type: string}
+      ssn: {type: string}
+  - api_name: found
+    object_type: city
+    kind: create
+    parameters:
+      name: {type: string, required: true}
+      realm: {type: string, required: true}
+      ssn: {type: string}
+"""
+
+
+def _overlay_env(tmp_path, *, row_policy, column_masks):
+    ws = Workspace.init(tmp_path / "ovl", name="ovl")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", pa.table({
+        "name": [f"city-{i}" for i in range(4)],
+        "realm": [["valinor", "beleriand"][i % 2] for i in range(4)],
+        "ssn": [f"ssn-{i}" for i in range(4)],
+    }))
+    (ws.ontology_dir / "o.yml").write_text(OVERLAY_ONTOLOGY)
+    ontology = load_ontology(ws.ontology_dir)
+    store.set_dataset_policy("cities", {
+        "dataset": "cities", "row_policy": row_policy, "column_masks": column_masks,
+    })
+    perms = PermissionService(store)
+    elf = User(id="e", username="elf", role=Role.editor)
+
+    def for_user(user):
+        return OntologyService(
+            ws, catalog, store, ontology,
+            policy=perms.query_policy_fn(user),
+            policy_for=perms.per_dataset_policy_fn(user),
+            plan_for=perms.arrow_policy_fn(user),
+            decide_for=lambda ds, cols, _u=user: perms.decide(ds, cols, _u),
+        )
+
+    return OntologyService(ws, catalog, store, ontology), for_user(elf)
+
+
+def test_an_update_to_a_masked_column_is_read_back_masked(tmp_path):
+    """Measured end to end: a mask-exempt editor applied ``rename`` setting
+    ``ssn``; a second, non-exempt editor then read the plaintext SSN out of
+    ``GET /ontology/objects/city/city-0``, out of an aggregate grouped by
+    ``ssn``, and by searching a fragment of it — while the same column of the
+    same dataset still read ``***`` everywhere else. The mask came back the
+    moment the edit was folded into the dataset, which is what proved the mask
+    itself was configured correctly and only the overlay path disclosed."""
+    admin, elf = _overlay_env(
+        tmp_path, row_policy=None,
+        column_masks=[{"column": "ssn", "mode": "redact", "exempt": []}],
+    )
+    assert elf.get("city", "city-0")["ssn"] == "***"
+    admin.apply_action("rename", "city-0", {"ssn": "SSN-987-65-4321"}, actor="root")
+
+    assert elf.get("city", "city-0")["ssn"] == "***"
+    assert {o["ssn"] for o in elf.query("city", limit=10)["objects"]} == {"***"}
+    groups = elf.aggregate("city", group_by=["ssn"])["groups"]
+    assert {g["ssn"] for g in groups} == {"***"}
+    assert elf.query("city", search="987-65")["objects"] == []
+    # The exact path (`_materialize`) is the oracle the other two are checked
+    # against, so it has to agree rather than be the hole they route around.
+    assert {o["ssn"] for o in elf._materialize(elf.ontology.object_type("city"))} == {
+        "***"
+    }
+
+
+def test_a_created_objects_masked_columns_are_read_back_masked(tmp_path):
+    """``_policy_admits`` ran the creates through the policy and then returned
+    the **raw** payload for whichever keys survived — so the row filter was
+    honoured and the column masks were not."""
+    admin, elf = _overlay_env(
+        tmp_path, row_policy=None,
+        column_masks=[{"column": "ssn", "mode": "redact", "exempt": []}],
+    )
+    admin.apply_action(
+        "found", "city-9",
+        {"name": "city-9", "realm": "valinor", "ssn": "CREATED-SECRET"}, actor="root",
+    )
+    assert elf.get("city", "city-9")["ssn"] == "***"
+    assert "CREATED-SECRET" not in str(elf.query("city", limit=10))
+    assert "CREATED-SECRET" not in str(
+        elf._materialize(elf.ontology.object_type("city"))
+    )
+
+
+def test_an_update_that_moves_a_row_out_of_the_allowlist_hides_it(tmp_path):
+    """The row filter ran on the *base* value and the overlay rewrote the
+    column afterwards, so a user confined to ``realm='valinor'`` kept reading
+    an object an admin had moved to ``'beleriand'`` — and could filter for it
+    by that value. It disappeared only once the edit was folded, i.e. for
+    exactly as long as the hand edit was live."""
+    admin, elf = _overlay_env(
+        tmp_path,
+        row_policy={"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]}]},
+        column_masks=[],
+    )
+    assert pks(elf.query("city", limit=10)) == {"city-0", "city-2"}
+    admin.apply_action("rename", "city-0", {"realm": "beleriand"}, actor="root")
+
+    assert pks(elf.query("city", limit=10)) == {"city-2"}
+    assert elf.get("city", "city-0") is None
+    assert elf.query("city", filters={"realm": "beleriand"})["objects"] == []
+    assert {o["__pk"] for o in elf._materialize(elf.ontology.object_type("city"))} == {
+        "city-2"
+    }
+    # And an update that leaves the row where it is stays visible: the rule is
+    # "this assignment moved it out", not "there is an edit".
+    admin.apply_action("rename", "city-2", {"realm": "valinor"}, actor="root")
+    assert pks(elf.query("city", limit=10)) == {"city-2"}
+
+
+def test_a_policied_service_that_cannot_resolve_its_policy_refuses_the_overlay(
+    tmp_path,
+):
+    """Fail closed rather than optional. A service constructed with a policy
+    but no ``decide_for`` cannot hold the overlay to the same rules as the rows
+    it merges onto, and serving it unpoliced in that case is how the fix would
+    quietly stop applying on the next call site."""
+    admin, elf = _overlay_env(
+        tmp_path, row_policy=None,
+        column_masks=[{"column": "ssn", "mode": "redact", "exempt": []}],
+    )
+    admin.apply_action("rename", "city-0", {"ssn": "SSN-987-65-4321"}, actor="root")
+    elf.decide_for = None
+    with pytest.raises(ValueError, match="decide_for"):
+        elf.query("city", limit=10)
+
+
+NULL_KEY_ONTOLOGY = """
+object_types:
+  - api_name: city
+    backing_dataset: cities
+    primary_key: name
+    title_property: name
+    properties:
+      name: {type: string}
+      realm: {type: string}
+actions:
+  - api_name: rekey
+    object_type: city
+    kind: update
+    parameters:
+      name: {type: string}
+      realm: {type: string}
+"""
+
+
+def test_an_update_may_not_clear_an_objects_primary_key(tmp_path):
+    """The null case, which ``_refuse_primary_key_rewrite`` short-circuited as
+    "restating the key is not a rewrite". It is neither: the key is present in
+    the payload and set to nothing. (An action whose key parameter is
+    ``required`` catches it by accident; one where it is optional — which is
+    the ordinary way to write a partial-update action — did not.)
+
+    Measured through the live route: a policied editor set the key to null, got
+    200, and the object rendered with ``__pk`` of the string ``'None'``,
+    findable under neither its old key nor ``'None'`` (the SQL compares
+    ``CAST(name AS VARCHAR) = 'None'`` against a NULL column, which is never
+    true). There is no API anywhere in ``laurelin/`` to revoke a live object
+    edit, so it is unaddressable permanently — and a second null on another row
+    wedged ``writeback`` for the whole object type, two NULL keys being
+    duplicate keys, with a 400 no operator action could clear.
+    """
+    ws = Workspace.init(tmp_path / "nk", name="nk")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("cities", cities())
+    (ws.ontology_dir / "o.yml").write_text(NULL_KEY_ONTOLOGY)
+    svc = OntologyService(ws, catalog, store, load_ontology(ws.ontology_dir))
+
+    with pytest.raises(ValueError, match="primary key"):
+        svc.apply_action("rekey", pk="city-0", parameters={"name": None})
+    assert svc.get("city", "city-0") is not None
+    assert len(svc.query("city", limit=10)["objects"]) == 6
+    # A non-key property may still be cleared; the rule is about identity.
+    svc.apply_action("rekey", pk="city-0", parameters={"realm": None})
+    assert svc.get("city", "city-0")["realm"] is None
+    # And the fold that two null keys would have blocked forever still runs.
+    with pytest.raises(ValueError, match="primary key"):
+        svc.apply_action("rekey", pk="city-2", parameters={"name": None})
+    assert svc.writeback("city", actor="root")["folded"] == 1
+
+
+def test_the_index_routes_are_gated_per_object_type_like_every_other(tmp_path):
+    """``POST`` and ``DELETE /ontology/object-types/{name}/index`` were gated by
+    the **global EDITOR role alone** while every other ``/ontology`` route runs
+    ``_require_ot_view``/``_require_ot_edit``. Two things went through it:
+
+    * a global editor with *no* grant on the type — 403 on the type and 403 on
+      its objects — got a 200 carrying the global object count and the whole
+      state block, and could DELETE the owner's index out from under them;
+    * a caller with view but a row policy showing them three of six objects got
+      ``objects: 6``, the exact number ``get_object_type`` withholds from a
+      policied caller ("operator numbers: they go to callers the backing
+      dataset's policy does not narrow").
+    """
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+
+    ws = Workspace.init(tmp_path / "idx", name="idx")
+    store = MetadataStore(ws.metadata_path)
+    DatasetCatalog(ws, store).write("cities", cities())
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+
+    app = create_app(ws)
+    admin = TestClient(app)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin.post("/api/v1/auth/setup", json=creds)
+    admin.post("/api/v1/auth/login", json=creds)
+    admin.post("/api/v1/users",
+               json={"username": "elf", "password": "password123", "role": "editor"})
+    elf = TestClient(app)
+    elf.post("/api/v1/auth/login",
+             json={"username": "elf", "password": "password123"})
+
+    # (a) no grant on this object type at all.
+    assert admin.put("/api/v1/ontology/permissions/city", json={"grants": [
+        {"subject_kind": "user", "subject": "root",
+         "can_view": True, "can_edit": True}]}).status_code == 200
+    assert elf.get("/api/v1/ontology/object-types/city").status_code == 403
+    assert elf.get("/api/v1/ontology/objects/city").status_code == 403
+    assert elf.post("/api/v1/ontology/object-types/city/index").status_code == 403
+    assert elf.delete("/api/v1/ontology/object-types/city/index").status_code == 403
+    # The owner's index is still theirs to build, and still there afterwards.
+    assert admin.post("/api/v1/ontology/object-types/city/index").status_code == 200
+    assert admin.get(
+        "/api/v1/ontology/object-types/city").json()["index"]["indexed"] is True
+
+    # (b) grant restored, but a row policy narrows what elf may see. The
+    # rebuild is allowed; the operator counters are not disclosed.
+    assert admin.put("/api/v1/ontology/permissions/city", json={"grants": [
+        {"subject_kind": "user", "subject": "root",
+         "can_view": True, "can_edit": True},
+        {"subject_kind": "user", "subject": "elf",
+         "can_view": True, "can_edit": True}]}).status_code == 200
+    assert admin.put("/api/v1/datasets/cities/policy", json={
+        "row_policy": {"column": "realm", "rules": [
+            {"subject_kind": "user", "subject": "elf", "values": ["valinor"]}]},
+        "column_masks": [],
+    }).status_code == 200
+    assert admin.put("/api/v1/datasets/cities/permissions", json={"grants": [
+        {"subject_kind": "user", "subject": "root",
+         "can_view": True, "can_edit": True},
+        {"subject_kind": "user", "subject": "elf",
+         "can_view": True, "can_edit": True}]}).status_code == 200
+    listed = elf.get("/api/v1/ontology/objects/city").json()
+    assert listed["total"] == 3
+    built = elf.post("/api/v1/ontology/object-types/city/index")
+    assert built.status_code == 200
+    assert built.json()["objects"] is None
+    assert built.json()["state"] is None
+    # The unpoliced caller still gets the numbers they are there to operate on.
+    assert admin.post("/api/v1/ontology/object-types/city/index").json()["objects"] == 6

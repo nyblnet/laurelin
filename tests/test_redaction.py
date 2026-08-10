@@ -315,26 +315,36 @@ def test_no_credential_reaches_a_browser_through_the_sources_routes(
     assert secret not in admin.get("/api/v1/sources/s").text
 
 
-def test_a_keyword_string_filed_under_a_key_that_does_not_claim_a_url_is_disclosed():
-    """**A residual, pinned rather than assumed.**
+def test_a_keyword_connection_string_is_withheld_whatever_key_it_sits_under():
+    """This was a pinned *residual* — a driver blob under some name other than
+    ``url`` was disclosed knowingly, on the argument that withholding every
+    scalar that might one day be one would empty the Sources screen.
 
-    A value is held to the DSN rules when the config says it is an endpoint —
-    ``url``, ``uri``, ``base_url`` — or when it is visibly URL-shaped. A driver
-    blob parked under some other name is neither, and withholding every scalar
-    that might one day be one would empty the Sources screen: a file source's
-    ``path`` is ``/mnt/land/*.csv``, and that is the common case by a mile.
+    The argument was sound and the conclusion was too wide. Measured on the
+    live routes: ``config.path`` holding ``Driver={x};Server=db;Uid=a;Pwd=S``
+    reached every EDITOR of ``GET /sources``, and the same string under a
+    federated dataset's ``source`` reached every **VIEWER** of ``GET
+    /datasets`` — a privilege level below where the identical credential in a
+    ``url`` is withheld.
 
-    So this is disclosed, and it is disclosed *knowingly*. Closing it means
-    answering the same open question as ``user@host:port/db``: whether these
-    routes should show operator-supplied values at all, or only the shape of
-    them, as ``export/secrets.py`` does with its allowlist.
+    A rule narrow enough to keep the screen: a password keyword *beside* a
+    connection keyword. ``/mnt/land/*.csv`` has neither and is still shown,
+    which is the common case the residual was protecting.
     """
     odbc = "Server=db;Uid=alice;Pwd=hunter2;"
-    assert redacted_config({"note": odbc})["note"] == odbc
-    # But the moment it looks like a URL, wherever it sits, it is redacted.
+    assert redacted_config({"note": odbc})["note"] == WITHHELD
+    assert "hunter2" not in _flat(federation.redacted_source({"connection": odbc}))
+    assert "hunter2" not in _flat(
+        redacted_config({"query": "SELECT dblink('host=db user=a password=hunter2')"})
+    )
+    # The moment it looks like a URL, wherever it sits, it is redacted.
     assert "hunter2" not in _flat(
         redacted_config({"note": "postgresql://alice:hunter2@db/prod"})
     )
+    # And an ordinary path, which has no credential keyword in it, still reads
+    # as itself: this is what "would empty the Sources screen" meant.
+    assert redacted_config({"path": "/mnt/land/*.csv"})["path"] == "/mnt/land/*.csv"
+    assert redacted_config({"format": "csv"})["format"] == "csv"
 
 
 def test_no_credential_reaches_a_browser_through_the_engines_routes(tmp_path):
@@ -681,3 +691,211 @@ def test_the_audit_route_redacts_a_credential_no_writer_thought_to_redact(tmp_pa
     # The trail still says what happened and under which key.
     assert "client_secret" in row["details"]
     assert "db.internal" in row["details"]["error"]
+
+
+# ---------------------------------------------- the second adversarial pass
+
+def test_a_scheduled_sync_failure_never_puts_the_password_on_the_audit_route(tmp_path):
+    """The same escalation as
+    ``test_a_viewer_cannot_read_a_connector_password_out_of_the_audit_trail``,
+    reached through the scheduler instead of through ``POST /sources/{n}/sync``.
+
+    ``connectors.sync_source`` redacts, records the redacted copy, and then
+    re-raises the **original** exception. ``Scheduler._run`` caught that and
+    wrote ``str(exc)`` into ``schedules.last_error`` and into an audit row, so
+    the identical password came back out of the VIEWER-gated ``/audit`` on a
+    workspace where the same viewer is 403 on both ``/sources`` and
+    ``/schedules``. The ``/audit`` backstop cannot see it: psycopg's sentence
+    has no ``://`` and no credential word in it.
+    """
+    from laurelin.core import scheduler as scheduler_mod
+
+    admin = _admin(tmp_path)
+    secret = "SUPER SEKRET"
+    admin.put("/api/v1/datasets/d", json={"name": "d"})
+    admin.put("/api/v1/sources/pg", json={
+        "type": "postgres", "dataset": "d",
+        "config": {"url": f"postgresql://alice:{secret}@127.0.0.1:55432/prod",
+                   "table": "public.t"},
+    })
+    admin.put("/api/v1/schedules/nightly", json={
+        "enabled": True, "trigger": "cron", "cron": "0 3 * * *",
+        "action": "sync", "source": "pg"})
+    assert admin.post("/api/v1/schedules/nightly/run").status_code == 200
+
+    # The same code path the background thread runs, ticked by hand.
+    from laurelin.api.app import _scheduler_targets
+
+    fired = scheduler_mod.Scheduler(
+        open_stores=lambda: _scheduler_targets(admin.app), worker_id="test"
+    ).tick()
+    assert "nightly" in fired
+
+    assert secret not in admin.get("/api/v1/schedules").text
+    admin.post("/api/v1/users",
+               json={"username": "vw2", "password": "viewerpw1!", "role": "viewer"})
+    viewer = TestClient(admin.app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vw2", "password": "viewerpw1!"})
+    audit = viewer.get("/api/v1/audit")
+    assert audit.status_code == 200
+    assert secret not in audit.text
+    # The escalation this closes, stated: the same user reaches neither route
+    # the failure is otherwise readable from.
+    assert viewer.get("/api/v1/sources").status_code == 403
+    assert viewer.get("/api/v1/schedules").status_code == 403
+    # And the trail still says the schedule failed.
+    assert any(e["action"] == "schedule_failed" for e in audit.json())
+
+
+KEYWORD_CREDENTIALS = [
+    ("libpq conninfo in a DuckDB ATTACH",
+     "ATTACH 'host=db.internal port=5432 dbname=prod user=alice "
+     "password=KWSEKRET' AS pg (TYPE POSTGRES); SELECT * FROM pg.public.t"),
+    ("libpq conninfo inside postgres_scan",
+     "SELECT * FROM postgres_scan('host=db.internal user=alice "
+     "password=KWSEKRET dbname=prod', 'public', 't')"),
+    ("odbc keyword string",
+     "SELECT * FROM odbc_scan('Driver={x};Server=db;Uid=alice;Pwd=KWSEKRET;')"),
+    ("duckdb CREATE SECRET",
+     "CREATE SECRET s (TYPE S3, KEY_ID 'AKIAX', SECRET 'KWSEKRET'); "
+     "SELECT * FROM read_parquet('s3://b/k')"),
+    ("mysql conninfo",
+     "ATTACH 'host=db user=alice password=KWSEKRET database=prod' AS my (TYPE MYSQL)"),
+]
+
+
+@pytest.mark.parametrize("label, sql", KEYWORD_CREDENTIALS,
+                         ids=[k[0] for k in KEYWORD_CREDENTIALS])
+def test_a_credential_that_is_not_a_url_is_stopped_at_the_dashboard_door(
+    tmp_path, label, sql
+):
+    """The gate was ``value != redact_value(value)``, and ``redact_value`` only
+    acts on strings containing ``://`` — so every credential format that is not
+    a URL was invisible to it. DuckDB's postgres and mysql extensions take a
+    libpq conninfo verbatim in ``ATTACH`` and ``postgres_scan``; measured, all
+    five of these saved with a 200 and a plain VIEWER read the password out of
+    ``GET /dashboards``, which is the leak this gate was written to stop.
+    """
+    admin = _admin(tmp_path)
+    panel = {"id": "p1", "title": "p", "kind": "table", "sql": sql}
+    r = admin.put("/api/v1/dashboards/kw", json={"title": "t", "panels": [panel]})
+    assert r.status_code == 400, r.text
+    assert "KWSEKRET" not in r.text
+    assert "KWSEKRET" not in admin.get("/api/v1/dashboards").text
+
+
+def test_every_free_text_field_of_a_schedule_is_gated_not_just_its_targets(tmp_path):
+    """The loop ran over ``body.targets`` and stopped there. ``source`` sits in
+    the same request, the same row and the same ``_dump``, and took the exact
+    DSN the gate refuses one field over — then ``GET /schedules`` handed it
+    back verbatim."""
+    admin = _admin(tmp_path)
+    for field in ("source", "upstream_dataset"):
+        body = {"enabled": False, "trigger": "cron", "cron": "0 3 * * *",
+                "action": "build", "targets": [],
+                field: "s3://key:SCHEDSEK3@bucket/t"}
+        r = admin.put(f"/api/v1/schedules/x{field}", json=body)
+        assert r.status_code == 400, f"{field}: {r.text}"
+        assert "SCHEDSEK3" not in r.text
+    assert "SCHEDSEK3" not in admin.get("/api/v1/schedules").text
+
+
+AUTHORABLE = [
+    ("s3 prefix keyed by an email address",
+     "SELECT * FROM read_parquet('s3://reports/exports/alice@example.com/x.parquet')"),
+    ("public csv with a query string",
+     "SELECT * FROM read_csv_auto('https://data.example.gov/tax.csv?format=csv')"),
+    ("object version in a query string",
+     "SELECT * FROM read_parquet('https://b.s3.amazonaws.com/a.parquet?versionId=3')"),
+    ("date-tagged filename holding an at sign",
+     "SELECT * FROM read_csv_auto('https://reports.example.com/exports/x@2024.csv')"),
+]
+
+
+@pytest.mark.parametrize("label, sql", AUTHORABLE, ids=[a[0] for a in AUTHORABLE])
+def test_a_url_with_no_credential_in_it_is_authorable_as_a_panel(tmp_path, label, sql):
+    """The other direction, and it is a defect of the same gate.
+
+    ``redact_dsn`` returns ``WITHHELD`` for a URL carrying a query and for an
+    ``@`` that falls after a ``/`` — in both cases because the value is
+    *ambiguous*, not because a credential was found. A gate built on "did
+    ``redact_value`` change anything" cannot tell those two apart, so it
+    refused every one of these with a 400 saying it "embeds a connection string
+    with a credential in it", which is false, and there is no override: the
+    panel simply cannot be authored. ``redaction``'s own docstring names the
+    email-keyed S3 prefix and the date-tagged filename as real cases.
+    """
+    admin = _admin(tmp_path)
+    panel = {"id": "p1", "title": "p", "kind": "table", "sql": sql}
+    r = admin.put("/api/v1/dashboards/ok", json={"title": "t", "panels": [panel]})
+    assert r.status_code == 200, r.text
+    assert admin.get("/api/v1/dashboards/ok").json()["panels"][0]["sql"] == sql
+    # And the same value as a schedule target.
+    target = sql.split("'")[1]
+    ok = admin.put("/api/v1/schedules/ok", json={
+        "enabled": False, "trigger": "cron", "cron": "0 3 * * *",
+        "action": "build", "targets": [target]})
+    assert ok.status_code == 200, ok.text
+
+
+def test_a_credential_hidden_by_an_ambiguous_url_is_still_refused(tmp_path):
+    """The boundary of the test above, so relaxing the gate cannot become
+    "allow every ``@`` after a slash". ``postgresql://alice:pa/ss@db/prod`` has
+    its ``@`` after a ``/`` too — but its first segment is ``alice:pa``, which
+    is not a hostname, so the ``@`` opens a host and what precedes it is a
+    password."""
+    admin = _admin(tmp_path)
+    for sql in (
+        "SELECT * FROM postgres_scan('postgresql://alice:pa/ss@db/prod','public','t')",
+        "SELECT * FROM read_csv('https://x.example.com/a.csv?api_key=SLIPPED')",
+    ):
+        r = admin.put("/api/v1/dashboards/no", json={
+            "title": "t", "panels": [{"id": "p", "title": "p", "kind": "table",
+                                      "sql": sql}]})
+        assert r.status_code == 400, sql
+    assert admin.get("/api/v1/dashboards").json() == []
+
+
+TERMINATORS = [("space", " "), ("comma", ","), ("semicolon", ";"),
+               ("quote", "'"), ("close paren", ")"), ("close bracket", "]")]
+
+
+@pytest.mark.parametrize("label, ch", TERMINATORS, ids=[t[0] for t in TERMINATORS])
+def test_a_password_holding_an_at_sign_and_a_terminator_never_ships_in_part(label, ch):
+    """``_free_form_is_truncated`` skipped any match that already contained an
+    ``@`` — "the authority is inside the match" — which is true only when that
+    ``@`` is the *last* one.
+
+    A password holding both an ``@`` and a terminator splits the match early:
+    ``postgres://alice:p@ss word@db/prod`` matched only to ``p@ss``, and
+    ``redact_dsn`` masked to the ``@`` *inside the fragment*, shipping the rest
+    of the password under a ``*****`` that positively asserts the credential
+    was removed. That breaks ``MASK``'s contract — everything else here is real
+    — so the answer is ``WITHHELD``.
+    """
+    password = f"p@ss{ch}TAIL"
+    dsn = f"postgres://alice:{password}@db.internal:5432/prod"
+    prose = f"could not connect: {dsn}"
+    assert "TAIL" not in str(redaction.redact_text(prose))
+    sql = f"SELECT * FROM postgres_scan('{dsn}', 'public', 't')"
+    assert "TAIL" not in _flat(redacted_config({"query": sql}))
+    # A DSN whose password holds none of them is still masked, not withheld:
+    # the rule must not collapse into "withhold everything".
+    plain = "could not connect: postgres://alice:plainpw@db.internal:5432/prod"
+    assert redaction.redact_text(plain) == (
+        "could not connect: postgres://alice:*****@db.internal:5432/prod"
+    )
+
+
+def test_two_dsns_in_one_message_are_both_masked_rather_than_withheld_whole():
+    """The bound on the rule above. The lookahead for a stray ``@`` skips any
+    that sits inside another matched run — a second DSN's userinfo belongs to
+    that URL, not to this one — so a message naming two endpoints stays
+    readable."""
+    text = ("replication from postgres://a:pw1@h1.internal/db to "
+            "postgres://b:pw2@h2.internal/db failed")
+    out = str(redaction.redact_text(text))
+    assert out != WITHHELD
+    assert "pw1" not in out and "pw2" not in out
+    assert "h1.internal" in out and "h2.internal" in out

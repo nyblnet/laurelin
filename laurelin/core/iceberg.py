@@ -41,7 +41,7 @@ from typing import Any, Optional
 
 import pyarrow as pa
 
-from laurelin.core.fileperms import ensure_private_file
+from laurelin.core.fileperms import ensure_private_file, mkdir_private
 
 # Table identifiers are `<namespace>.<name>`; a dataset name is already
 # validated as ^[a-z][a-z0-9_]*$, but the namespace comes from config.
@@ -133,7 +133,21 @@ class IcebergTables:
             # store creates prefixes implicitly.
             uri = warehouse_uri(self.workspace)
             if uri.startswith("file://"):
-                Path(uri[len("file://"):]).mkdir(parents=True, exist_ok=True)
+                # 0700, like data/ — a bare mkdir here was the whole exposure.
+                # `core/config.py` makes data/, pipelines/ and ontology/
+                # private precisely because the workspace root is only 0700
+                # when Laurelin created it, and the documented Docker shape
+                # (`RUN mkdir -p /data`, or any bind-mounted volume) leaves it
+                # 0755. iceberg/ arrived later and never joined that list, so
+                # under a pre-existing root the whole chain came out
+                # root(0755)/iceberg(0755)/…/data(0755)/*.parquet(0644):
+                # governed dataset Parquet readable by every local user, with
+                # no row policy and no column masks. Measured through
+                # POST /api/v1/datasets/{name}/iceberg at umask 022, on both a
+                # SQLite and a PostgreSQL metadata store. pyiceberg creates the
+                # tree below this at `0777 & ~umask` and its files at 0644; a
+                # private parent is what contains them, exactly as for data/.
+                mkdir_private(Path(uri[len("file://"):]))
             try:
                 self._catalog.create_namespace(self.namespace)
             except Exception:

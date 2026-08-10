@@ -56,12 +56,19 @@ def svc(tmp_path):
 
 def slow(svc, **kw):
     """The exact in-memory path, forced by making the dataset look policied."""
+    from laurelin.core.permissions import PolicyDecision
+
     original = svc.policy_for
+    original_decide = svc.decide_for
     svc.policy_for = lambda ds: (lambda t: t)   # identity: no filtering, but not None
+    # The decision has to match the pretend policy, or the overlay guard
+    # refuses to serve an overlay it cannot hold to the same rules.
+    svc.decide_for = lambda ds, cols: PolicyDecision()
     try:
         return svc.query("part", **kw)
     finally:
         svc.policy_for = original
+        svc.decide_for = original_decide
 
 
 def fast(svc, **kw):

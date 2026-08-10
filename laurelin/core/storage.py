@@ -21,6 +21,7 @@ version, which is the failure the rename was protecting against.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Iterable, Optional
@@ -30,12 +31,47 @@ import pyarrow.dataset as pads
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
+from laurelin.core.fileperms import mkdir_private
+
 # Object-store URI schemes pyarrow can address natively.
-_REMOTE_SCHEMES = ("s3://", "gs://", "gcs://", "abfs://", "abfss://", "az://")
+_REMOTE_SCHEMES = ("s3", "gs", "gcs", "abfs", "abfss", "az")
+
+# Schemes that name an object store this build cannot address, plus the
+# near-misses of the ones it can. They exist as a *refusal* list rather than
+# being silently treated as directory names — see :meth:`Storage.for_uri`.
+_UNSUPPORTED_SCHEMES = (
+    "s3a", "s3n", "wasb", "wasbs", "adl", "hdfs", "http", "https", "ftp", "oss",
+    "cos", "obs", "swift", "b2", "r2", "minio",
+)
+
+# Anything of the form `scheme:` — including the one-slash `s3:/bucket` typo,
+# which is not a URI at all but is unmistakably a botched attempt at one.
+_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):(//)?")
+
+
+class UnsupportedDataURI(ValueError):
+    """A ``LAURELIN_DATA_URI`` naming a scheme this build cannot address."""
 
 
 def is_remote_uri(uri: str) -> bool:
-    return str(uri).startswith(_REMOTE_SCHEMES)
+    """Whether `uri` names an object store rather than a local directory.
+
+    Case-insensitive, because ``S3://bucket/prefix`` is an object store URI
+    that an operator typed and a filesystem path to nobody. This used to be
+    ``str.startswith`` against a fixed tuple of lowercase ``scheme://``
+    prefixes, so ``S3://``, ``s3:/`` and ``s3a://`` were all judged *local* and
+    quietly became directories named ``S3:/bucket/prefix`` relative to the
+    process CWD — 0755, with the governed Parquet 0644 inside, on the
+    container's own disk, while the operator believed the data was in a bucket
+    behind a bucket policy. Nothing logged, warned or failed, and the data
+    vanished with the container.
+    """
+    match = _SCHEME_RE.match(str(uri))
+    return (
+        match is not None
+        and bool(match.group(2))
+        and match.group(1).lower() in _REMOTE_SCHEMES
+    )
 
 
 class Storage:
@@ -53,15 +89,44 @@ class Storage:
         """Build storage for a base URI.
 
         ``s3://bucket/prefix`` (and gs/abfs) use pyarrow's native filesystems,
-        picking up credentials from the usual environment. Anything else is
-        treated as a local directory.
+        picking up credentials from the usual environment. A path with no
+        scheme is a local directory.
+
+        **A scheme this build cannot address is an error, not a directory
+        name.** It used to fall through to the local branch, which meant a
+        typo in ``LAURELIN_DATA_URI`` — ``s3a://``, ``S3://``, ``s3:/`` —
+        created a directory literally called ``s3a:/bucket/prefix`` under the
+        process CWD and wrote every governed Parquet into it at 0644, while
+        the operator believed the data was in S3. A misconfiguration that
+        silently relocates the data plane out of its bucket and onto a
+        container's ephemeral local disk has to fail at startup, loudly, with
+        the URI in the message.
+
+        The local directory is created with :func:`fileperms.mkdir_private`,
+        not a bare ``mkdir``: a ``LAURELIN_DATA_URI`` pointing at a local path
+        takes the data plane *outside* the 0700 workspace root, and it came
+        out 0755 with 0644 Parquet inside — the same exposure ``core/config``
+        creates ``data/`` privately to prevent, one directory over.
         """
         text = str(uri)
-        if is_remote_uri(text):
-            filesystem, path = pafs.FileSystem.from_uri(text)
-            return cls(filesystem, path, text)
+        match = _SCHEME_RE.match(text)
+        if match is not None:
+            scheme = match.group(1).lower()
+            if scheme in _REMOTE_SCHEMES and match.group(2):
+                # Lowercased for pyarrow, which does not accept `S3://`.
+                normalized = scheme + text[len(match.group(1)):]
+                filesystem, path = pafs.FileSystem.from_uri(normalized)
+                return cls(filesystem, path, normalized)
+            raise UnsupportedDataURI(
+                f"Cannot use {text!r} as a data location: {match.group(1)!r} is "
+                f"not an object-store scheme this build can address "
+                f"({', '.join(s + '://' for s in _REMOTE_SCHEMES)}). Left as "
+                f"it is, this would become a local directory of that name and "
+                f"every dataset would be written to this host's disk instead "
+                f"of the store."
+            )
         root = Path(text).resolve()
-        root.mkdir(parents=True, exist_ok=True)
+        mkdir_private(root)
         return cls(pafs.LocalFileSystem(), str(root), str(root))
 
     @classmethod

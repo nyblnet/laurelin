@@ -14,6 +14,7 @@ import tarfile
 import uuid
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from laurelin.catalog import DatasetCatalog
@@ -1161,3 +1162,120 @@ def test_a_namespaced_marking_is_renamed_in_the_clearance_checklist_too(
     assert report.quarantined_clearances == [
         {"username": "vic", "marking_at_source": "pii", "marking": renamed}
     ]
+
+
+def test_an_import_never_writes_over_a_part_the_destination_already_has(
+    tmp_path, make_store
+):
+    """**The destination's live governed data, silently replaced.**
+
+    ``_write_part`` calls ``storage.open_output_stream``, which truncates —
+    there is no ``O_EXCL`` on that path — and the part-write loop used the
+    archive member name verbatim as the destination storage key.
+    ``--rename-prefix`` renames only the metadata; it never touched
+    ``files_json`` or the member keys. So on the documented *safe* resolution
+    for a name collision — a ``note`` reading "imported as 'copy_salaries'",
+    not a refusal — the archive's ``data/salaries/parts/<uuid>.parquet`` landed
+    on top of the destination's live part of that exact key, which the
+    destination's own ``salaries`` still references. Measured end to end
+    through ``GET /api/v1/workspace/export`` and
+    ``POST /api/v1/workspace/import``: after a repack of one member, the
+    original dataset returned the attacker's rows.
+
+    Every archive exported from a workspace keeps that workspace's part keys,
+    so a round trip collides on every part by construction, and the archive is
+    unsigned (``docs/PORTABILITY.md`` says so) — its Parquet is whatever the
+    person holding the tar wanted.
+
+    The sibling this also closes: the pre-commit rollback deletes
+    ``written_parts``, and when those keys were the destination's own, a merge
+    that failed after the part write deleted the destination's live data.
+    """
+    ws = Workspace.init(tmp_path / "self", name="self")
+    store = make_store(ws)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("salaries", pa.table({"who": ["alice", "bob"],
+                                        "amount": pa.array([100, 200], pa.int64())}))
+    before = catalog.read("salaries").to_pylist()
+
+    archive = tmp_path / "self.tar"
+    export_workspace(ws, store, archive, ExportOptions())
+    # The archive is unsigned, so its Parquet is whatever the holder wants.
+    # Repacking one member with a regenerated (honest) trailer is what makes
+    # an overwrite *visible*: without it the clobber writes identical bytes
+    # over identical bytes and no assertion about rows could see it.
+    tampered = pa.table({"who": ["attacker"], "amount": pa.array([999999], pa.int64())})
+    sink = pa.BufferOutputStream()
+    pq.write_table(tampered, sink)
+    _swap_member(archive, "data/salaries/parts/", sink.getvalue().to_pybytes())
+
+    planned = import_workspace(
+        archive, ws, store,
+        ImportOptions(merge=True, dry_run=True, rename_prefix="copy_"),
+    )
+    assert planned.dataset_renames == {"salaries": "copy_salaries"}
+    report = import_workspace(
+        archive, ws, store,
+        ImportOptions(merge=True, rename_prefix="copy_",
+                      confirm=planned.report_sha256),
+    )
+    assert report.applied
+
+    # The destination's own dataset reads exactly what it read before.
+    assert DatasetCatalog(ws, store).read("salaries").to_pylist() == before
+    # The relocation is reported rather than silent.
+    assert any("already uses" in w for w in report.warnings), report.warnings
+    # And the imported copy points at the parts that were actually written, so
+    # the relocation did not trade a clobber for a dangling reference: it reads
+    # the archive's (tampered) rows, under its own name, where it belongs.
+    assert DatasetCatalog(ws, store).read("copy_salaries").to_pylist() == [
+        {"who": "attacker", "amount": 999999}
+    ]
+    # Structurally: the two datasets share no storage key at all.
+    src_keys = set(store.get_version("salaries", None).files)
+    copy_keys = set(store.get_version("copy_salaries", None).files)
+    assert src_keys and copy_keys and src_keys.isdisjoint(copy_keys)
+
+
+def _swap_member(archive, member_prefix: str, replacement: bytes) -> None:
+    """Rewrite the first member under `member_prefix`, regenerating TRAILER.json.
+
+    ``_verify_trailer`` hashes every arriving member against the trailer, so a
+    partial tamper is already refused; a full repack is the unsigned-archive
+    limitation ``docs/PORTABILITY.md`` discloses, and it is the shape that
+    turns "an import of lies" into "the destination's data replaced".
+    """
+    import hashlib
+
+    members = []
+    with tarfile.open(archive) as tar:
+        for info in tar.getmembers():
+            data = tar.extractfile(info).read() if info.isreg() else b""
+            members.append((info.name, data))
+    swapped = False
+    out = []
+    for name, data in members:
+        if name == "TRAILER.json":
+            continue
+        if not swapped and name.startswith(member_prefix):
+            data, swapped = replacement, True
+        out.append((name, data))
+    assert swapped, f"no member under {member_prefix!r}"
+    digests, total = {}, 0
+    with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in out:
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.type = len(data), 0o600, tarfile.REGTYPE
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            tar.addfile(info, io.BytesIO(data))
+            digests[name] = {"sha256": hashlib.sha256(data).hexdigest(),
+                             "bytes": len(data)}
+            total += len(data)
+        trailer = json.dumps({"members": digests, "member_count": len(digests),
+                              "total_bytes": total}, indent=2).encode() + b"\n"
+        info = tarfile.TarInfo("TRAILER.json")
+        info.size, info.mode, info.type = len(trailer), 0o600, tarfile.REGTYPE
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        tar.addfile(info, io.BytesIO(trailer))

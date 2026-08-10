@@ -466,6 +466,7 @@ def test_a_fold_by_a_policied_user_does_not_rewrite_the_dataset_as_they_see_it(t
         policy=perms.query_policy_fn(elf),
         policy_for=perms.per_dataset_policy_fn(elf),
         plan_for=perms.arrow_policy_fn(elf),
+        decide_for=lambda ds, cols, _u=elf: perms.decide(ds, cols, _u),
     )
     elf_svc.apply_action("rename", pk="city-c", parameters={"realm": "valinor"})
     assert elf_svc.query("city", limit=50)["total"] == 2, "the policy does apply"

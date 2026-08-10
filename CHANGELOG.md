@@ -14,6 +14,148 @@ most: each was a live disclosure or a live bypass on a running server, each was
 reproduced before it was fixed, and each fix was reverted and watched to fail
 before being restored.
 
+### Fixed: eighteen defects from a third adversarial pass
+
+The two rounds below were attacked again by agents who had written none of the
+code. Every entry here was reproduced on a running server first, and every fix
+was reverted and watched to fail its own regression test before being restored.
+
+**Credential disclosure (`laurelin/core/redaction.py` and its callers).**
+
+- **A scheduled sync put the password on the VIEWER-gated audit route.**
+  `connectors.sync_source` redacts, records the redacted copy, and then
+  re-raises the *original* exception; `Scheduler._run` caught that and wrote
+  `str(exc)` into `schedules.last_error` and into an audit row. So the leak the
+  connector documents as fixed was fixed on the `POST /sources/{n}/sync` path
+  only: through a schedule, a plain viewer — 403 on `/sources`, 403 on
+  `/schedules` — read `unexpected spaces found in "SUPER SEKRET"` out of
+  `GET /audit`. The `/audit` backstop cannot catch it: that sentence has no
+  `://` and no credential *word* in it. The scheduler now redacts at the point
+  of record, loading the source's own config to do it.
+- **The credential gate was shape-only, and a credential is not always a URL.**
+  `credential_in_free_text` was `value != redact_value(value)`, and
+  `redact_value` only acts on strings containing `://`. A libpq conninfo in a
+  dashboard panel's `ATTACH` — which DuckDB's postgres and mysql extensions
+  accept verbatim — an ODBC keyword string, and a DuckDB `CREATE SECRET` all
+  passed the gate, and a plain VIEWER read the password from `GET /dashboards`.
+  Same hole on schedule targets. There is now a `keyword_credential` test:
+  a password keyword *beside* a connection keyword, which is narrow enough not
+  to reject `WHERE password = :p`.
+- **The same gate refused legitimate URLs with a factually false 400.**
+  `redact_dsn` withholds a URL carrying a query, and one whose `@` falls after
+  a `/`, because those are *ambiguous* — not because a credential was found. A
+  gate built on "did anything change" could not tell the two apart, so a public
+  CSV with `?format=csv` and an S3 prefix keyed by an email address were both
+  refused as embedding a credential, with no override and no way to author the
+  panel at all. The gate now asks its own question, and
+  `postgresql://alice:pa/ss@db/prod` is still refused: its first segment is not
+  a hostname.
+- **`MASK` shipped most of a password containing `@`.**
+  `_free_form_is_truncated` skipped any match that already contained an `@` —
+  true only if that `@` is the last one. `postgres://alice:p@ss word@db/prod`
+  matched only as far as `p@ss`, and the result masked to the `@` *inside the
+  fragment*, shipping the rest of the password under a `*****` that asserts the
+  credential was removed. Reproduced on every terminator in the regex class,
+  through `POST /engines/{n}/test` (whose body also said `"withheld": false`)
+  and through a source's `query`. A message naming two DSNs still has both
+  masked rather than being withheld whole.
+- **A schedule's `source` and `upstream_dataset` had no gate at all.** The loop
+  ran over `targets` and stopped there; the exact DSN it refuses was accepted
+  one field over and returned verbatim by `GET /schedules`.
+- **A keyword credential under an ordinary key reached a VIEWER.** `path`,
+  `query` and `connection` are not URL-shaped, so `redact_mapping` disclosed
+  `Driver={x};Server=db;Uid=a;Pwd=…` to every editor of `GET /sources` — and,
+  through `federation.redacted_source`, to every **viewer** of `GET /datasets`.
+  The module docstring conceded the first case and not the second; both are
+  now withheld.
+
+**File permissions (`laurelin/core/fileperms.py` and the paths around it).**
+
+- **`harden_existing` preserved group WRITE, and every surface called the
+  result "readable by its group".** Every sentence of the argument for keeping
+  group access is about *read* — a backup agent, an on-call operator without
+  write. `metadata.db` is the file that says who is an admin. At `umask 002`
+  (the Debian/Ubuntu login default, and what a systemd unit with `UMask=0002`
+  sets) a pre-`fileperms` release left it 0664, the repair took it to 0660, and
+  a member of that group — not a Laurelin user at all — opened it with
+  `sqlite3`, ran `update users set role='admin'`, and reached the ADMIN-only
+  routes. Group write is now stripped like world access; group *read* still
+  survives, and `describe()`, the note and the UI badge now say which of the
+  two they are looking at.
+- **The Iceberg warehouse was never mode-protected.** `data/`, `pipelines/` and
+  `ontology/` are created 0700 because the workspace root is only 0700 when
+  Laurelin made it — and the documented Docker shape leaves it 0755.
+  `iceberg/` arrived later and never joined that list, so
+  `POST /datasets/{n}/iceberg` produced governed Parquet at 0644 inside 0755
+  directories, readable by every local user with no row policy and no masks.
+- **A local or mistyped `LAURELIN_DATA_URI` put the data plane on local disk at
+  0755.** `is_remote_uri` was a case-sensitive exact-prefix match, so
+  `S3://bucket/p`, `s3:/bucket/p` and `s3a://bucket/p` were all judged *local*
+  and became directories of that literal name under the process CWD, with the
+  governed Parquet 0644 inside, while the operator believed the data was in a
+  bucket. Nothing logged, warned or failed. Unaddressable schemes are now a
+  startup error, and a local data URI is created 0700.
+- **`metadata.db` was created 0644, with no note, when its path was a dangling
+  symlink.** Relocating the database to another volume before first start is
+  ordinary; `O_EXCL` refuses to follow the link, `harden_existing` then stat'd
+  through it, got `-1`, and did nothing, so sqlite3 created the real file at
+  `0666 & ~umask` — holding the scrypt hashes, session tokens and DSNs written
+  during the bootstrap run. It self-repaired on the *next* start.
+- **`LAURELIN_STRICT_FILE_MODE=1` did not touch the two other rows the admin
+  screen shows.** `laurelin.yml` stayed 0644 and the workspace directory 0755,
+  on every restart, under a card offering exactly the two remedies that
+  provably did nothing. Strict mode now takes both, from `find` as well as
+  `init`, because a restart is what the card asks for.
+- **`iceberg-catalog.db` was absent from `GET /workspace/file-security`**,
+  though `core/iceberg.py` pre-creates it 0600 on the argument that a warehouse
+  URI in it can carry a credential. On a PostgreSQL store the report listed one
+  file while the SQLite catalog sat beside it on disk.
+- **Concurrent `Workspace.init` raised an unhandled `FileExistsError`** from a
+  check-then-`O_EXCL` race — 17 of 40 trials, and reachable from the front door
+  via `api/context._bundle` on a threadpool.
+
+**Ontology overlay and object index.**
+
+- **Column masks were bypassed on read.** A live overlay edit is merged onto
+  the base rows *after* the policied scan, so a masked column written by a
+  mask-exempt editor was read back in plaintext by a masked reader — through
+  the object, through `aggregate` grouped by that column, and by searching a
+  fragment of the value. The mask returned the moment the edit was folded,
+  which is what proved only the overlay path disclosed. The same for creates:
+  `_policy_admits` honoured the row filter and returned the **raw** payload.
+  The *write* half of this guard was present and correct the whole time; the
+  read half did not exist.
+- **Row policy was bypassed the same way.** A user restricted to
+  `realm='valinor'` kept reading an object an admin had moved to
+  `'beleriand'`, and could filter for it by that value — for exactly as long as
+  the hand edit was live. A service built with a policy but no way to resolve
+  it against the overlay now refuses rather than serving it unpoliced.
+- **An update could erase a primary key.** `new_key is None` short-circuited as
+  "restating the key". The object rendered with a `__pk` of the string `'None'`
+  and was addressable under neither name, with no API anywhere to revoke a live
+  object edit — and a second one wedged `writeback` for the whole object type,
+  permanently, from two ordinary action calls.
+- **`POST`/`DELETE /ontology/object-types/{n}/index` had no per-type gate.** A
+  global editor with no grant on the type — 403 on the type and on its objects
+  — got a 200 with the global object count and could drop the owner's index;
+  and a policied caller got the operator counters `get_object_type`
+  deliberately withholds from them.
+
+**Import.**
+
+- **`--merge --rename-prefix` overwrote the destination's live dataset parts.**
+  `_write_part` truncates, and the part-write loop used the archive member name
+  verbatim as the destination storage key; the rename touches only metadata.
+  So on the documented *safe* resolution for a name collision — a `note`, not a
+  refusal — an archive's `data/salaries/parts/<uuid>.parquet` landed on top of
+  the destination's live part of that key, which its own `salaries` still
+  referenced. Every archive exported from a workspace keeps that workspace's
+  part keys, so a round trip collides by construction, and the archive is
+  unsigned. Arriving parts whose key is already in use are now written to fresh
+  keys, with the version rows rewritten in the same pass and the relocation
+  reported. This also closes the sibling: the pre-commit rollback deletes
+  `written_parts`, which were the destination's own keys.
+
 ### Fixed: three DSN redactors that disclosed live credentials on admin routes
 
 `federation.redacted_source`, `engines._redact_uri` and
