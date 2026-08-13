@@ -3,6 +3,7 @@
 // CodeMirror 6 Python editor. Editing is gated on the editor role.
 
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
@@ -12,7 +13,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { ApiError, api, API } from "../api";
 import type { PipelineFileContent, PipelineFileInfo, PipelineWriteResult } from "../types";
 import { useAuth } from "../auth";
-import { ErrorBox, PageHeader, Spinner } from "../ui";
+import { ErrorBox, FailureNote, PageHeader, Spinner } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
 
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
@@ -45,6 +46,8 @@ export function TransformsView() {
   const filesQ = useQuery({
     queryKey: ["pipelines"],
     queryFn: () => api.get<PipelineFileInfo[]>(`${API}/pipelines`),
+    // Editor-gated on the server; asking as a viewer buys a 403 and nothing else.
+    enabled: canEdit,
   });
 
   // Load a file's content on demand (only for existing files).
@@ -151,14 +154,16 @@ export function TransformsView() {
       window.alert("Invalid name. Use lowercase letters, digits and underscores, starting with a letter (e.g. aviation).");
       return;
     }
-    const name = `${base}.py`;
-    if ((filesQ.data ?? []).some((f) => f.name === name)) {
-      window.alert(`A file named ${name} already exists.`);
+    // Compare stems, not filenames. The API returns `name` as the bare module
+    // name; this used to compare it against `${base}.py`, so the guard never
+    // fired and "New file" over an existing name silently overwrote it on save.
+    if ((filesQ.data ?? []).some((f) => f.name === base)) {
+      window.alert(`A file named ${base}.py already exists.`);
       return;
     }
     setSaveResult(null);
     saveMut.reset();
-    setBuffer({ name, isNew: true });
+    setBuffer({ name: base, isNew: true });
     setDoc(NEW_FILE_TEMPLATE);
     viewRef.current?.focus();
   }
@@ -182,12 +187,25 @@ export function TransformsView() {
 
       <ImportedPipelinesNotice />
 
-      {!canEdit && (
-        <div className="dim" style={{ fontSize: 12.5, marginBottom: 12 }}>
-          Editing transforms requires the editor role. You can browse and read files.
+      {/* R2 raised the *read* here to editor, and the page has to say so
+          instead of showing a 403 in a red box. A pipeline file is exec'd on
+          every build, so writing one is code-execution-equivalent — and reading
+          one hands you the same authored text. The viewer's real need is
+          lineage, which is on the Pipeline tab and still theirs. */}
+      {!canEdit ? (
+        <div className="withheld-box">
+          <div className="withheld-head">Pipeline files are not shown to your role</div>
+          <p>
+            They reach an editor and above — the level that can write them. A
+            transform file is Python that Laurelin executes, so being able to
+            read one is the same disclosure as being able to write one.
+          </p>
+          <p style={{ marginTop: 8 }}>
+            What every transform produces, what it reads, and how a build went
+            are on the <Link to="/pipeline">Pipeline</Link> tab, which is yours.
+          </p>
         </div>
-      )}
-
+      ) : (
       <div className="tf-layout">
         <aside className="tf-sidebar">
           <div className="tf-head faint">Pipeline files</div>
@@ -215,9 +233,16 @@ export function TransformsView() {
                   >
                     <span className="tf-item-name mono">{f.name}</span>
                     <span className="tf-item-sub">
-                      {f.error !== null ? (
-                        <span className="badge badge-red" title={f.error}>
-                          error
+                      {/* R1: the listing carries a boolean, not the exception
+                          text — the file is exec'd, so that text was whatever
+                          an arbitrary library said while importing it. Open the
+                          file to see the classified reason. */}
+                      {f.failed ? (
+                        <span
+                          className="badge badge-red"
+                          title="This file does not import. Open it to see why."
+                        >
+                          will not import
                         </span>
                       ) : f.transforms.length > 0 ? (
                         <span className="dim">{f.transforms.join(", ")}</span>
@@ -277,10 +302,16 @@ export function TransformsView() {
             </div>
           )}
           {saveResult?.collect_error && (
-            <div className="tf-note bad" title={saveResult.collect_error}>
-              File saved, but the pipeline DAG has an error: {saveResult.collect_error}
-            </div>
+            <>
+              <div className="tf-note bad">
+                File saved, but the pipeline DAG will not collect.
+              </div>
+              <FailureNote failure={saveResult.collect_error} />
+            </>
           )}
+          {/* Why the file that is *open* will not import — the detail the
+              listing deliberately does not carry. */}
+          {contentQ.data?.failure && <FailureNote failure={contentQ.data.failure} />}
           {saveMut.error != null && !saveMut.isPending && <ErrorBox error={saveMut.error} />}
           {delMut.error != null && !delMut.isPending && <ErrorBox error={delMut.error} />}
 
@@ -303,6 +334,7 @@ export function TransformsView() {
           </div>
         </main>
       </div>
+      )}
 
       <style>{`
         .tf-layout {

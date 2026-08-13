@@ -20,8 +20,11 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  FailureBadge,
+  FailureNote,
   PageHeader,
   Spinner,
+  Withheld,
   fmtNum,
   fmtTime,
 } from "../ui";
@@ -216,8 +219,22 @@ function LineageGraphView({ graph }: { graph: LineageGraph }) {
 
 // A transform with no declared expectations shows nothing rather than "0/0" —
 // absence of checks is a different statement from checks that all passed.
+//
+// And "you were not sent them" is a third statement again. An expectation's
+// `message` is prose an editor wrote in a pipeline file, so the whole list is
+// OPERATIONAL and a viewer receives no key — which would render as the "no
+// checks declared" dash and quietly misinform them.
 function Expectations({ results }: { results?: ExpectationResult[] }) {
-  if (!results || results.length === 0) return <span className="dim">—</span>;
+  if (results === undefined) {
+    return (
+      <Withheld
+        what="A transform's expectation results"
+        role="editor"
+        why="Each carries a message written in the pipeline file."
+      />
+    );
+  }
+  if (results.length === 0) return <span className="dim">—</span>;
   const failed = results.filter((r) => !r.passed);
   if (failed.length === 0) {
     return <Badge tone="green">{results.length} passed</Badge>;
@@ -262,11 +279,20 @@ function BuildCard({ build }: { build: Build }) {
       render: (t) => <Expectations results={t.expectations} />,
     },
     {
-      label: "Error",
-      render: (t) =>
-        t.error ? <span style={{ color: "var(--red)" }}>{t.error}</span> : "",
+      // R1: this column used to print f"{type(exc).__name__}: {exc}" — whatever
+      // an arbitrary library said while a transform ran, on a viewer-readable
+      // route. It now prints Laurelin's own classification; the driver's words
+      // exist only in the server log, findable by the ref in the tooltip.
+      label: "Failure",
+      render: (t) => (t.failure ? <FailureBadge failure={t.failure} /> : ""),
     },
   ];
+
+  // Per-task detail is only worth its space when it says more than the
+  // build-level record already did — which means when the reader got the wide
+  // projection. A viewer's copy of both is `{code, subject}`, so printing them
+  // one under the other just says the same sentence twice.
+  const failedTasks = build.tasks.filter((t) => t.failure?.detail_ref);
 
   return (
     <div className="card">
@@ -291,12 +317,21 @@ function BuildCard({ build }: { build: Build }) {
         </span>
       </div>
 
-      {build.error && (
-        <div style={{ color: "var(--red)", marginTop: 8 }}>{build.error}</div>
-      )}
+      {build.failure && <FailureNote failure={build.failure} />}
 
       {open && (
         <div style={{ marginTop: 12 }}>
+          {/* The build-level record says *that* it failed; the per-task one
+              says which step and carries the log reference. Both, in that
+              order, so an operator reads the cause without expanding twice. */}
+          {failedTasks.map((t) => (
+            <div key={t.transform_name} style={{ marginBottom: 8 }}>
+              <div className="mono dim" style={{ fontSize: 12 }}>
+                {t.transform_name}
+              </div>
+              <FailureNote failure={t.failure!} />
+            </div>
+          ))}
           {build.tasks.length === 0 ? (
             <EmptyState>No tasks.</EmptyState>
           ) : (

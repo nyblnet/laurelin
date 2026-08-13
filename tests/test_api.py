@@ -10,6 +10,7 @@ from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.models import Role
 
 PIPELINE = '''\
 import pyarrow.compute as pc
@@ -485,6 +486,80 @@ def test_audit_listing_and_limit(client):
     assert len(r.json()) == 1
 
 
+# -- R2: who may read the trail ------------------------------------------------
+
+@pytest.fixture
+def three_roles(workspace):
+    """admin / editor / viewer against one real, authenticated app."""
+    app = create_app(workspace)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    out = [admin]
+    for name, role in (("ed", "editor"), ("vic", "viewer")):
+        assert admin.post("/api/v1/users", json={
+            "username": name, "password": "password123", "role": role,
+        }).status_code in (200, 201)
+        c = TestClient(app)
+        assert c.post("/api/v1/auth/login", json={
+            "username": name, "password": "password123",
+        }).status_code == 200
+        out.append(c)
+    return tuple(out)
+
+
+def test_audit_is_editor_gated_and_a_viewer_sees_only_their_own_actions(three_roles):
+    """`log_audit` takes an open dict, and rounds 2 and 3 were both "a writer
+    put driver text in the bag". A viewer reading other people's bags is one
+    careless call site from round 5.
+
+    The stated need — "a user should see what was done" — is served by
+    /audit/mine, which discloses nothing new by construction: you cannot learn a
+    secret from a row you wrote."""
+    admin, editor, viewer = three_roles
+    assert admin.put(
+        "/api/v1/dashboards/d", json={"title": "d", "panels": []}
+    ).status_code == 200
+
+    assert viewer.get("/api/v1/audit").status_code == 403
+    assert editor.get("/api/v1/audit").status_code == 200
+    assert admin.get("/api/v1/audit").status_code == 200
+
+    mine = viewer.get("/api/v1/audit/mine")
+    assert mine.status_code == 200
+    assert all(row["actor"] == "vic" for row in mine.json())
+    assert not any(row["action"] == "dashboard_updated" for row in mine.json())
+
+
+def test_an_undeclared_audit_writer_is_admin_only_by_default(workspace, three_roles):
+    """New call site ⇒ fails closed. The writer has to argue the level down."""
+    admin, editor, _viewer = three_roles
+    store = MetadataStore(workspace.metadata_path)
+    store.log_audit("careless_writer", {"reason": "driver said SEKRET"}, actor="root")
+
+    assert "careless_writer" not in [e["action"] for e in editor.get("/api/v1/audit").json()]
+    assert "careless_writer" in [e["action"] for e in admin.get("/api/v1/audit").json()]
+    assert "SEKRET" not in editor.get("/api/v1/audit").text
+
+
+def test_an_applied_action_does_not_record_the_objects_property_values(client):
+    """The sharpest leak in the trail, and one no credential matcher could have
+    caught: `parameters` was the object's own property VALUES, and /audit was
+    viewer-gated. A viewer holding a 403 on the object type read them."""
+    r = client.post(
+        "/api/v1/ontology/actions/update_plane_status/apply",
+        json={"pk": "N100", "parameters": {"status": "GOVERNED_VALUE"}},
+    )
+    assert r.status_code == 200, r.text
+    audit = client.get("/api/v1/audit").json()
+    applied = [e for e in audit if e["action"] == "action_applied"]
+    assert applied, "the action should still be recorded"
+    assert "parameters" not in applied[0]["details"]
+    assert applied[0]["details"]["edit_id"], "the full record is still reachable"
+    assert "GOVERNED_VALUE" not in client.get("/api/v1/audit").text
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -559,3 +634,244 @@ def test_pipeline_and_ontology_reload(client, workspace):
         "      code: {type: string}\n"
     )
     assert len(client.get("/api/v1/ontology/object-types").json()) == 3
+
+
+# ---------------------------------------------------------------------------
+# One unimportable pipeline file must not take out the pages that read the DAG
+# ---------------------------------------------------------------------------
+#
+# Found by driving the UI: dropping a file that raises on import into
+# `pipelines/` made a VIEWER's Pipeline page render "Error 500: Internal Server
+# Error". `get_registry` calls `collect_transforms`, which raises
+# `PipelineError`, which has no exception handler — so every route depending on
+# the registry died, `GET /transforms` (viewer) included.
+
+def _broken_pipeline_clients(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.core.config import Workspace
+
+    ws = Workspace.init(tmp_path / "ws", name="brokenpipes")
+    ws.pipelines_dir.mkdir(exist_ok=True)
+    (ws.pipelines_dir / "unimportable.py").write_text(
+        # Stands in for a library that quotes its own configuration back at you
+        # while a pipeline imports it.
+        'raise RuntimeError("import blew up: postgresql://u:PIPE-SENTINEL@h/db")\n'
+    )
+    app = create_app(ws)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin = TestClient(app)
+    admin.post("/api/v1/auth/setup", json=creds)
+    admin.post("/api/v1/auth/login", json=creds)
+    admin.post("/api/v1/users",
+               json={"username": "vic", "password": "password123", "role": "viewer"})
+    viewer = TestClient(app)
+    viewer.post("/api/v1/auth/login", json={"username": "vic", "password": "password123"})
+    return admin, viewer
+
+
+def test_a_pipeline_file_that_will_not_import_names_itself_instead_of_500ing(tmp_path):
+    _admin, viewer = _broken_pipeline_clients(tmp_path)
+    r = viewer.get("/api/v1/transforms")
+    # 409 — the request is fine, the state of the workspace is not.
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "unimportable" in detail, "the operator has to know which file"
+    assert "Transforms" in detail, "and where to go and fix it"
+
+
+def test_the_pipeline_collection_error_does_not_repeat_the_librarys_own_words(tmp_path):
+    """R1 at a catch site nobody had converted.
+
+    `PipelineError`'s message interpolates `f"{type(exc).__name__}: {exc}"` from
+    whatever the file raised, plus the server's absolute path — and this route
+    is readable by a viewer. Only `exc.pipeline`, a Laurelin identifier, may
+    reach the response.
+    """
+    _admin, viewer = _broken_pipeline_clients(tmp_path)
+    body = viewer.get("/api/v1/transforms").text
+    assert "PIPE-SENTINEL" not in body
+    assert "RuntimeError" not in body
+    assert "/pipelines/" not in body, "nor the server's filesystem layout"
+
+
+def test_a_build_still_refuses_when_a_pipeline_file_will_not_import(tmp_path):
+    """Degrading must not become "quietly build nothing". A workspace whose
+    pipelines do not import cannot be built, and says so."""
+    admin, _viewer = _broken_pipeline_clients(tmp_path)
+    r = admin.post("/api/v1/builds", json={})
+    assert r.status_code == 409
+    assert "unimportable" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# R1's backstop: the two global exception handlers
+# ---------------------------------------------------------------------------
+
+def test_an_uncaught_library_exception_does_not_return_that_librarys_words(
+    workspace, monkeypatch
+):
+    """`@app.exception_handler(ValueError)` turned **any** library's exception
+    into a response body carrying that library's raw text, because
+    `pyarrow.lib.ArrowInvalid` is a `ValueError` and `ArrowKeyError` is a
+    `KeyError`.
+
+    Measured: with `LAURELIN_ICEBERG_WAREHOUSE=s3://AKIA…:SECRET@bucket/wh`, an
+    EDITOR uploading a CSV to an Iceberg dataset got back
+
+        400 {"detail": "Not a valid bucket name: 'AKIA…:SECRET@bucket'"}
+
+    — pyiceberg handed the netloc, userinfo and all, to pyarrow, which raised.
+    Catch sites are still where a failure should be classified; this is the net
+    under them, and it fails closed on anything Laurelin did not raise itself.
+    """
+    from fastapi.routing import APIRoute
+
+    def _boom():
+        import pyarrow as pa
+
+        # Raised inside pyarrow, from a call Laurelin made — the exact shape of
+        # the iceberg warehouse case, with no pyiceberg needed to reproduce it.
+        pa.compute.cast(pa.array(["S3KRET_LIBRARY_TEXT"]), pa.int64())
+
+    app = create_app(workspace, no_auth=True)
+    # In front of the StaticFiles mount at "/", which create_app adds last and
+    # which would otherwise answer this path with a 404 from the SPA.
+    app.router.routes.insert(0, APIRoute("/api/v1/__probe_thirdparty", _boom, methods=["GET"]))
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.get("/api/v1/__probe_thirdparty")
+    assert r.status_code == 400
+    assert "S3KRET_LIBRARY_TEXT" not in r.text, r.text
+    assert "err-" in r.text, "the operator still needs a handle into the log"
+
+
+def test_a_first_party_message_still_reaches_the_caller(client):
+    """The backstop must not flatten Laurelin's own 400s into a code. A route
+    that raises `ValueError("...")` is how most of this API says "you typed it
+    wrong", and that sentence is ours."""
+    r = client.post("/api/v1/query", json={"sql": ""})
+    assert r.status_code in (400, 422)
+    assert r.text.strip()
+
+
+# ---------------------------------------------------------------------------
+# The audit trail: one mechanism, not two
+# ---------------------------------------------------------------------------
+
+def test_a_viewer_reading_their_own_audit_rows_does_not_receive_the_details_bag(
+    three_roles,
+):
+    """`GET /audit/mine` was `_dump(entry) | {"details": entry.details}` — an
+    explicit override of the projection, in the module that defines the single
+    serialization point.
+
+    The justification was "the details came from their own request, so there is
+    nothing here they did not already have", and it is false for a whole class
+    of rows: a viewer triggering a source sync supplies a *name*, and Laurelin
+    builds the rest of the bag from an ADMIN-authored connector config.
+    Reproduced: a viewer read a live endpoint, driver and rendered message out
+    of this route.
+    """
+    admin, _editor, viewer = three_roles
+    store = MetadataStore(_ws_of(admin))
+    store.log_audit(
+        "source_sync_failed",
+        {"endpoint": "secret-db.internal.corp:55999", "password": "S3KRET_BAG"},
+        actor="vic",
+    )
+    r = viewer.get("/api/v1/audit/mine")
+    assert r.status_code == 200
+    assert "S3KRET_BAG" not in r.text, r.text[:400]
+    # They still learn *that* they did it, which is the stated need.
+    assert any(row["action"] == "source_sync_failed" for row in r.json())
+    assert all("details" not in row for row in r.json())
+
+
+def test_an_audit_row_declared_editor_readable_actually_reaches_an_editor(three_roles):
+    """`min_read_role` was inert: `list_audit` chose which rows an editor saw
+    and then the serializer dropped `details` from all of them, because
+    `AuditEvent` is class-level admin. All five `min_read_role=Role.editor`
+    declarations in the tree were dead code, each with a comment asserting a
+    disclosure that did not happen — while `/audit/mine` handed a viewer the
+    same bag whole. The privilege ordering was inverted."""
+    admin, editor, viewer = three_roles
+    store = MetadataStore(_ws_of(admin))
+    store.log_audit("source_sync_failed", {"source": "crm", "why": "editor_visible"},
+                    actor="root", min_read_role=Role.editor)
+    store.log_audit("engine_updated", {"uri": "grpc://x", "why": "admin_only"},
+                    actor="root")
+
+    rows = {r["action"]: r for r in editor.get("/api/v1/audit").json()}
+    assert rows["source_sync_failed"]["details"]["why"] == "editor_visible"
+    # An undeclared row is not offered to an editor at all — `min_read_role` is
+    # still the row filter on this route. The declaration now decides *both*
+    # questions, which is the fix: it used to choose the rows and then be
+    # overruled on their contents.
+    assert "engine_updated" not in rows
+    # An admin reads both, and a viewer reaches neither route.
+    admin_rows = {r["action"]: r for r in admin.get("/api/v1/audit").json()}
+    assert admin_rows["engine_updated"]["details"]["why"] == "admin_only"
+    assert viewer.get("/api/v1/audit").status_code == 403
+
+
+def test_a_pre_migration_audit_row_is_not_readable_by_the_viewer_who_wrote_it(
+    three_roles,
+):
+    """`_migrate_failures` stamps every pre-existing row `admin` precisely
+    because "the rows were written by callers who had no idea who would read
+    them" — and `/audit/mine` then exempted them from that stamp. Reproduced: a
+    user demoted from editor to viewer read a live DSN and password out of a
+    migrated row they had written themselves."""
+    admin, _editor, viewer = three_roles
+    store = MetadataStore(_ws_of(admin))
+    store.log_audit(
+        "source_sync_failed",
+        {"error": "connection failed: postgresql://svc:OLD_AUDIT_PW@pg.internal/crm"},
+        actor="vic",  # they wrote it, back when they were an editor
+    )
+    r = viewer.get("/api/v1/audit/mine")
+    assert r.status_code == 200
+    assert "OLD_AUDIT_PW" not in r.text, r.text[:400]
+
+
+def _ws_of(admin_client):
+    """The metadata path behind a TestClient's app."""
+    return admin_client.app.state.workspace.metadata_path
+
+
+def test_a_route_level_catch_does_not_return_a_librarys_words_either(
+    workspace, monkeypatch
+):
+    """The global handlers are the net; these are the catches *above* it.
+
+    Several `except (ValueError, KeyError)` blocks in the API wrap a call that
+    reaches a third-party library — `catalog.iceberg_branch` goes into pyiceberg
+    — and `pyarrow.lib.ArrowInvalid` **is** a `ValueError` while `ArrowKeyError`
+    **is** a `KeyError`. Same class as the confirmed iceberg-warehouse
+    disclosure, one level down, so `failure.safe_detail` answers it the same
+    way: our message if we raised it, a `Failure` if we did not.
+    """
+    import pyarrow as pa
+
+    from laurelin.core.failure import safe_detail
+
+    try:
+        raise ValueError("a first-party 400 the caller should read")
+    except ValueError as exc:
+        # (raised here, so not first-party — the point is the *other* branch)
+        assert "err-" in safe_detail(exc)
+
+    from laurelin.connectors.connectors import validate_source
+
+    try:
+        validate_source("not_a_connector", {})
+    except ValueError as exc:
+        assert "not_a_connector" in safe_detail(exc)
+
+    try:
+        pa.compute.cast(pa.array(["S3KRET_ROUTE_LEVEL"]), pa.int64())
+    except ValueError as exc:
+        detail = safe_detail(exc, subject="dataset:x")
+        assert "S3KRET_ROUTE_LEVEL" not in detail
+        assert "err-" in detail

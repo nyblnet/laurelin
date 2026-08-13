@@ -22,8 +22,9 @@ from laurelin.api.context import (
     identity_store,
     is_multi,
 )
-from laurelin.core import redaction
+from laurelin.core import serialize
 from laurelin.core.auth import THROTTLED, AuthService
+from laurelin.core.failure import Failure, FailureCode, Phase, safe_detail
 from laurelin.core.models import Role, User, utcnow_iso
 
 SESSION_COOKIE = "laurelin_session"
@@ -175,7 +176,11 @@ require_admin = require_role(Role.admin)
 
 
 def _user_json(user: User) -> dict:
-    return user.model_dump(mode="json")
+    # Through the one serializer, like everything else. `User` is `Governed`
+    # with every field PRESENTATION — they are identity facts the account
+    # holder reads about themselves — so this is behaviour-preserving today
+    # and fails closed for a field somebody adds tomorrow.
+    return serialize.dump(user)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +216,7 @@ def _status_user(request: Request, user: User) -> dict:
     if is_multi(request):
         control = request.app.state.control
         data["workspaces"] = (
-            [w.model_dump(mode="json") | {"role": "admin"}
+            [serialize.dump(w) | {"role": "admin"}
              for w in control.list_workspaces()]
             if user.superadmin
             else control.workspaces_for_user(user.username)
@@ -338,16 +343,19 @@ def oidc_callback(request: Request, response: Response):
             raise OIDCError("No id_token in token response")
         claims = provider.validate_id_token(id_token, flow["nonce"])
     except OIDCError as exc:
-        # The provider's own words. A token endpoint that rejects the request
-        # tends to quote the request back, and the request carries
-        # `client_secret` — so the trail gets the shape of the failure and the
-        # server log gets the rest.
-        store.log_audit(
-            "oidc_login_failed",
-            {"reason": str(redaction.redact_text(str(exc)))},
-            actor="oidc",
+        # R1. `redact_text(str(exc))` was a redacted provider sentence, which is
+        # still a provider sentence. What the trail gets now is the shape of the
+        # failure; the server log gets the rest.
+        failure = Failure.from_exception(
+            exc, code=FailureCode.AUTH_REJECTED, phase=Phase.authenticate,
+            subject="oidc:login", driver="requests",
         )
-        raise HTTPException(status_code=400, detail=str(exc))
+        store.log_audit(
+            "oidc_login_failed", {"failure": failure.audit_projection()}, actor="oidc",
+        )
+        # Unauthenticated caller: the brief form. The endpoint here is the
+        # IdP host out of an ADMIN-authored provider config.
+        raise HTTPException(status_code=400, detail=failure.render_brief()) from None
 
     username = cfg.username_for(claims)
     if not username:
@@ -410,8 +418,21 @@ async def saml_acs(request: Request):
     try:
         username, groups = request.app.state.saml_provider.parse_response(str(saml_response))
     except Exception as exc:  # noqa: BLE001 - any validation failure is an auth failure
-        store.log_audit("saml_login_failed", {"reason": str(exc)[:200]}, actor="saml")
-        raise HTTPException(status_code=400, detail=f"SAML validation failed: {exc}")
+        # R1, and this was the worst-shaped one in the tree: **unredacted**,
+        # written to a VIEWER-gated audit route, from an **attacker-supplied**
+        # `SAMLResponse` on an **unauthenticated** endpoint. A key called
+        # `reason` is exactly what a backstop keyed on key *names* cannot help
+        # with, which is why `_redacted_audit_details` is gone rather than
+        # extended.
+        failure = Failure.from_exception(
+            exc, code=FailureCode.AUTH_REJECTED, phase=Phase.authenticate,
+            subject="saml:login", driver="python",
+        )
+        store.log_audit(
+            "saml_login_failed", {"failure": failure.audit_projection()}, actor="saml"
+        )
+        # Unauthenticated, and the input is attacker-supplied. Brief.
+        raise HTTPException(status_code=400, detail=failure.render_brief()) from None
     auth = identity_auth(request)
     user = auth.provision_oidc_user(username, cfg.role_for(groups), cfg.is_superadmin(groups))
     if user.disabled:
@@ -683,7 +704,7 @@ def _require_multi(request: Request) -> ControlStore:
 def list_workspaces(request: Request, admin: Superadmin) -> list[dict]:
     control = _require_multi(request)
     return [
-        w.model_dump(mode="json") | {"members": len(control.list_members(w.slug))}
+        serialize.dump(w) | {"members": len(control.list_members(w.slug))}
         for w in control.list_workspaces()
     ]
 
@@ -696,14 +717,14 @@ def create_workspace(
     try:
         slug = validate_slug(body.slug.strip().lower())
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="auth"))
     if control.get_workspace(slug) is not None:
         raise HTTPException(status_code=409, detail=f"Workspace already exists: {slug!r}")
     # Create the workspace directory (idempotent if files already exist on disk).
     Workspace.init(request.app.state.root / slug, name=body.name or slug, description=body.description)
     info = control.create_workspace(slug, body.name or slug, body.description)
     control.log_audit("workspace_created", {"slug": slug}, actor=admin.username)
-    return info.model_dump(mode="json")
+    return serialize.dump(info)
 
 
 @workspaces_router.patch("/{slug}")
@@ -717,7 +738,7 @@ def update_workspace(
     control.log_audit("workspace_updated", {"slug": slug}, actor=admin.username)
     info = control.get_workspace(slug)
     assert info is not None
-    return info.model_dump(mode="json")
+    return serialize.dump(info)
 
 
 @workspaces_router.delete("/{slug}")

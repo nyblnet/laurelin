@@ -54,6 +54,7 @@ import pyarrow as pa
 
 from laurelin.core import federation
 from laurelin.core.dialects import STARROCKS
+from laurelin.core.failure import Failure, Phase, connect_failure
 
 SOURCE_TYPES = ("table",)
 
@@ -173,6 +174,16 @@ def scan_expression(source: dict[str, Any]) -> str:
 # Connection and execution
 # ---------------------------------------------------------------------------
 
+def _table_subject(source: dict[str, Any]) -> str:
+    """A `Failure.subject` naming the table, from OUR validated config.
+
+    `validate_source` has already forced the table through `_TABLE_RE`
+    (letters, digits, underscores and dots), so this is a Laurelin identifier
+    by the time it gets here — and `Failure` re-gates it anyway.
+    """
+    return str(source.get("table", "")) or "table"
+
+
 def connect(source: dict[str, Any], connect_timeout: int = 10):
     """A connection to the StarRocks FE named by the source's url.
 
@@ -198,20 +209,17 @@ def connect(source: dict[str, Any], connect_timeout: int = 10):
             **params,
         )
     except Exception as exc:  # noqa: BLE001 - the driver raises several classes
-        raise StarRocksError(
-            f"Could not connect to StarRocks at {params['host']}:{params['port']}: "
-            f"{_redact(exc, params['password'])}"
-        ) from exc
-
-
-def _redact(exc: Exception, password: str) -> str:
-    """A driver error with the password removed.
-
-    The connector puts the connection parameters it was given into some of its
-    error messages, and those messages travel to the API as a 502 body.
-    """
-    text = str(exc)
-    return text.replace(password, "*****") if password else text
+        # R1. `_redact` lived here: `str(exc).replace(password, "*****")`. It
+        # only ever worked when the driver quoted the password back *verbatim*,
+        # and mysql-connector does not always — which is the same defeat round 3
+        # found on the psycopg path. mysql-connector *does* give a usable errno
+        # at connect (measured: 1045 wrong password, 2003 refused, 2005 bad
+        # host), so classification here is mostly the driver's own code, with
+        # Laurelin's TCP pre-flight as the fallback.
+        raise StarRocksError(failure=connect_failure(
+            exc, subject=f"starrocks:{params['host']}", driver="mysql.connector",
+            dsn=str(source.get("url", "")), config=source,
+        )) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +308,13 @@ def schema_of(source: dict[str, Any], con=None) -> pa.Schema:
     except StarRocksError:
         raise
     except Exception as exc:  # noqa: BLE001 - the driver raises several classes
-        raise StarRocksError(f"Could not read the StarRocks table: {exc}") from exc
+        # Was `f"Could not read the StarRocks table: {exc}"` — no redaction at
+        # all on this line, and it reached a 502 body.
+        raise StarRocksError(failure=Failure.from_exception(
+            exc, phase=Phase.describe, driver="mysql.connector",
+            subject=f"starrocks:{_table_subject(source)}",
+            dsn=str(source.get("url", "")), config=source,
+        )) from exc
     finally:
         if owned:
             con.close()
@@ -396,7 +410,12 @@ def run(
     except StarRocksError:
         raise
     except Exception as exc:  # noqa: BLE001 - the driver raises several classes
-        raise StarRocksError(f"StarRocks query failed: {exc}") from exc
+        # Also previously unredacted.
+        raise StarRocksError(failure=Failure.from_exception(
+            exc, phase=Phase.execute, driver="mysql.connector",
+            subject=f"starrocks:{_table_subject(source or {})}",
+            dsn=str((source or {}).get("url", "")), config=source,
+        )) from exc
     finally:
         if owned:
             con.close()

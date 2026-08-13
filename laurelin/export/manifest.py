@@ -284,9 +284,12 @@ TABLE_POLICY: dict[str, TableSpec] = {
         ),
         drop_columns=(
             "next_run_at", "last_run_at", "last_status", "last_error",
-            "last_build_id", "claimed_by", "lease_expires_at",
+            "last_failure_json", "last_build_id", "claimed_by", "lease_expires_at",
         ),
-        error_columns=("last_error",),
+        # `last_failure_json` holds a `Failure`, which is safe by construction —
+        # but the export is a file that leaves the building, and there is no
+        # reason for it to carry failure history at all.
+        error_columns=("last_error", "last_failure_json"),
         scan_columns=("targets_json",),
         conflict_key=("name",),
         order=33,
@@ -300,9 +303,9 @@ TABLE_POLICY: dict[str, TableSpec] = {
             "created_by", "last_sync_at", "last_sync_status",
             "last_sync_version", "last_sync_rows", "cursor_value",
         ),
-        drop_columns=("last_sync_error",),
+        drop_columns=("last_sync_error", "last_sync_failure_json"),
         secret_columns=("config_json",),
-        error_columns=("last_sync_error",),
+        error_columns=("last_sync_error", "last_sync_failure_json"),
         scan_columns=("config_json",),
         conflict_key=("name",),
         order=34,
@@ -323,7 +326,10 @@ TABLE_POLICY: dict[str, TableSpec] = {
         "it renders as GENERATED ALWAYS AS IDENTITY, which rejects an explicit "
         "insert. Rows go in source order and list_audit orders by id DESC, so "
         "ordering survives reassignment.",
-        columns=("timestamp", "actor", "action", "details_json"),
+        # min_read_role travels: it is the audience decision the writer made
+        # about this row, and an import that dropped it would silently widen
+        # every carried row to the column default.
+        columns=("timestamp", "actor", "action", "details_json", "min_read_role"),
         drop_columns=("id",),
         # details_json is walked, not nulled: an audit trail with its subjects
         # removed is not an audit trail. Only credential-shaped and error keys
@@ -369,9 +375,9 @@ TABLE_POLICY: dict[str, TableSpec] = {
         "re-executed at the destination. Finished rows are history only.",
         drop_columns=(
             "seq", "id", "targets_json", "status", "started_at", "finished_at",
-            "error", "claimed_by", "lease_expires_at",
+            "error", "failure_json", "claimed_by", "lease_expires_at",
         ),
-        error_columns=("error",),
+        error_columns=("error", "failure_json"),
     ),
     "build_tasks": TableSpec(
         _EPHEMERAL,
@@ -379,10 +385,10 @@ TABLE_POLICY: dict[str, TableSpec] = {
         "dangle, which is a cosmetic broken link, not a correctness problem.",
         drop_columns=(
             "build_id", "transform_name", "output_dataset", "status",
-            "started_at", "finished_at", "error", "rows_written",
+            "started_at", "finished_at", "error", "failure_json", "rows_written",
             "output_version", "expectations_json",
         ),
-        error_columns=("error",),
+        error_columns=("error", "failure_json"),
     ),
 
     # -- derived: recomputable, and wrong if copied --------------------------

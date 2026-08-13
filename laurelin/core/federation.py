@@ -44,7 +44,18 @@ _PG_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$"
 
 
 class FederationError(RuntimeError):
-    """A federated source could not be reached or scanned."""
+    """A federated source could not be reached or scanned.
+
+    Carries a :class:`~laurelin.core.failure.Failure`, and ``str()`` renders
+    *that* rather than whatever the driver said. DuckDB's postgres extension
+    prefixes its IO Error with the whole connection string, so this class's
+    message used to be a live password on its way to a 502 body, a reverse
+    proxy access log and the UI's error box.
+    """
+
+    def __init__(self, message: str = "", failure=None):
+        self.failure = failure
+        super().__init__(failure.render() if failure is not None else message)
 
 
 def workbench_enabled() -> bool:
@@ -86,14 +97,21 @@ def validate_source(source: dict[str, Any]) -> None:
 
 
 def redacted_source(source: dict[str, Any]) -> dict[str, Any]:
-    """Source config safe to return from the API.
+    """Source config as an **admin** may read it back. Not a boundary.
 
-    The regex that used to live here matched ``//user:pass@`` and nothing else,
-    so a password containing '/', a DSN with no username, a secret in a query
-    parameter and an ODBC keyword string all travelled verbatim to anyone who
-    could read the dataset. It is gone; ``core/redaction.py`` decides *whether*
-    a value may be shown before it decides how, and its docstring carries the
-    measurements and the disclosure policy this route still follows.
+    Under R2 this runs on one branch only: `DatasetInfo.source` declares
+    `AuthoredBy(Role.admin)`, so an editor and a viewer never receive the key at
+    all and get `DatasetInfo.source_descriptor` instead. What survives here is a
+    courtesy to the admin who *can* read it — "the person who typed it" and
+    "the person reading this screen" are not necessarily the same admin — and it
+    is explicitly **not** a confidentiality boundary. No test may assert that a
+    bypass of it is a security failure.
+
+    That distinction is the whole point of task #53. This function used to be
+    the only thing between a plain editor and a live credential, and it let five
+    of six measured shapes through: `password='…'`, `Pwd='…'`, `Password:…`, a
+    bare AWS key pair and a positional JDBC URL. It was not made better. It was
+    moved off the path where being wrong mattered.
     """
     return redaction.redact_mapping(source)
 
@@ -162,9 +180,19 @@ def connect(source: dict[str, Any]) -> duckdb.DuckDBPyConnection:
                 con.execute(f"LOAD {ext}")
             except Exception as exc:  # noqa: BLE001
                 con.close()
+                # R1: `: {exc}` stood at the end of this message. The
+                # extension loader's own sentence names the download URL and
+                # the local extension directory, and on the postgres extension
+                # it has been seen to carry the DSN it was mid-way through
+                # using. No interpolation, and no `Failure` either — the
+                # *route* classifies, where the subject and the DSN are known
+                # (`routes._driver_failure`), and it reads `__cause__` to get
+                # there. Attaching one here would shadow that with a worse
+                # answer.
                 raise FederationError(
                     f"The {ext!r} DuckDB extension could not be loaded, which "
-                    f"{source['type']} sources require: {exc}"
+                    f"{source['type']} sources require. The loader's own "
+                    "message is in the server log."
                 ) from exc
         if not is_local_source(source):
             con.execute("SET disabled_filesystems='LocalFileSystem'")
@@ -194,7 +222,11 @@ def schema_of(
         expr, params, _ = scan_expression(source)
         return con.execute(f"SELECT * FROM {expr} LIMIT 0", params).arrow().schema
     except duckdb.Error as exc:
-        raise FederationError(f"Could not read the federated source: {exc}") from exc
+        # No `{exc}` and no `Failure`: same reason as above. The registration
+        # route classifies from `__cause__` with the DSN in hand, which is what
+        # puts the endpoint in the operator's 502 — "refused the connection" and
+        # "no such table" are one glance apart only if the host survives.
+        raise FederationError("Could not read the federated source.") from exc
     finally:
         if owned:
             con.close()

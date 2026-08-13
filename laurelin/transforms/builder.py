@@ -18,6 +18,7 @@ from laurelin.catalog import DatasetCatalog
 from laurelin.core import engines, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.failure import Failure, FailureCode, Phase
 from laurelin.core.models import (
     BuildInfo,
     BuildStatus,
@@ -133,9 +134,18 @@ class Builder:
         except ValueError as exc:
             # Normally caught at request time; guards the worker against a
             # pipeline edit racing the queue.
+            # R1: `error=str(exc)` here put a ValueError's text on a
+            # VIEWER-gated route (GET /builds). The message is ours — the
+            # planner raised it — but the rule is "convert at the catch site"
+            # with no exceptions, because the next raise inside `plan` will come
+            # from somewhere else.
             self.store.update_build(
                 build_id, status=BuildStatus.failed,
-                started_at=utcnow_iso(), finished_at=utcnow_iso(), error=str(exc),
+                started_at=utcnow_iso(), finished_at=utcnow_iso(),
+                failure=Failure.from_exception(
+                    exc, code=FailureCode.TRANSFORM_FAILED, phase=Phase.plan,
+                    subject=f"build:{build_id}", driver="python",
+                ),
             )
             failed = self.store.get_build(build_id)
             assert failed is not None
@@ -170,9 +180,15 @@ class Builder:
                         status=BuildStatus.failed,
                         started_at=utcnow_iso(),
                         finished_at=utcnow_iso(),
-                        error=(
-                            "Skipped: upstream input(s) failed to build: "
-                            + ", ".join(blocked_by)
+                        # A first-party fact with a first-party shape: this
+                        # task never ran because a named upstream failed. The
+                        # names are dataset names, which the reader of a build
+                        # already sees.
+                        failure=Failure(
+                            code=FailureCode.TRANSFORM_FAILED,
+                            phase=Phase.plan,
+                            subject=f"transform:{spec.name}",
+                            counters={"blocked_by": len(blocked_by)},
                         ),
                     ),
                 )
@@ -267,7 +283,13 @@ class Builder:
                 any_failed = True
                 failed_outputs.add(spec.output.dataset)
                 task.status = BuildStatus.failed
-                task.error = f"{type(exc).__name__}: {exc}"
+                # R1, and this is the leak reproduced live on this tree: the old
+                # line was `task.error = f"{type(exc).__name__}: {exc}"`, and a
+                # plain VIEWER read a driver-authored sentinel out of GET
+                # /builds/{id}, GET /builds and GET /pipelines/{name}. There was
+                # no redactor anywhere on this path — `grep -rn redact
+                # laurelin/transforms/` returned nothing.
+                task.failure = _task_failure(exc, spec)
             task.finished_at = utcnow_iso()
             self.store.upsert_build_task(build.id, task)
 
@@ -283,7 +305,11 @@ class Builder:
             build.id,
             status=final_status,
             finished_at=utcnow_iso(),
-            error="One or more tasks failed" if any_failed else None,
+            failure=Failure(
+                code=FailureCode.TRANSFORM_FAILED, phase=Phase.execute,
+                subject=f"build:{build.id}",
+                counters={"failed_tasks": len(failed_outputs)},
+            ) if any_failed else None,
         )
         self.store.log_audit(
             "build_finished", {"build_id": build.id, "status": final_status.value}
@@ -542,3 +568,33 @@ class Builder:
         if isinstance(result, pa.RecordBatchReader):
             result = result.read_all()
         return result
+
+
+def _task_failure(exc: BaseException, spec) -> Failure:
+    """One transform task's failure, as Laurelin records it.
+
+    A transform can fail three ways and they mean different things to whoever
+    reads the build: a declared expectation rejected the output, a remote engine
+    refused, or our own Python raised. Only the first is worth a distinct code;
+    everything else is TRANSFORM_FAILED (or DuckDB's own classification) plus a
+    `detail_ref` that finds the traceback in the log.
+
+    The count of failed expectations is carried as an *integer*, not the
+    concatenated `message` strings that `ExpectationError.__str__` builds —
+    those messages are prose an editor wrote in a pipeline file, which is
+    exactly the class of text R2 withholds from a viewer. `task.expectations`
+    already holds the structured per-check results for the editor who may read
+    them.
+    """
+    subject = f"transform:{spec.name}"
+    if isinstance(exc, ExpectationError):
+        return Failure.from_exception(
+            exc, code=FailureCode.EXPECTATION_FAILED, phase=Phase.write,
+            subject=subject, driver="python",
+            counters={"failed_expectations": len(getattr(exc, "failures", []))},
+        )
+    driver = "duckdb" if type(exc).__module__.split(".")[0] == "duckdb" else "python"
+    return Failure.from_exception(
+        exc, phase=Phase.execute, subject=subject, driver=driver,
+        code=None if driver == "duckdb" else FailureCode.TRANSFORM_FAILED,
+    )

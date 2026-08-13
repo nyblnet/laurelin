@@ -9,8 +9,9 @@ from typing import Optional
 
 import typer
 
-from laurelin.core import fileperms
+from laurelin.core import fileperms, serialize
 from laurelin.core.config import Workspace, WorkspaceNotFound
+from laurelin.core.roles import Role
 
 app = typer.Typer(
     name="laurelin",
@@ -188,9 +189,24 @@ def build(
             for t in info.tasks
         ],
     )
-    for t in info.tasks:
-        if t.error:
-            typer.echo(f"  {t.transform_name}: {t.error}", err=True)
+    # `as_author` is R2's one deliberate opt-out, and this is what it is for.
+    # The CLI is not a privilege crossing: possession of the workspace directory
+    # *is* the credential here, so the operator gets the endpoint an HTTP editor
+    # would not. Saying so with a greppable context manager rather than by
+    # reaching past the serializer is the whole point — `tests/test_audience.py`
+    # asserts this name appears nowhere under `laurelin/api/`.
+    with serialize.as_author(Role.admin):
+        for t in info.tasks:
+            if t.failure is not None:
+                # R1: the operator gets Laurelin's sentence plus the
+                # `detail_ref` that finds the driver's own words in the server
+                # log. There is no longer a "more" to print — the driver's text
+                # was never stored. `laurelin serve` logs it under this ref.
+                typer.echo(
+                    f"  {t.transform_name}: "
+                    f"{serialize.detail_for(t.failure, Role.admin)}",
+                    err=True,
+                )
     if info.status.value != "succeeded":
         raise typer.Exit(1)
 
@@ -600,7 +616,13 @@ def import_cmd(
         _cli_fail(exc)
 
     destination = report or (ws.root / "import_report.json")
-    _write_private(destination, json.dumps(result.model_dump(mode="json"), indent=2))
+    # Same opt-out, same reason: this file is written 0600 into the operator's
+    # own filesystem, and a governance report with its subjects withheld is not
+    # a governance report.
+    with serialize.as_author(Role.admin):
+        _write_private(
+            destination, json.dumps(serialize.dump(result), indent=2)
+        )
     _print_import_report(result, destination)
 
 

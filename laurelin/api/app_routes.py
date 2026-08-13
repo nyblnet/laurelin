@@ -14,8 +14,9 @@ name a property or action that doesn't exist and fail later in front of a user.
 from __future__ import annotations
 
 import re
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from laurelin.api.routes import (
@@ -28,8 +29,9 @@ from laurelin.api.routes import (
     UserDep,
     _dump,
     _require_ot_view,
+    stored_instruction_error,
 )
-from laurelin.core.models import ObjectAppInfo, utcnow_iso
+from laurelin.core.models import ObjectAppInfo, Role, utcnow_iso
 
 apps_router = APIRouter(tags=["apps"])
 
@@ -75,6 +77,66 @@ def get_app(
     # Same 403 as opening the object type directly — an app is not a side door.
     _require_ot_view(perms, user, service, app.object_type)
     return _dump(app)
+
+
+@apps_router.get("/apps/{name}/objects", dependencies=[VIEWER])
+def query_app_objects(
+    name: str,
+    store: StoreDep,
+    service: OntologyDep,
+    perms: PermDep,
+    user: UserDep,
+    search: Optional[str] = None,
+    limit: int = Query(100, ge=0, le=10_000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """The app's objects, scoped by the app's **stored** filters.
+
+    R2 makes this route necessary, and the reason is worth stating because it is
+    the same shape as the dashboard-panel one. ``ObjectAppInfo.filters`` is a
+    filter expression — an instruction, not a caption — so it is OPERATIONAL and
+    an app is admin-authored: nobody below admin receives it. But the client was
+    the thing applying it, turning ``filters`` into ``?filter.status=...`` on
+    ``GET /ontology/objects/{type}``. Withhold the filters from the client and
+    that client shows the app's whole object type instead of its curated slice —
+    "Aircraft in maintenance" quietly becomes "aircraft".
+
+    So the server applies them, exactly as it now runs a stored panel: it holds
+    the instruction, and the caller's own permissions decide the rows.
+    ``_require_ot_view`` first, then ``service.query`` — the same composed
+    object-type permission, row policy and column masking as the generic route.
+    An app still adds no access of its own.
+
+    The caller's ``search`` composes *with* the app's filters and cannot widen
+    them: filters are applied server-side from the stored definition and are not
+    read from the request at all.
+    """
+    app = store.get_object_app(name)
+    if app is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {name!r}")
+    _require_ot_view(perms, user, service, app.object_type)
+    try:
+        return service.query(
+            app.object_type,
+            search=search,
+            filters=dict(app.filters) or None,
+            limit=limit,
+            offset=offset,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # The stored filters are ADMIN-authored and this route is VIEWER-gated,
+        # so its failure path is an oracle for them unless it is projected.
+        # `PUT /apps/{name}` validates filter keys against the live ontology,
+        # which closes this on day one and not on day two: rename a property in
+        # `ontology/*.yml` — an ordinary admin act — and the next viewer to open
+        # the app got back
+        #     400 "Unknown filter property 'acquisition_programme' for …"
+        # naming a filter the same viewer's `GET /apps/{name}` correctly omits.
+        raise stored_instruction_error(
+            exc, subject=f"object_app:{name}", author=Role.admin
+        ) from None
 
 
 @apps_router.put("/apps/{name}", dependencies=[ADMIN])

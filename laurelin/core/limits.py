@@ -236,6 +236,28 @@ def clickhouse_settings(limits: QueryLimits) -> str:
     return ", ".join(parts)
 
 
+def _driver_text(exc: BaseException) -> str:
+    """The driver's own words, from the exception *or* from what wrapped it.
+
+    R1 converts a driver exception into a `Failure` at the catch site, so by the
+    time these guards see it `str(exc)` is Laurelin's sentence and the vendor
+    code is gone from it. That silently broke the 408/413 distinction: a
+    ClickHouse `Code: 159 TIMEOUT_EXCEEDED` became a generic remote failure.
+
+    Reading the cause chain in-process is not a breach of R1 — `Failure.
+    from_exception` does exactly this to classify. R1 is about what gets
+    *stored* or *returned*, and nothing here is either: what comes out of these
+    guards is `QueryTimeout`/`QueryTooLarge`, whose messages are first-party and
+    name the budget rather than the query.
+    """
+    parts, seen, cur = [], set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(str(cur))
+        cur = cur.__cause__ or cur.__context__
+    return "\n".join(parts)
+
+
 @contextmanager
 def clickhouse_guard(limits: QueryLimits) -> Iterator[None]:
     """Translate ClickHouse's resource errors into Laurelin's.
@@ -246,7 +268,7 @@ def clickhouse_guard(limits: QueryLimits) -> Iterator[None]:
     try:
         yield
     except Exception as exc:  # noqa: BLE001 - chdb raises bare RuntimeError
-        text = str(exc)
+        text = _driver_text(exc)
         if "Code: 159" in text or "TIMEOUT_EXCEEDED" in text:
             metrics.query_rejections.labels(reason="timeout").inc()
             raise QueryTimeout(
@@ -304,8 +326,8 @@ def starrocks_guard(limits: QueryLimits) -> Iterator[None]:
     try:
         yield
     except Exception as exc:  # noqa: BLE001 - the driver raises several classes
-        text = str(exc)
-        errno = getattr(exc, "errno", None)
+        text = _driver_text(exc)
+        errno = getattr(exc, "errno", None) or getattr(exc.__cause__, "errno", None)
         if errno == 5024 or "reached its timeout" in text:
             metrics.query_rejections.labels(reason="timeout").inc()
             raise QueryTimeout(

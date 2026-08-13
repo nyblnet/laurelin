@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.connectors import redacted_config
-from laurelin.core import engines, federation, redaction
+from laurelin.core import authoring_hints, engines, federation, redaction
 from laurelin.core.config import Workspace
 from laurelin.core.redaction import MASK, WITHHELD
 
@@ -258,7 +258,7 @@ def test_an_engine_error_message_never_echoes_the_credential():
     like ``//user:pass@`` travelled."""
     text = ("Could not connect to engine 'trino' at "
             "grpc+tls://alice:hunter2@trino:443: Flight returned unauthenticated")
-    out = redaction.redact_text(text)
+    out = authoring_hints.redact_text(text)
     assert "hunter2" not in out
     assert "grpc+tls://alice:*****@trino:443" in out
     assert "Flight returned unauthenticated" in out
@@ -275,14 +275,14 @@ def test_prose_that_still_looks_like_a_credential_is_withheld_whole(text):
     """No redactor in this tree covers free-form driver text, so the message
     goes rather than travelling half-read. The unredacted exception is logged
     server-side — see ``engine_routes.test_engine``."""
-    assert redaction.redact_text(text) == WITHHELD
+    assert authoring_hints.redact_text(text) == WITHHELD
 
 
 def test_the_masked_dsn_does_not_make_its_own_message_look_like_a_credential():
     """The credential scanner matches the *word*, so run over the whole string
     it would trip on the ``postgresql://`` this function just finished masking
     and withhold a message that is already safe. It sees only the prose."""
-    out = redaction.redact_text("connect to postgresql://alice:hunter2@db/prod timed out")
+    out = authoring_hints.redact_text("connect to postgresql://alice:hunter2@db/prod timed out")
     assert out != WITHHELD and "hunter2" not in out
 
 
@@ -371,8 +371,13 @@ def test_an_engine_connectivity_failure_reports_without_disclosing(tmp_path):
     body = r.json()
     assert body["ok"] is False
     assert "hunter2" not in r.text
-    # Whichever way it went, the operator is told which one it was.
-    assert body["withheld"] is (body["detail"] == WITHHELD)
+    # R1: the operator gets a code, our own host:port and a `detail_ref` — not
+    # the driver's prose, and not the string "***** (withheld)", which is what
+    # `redact_text` returned when it could not tell and left the operator with
+    # no diagnostic at all.
+    assert body["failure"]["subject"] == "engine:trino"
+    assert body["failure"]["endpoint"] == "127.0.0.1:1"
+    assert body["failure"]["detail_ref"].startswith("err-")
 
 
 def test_no_credential_reaches_a_browser_through_a_federated_dataset(tmp_path):
@@ -445,7 +450,7 @@ def test_a_password_holding_a_url_delimiter_does_not_survive_in_driver_prose(lab
     whole — this is the ``POST /engines/{name}/test`` body."""
     text = (f"Could not connect at grpc+tls://svc:pa{ch}SEKRETTAIL@trino:443: "
             f"connection refused")
-    assert "SEKRETTAIL" not in str(redaction.redact_text(text))
+    assert "SEKRETTAIL" not in str(authoring_hints.redact_text(text))
 
 
 def test_a_credential_free_url_beside_an_unrelated_at_sign_is_still_shown():
@@ -526,7 +531,7 @@ def test_a_credential_a_driver_quotes_as_prose_is_substituted_from_the_config():
     """
     config = {"url": "postgresql://alice:SUPER SEKRET@db.internal:5432/prod"}
     text = 'ProgrammingError: unexpected spaces found in "SUPER SEKRET", use %20'
-    out = str(redaction.redact_driver_text(text, redaction.secrets_in_config(config)))
+    out = str(authoring_hints.redact_driver_text(text, authoring_hints.secrets_in_config(config)))
     assert "SUPER SEKRET" not in out
     # The sentence survives: an operator who cannot tell what failed reads the
     # log instead, and this field exists so they do not have to.
@@ -539,7 +544,7 @@ def test_a_credential_in_a_url_query_is_substituted_even_when_the_scheme_is_mang
     on. Substituting what the config says we handed over does not care."""
     config = {"path": "s3://AKIAX:SEKRETPW@bucket/x.parquet"}
     text = "Cannot stat file /srv/s3:/AKIAX:SEKRETPW@bucket/x.parquet: errno 2"
-    out = str(redaction.redact_driver_text(text, redaction.secrets_in_config(config)))
+    out = str(authoring_hints.redact_driver_text(text, authoring_hints.secrets_in_config(config)))
     assert "SEKRETPW" not in out
 
 
@@ -547,13 +552,13 @@ def test_a_driver_message_that_still_holds_a_known_secret_is_withheld_whole():
     """The backstop. A secret too short to substitute out of a sentence without
     wrecking it is not a secret we may ship — the verify pass sees it survive
     and withholds the message rather than returning a partially-scrubbed one."""
-    out = redaction.redact_driver_text("connection refused for ab", ["ab"])
+    out = authoring_hints.redact_driver_text("connection refused for ab", ["ab"])
     assert out == WITHHELD
 
 
 def test_the_query_string_of_a_configured_url_counts_as_a_secret():
     config = {"url": "http://data.example.com/export.csv?api_key=SEKRET_TOKEN"}
-    assert "SEKRET_TOKEN" in redaction.secrets_in_config(config)
+    assert "SEKRET_TOKEN" in authoring_hints.secrets_in_config(config)
 
 
 # --------------------------------------------------- live routes, second round
@@ -596,13 +601,20 @@ def test_a_viewer_cannot_read_a_connector_password_out_of_the_audit_trail(tmp_pa
     viewer = TestClient(admin.app)
     viewer.post("/api/v1/auth/login",
                 json={"username": "vw", "password": "viewerpw1!"})
-    audit = viewer.get("/api/v1/audit")
-    assert audit.status_code == 200
-    assert secret not in audit.text
-    # The escalation this closes, stated: the same user cannot read the source.
+    # R2 closed this by privilege rather than by scanning: `/audit` is
+    # EDITOR-gated now, and `/audit/mine` returns only rows this user wrote.
+    assert viewer.get("/api/v1/audit").status_code == 403
+    mine = viewer.get("/api/v1/audit/mine")
+    assert mine.status_code == 200
+    assert secret not in mine.text
     assert viewer.get("/api/v1/sources").status_code == 403
-    # And the trail still says what happened.
-    assert any(e["action"] == "source_sync_failed" for e in audit.json())
+    # And the trail still says what happened, for the editor who owns sources.
+    trail = admin.get("/api/v1/audit").json()
+    assert any(e["action"] == "source_sync_failed" for e in trail)
+    # R1: what the row carries is a Failure, not the driver's sentence.
+    row = next(e for e in trail if e["action"] == "source_sync_failed")
+    assert row["details"]["failure"]["subject"] == "source:s"
+    assert secret not in admin.get("/api/v1/audit").text
 
 
 def test_registering_a_federated_source_never_echoes_the_dsn_back(tmp_path):
@@ -635,14 +647,21 @@ def test_a_dashboard_panel_may_not_store_a_credential_a_viewer_would_read(tmp_pa
         {"id": "p1", "title": "p", "kind": "table",
          "sql": "SELECT * FROM postgres_scan("
                 "'postgresql://alice:DASHSEKRET@db.internal:5432/prod','public','t')"}]})
-    assert r.status_code == 400
-    assert "DASHSEKRET" not in r.text
-    assert admin.get("/api/v1/dashboards").json() == []
-    # A panel with no credential in it is unaffected.
-    ok = admin.put("/api/v1/dashboards/d2", json={"title": "t", "panels": [
-        {"id": "p1", "title": "p", "kind": "table",
-         "sql": "SELECT * FROM read_csv('https://data.example.com/a.csv')"}]})
-    assert ok.status_code == 200, ok.text
+    # The door is a HINT now, not a gate: it saves, and warns.
+    assert r.status_code == 200, r.text
+    assert r.json()["warnings"], "the obvious DSN shape should still be flagged"
+
+    # And the leak is closed one level down, by audience rather than by
+    # scanning: the viewer never receives `sql`, whatever it contains.
+    admin.post("/api/v1/users",
+               json={"username": "vd", "password": "viewerpw1!", "role": "viewer"})
+    viewer = TestClient(admin.app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vd", "password": "viewerpw1!"})
+    assert "DASHSEKRET" not in viewer.get("/api/v1/dashboards").text
+    assert "DASHSEKRET" not in viewer.get("/api/v1/dashboards/d1").text
+    # The editor who wrote it still round-trips it into their textarea.
+    assert "DASHSEKRET" in admin.get("/api/v1/dashboards/d1").text
 
 
 def test_a_schedule_target_may_not_store_a_credential(tmp_path):
@@ -652,23 +671,38 @@ def test_a_schedule_target_may_not_store_a_credential(tmp_path):
     r = admin.put("/api/v1/schedules/s1", json={
         "trigger": "cron", "cron": "0 * * * *", "action": "build",
         "targets": ["s3://key:SCHEDSEKRET@bucket/t"]})
-    assert r.status_code == 400
-    assert "SCHEDSEKRET" not in r.text
-    assert "SCHEDSEKRET" not in admin.get("/api/v1/schedules").text
+    # A warning, not a refusal: every ScheduleInfo field is OPERATIONAL and both
+    # schedule routes are editor-gated, so a credential pasted here is not
+    # readable one privilege level down — which is what the gate existed for.
+    assert r.status_code == 200, r.text
+    assert r.json()["warnings"]
+
+    admin.post("/api/v1/users",
+               json={"username": "vs", "password": "viewerpw1!", "role": "viewer"})
+    viewer = TestClient(admin.app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vs", "password": "viewerpw1!"})
+    assert viewer.get("/api/v1/schedules").status_code == 403
     ok = admin.put("/api/v1/schedules/s2", json={
         "trigger": "cron", "cron": "0 * * * *", "action": "build",
         "targets": ["s3://bucket/t"]})
     assert ok.status_code == 200, ok.text
+    assert ok.json()["warnings"] == []
 
 
-def test_the_audit_route_redacts_a_credential_no_writer_thought_to_redact(tmp_path):
-    """The backstop, isolated from the writer that made it unnecessary.
+def test_a_careless_audit_writer_discloses_to_nobody_below_admin(tmp_path):
+    """What replaced the backstop, isolated from the writers that behave.
 
-    ``sync_source`` now redacts before it records, which is the fix. This test
-    does not go through it: it writes an audit row directly, the way any future
-    caller of ``log_audit`` — which takes an open ``dict`` — will. ``/audit`` is
-    VIEWER-gated, so the next person to drop a driver's exception in there
-    would reopen the same escalation.
+    ``_redacted_audit_details`` used to walk this bag looking for
+    credential-shaped *key names*, and it is deleted. A backstop keyed on key
+    names cannot help a key called ``error`` or ``reason`` — which is exactly
+    what the SAML handler put an attacker-supplied parse failure into, with no
+    redaction at all, on an unauthenticated route.
+
+    So the bag is gated by privilege instead. ``log_audit`` takes an open dict
+    and a ``min_read_role`` that **defaults to admin**: a caller who does not
+    think about disclosure discloses to nobody below admin. New call site ⇒
+    fails closed, which is the property that was missing.
     """
     from laurelin.core.db import MetadataStore
 
@@ -683,12 +717,25 @@ def test_the_audit_route_redacts_a_credential_no_writer_thought_to_redact(tmp_pa
     creds = {"username": "root", "password": "trustno1!"}
     client.post("/api/v1/auth/setup", json=creds)
     client.post("/api/v1/auth/login", json=creds)
+    for name, role in (("ed2", "editor"), ("vw3", "viewer")):
+        client.post("/api/v1/users",
+                    json={"username": name, "password": "viewerpw1!", "role": role})
 
-    audit = client.get("/api/v1/audit")
-    assert audit.status_code == 200
-    assert "hunter2" not in audit.text and "SEKRET" not in audit.text
-    row = next(e for e in audit.json() if e["action"] == "something_failed")
-    # The trail still says what happened and under which key.
+    def as_user(name):
+        c = TestClient(client.app)
+        c.post("/api/v1/auth/login", json={"username": name, "password": "viewerpw1!"})
+        return c
+
+    assert as_user("vw3").get("/api/v1/audit").status_code == 403
+    editor = as_user("ed2").get("/api/v1/audit")
+    assert editor.status_code == 200
+    assert "hunter2" not in editor.text and "SEKRET" not in editor.text
+    assert not [e for e in editor.json() if e["action"] == "something_failed"]
+
+    # The admin — the level this writer implicitly declared — still sees it
+    # whole. An audit trail with its subjects removed is not an audit trail.
+    row = next(e for e in client.get("/api/v1/audit").json()
+               if e["action"] == "something_failed")
     assert "client_secret" in row["details"]
     assert "db.internal" in row["details"]["error"]
 
@@ -737,15 +784,18 @@ def test_a_scheduled_sync_failure_never_puts_the_password_on_the_audit_route(tmp
     viewer = TestClient(admin.app)
     viewer.post("/api/v1/auth/login",
                 json={"username": "vw2", "password": "viewerpw1!"})
-    audit = viewer.get("/api/v1/audit")
-    assert audit.status_code == 200
-    assert secret not in audit.text
+    assert viewer.get("/api/v1/audit").status_code == 403
+    assert secret not in viewer.get("/api/v1/audit/mine").text
     # The escalation this closes, stated: the same user reaches neither route
     # the failure is otherwise readable from.
     assert viewer.get("/api/v1/sources").status_code == 403
     assert viewer.get("/api/v1/schedules").status_code == 403
-    # And the trail still says the schedule failed.
-    assert any(e["action"] == "schedule_failed" for e in audit.json())
+    # And the trail still says the schedule failed — with a Failure in it, so
+    # the *editor* who owns the schedule can act without reading a driver.
+    trail = admin.get("/api/v1/audit").json()
+    row = next(e for e in trail if e["action"] == "schedule_failed")
+    assert row["details"]["failure"]["subject"] == "schedule:nightly"
+    assert secret not in admin.get("/api/v1/audit").text
 
 
 KEYWORD_CREDENTIALS = [
@@ -770,19 +820,26 @@ KEYWORD_CREDENTIALS = [
 def test_a_credential_that_is_not_a_url_is_stopped_at_the_dashboard_door(
     tmp_path, label, sql
 ):
-    """The gate was ``value != redact_value(value)``, and ``redact_value`` only
-    acts on strings containing ``://`` — so every credential format that is not
-    a URL was invisible to it. DuckDB's postgres and mysql extensions take a
-    libpq conninfo verbatim in ``ATTACH`` and ``postgres_scan``; measured, all
-    five of these saved with a 200 and a plain VIEWER read the password out of
-    ``GET /dashboards``, which is the leak this gate was written to stop.
+    """Five credential formats with no ``://`` in them — the round-3 bypass.
+
+    **This test no longer asserts that the door refuses them, and that is the
+    point.** Each saves with a 200 and is unreadable by a viewer, because
+    confidentiality now rests on the audience annotation on
+    ``DashboardPanel.sql`` rather than on a matcher recognising a format.
+    Widening ``_KEYWORD_SECRET_RE`` to catch a sixth format would be round four
+    of the same mistake.
     """
     admin = _admin(tmp_path)
     panel = {"id": "p1", "title": "p", "kind": "table", "sql": sql}
     r = admin.put("/api/v1/dashboards/kw", json={"title": "t", "panels": [panel]})
-    assert r.status_code == 400, r.text
-    assert "KWSEKRET" not in r.text
-    assert "KWSEKRET" not in admin.get("/api/v1/dashboards").text
+    assert r.status_code == 200, r.text
+    admin.post("/api/v1/users",
+               json={"username": "vk", "password": "viewerpw1!", "role": "viewer"})
+    viewer = TestClient(admin.app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vk", "password": "viewerpw1!"})
+    assert "KWSEKRET" not in viewer.get("/api/v1/dashboards").text
+    assert "KWSEKRET" not in viewer.get("/api/v1/dashboards/kw").text
 
 
 def test_every_free_text_field_of_a_schedule_is_gated_not_just_its_targets(tmp_path):
@@ -796,9 +853,16 @@ def test_every_free_text_field_of_a_schedule_is_gated_not_just_its_targets(tmp_p
                 "action": "build", "targets": [],
                 field: "s3://key:SCHEDSEK3@bucket/t"}
         r = admin.put(f"/api/v1/schedules/x{field}", json=body)
-        assert r.status_code == 400, f"{field}: {r.text}"
-        assert "SCHEDSEK3" not in r.text
-    assert "SCHEDSEK3" not in admin.get("/api/v1/schedules").text
+        # Every field is warned about, not just `targets` — the hint's coverage
+        # is still worth keeping honest even though nothing depends on it.
+        assert r.status_code == 200, f"{field}: {r.text}"
+        assert r.json()["warnings"], field
+    admin.post("/api/v1/users",
+               json={"username": "vf", "password": "viewerpw1!", "role": "viewer"})
+    viewer = TestClient(admin.app)
+    viewer.post("/api/v1/auth/login",
+                json={"username": "vf", "password": "viewerpw1!"})
+    assert viewer.get("/api/v1/schedules").status_code == 403
 
 
 AUTHORABLE = [
@@ -840,11 +904,14 @@ def test_a_url_with_no_credential_in_it_is_authorable_as_a_panel(tmp_path, label
 
 
 def test_a_credential_hidden_by_an_ambiguous_url_is_still_refused(tmp_path):
-    """The boundary of the test above, so relaxing the gate cannot become
-    "allow every ``@`` after a slash". ``postgresql://alice:pa/ss@db/prod`` has
-    its ``@`` after a ``/`` too — but its first segment is ``alice:pa``, which
-    is not a hostname, so the ``@`` opens a host and what precedes it is a
-    password."""
+    """The boundary of the test above, kept as a HINT-quality assertion.
+
+    ``postgresql://alice:pa/ss@db/prod`` has its ``@`` after a ``/`` too — but
+    its first segment is ``alice:pa``, which is not a hostname, so the ``@``
+    opens a host and what precedes it is a password. The hint should still say
+    so; it just no longer refuses the save, and nothing depends on it being
+    right (see ``test_the_authoring_hint_is_not_load_bearing``).
+    """
     admin = _admin(tmp_path)
     for sql in (
         "SELECT * FROM postgres_scan('postgresql://alice:pa/ss@db/prod','public','t')",
@@ -853,8 +920,8 @@ def test_a_credential_hidden_by_an_ambiguous_url_is_still_refused(tmp_path):
         r = admin.put("/api/v1/dashboards/no", json={
             "title": "t", "panels": [{"id": "p", "title": "p", "kind": "table",
                                       "sql": sql}]})
-        assert r.status_code == 400, sql
-    assert admin.get("/api/v1/dashboards").json() == []
+        assert r.status_code == 200, sql
+        assert r.json()["warnings"], sql
 
 
 TERMINATORS = [("space", " "), ("comma", ","), ("semicolon", ";"),
@@ -877,13 +944,13 @@ def test_a_password_holding_an_at_sign_and_a_terminator_never_ships_in_part(labe
     password = f"p@ss{ch}TAIL"
     dsn = f"postgres://alice:{password}@db.internal:5432/prod"
     prose = f"could not connect: {dsn}"
-    assert "TAIL" not in str(redaction.redact_text(prose))
+    assert "TAIL" not in str(authoring_hints.redact_text(prose))
     sql = f"SELECT * FROM postgres_scan('{dsn}', 'public', 't')"
     assert "TAIL" not in _flat(redacted_config({"query": sql}))
     # A DSN whose password holds none of them is still masked, not withheld:
     # the rule must not collapse into "withhold everything".
     plain = "could not connect: postgres://alice:plainpw@db.internal:5432/prod"
-    assert redaction.redact_text(plain) == (
+    assert authoring_hints.redact_text(plain) == (
         "could not connect: postgres://alice:*****@db.internal:5432/prod"
     )
 
@@ -895,7 +962,166 @@ def test_two_dsns_in_one_message_are_both_masked_rather_than_withheld_whole():
     readable."""
     text = ("replication from postgres://a:pw1@h1.internal/db to "
             "postgres://b:pw2@h2.internal/db failed")
-    out = str(redaction.redact_text(text))
+    out = str(authoring_hints.redact_text(text))
     assert out != WITHHELD
     assert "pw1" not in out and "pw2" not in out
     assert "h1.internal" in out and "h2.internal" in out
+
+
+# ---------------------------------------------------------------------------
+# The proof obligation
+# ---------------------------------------------------------------------------
+
+def test_the_authoring_hint_is_not_load_bearing(tmp_path, monkeypatch):
+    """**The single most important test in this change.**
+
+    It deletes the free-text matcher — ``credential_in_free_text`` always says
+    "no", ``redact_text`` and ``redact_driver_text`` become the identity — and
+    re-runs the leak battery. It must pass.
+
+    If it ever fails, the design is broken, not the matcher: something's
+    confidentiality has crept back onto a guess about prose, and widening the
+    regex is round four of the mistake this task exists to end.
+
+    What each leak rests on instead is listed in
+    ``laurelin/core/authoring_hints.py``'s docstring.
+    """
+    from laurelin.core import authoring_hints
+
+    monkeypatch.setattr(authoring_hints, "credential_in_free_text", lambda v: False)
+    monkeypatch.setattr(authoring_hints, "redact_text", lambda t: t)
+    monkeypatch.setattr(authoring_hints, "redact_driver_text", lambda t, s=None: t)
+    monkeypatch.setattr(authoring_hints, "secrets_in_config", lambda c: [])
+
+    ws = Workspace.init(tmp_path / "ws", name="nohint")
+    app = create_app(ws)
+    admin = TestClient(app)
+    creds = {"username": "root", "password": "trustno1!"}
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    assert admin.post("/api/v1/users", json={
+        "username": "vic", "password": "password123", "role": "viewer",
+    }).status_code in (200, 201)
+    viewer = TestClient(app)
+    assert viewer.post("/api/v1/auth/login", json={
+        "username": "vic", "password": "password123",
+    }).status_code == 200
+
+    sentinel = "NOHINT_SEKRET"
+    # 1. A dashboard panel — the field rounds 1-3 all leaked. Saved with 200
+    #    because the gate is a hint now, and unreadable because `sql` is
+    #    OPERATIONAL.
+    assert admin.put("/api/v1/dashboards/d", json={"title": "d", "panels": [{
+        "id": "p1", "title": "t",
+        "sql": f"SELECT * FROM postgres_scan('host=db password={sentinel}')",
+    }]}).status_code == 200
+    assert sentinel not in viewer.get("/api/v1/dashboards/d").text
+    assert sentinel not in viewer.get("/api/v1/dashboards").text
+
+    # 2. A schedule target — round 3's second bypass, same shape.
+    assert admin.put("/api/v1/schedules/s", json={
+        "trigger": "cron", "cron": "0 3 * * *", "action": "build",
+        "targets": [f"s3://k:{sentinel}@bucket/t"],
+    }).status_code == 200
+    assert viewer.get("/api/v1/schedules").status_code == 403
+
+    # 3. The audit trail, which is where rounds 2 and 3 both surfaced.
+    assert sentinel not in viewer.get("/api/v1/audit/mine").text
+    assert viewer.get("/api/v1/audit").status_code == 403
+
+    # 4. A failing query does not echo the statement back.
+    r = viewer.post("/api/v1/query", json={"sql": f"SELECT {sentinel}_col"})
+    assert r.status_code == 400
+    assert sentinel not in r.text
+
+
+def test_nothing_rests_on_the_matcher_at_the_admin_to_editor_crossing(
+    tmp_path, monkeypatch
+):
+    """The companion to `test_the_authoring_hint_is_not_load_bearing`, and the
+    one that would have caught the last critical.
+
+    That test deletes `authoring_hints` — the *write-time* half. This one
+    deletes the **structural** half as well: `redact_value`, `redact_mapping`
+    and `keyword_credential`, the functions `federation.redacted_source` and
+    `connectors.redacted_config` call. Those are what an EDITOR's copy of a
+    federated dataset's `source` used to rest on, and five of six measured
+    credential shapes walked straight past them:
+
+        password='LEAKED'   Pwd='LEAKED';   Password:LEAKED
+        AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/LEAKED
+        jdbc:mysql://db:3306/prod,svc,LEAKED
+
+    Only the first shape in the battery was withheld, and only because the
+    matcher happened to fire on it. Adding a quote after `password=` defeated
+    the boundary — which is the definition of a boundary resting on a guess
+    about prose.
+
+    With every one of them neutered, no principal below admin may read any of
+    it, because the field is not serialized to them at all.
+    """
+    from laurelin.core import authoring_hints, redaction
+
+    # The write-time hint...
+    monkeypatch.setattr(authoring_hints, "credential_in_free_text", lambda v: False)
+    monkeypatch.setattr(authoring_hints, "redact_text", lambda t: t)
+    monkeypatch.setattr(authoring_hints, "redact_driver_text", lambda t, s=None: t)
+    monkeypatch.setattr(authoring_hints, "secrets_in_config", lambda c: [])
+    # ...and the read-time structural half, which is the part this test adds.
+    monkeypatch.setattr(redaction, "redact_value", lambda v: v)
+    monkeypatch.setattr(redaction, "redact_dsn", lambda v: v)
+    monkeypatch.setattr(redaction, "keyword_credential", lambda v: False)
+    monkeypatch.setattr(redaction, "redact_mapping", lambda c: c)
+    monkeypatch.setattr(redaction, "withhold_values", lambda c: c)
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet = tmp_path / "x.parquet"
+    pq.write_table(pa.table({"a": [1]}), parquet)
+
+    ws = Workspace.init(tmp_path / "ws", name="nomatcher")
+    app = create_app(ws)
+    creds = {"username": "root", "password": "trustno1!"}
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    for name, role in (("ed", "editor"), ("vic", "viewer")):
+        assert admin.post("/api/v1/users", json={
+            "username": name, "password": "password123", "role": role,
+        }).status_code in (200, 201)
+
+    # Every shape that defeated `keyword_credential`, plus the one it caught.
+    shapes = {
+        "odbc_unquoted": "Server=db;Uid=svc;Pwd=NOMATCH_1;",
+        "conninfo_quoted": "host=db user=svc password='NOMATCH_2'",
+        "odbc_quoted": "Server=db;Uid=svc;Pwd='NOMATCH_3';",
+        "colon_form": "Server:db User:svc Password:NOMATCH_4",
+        "aws_pair": "AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/NOMATCH_5",
+        "jdbc": "jdbc:mysql://db:3306/prod,svc,NOMATCH_6",
+        "url": "postgresql://svc:NOMATCH_7@db.internal:5432/crm",
+    }
+    assert admin.put("/api/v1/datasets/remote/federated", json={
+        "source": {"type": "parquet", "path": str(parquet), **shapes},
+        "description": "d",
+    }).status_code == 200
+
+    # An admin authored it and may read it back — with the matcher deleted they
+    # get it verbatim, and that is fine: `redacted_source` is a courtesy to the
+    # person who typed it, explicitly not a boundary.
+    assert "NOMATCH_2" in admin.get("/api/v1/datasets/remote").text
+
+    for username in ("ed", "vic"):
+        client = TestClient(app)
+        assert client.post("/api/v1/auth/login", json={
+            "username": username, "password": "password123",
+        }).status_code == 200
+        for path in ("/api/v1/datasets", "/api/v1/datasets/remote"):
+            body = client.get(path).text
+            for label in shapes:
+                assert f"NOMATCH_{list(shapes).index(label) + 1}" not in body, (
+                    f"{username} read {label} from {path} with the matcher deleted"
+                )
+            # ...and the product still works: shape, built by us.
+            assert "source_descriptor" in body
+            assert "parquet" in body

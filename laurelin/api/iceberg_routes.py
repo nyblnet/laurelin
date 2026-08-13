@@ -29,6 +29,7 @@ from laurelin.api.routes import (
     router,
 )
 from laurelin.core import iceberg
+from laurelin.core.failure import safe_detail
 
 
 def _require_iceberg() -> None:
@@ -74,7 +75,12 @@ def create_iceberg_dataset(
         try:
             table = catalog.parse_upload(tmp_path)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
+            raise HTTPException(
+                status_code=400, detail=safe_detail(exc, subject=f"dataset:{name}")
+            ) from None
+        # NOT inside the try: `write_iceberg` goes into pyiceberg and pyarrow, and
+        # what comes back is caught by `app._catch_all_detail`. That is where
+        # this belongs — a catch here would have to guess the phase.
         info = catalog.write_iceberg(name, table, mode=mode)
     store.log_audit(
         "iceberg_written",
@@ -122,7 +128,7 @@ def create_iceberg_branch(
     try:
         result = catalog.iceberg_branch(name, body.branch, from_version=body.from_version)
     except (ValueError, KeyError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="dataset")) from None
     store.log_audit("iceberg_branch_created",
                     {"dataset": name, "branch": body.branch}, actor=actor)
     return result
@@ -143,7 +149,7 @@ def delete_iceberg_branch(
     try:
         catalog.delete_iceberg_branch(name, branch)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="dataset")) from None
     store.log_audit("iceberg_branch_deleted",
                     {"dataset": name, "branch": branch}, actor=actor)
     return {"deleted": branch}
@@ -165,7 +171,7 @@ def merge_iceberg_branch(
         info = catalog.merge_iceberg_branch(name, branch)
     except (ValueError, KeyError) as exc:
         # A diverged branch is a 409: it's a conflict, not a malformed request.
-        raise HTTPException(status_code=409, detail=str(exc)) from None
+        raise HTTPException(status_code=409, detail=safe_detail(exc, subject="dataset")) from None
     store.log_audit("iceberg_branch_merged",
                     {"dataset": name, "branch": branch, "version": info.version},
                     actor=actor)
@@ -206,7 +212,7 @@ def evolve_iceberg_schema(
             rename=body.rename or None, allow_breaking=body.allow_breaking,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="dataset")) from None
     store.log_audit(
         "iceberg_schema_evolved",
         {"dataset": name, "add": list(body.add), "drop": body.drop,

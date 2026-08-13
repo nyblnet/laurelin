@@ -239,7 +239,24 @@ def remote_transform(
 # ---------------------------------------------------------------------------
 
 class PipelineError(RuntimeError):
-    """A pipeline file failed to execute during collection."""
+    """A pipeline file failed to execute during collection.
+
+    ``pipeline`` names the offending file — a Laurelin identifier, not a path
+    and not a driver's sentence — so a caller can say *which* file will not
+    import without repeating ``str(exc)``.
+
+    That distinction is load-bearing under R1. The message of this exception is
+    **not** first-party text on the import branch: ``collect_transforms``
+    interpolates ``{type(exc).__name__}: {exc}`` from whatever an arbitrary
+    library raised while the file was being ``exec``-ed, plus the server's
+    absolute path. It is fine in a log and fine as the input to
+    ``Failure.from_exception`` (which stores none of it). It must not be put in
+    a response body.
+    """
+
+    def __init__(self, message: str, pipeline: str = ""):
+        super().__init__(message)
+        self.pipeline = pipeline
 
 
 def collect_transforms(pipelines_dir: Path) -> TransformRegistry:
@@ -267,6 +284,7 @@ def collect_transforms(pipelines_dir: Path) -> TransformRegistry:
                 exec(code, namespace)
             except Exception as exc:
                 raise PipelineError(
-                    f"Error in pipeline file {path}: {type(exc).__name__}: {exc}"
+                    f"Error in pipeline file {path}: {type(exc).__name__}: {exc}",
+                    pipeline=path.stem,
                 ) from exc
     return registry

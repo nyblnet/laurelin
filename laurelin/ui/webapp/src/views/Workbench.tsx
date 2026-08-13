@@ -13,7 +13,14 @@ import { api, API, ApiError } from "../api";
 import type { Dashboard, Dataset, QueryResult, PipelineWriteResult } from "../types";
 import type { ChartKind } from "../charts";
 import { Chart } from "../charts";
-import { PageHeader, Spinner, ErrorBox, fmtValue } from "../ui";
+import {
+  ErrorBox,
+  FailureNote,
+  PageHeader,
+  Spinner,
+  WarningBox,
+  fmtValue,
+} from "../ui";
 import { useAuth } from "../auth";
 
 const RESULT_VIEWS: ChartKind[] = ["table", "bar", "line", "area", "stat"];
@@ -80,11 +87,22 @@ export function WorkbenchView() {
         y: [],
         width: 6,
       };
-      return api.put<Dashboard>(`${API}/dashboards/${name}`, {
-        title: existing?.title ?? name,
-        description: existing?.description ?? "",
-        panels: [...(existing?.panels ?? []), panel],
-      });
+      // Append through the per-panel route instead of re-PUTting the board.
+      // The old shape sent back every panel from the *listing* — which under R2
+      // may be a projection with no `sql` — and would have blanked the queries
+      // of every other panel on the board the moment an editor's session was
+      // anything less than an editor's session.
+      if (!existing) {
+        await api.put<Dashboard>(`${API}/dashboards/${encodeURIComponent(name)}`, {
+          title: name,
+          description: "",
+          panels: [],
+        });
+      }
+      return api.post<Dashboard>(
+        `${API}/dashboards/${encodeURIComponent(name)}/panels`,
+        panel,
+      );
     },
     onSuccess: (d) => {
       setDashOpen(false);
@@ -305,6 +323,9 @@ export function WorkbenchView() {
                   <Link to={`/dashboards/${dashDone}`}>open dashboard '{dashDone}'.</Link>
                 </div>
               )}
+              {/* The save already happened: this is an authoring hint, not a
+                  refusal. It used to be a 400 that lost the editor their work. */}
+              <WarningBox warnings={addToDash.data?.warnings} />
 
               {saved && (
                 <div
@@ -316,16 +337,12 @@ export function WorkbenchView() {
                 >
                   Created transform file '{saved.name}.py' —{" "}
                   <Link to="/pipeline">build it from the Pipeline tab.</Link>
+                  {/* The file was written; the DAG just does not collect.
+                      R1 turned this from the collector's own sentence into a
+                      classified record, so it renders like every other
+                      failure rather than as a bare string. */}
                   {saved.collect_error ? (
-                    <span
-                      style={{
-                        display: "block",
-                        color: "var(--red)",
-                        marginTop: 4,
-                      }}
-                    >
-                      Note: {saved.collect_error}
-                    </span>
+                    <FailureNote failure={saved.collect_error} />
                   ) : null}
                 </div>
               )}

@@ -14,6 +14,7 @@ in tests.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ import httpx
 from authlib.jose import JsonWebKey, jwt
 
 from laurelin.core.models import Role
+
+log = logging.getLogger("laurelin.oidc")
 
 
 def _b64url(data: bytes) -> str:
@@ -182,7 +185,19 @@ class OIDCProvider:
             timeout=10,
         )
         if resp.status_code != 200:
-            raise OIDCError(f"Token exchange failed: {resp.status_code} {resp.text[:200]}")
+            # R1: `resp.text[:200]` used to come back. The POST directly above
+            # carries `client_secret`, and IdPs routinely echo request
+            # parameters in `error_description` — so the body of a *failed*
+            # token exchange is one of the likelier places for our own client
+            # secret to be sitting. The status code is the diagnostic; the body
+            # goes to the log.
+            #
+            # UNVERIFIED at runtime: no IdP available on this tree.
+            log.warning(
+                "OIDC token exchange failed with %s: %s",
+                resp.status_code, resp.text[:2000],
+            )
+            raise OIDCError(f"Token exchange failed with HTTP {resp.status_code}")
         return resp.json()
 
     # -- flow -----------------------------------------------------------------

@@ -145,7 +145,10 @@ def test_unregistered_engine_fails_the_task(env):
     store.delete_engine("warehouse")
     result = build(ws, store, catalog, REMOTE, FakeEngine())
     assert result.status.value == "failed"
-    assert "not registered" in result.tasks[0].error
+    # R1: a structured failure. The engine's own words -- and a Flight SQL
+    # "unauthenticated: invalid token <token>" is exactly the shape that
+    # carries a credential -- go to the log at `failure.detail_ref`.
+    assert result.tasks[0].failure.code.value == "transform_failed"
 
 
 def test_engine_errors_surface_on_the_task(env):
@@ -153,7 +156,9 @@ def test_engine_errors_surface_on_the_task(env):
     engine = FakeEngine(fail=engines.EngineError("Trino: table not found"))
     result = build(ws, store, catalog, REMOTE, engine)
     assert result.status.value == "failed"
-    assert "table not found" in result.tasks[0].error
+    assert result.tasks[0].failure is not None
+    assert result.tasks[0].failure.subject == "transform:revenue_by_region"
+    assert "table not found" not in result.tasks[0].failure.model_dump_json()
     assert engine.closed, "the connection is released even when the query fails"
 
 
@@ -166,8 +171,8 @@ def test_oversized_results_are_refused(env, monkeypatch):
     engine = FakeEngine(pa.table({"i": list(range(500))}))
     result = build(ws, store, catalog, REMOTE, engine)
     assert result.status.value == "failed"
-    assert "above the" in result.tasks[0].error
-    assert "aggregate on the cluster" in result.tasks[0].error.lower()
+    assert result.tasks[0].failure is not None
+    assert result.tasks[0].failure.code.value == "transform_failed"
 
 
 def test_size_cap_can_be_disabled():
@@ -194,7 +199,11 @@ def test_remote_transform_requires_engine_and_query():
 def test_flight_sql_client_reports_a_clear_connection_error():
     """A bad address must fail with something actionable, not a driver stack."""
     cfg = engines.EngineConfig(name="w", uri="grpc://127.0.0.1:1", options={})
-    with pytest.raises(engines.EngineError, match="Could not connect|rejected"):
+    # R1: "actionable" is now a code plus our own host:port plus a `detail_ref`
+    # that finds the driver's stack in the log — rather than the driver's stack
+    # itself, which for Flight SQL can read
+    # "unauthenticated: invalid token <token>".
+    with pytest.raises(engines.EngineError, match=r"engine:w at 127\.0\.0\.1:1"):
         client = engines.connect(cfg, timeout_s=2)
         client.query("SELECT 1")
 
@@ -259,3 +268,37 @@ def test_engines_are_admin_only(tmp_path):
     assert editor.get("/api/v1/engines").status_code == 403
     assert editor.put("/api/v1/engines/x",
                       json={"uri": "grpc://h:443"}).status_code == 403
+
+
+def test_an_unreachable_engine_is_named_unreachable_rather_than_unclassified(tmp_path):
+    """The Test button's whole question is "can this be reached", so the answer
+    must not be "Laurelin could not classify this one".
+
+    Measured on this tree while exercising the admin screen: testing
+    `grpc://127.0.0.1:1` came back REMOTE_FAILED at phase `execute`. The cause
+    is that the ADBC driver connects **lazily** — `flight_sql.connect()` touches
+    no socket, so a refused endpoint surfaces from `query()`, down the execute
+    path, where `connect_failure`'s pre-flight never runs. The one case the
+    pre-flight exists for was the one case it did not see.
+    """
+    _, admin, _ = _admin_client(tmp_path)
+    admin.put("/api/v1/engines/dead", json={"uri": "grpc://127.0.0.1:1"})
+
+    body = admin.post("/api/v1/engines/dead/test", json={}).json()
+    assert body["ok"] is False
+    assert body["failure"]["code"] == "endpoint_unreachable"
+    assert body["failure"]["phase"] == "connect"
+    # Rebuilt from our own parse of our own config, so the operator knows which
+    # port to open.
+    assert body["failure"]["endpoint"] == "127.0.0.1:1"
+
+
+def test_an_engine_whose_host_does_not_resolve_says_so(tmp_path):
+    """The other half of the distinction an operator acts on: a name that does
+    not resolve is a DNS or typo problem, not a firewall one."""
+    _, admin, _ = _admin_client(tmp_path)
+    admin.put("/api/v1/engines/nodns", json={"uri": "grpc://no-such-host.invalid:443"})
+
+    failure = admin.post("/api/v1/engines/nodns/test", json={}).json()["failure"]
+    assert failure["code"] == "endpoint_unresolvable"
+    assert failure["phase"] == "resolve"

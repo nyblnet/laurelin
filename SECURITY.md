@@ -81,63 +81,100 @@ the sandbox with `SET` are all blocked, and there are regression tests for
 each. A dataset you can't see is an *unknown table*, not a permission error —
 no existence oracle.
 
-**Secrets aren't echoed.** Connector configs, federated dataset sources and
-engine URIs go through one redactor (`laurelin/core/redaction.py`) in every API
-response; API tokens are shown exactly once, at creation. The rule is *shape
-first*: a `scheme://user:password@host` DSN has its credential masked, and any
-value whose shape cannot be read — an ODBC keyword string, a URL carrying a
-query, a driver's option namespace, a nested config object — is withheld whole
-rather than guessed at. Three redactors with three regexes preceded this and
-leaked ten different credential forms between them; guessing where a secret
-sits is what failed, so the replacement does not guess.
+**Secrets aren't echoed — and that no longer rests on recognising one.** Three
+rounds of attackers found credential disclosures in the module that tried to
+*detect* credentials in free text, and each round something walked around the
+newest regex. Finding a credential inside a string is not decidable: libpq
+conninfo, ODBC keyword strings, JDBC URLs, `CREATE SECRET` bodies, a driver's
+prose, and formats nobody has enumerated are all valid places for a password.
+Two rules replace the detector, and **nothing's confidentiality depends on it
+any more**.
 
-One narrow exception, because the shape rules are structurally blind to it: a
-credential written as `keyword=value` with no `://` anywhere — a libpq
-conninfo, an ODBC keyword string, a DuckDB `CREATE SECRET`. A password keyword
-*beside* a connection keyword withholds the value whatever key it sits under.
-That is a vocabulary test rather than a shape test, and it is bounded to the
-one case where there is no shape to read.
+*R1 — third-party driver text is never persisted or returned.* Every place a
+driver or library exception is caught converts it, at the catch site, into a
+`Failure` (`laurelin/core/failure.py`): a code and a phase from closed enums, a
+subject in Laurelin's own namespace, a `host:port` rebuilt from Laurelin's own
+parse of its own config, integer counters, and a `detail_ref`. The only
+driver-derived fields are the exception's class name and its vendor code, both
+gated on the shape of a *Python identifier* — which no conninfo, ODBC string,
+JDBC URL, `CREATE SECRET` body or PEM block can satisfy. That question is
+decidable; "does this contain a credential" is not.
 
-What a masked DSN still shows is the endpoint: `user@host:port/db`. Whether
-that belongs in a viewer-readable response is an open question we have not
-answered, and it is stated in the redactor's docstring alongside the rest of the
-residual (a secret in a URL *path*, or pasted into a free-form value, is not
-detectable and is not removed). The workspace export answers it the strict way
-and withholds the endpoint too — see docs/PORTABILITY.md.
+There is a net under the catch sites, because there has to be:
+`@app.exception_handler(ValueError)` and `(KeyError)` catch anything uncaught,
+and `pyarrow.lib.ArrowInvalid` **is** a `ValueError` while `ArrowKeyError` **is**
+a `KeyError`. An editor read an operator's S3 warehouse credential out of a 400
+that way. `failure.is_first_party` decides on the **deepest traceback frame** —
+where the `raise` is written — rather than on the exception's type, and anything
+else becomes a `Failure`. The route-level `except ValueError` blocks above that
+net apply the same rule through `failure.safe_detail`: most of them are catching
+Laurelin's own validation and echoing the caller's own input back, which is
+fine, but several wrap a call that reaches a third-party library, and the check
+costs nothing when the exception is ours.
 
-**A third party's error text is treated as credential-bearing.** A driver
-quotes back the connection string it was handed, in prose with no shape a
-redactor can find — a password containing a space came back from psycopg as
-``unexpected spaces found in "SUPER SEKRET"``, and that string was stored on the
-source row and served. So a failed sync, a failed federated-source probe and a
-failed engine test all have the credentials the config says we issued
-*substituted out by value* first, then the shape rules applied, then the whole
-message withheld if a known secret survived both.
+*R2 — author-written free text is readable only at the privilege level that
+could author it.* If you cannot write it, you cannot read it. Fields declare an
+audience (`laurelin/core/audience.py`); anything not explicitly `PRESENTATION`
+is withheld from readers below the record's authoring role, enforced at one
+serialization point (`laurelin/core/serialize.py`). A field added tomorrow with
+no annotation fails closed; a model added tomorrow is admin-only. A field whose
+*writer* sits above its record says so with `AuthoredBy` — `DatasetInfo.source`
+is written only by the three admin registration routes, so it reaches admin and
+nobody else even though a dataset is editor-authored. Descending into a nested
+record can only ever disclose less.
 
-One consequence to plan for: whenever a message is redacted or withheld from the
-browser, the unredacted exception is written to the **server log** so the
-operator can still diagnose it. Treat server logs as credential-bearing and give
-them the same protection as `metadata.db`.
+The three practical consequences:
 
-**Free-form fields that are executed are gated on write, not on read.** A
-dashboard panel's SQL and a schedule's targets are stored and returned verbatim,
-and a panel's SQL round-trips through the editor's textarea — redacting on read
-would let a mask be saved over the real query. A value embedding a
-`user:password@host` connection string is therefore refused at `PUT` with a
-message pointing at registered sources — as is a `keyword=value` connection
-string, and a URL whose query names a secret-ish parameter. Every free-form
-field of a schedule is gated, not only its targets.
+- A connector's `config`, a federated dataset's `source` and an engine's URI are
+  **not disclosed below admin at all**. Not a better denylist over somebody
+  else's config vocabulary — the absence of one. What a lower-privileged reader
+  gets is a Laurelin-built descriptor (which table, in which format) assembled
+  from an allowlist of shape keys with an identifier-shaped gate on every value.
+- A dashboard panel's SQL is not disclosed to a viewer. They get the **rows**:
+  `POST /dashboards/{name}/panels/{id}/run` executes the stored panel
+  server-side *as the caller*, with that caller's ACL, row-level security and
+  column masking. A stored dashboard still grants nobody new read access.
+- **Error paths are read paths.** A 400 that says a stored instruction is broken
+  must not quote the instruction to a principal who may not read it. The
+  message naming the offending field goes to whoever could have authored it;
+  everyone else gets a code and a `detail_ref`. `HTTPException(detail=…)` does
+  not pass through the serializer, so the routes that carry a failure call
+  `serialize.detail_for` explicitly.
 
-The gate is deliberately narrower than the *display* redactor, and the residual
-follows from that: `redact_dsn` withholds a URL carrying a query because it
-cannot tell which parameter is the secret, but a gate that refused every such
-URL made a public CSV with `?format=csv` — and an S3 prefix keyed by an email
-address — impossible to author at all, with a 400 that said it embedded a
-credential. So the gate refuses a query parameter whose *name* is
-credential-shaped and admits the rest; a secret in a query parameter named
-something else, or in a URL path, reaches a viewer verbatim. Values stored
-before this are not retroactively redacted; `laurelin export` scans for them
-and refuses.
+`laurelin/core/authoring_hints.py` still holds the old free-text matcher. It is
+an **authoring hint and not a boundary**: saving a panel that looks like it
+contains a connection string succeeds with a warning in the response body rather
+than a 400. Being wrong costs an editor a banner instead of a viewer a password.
+`tests/test_redaction.py::test_the_authoring_hint_is_not_load_bearing`
+monkeypatches the matcher to always return "clean" and re-runs the entire leak
+battery; it passes.
+
+**What is still disclosed, deliberately.** An author's *captions* reach the
+audience they were written for: a dashboard panel's `title`, and the `alias` on
+a metric, which becomes the column header a viewer reads. An editor who puts a
+credential in a column header has disclosed it to their own readers on purpose,
+exactly as they would by typing it into the panel title. The invariant Laurelin
+asserts and tests is about *instructions* — a panel's `sql`, `group_by`,
+`filters`, `search`, and its metrics' `op` and `property` — not about labels.
+
+**The server log is where driver text now lives, and that is a deployment
+decision.** R1 *relocates* a driver's exact words from a browser-readable
+database column to the process log, tagged with the same `detail_ref` the API
+returns. Who can read that is **not bounded by any Laurelin role** — it is
+whoever can read your log sink. If those logs are shipped to a SIEM whose
+readership is wider than your admin group, you have widened the audience of
+every credential your operators have pasted into a connector config. Treat the
+server log as credential-bearing and give it the same protection as
+`metadata.db`. A best-effort substitution of known secrets runs on the log path
+as a courtesy for a sink Laurelin does not own; it is explicitly not a boundary.
+
+**One data-destroying migration, on purpose.** `builds.error`,
+`build_tasks.error`, `sources.last_sync_error` and `schedules.last_error` are
+set to NULL on upgrade. Those columns hold prose of unknown provenance that can
+never be re-classified, they are *known* to contain live credentials, and they
+sit in a file whose permissions were themselves a shipped bug. Every
+pre-existing `audit_log` row is stamped `min_read_role='admin'` for the same
+reason: its writer had no idea who would read it.
 
 **Mutations are audited** with actor, action, and details.
 
@@ -229,6 +266,25 @@ A short checklist; details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
       them, and the relocation is reported in the import warnings — but the
       *rows* it brings are still whatever the archive said.
 - [ ] Review the audit log periodically — it only helps if someone reads it.
+- [ ] **Treat the server log as an operator-privilege artifact, and check who
+      your log sink is shared with.** Laurelin no longer persists third-party
+      driver text anywhere a browser can reach it: an exception from psycopg,
+      mysql-connector, DuckDB or a Flight SQL driver is converted at the catch
+      site into a structured `Failure` (an error code, a phase, a subject in
+      Laurelin's own namespace, our own `host:port`, integer counters) and the
+      driver's own sentence goes to the process log, tagged with the same
+      `detail_ref` the stored failure carries.
+
+      That is a *relocation*, not a sanitization, and it is the deliberate
+      trade: an operator has to be able to read what actually broke. A driver
+      quotes back the connection string it was handed, so those log lines can
+      contain any credential an operator has pasted into a connector config.
+      **If your logs are shipped to a SIEM whose readership is wider than your
+      admin group, you have widened the audience of every one of those
+      credentials.** Laurelin makes a best-effort pass to substitute out the
+      secrets it can name from the config in hand; that is a courtesy for a
+      sink Laurelin does not own, not a control — see
+      `laurelin/core/authoring_hints.py`.
 
 ## Scope
 

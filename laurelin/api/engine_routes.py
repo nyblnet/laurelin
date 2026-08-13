@@ -19,7 +19,24 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from laurelin.api.routes import ADMIN, ActorDep, StoreDep
-from laurelin.core import engines, redaction
+from laurelin.core import engines, serialize
+from laurelin.core.failure import (
+    Failure,
+    FailureCode,
+    Phase,
+    probe_endpoint,
+    safe_detail,
+)
+from laurelin.core.roles import Role
+
+# The pre-flight verdicts that mean "this endpoint cannot be used at all", as
+# opposed to "the socket was fine and something later went wrong".
+_UNUSABLE_ENDPOINT = frozenset({
+    FailureCode.CREDENTIAL_MALFORMED,
+    FailureCode.ENDPOINT_UNRESOLVABLE,
+    FailureCode.ENDPOINT_UNREACHABLE,
+    FailureCode.ENDPOINT_TIMEOUT,
+})
 
 engines_router = APIRouter(tags=["engines"])
 _log = logging.getLogger(__name__)
@@ -58,7 +75,7 @@ def upsert_engine(
     try:
         engines.validate_engine(config)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="engine")) from None
 
     existing = store.get_engine(name)
     store.upsert_engine(
@@ -100,19 +117,47 @@ def test_engine(name: str, store: StoreDep) -> dict:
         finally:
             client.close()
     except Exception as exc:  # noqa: BLE001 - report any failure to the operator
-        # `_redact_uri` used to run over this whole string, which only ever
-        # worked by accident: it is a driver's prose, not a URI. `redact_text`
-        # masks the DSNs it can parse and withholds the message whole when the
-        # rest of it still looks like a credential — a Flight SQL
-        # "unauthenticated: invalid token <token>" is exactly that shape.
-        #
-        # The unredacted exception goes to the server log, because withholding
-        # it from the browser is a disclosure decision, not a decision to
-        # destroy the operator's only diagnostic.
-        _log.warning("engine %r failed its connectivity test: %s", name, exc)
-        detail = redaction.redact_text(str(exc))
-        return {"ok": False, "detail": detail,
-                "withheld": detail == redaction.WITHHELD}
+        # R1. `redact_text(str(exc))` ran a shape-matcher over a driver's prose
+        # and, when it could not tell, withheld the whole message — so the
+        # operator's only diagnostic became the literal string
+        # "***** (withheld)". A Failure is strictly better in both directions:
+        # nothing from the driver is returned, *and* the operator gets a code
+        # they can act on plus a ref that finds the full text in the log.
+        failure = getattr(exc, "failure", None) or Failure.from_exception(
+            exc, phase=Phase.connect, subject=f"engine:{name}",
+            driver="adbc_flightsql", dsn=e["uri"], config=e.get("options"),
+        )
+        if failure.code is FailureCode.REMOTE_FAILED:
+            # The ADBC driver connects **lazily**: `flight_sql.connect()` returns
+            # a handle without touching the network, so a refused endpoint
+            # surfaces from `query()` — down the execute path, where
+            # `connect_failure`'s pre-flight never runs. Measured on this tree:
+            # testing `grpc://127.0.0.1:1` reported REMOTE_FAILED "Laurelin
+            # could not classify this one", for the single case the pre-flight
+            # exists to classify.
+            #
+            # This route is a connectivity probe by definition, so when nothing
+            # else classified it, ask the question the operator pressed the
+            # button to ask. Same first-party facts as everywhere else: a
+            # getaddrinfo and a TCP connect that *Laurelin* made.
+            code, phase, endpoint = probe_endpoint(e["uri"], fallback_endpoint=failure.endpoint)
+            # Only adopt the pre-flight's answer when it found the endpoint
+            # *unusable*. If DNS and TCP both succeed, `probe_endpoint` reports
+            # AUTH_REJECTED — a sound inference for a driver that failed while
+            # connecting, and a wrong one here, where the failure came from a
+            # query against a socket that was plainly up. REMOTE_FAILED plus the
+            # log reference is the honest answer in that case; "rotate your
+            # credential" would not be.
+            if code in _UNUSABLE_ENDPOINT:
+                failure = failure.model_copy(
+                    update={"code": code, "phase": phase, "endpoint": endpoint}
+                )
+        # An engine is admin-authored and every engine route is ADMIN, so
+        # `detail_for` renders in full here — it is written this way so the
+        # rule is uniform and a future relaxation of the gate cannot
+        # silently start disclosing the endpoint.
+        return {"ok": False, "failure": serialize.dump(failure),
+                "detail": serialize.detail_for(failure, Role.admin)}
     return {"ok": True}
 
 

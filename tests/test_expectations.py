@@ -100,7 +100,13 @@ def test_a_violated_expectation_fails_the_build(env, expectation, produce, expec
     _, info = build(env, registry_with(declare))
     task = info.tasks[0]
     assert task.status.value == "failed"
-    assert "expectation" in (task.error or "").lower()
+    # R1: an expectation's `message` is prose an EDITOR wrote in a pipeline
+    # file, so it is not stored on the failure. What is stored is the code and
+    # a count; the per-check results (with their messages) stay on
+    # `task.expectations`, which is OPERATIONAL and editor-only.
+    assert task.failure is not None
+    assert task.failure.code.value == "expectation_failed"
+    assert task.failure.counters["failed_expectations"] >= 1
 
     failed = [r for r in task.expectations if not r["passed"]]
     assert len(failed) == 1

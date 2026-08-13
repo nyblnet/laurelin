@@ -2245,6 +2245,15 @@ class OntologyService:
             actor=actor,
         )
         self._record_edit(ot, edit)
+        # `"parameters": payload` was here, and it was the sharpest leak in the
+        # audit trail — sharper than any credential, because no matcher was ever
+        # going to catch it. `payload` is the object's own property VALUES, and
+        # `/audit` was VIEWER-gated: a viewer holding a **403** on the object
+        # type read that object's data off the audit route. Governed data, one
+        # privilege level below its own ACL, in a governance product.
+        #
+        # `edit_id` points at the full record for anyone entitled to it, which
+        # is what an auditor actually needs — a stable handle, not a copy.
         self.store.log_audit(
             "action_applied",
             {
@@ -2253,7 +2262,7 @@ class OntologyService:
                 "pk_value": pk_value,
                 "kind": kind.value,
                 "edit_id": edit.id,
-                "parameters": payload,
+                "parameter_count": len(payload or {}),
             },
             actor=actor,
         )

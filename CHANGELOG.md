@@ -14,6 +14,311 @@ most: each was a live disclosure or a live bypass on a running server, each was
 reproduced before it was fixed, and each fix was reverted and watched to fail
 before being restored.
 
+### Changed: credentials are no longer detected in free text — the detector stopped being a boundary
+
+Three adversarial passes found 22, then 17, then 18 confirmed defects, and the
+credential-redaction module produced criticals in **all three**. Round 1:
+three redactors, three different guesses about where a credential lives. Round
+2: driver exceptions stored verbatim reached a VIEWER via `GET /audit`. Round 3:
+the same leak on the scheduler path nobody had checked, plus
+`credential_in_free_text` only understanding `://` — so libpq conninfo, ODBC
+keyword strings and DuckDB `CREATE SECRET` bodies saved with 200 and a viewer
+read them off `GET /dashboards`.
+
+Each round widened a matcher and each round something walked around it, because
+**finding a credential inside free text is not decidable**. This release stops
+trying. Two rules replace it.
+
+**R1 — third-party driver text is never persisted.** Every place a driver or
+library exception is caught now converts it *at the catch site* into a
+`Failure` (`laurelin/core/failure.py`): a code from a closed enum, a phase from
+a closed enum, a subject in Laurelin's own namespace, a `host:port` rebuilt
+from Laurelin's own parse of its own config, integer counters, and a
+`detail_ref`. The only driver-derived fields are the exception's class name and
+its vendor code, both gated on the shape of a *Python identifier* — which no
+conninfo, ODBC string, JDBC URL, `CREATE SECRET` body or PEM block can satisfy.
+That is decidable; "does this contain a credential" is not. The driver's own
+words go to the server log and nowhere else.
+
+Because psycopg reports `sqlstate=None` on **every** connect failure (measured:
+wrong password, space in password, unknown database, bad host, refused port),
+Laurelin runs its own DNS lookup and TCP connect on the failure path to
+distinguish unresolvable / unreachable / timed out / rejected. Those are
+first-party facts from the stdlib, not a reading of somebody else's prose.
+
+**R2 — author-written free text is readable only at the privilege level that
+could author it.** Fields now declare an audience
+(`laurelin/core/audience.py`), enforced at the single serialization point
+(`laurelin/core/serialize.py`). Anything not explicitly `PRESENTATION` is
+withheld from readers below the record's authoring role, so a field added
+tomorrow fails closed, and a model added tomorrow is admin-only. A field whose
+*writer* sits above its record — `DatasetInfo.source`, written only by the three
+admin registration routes, inside an editor-authored dataset — says so with
+`AuthoredBy`, and descending into a nested record can only ever disclose less.
+
+**The viewer's dashboard still works, and this is the part that made R2
+affordable.** A viewer no longer receives panel SQL — they receive the rows.
+`POST /dashboards/{name}/panels/{panel_id}/run` executes the stored panel
+server-side **as the caller**, applying that caller's ACL, row-level security
+and column masking. The old invariant holds for a new reason: a stored
+dashboard still grants nobody new read access, because the server rather than
+the browser is now the thing running the query.
+
+**Breaking.**
+
+- `GET /audit` is now EDITOR-gated. New `GET /audit/mine` (VIEWER) returns the
+  caller's own rows — their headers always, their `details` only at the level
+  the row's writer declared. `audit_log` gains `min_read_role`, default `admin`,
+  which is both the row filter on `/audit` and the record's author role in the
+  serializer, so a new `log_audit` call site discloses to nobody below admin
+  until its writer says otherwise. `action_applied` no longer records `parameters` — a viewer
+  holding a **403** on an object type was reading that object's property values
+  out of the audit trail.
+- `GET /pipelines` and `GET /pipelines/{name}` are now EDITOR-gated. They return
+  `exec`-ed Python. A viewer's lineage need is served by `GET /transforms` and
+  `GET /lineage`, which stay VIEWER.
+- **A data-destroying migration.** `builds.error`, `build_tasks.error`,
+  `sources.last_sync_error` and `schedules.last_error` are set to NULL and
+  replaced by `*_failure_json`. Those columns hold prose of unknown provenance
+  that can never be re-classified, they are *known* to contain live credentials,
+  and they sit in a file whose permissions were themselves a shipped bug. What
+  is lost is diagnostics for builds that already finished; the migration logs
+  the row counts it cleared.
+- `GET /workspace` returns `root` only to an admin. `GET /health/ready` returns
+  `{"status": "unavailable"}` with no detail — it was handing an anonymous
+  caller 120 characters of whatever the store driver said.
+- `GET /datasets` and `GET /datasets/{name}` return `source` to an admin only,
+  and everyone else gets `source_descriptor` — which table, in which format,
+  built from an allowlist. `GET /sources` omits `config` entirely below admin. A source is
+  admin-authored and editor-read, so the crossing runs through the middle of the
+  record: an editor keeps the Laurelin-owned facts — name, connector kind,
+  target dataset, last sync time and status, and a structured `Failure` when it
+  went wrong — and the connection config is not disclosed at all. Not a better
+  denylist over somebody else's config vocabulary; the absence of one. The
+  Sources table says "admin only" in that column rather than drawing a blank,
+  which reads as "no source configured" and ends with someone retyping a DSN.
+- The credential gates on `PUT /dashboards/{name}` and `PUT /schedules/{name}`
+  are now non-blocking **warnings** in the response body rather than a 400. The
+  matcher is an authoring hint; nothing's confidentiality depends on it being
+  right, so being wrong should cost an editor a banner, not a legitimate save.
+
+`tests/test_redaction.py::test_the_authoring_hint_is_not_load_bearing` deletes
+the matcher — monkeypatching `credential_in_free_text` to `lambda v: False` —
+and re-runs the leak battery. It passes.
+
+See also `SECURITY.md`: the server log is now the one place driver text lives,
+which makes your log sink's readership a deployment decision.
+
+**The UI, and three defects that only appeared once it was driven.** Every
+withheld value now states that it is withheld and which role receives it —
+"admin only" in a connector's From column, "editor only" on a build's
+expectations, a boxed explanation where a federated dataset's endpoint used to
+be. A blank is the one rendering that is not allowed: "nothing configured" is
+what an operator reads from an empty field, and their next move is to type the
+credential in again. Structured failures render as a code, an endpoint, a phase
+and a `grep err-…` handle, so "the credential was never tested" and "the
+endpoint refused the credential" remain one glance apart. The sidebar no longer
+offers Transforms or Schedules to a viewer, and both pages say why if reached
+directly.
+
+Driving it as a real viewer found three things reading it did not:
+
+- **Object-backed dashboard panels rendered as an empty box for everyone.** The
+  run route returned `{groups, group_count, truncated}` for an object panel and
+  `{columns, rows, row_count, truncated}` for a SQL one; the browser used to
+  reconcile the two by deriving column names from the panel's own `group_by`
+  and `metrics` — exactly the fields R2 stops sending. The route now normalizes
+  both to one shape.
+- **An object app silently showed the *unscoped* list.** `ObjectAppInfo.filters`
+  is OPERATIONAL, and the client was the thing applying it, so "Aircraft in
+  maintenance" listed every aircraft. New `GET /apps/{name}/objects` (VIEWER)
+  applies the *stored* filters server-side and still resolves rows under the
+  caller's own permissions — the same shape as the panel run route.
+- **A dead Flight SQL engine reported "could not classify this one."** The ADBC
+  driver connects lazily, so a refused endpoint surfaces from `query()` and
+  never meets the connect pre-flight. `POST /engines/{name}/test` now re-probes
+  when nothing else classified it, and adopts the answer only when the endpoint
+  is genuinely unusable — a socket that opened and a query that failed is not an
+  authentication problem, and saying so would send an operator to rotate a
+  credential that is fine.
+
+### Fixed: nineteen defects from a fourth adversarial pass, all in the R1/R2 change itself
+
+R1 and R2 were attacked by agents who had written neither. Every entry was
+reproduced on a running server before it was fixed, and every fix was reverted
+and watched to fail its own regression test before being restored.
+
+The pattern behind most of them is one thing, not nineteen: **R1 and R2 were
+applied to the read path, and the error path is a read path too.** A stored
+instruction that a viewer may not read comes straight back out of the 400 that
+says the instruction is broken.
+
+**The last place confidentiality still rested on the free-text matcher.**
+
+- **An EDITOR read five live credentials out of `GET /datasets/{name}`.**
+  `DatasetInfo` is editor-authored, but `DatasetInfo.source` is written only by
+  the three ADMIN registration routes — so the field crossed a privilege
+  boundary inside a record that did not, and the only thing in the way was
+  `redaction.redact_mapping` → `redact_value` → `keyword_credential`. Measured,
+  through the real front door: `password='…'` (quoted, so `_KEYWORD_SECRET_RE`
+  missed it), `Pwd='…'`, `Password:…`, a bare AWS key pair and a positional
+  JDBC URL all shipped verbatim. One case was withheld, and only because the
+  matcher happened to fire. Adding a quote defeated the boundary.
+
+  Fields can now declare an authoring role above their record's
+  (`audience.AuthoredBy`), so `source` reaches admin and nobody else. What an
+  editor and a viewer get instead is `DatasetInfo.source_descriptor` — which
+  table, in which format — built by Laurelin from an **allowlist of shape keys**
+  with an identifier-shaped gate on every value. A key not on the list is absent
+  whatever it is called; a value that is not identifier-shaped is absent
+  whatever it contains. That question is decidable. "Does this contain a
+  credential" is not, and nothing's confidentiality depends on it any more.
+
+**Stored instructions coming back out of error paths.**
+
+- **`POST /dashboards/{name}/panels/{panel_id}/run` was an oracle for the panel
+  fields it withholds.** The SQL branch was converted; the object branch three
+  lines below it was not. As a plain viewer, against panels an editor saved:
+  `400 "Unknown group_by property 'postgresql://svc:…@internal-db:5432/x'"`,
+  and the same for `metrics[].property` and `metrics[].op`. Each of those
+  sentences is Laurelin's own, so R1 was satisfied and R2 was not: structure
+  fixes R1's problem, only privilege fixes R2's. The message that names the
+  offending field now goes to a principal who could have authored the panel;
+  everyone else gets a `Failure` with a new `definition_stale` code and a
+  `detail_ref`.
+- **The same route 500'd on an ordinary dropped column.** It caught `ValueError`
+  only, and `duckdb.BinderException` is not one — so a viewer's dashboard became
+  a bare "Internal Server Error" with no code, no reference and nothing to act
+  on. That is the empty box the whole R2 design is meant to avoid.
+- **`GET /apps/{name}/objects` quoted an app's admin-authored `filters` back to
+  a viewer.** Write-time validation closes this on day one and not on day two:
+  rename a property in `ontology/*.yml` — an ordinary admin act — and the next
+  viewer to open the app read the stale filter's name out of a 400. Note that
+  this route was *added* by R2, to stop the client applying the filters: the
+  instruction moved server-side and its text came back out the error path.
+- **`POST /sources/{name}/sync` returned the admin's endpoint in its 502.** The
+  route has no `dependencies=[...]`; its only gate is `_require_dataset_edit`,
+  which a plain editor always passes and a viewer passes with an explicit
+  `can_edit` grant. Both read `"The host for source:crm could not be resolved at
+  secret-db.internal.corp:55999"` while their own `GET /sources/crm` correctly
+  carries no `config` at all. `HTTPException(detail=…)` never passes through
+  `serialize.dump`, so R2 had no jurisdiction over it until asked:
+  `serialize.detail_for` now renders in full above the level that authored the
+  configuration and briefly below it. Reach included MCP, which surfaces a 502
+  `detail` verbatim into `LaurelinError`.
+
+**The two global exception handlers were a standing bypass of R1.**
+
+- **An EDITOR read the operator's S3 warehouse credential out of a 400.**
+  `@app.exception_handler(ValueError)` turns any uncaught exception of that type
+  into a response body carrying that library's raw words — and
+  `pyarrow.lib.ArrowInvalid` **is** a `ValueError`, `ArrowKeyError` **is** a
+  `KeyError`. Uploading a CSV to an Iceberg dataset with an `s3://KEY:SECRET@…`
+  warehouse returned `{"detail": "Not a valid bucket name:
+  'AKIAICESENT:ICESENTINELKEY@icebucket'"}`. R1 was being honoured catch site by
+  catch site, with no net underneath. `failure.is_first_party` decides on the
+  **deepest traceback frame** — where the `raise` is written, which is a fact,
+  rather than on the exception's type, which is not — and anything else becomes
+  a `Failure`.
+- The same rule now applies to the route-level catches *above* that net.
+  `failure.safe_detail` replaced every `HTTPException(detail=str(exc))` in the
+  API: a no-op when Laurelin raised the exception, a `Failure` when a library
+  did. Most of those blocks catch first-party validation and echo the caller's
+  own input, but several wrap a call into pyiceberg or pyarrow — the same
+  mechanism as the disclosure above, one level down.
+- **`FederationError` had no handler at all**, so `GET /datasets/{name}/rows`
+  500'd for every role the moment an upstream table was renamed away. Nothing
+  leaked (Starlette's 500 is bare) but the message it would have carried
+  interpolated DuckDB's `LINE 1:` echo of the `postgres_scan(...)` call, and
+  therefore the DSN, twice. Now a 502 with a structured failure.
+
+**The audit trail: two mechanisms answering one question, and the second
+cancelling the first.**
+
+- **`GET /audit/mine` (VIEWER) re-attached the raw details bag** with an explicit
+  `| {"details": entry.details}` override, in the module that defines the single
+  serialization point. Its justification — "the details came from their own
+  request" — is false by construction for a whole class of rows: a viewer
+  triggering a sync supplies a *name*, and Laurelin builds the rest of the bag
+  from an admin's connector config. A viewer read a whole `Failure` this way:
+  endpoint, driver, `detail_ref` and rendered message.
+- **The same route bypassed the migration's fail-closed default.**
+  `_migrate_failures` stamps every pre-existing row `admin` precisely because
+  "the rows were written by callers who had no idea who would read them", and
+  `list_audit`'s `actor` branch skipped that filter. Reproduced: a user demoted
+  from editor to viewer read a live DSN and password out of a migrated row.
+- **`min_read_role=Role.editor` was inert.** `list_audit` chose which rows an
+  editor saw and then the serializer dropped `details` from every one of them,
+  because `AuditEvent` is class-level admin. All five declarations in the tree
+  were dead code, each with a comment asserting a disclosure that did not
+  happen — while `/audit/mine` handed a viewer the same bag whole. The privilege
+  ordering was inverted. A row's `min_read_role` is now that record's author
+  role, so one mechanism decides which rows are offered and the same declaration
+  decides how much of each is filled in. Writers put `Failure.audit_projection()`
+  in the bag rather than the whole record, because `details` is an open dict and
+  the serializer cannot reach inside it.
+
+**Serialization.**
+
+- **Recursion widened instead of narrowing.** A `Failure` (editor-authored)
+  nested in a `SourceInfo` (admin-authored) was dumped in **full** to an editor
+  who had correctly been given only the projection of its parent — restoring the
+  admin's `endpoint`, which is rebuilt from the one field
+  `source_routes._public` exists to withhold. Descending into a record can now
+  only ever disclose less, and `Failure.endpoint` declares `AuthoredBy(admin)`
+  besides.
+- **The "one serialization point" was not one.** `routes.py:461` and five sites
+  in `auth_routes.py` called `model_dump` directly, and the guard meant to catch
+  that allowlisted three files wholesale — including the two they were in.
+  Nothing leaked, because every field involved happened to be PRESENTATION; both
+  were unannotated paths where a field added tomorrow ships. The guard is
+  per-line now, and the opt-out is an inline `# serialize-ok:` marker with a
+  reason. `as_author`, R2's deliberate escape hatch, had **no production caller
+  at all**, so the test policing it passed vacuously; `laurelin/cli.py` uses it
+  for real.
+
+**Product breakage introduced by the fix.**
+
+- **`_preserve_operational` made a panel's operational fields un-clearable.** It
+  inherited a stored value whenever the submitted one was falsy, which cannot
+  tell "the client omitted this key" from "the editor cleared it". An editor
+  clearing `group_by` got `200` and the old value back — a write silently
+  rejected with a success status — and converting a SQL panel to an object panel
+  was unreachable, returning `400 "A panel draws from either sql or object_type,
+  not both"` about text the server had just re-inserted. Absence is the signal
+  now, which is exactly what `serialize._projection` produces, because it omits
+  operational keys rather than blanking them.
+- **`Failure.driver` named the wrong library on two paths.**
+  `_driver_failure` hardcoded `duckdb` and also serves the ClickHouse and
+  StarRocks routes, so a `chdb` failure was filed under duckdb; and the `http`
+  connector claimed `requests` while `_pull_http` uses `urllib.request`. Not a
+  disclosure — but `driver` exists so an operator knows whose log line to read,
+  and a closed set populated wrongly is worse than an empty one. Read off the
+  raising class's module now, which is a fact.
+
+**The guard that was supposed to catch all of this inspected 24 of 144 routes.**
+It swept GET only, treated a 200 as the only body worth checking, and silently
+`continue`d past any route that 404'd — so 78 non-GET routes were outside it by
+construction, three of the disclosures above were in **4xx** bodies, one was on a
+**POST**, one was only visible to an *editor* (it only ever logged in as a
+viewer), and `GET /dashboards/{name}` — the route that leaked in all three
+previous rounds — was never checked once, because the fixture's dashboard was
+called `board` while `PATH_PARAMS["name"]` said `sales`. Two probe routes added
+to prove it both returned panel SQL to a viewer with the suite fully green.
+
+It now drives **every method of every route at two privilege levels** and asserts
+on the body whatever the status code is; every seeded record shares one name so a
+single parameter addresses all of them; and a GET that 404s even for an admin
+fails a companion test unless it is listed with a reason.
+
+**Known and accepted, not fixed.** An editor's chosen *captions* reach a viewer
+by design — a panel's `title`, and the `alias` on a metric, which becomes the
+column header a viewer reads. An editor who puts a credential in a column header
+has disclosed it to their own audience deliberately, the same way they would by
+putting it in the panel title. The invariant the guard states is about
+*instructions* — `sql`, `group_by`, `filters`, `search`, metric `op` and
+`property` — not about labels. See `SECURITY.md`.
+
 ### Fixed: eighteen defects from a third adversarial pass
 
 The two rounds below were attacked again by agents who had written none of the

@@ -29,12 +29,23 @@ from typing import Any, Optional, Protocol
 import pyarrow as pa
 
 from laurelin.core import redaction
+from laurelin.core.failure import Failure, Phase, connect_failure
 
 ENGINE_TYPES = ("flightsql",)
 
 
 class EngineError(RuntimeError):
-    """A delegated engine could not be reached, or rejected the query."""
+    """A delegated engine could not be reached, or rejected the query.
+
+    Carries a :class:`~laurelin.core.failure.Failure`; ``str()`` renders it.
+    UNVERIFIED on this tree what `adbc_driver_flightsql` prints — the extra is
+    not installed in this venv — which is exactly why the message may not be
+    stored: an unverified format is an unbounded format.
+    """
+
+    def __init__(self, message: str = "", failure=None):
+        self.failure = failure
+        super().__init__(failure.render() if failure is not None else message)
 
 
 class EngineClient(Protocol):
@@ -122,15 +133,19 @@ class FlightSQLClient:
                 "pip install 'laurelin[engines]'"
             ) from exc
 
+        self._name, self._uri = config.name, config.uri
         db_kwargs = dict(config.options or {})
         db_kwargs.setdefault(DatabaseOptions.TIMEOUT_QUERY.value, str(timeout_s))
         try:
             self._con = flight_sql.connect(config.uri, db_kwargs=db_kwargs)
         except Exception as exc:  # noqa: BLE001 - driver raises many types
-            raise EngineError(
-                f"Could not connect to engine {config.name!r} at "
-                f"{_redact_uri(config.uri)}: {exc}"
-            ) from exc
+            # R1: `{exc}` here was the driver's own sentence. A Flight SQL
+            # "unauthenticated: invalid token <token>" carries the token, and
+            # `config.options` can hold a `Bearer` header the driver echoes.
+            raise EngineError(failure=connect_failure(
+                exc, subject=f"engine:{config.name}", driver="adbc_flightsql",
+                dsn=config.uri, config=config.options,
+            )) from exc
 
     def query(self, sql: str, params: Optional[list] = None) -> pa.Table:
         try:
@@ -138,7 +153,10 @@ class FlightSQLClient:
                 cur.execute(sql, params or None)
                 return cur.fetch_arrow_table()
         except Exception as exc:  # noqa: BLE001
-            raise EngineError(f"Engine rejected the query: {exc}") from exc
+            raise EngineError(failure=Failure.from_exception(
+                exc, phase=Phase.execute, subject=f"engine:{self._name}",
+                driver="adbc_flightsql", dsn=self._uri,
+            )) from exc
 
     def close(self) -> None:
         try:

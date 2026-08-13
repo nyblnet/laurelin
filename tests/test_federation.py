@@ -334,3 +334,48 @@ def test_cannot_shadow_a_managed_dataset(tmp_path):
     r = client.put("/api/v1/datasets/owned/federated",
                    json={"source": {"type": "parquet", "path": str(remote)}})
     assert r.status_code == 409
+
+
+def test_a_broken_federated_scan_is_a_502_with_a_structured_failure(tmp_path):
+    """`FederationError` had no handler anywhere, so `GET /datasets/{name}/rows`
+    500'd for **every** role the moment an upstream table went away — the
+    ordinary case.
+
+    Starlette's bare 500 disclosed nothing, which is why this is filed low; what
+    makes it worth fixing is the message it *would* have carried.
+    `catalog.source_table` built `f"Scan of {name!r} failed: {exc}"`, and
+    DuckDB's postgres extension echoes the offending statement in a `LINE 1:`
+    block, so a DSN inside `postgres_scan(...)` appeared twice in that string.
+    One handler added above it would have shipped it. Structured, and handled.
+    """
+    import pyarrow.parquet as pq
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core.config import Workspace
+    from laurelin.core.db import MetadataStore
+
+    creds = {"username": "root", "password": "trustno1!"}
+    parquet = tmp_path / "rows.parquet"
+    pq.write_table(pa.table({"a": [1, 2]}), parquet)
+
+    ws = Workspace.init(tmp_path / "ws", name="fed")
+    DatasetCatalog(ws, MetadataStore(ws.metadata_path))
+    app = create_app(ws)
+    admin = TestClient(app, raise_server_exceptions=False)
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    assert admin.put("/api/v1/datasets/remote/federated", json={
+        "source": {"type": "parquet", "path": str(parquet)}, "description": "d",
+    }).status_code == 200
+    assert admin.get("/api/v1/datasets/remote/rows?limit=5").status_code == 200
+
+    # The upstream file goes away. Nothing else changes.
+    parquet.unlink()
+    r = admin.get("/api/v1/datasets/remote/rows?limit=5")
+    assert r.status_code == 502, r.status_code
+    body = r.json()["detail"]
+    assert "err-" in body, body
+    # DuckDB's own sentence, and the path it echoes, stay in the log.
+    assert str(parquet) not in body, body

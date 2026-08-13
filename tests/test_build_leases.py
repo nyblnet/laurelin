@@ -61,7 +61,9 @@ def test_reaper_fails_abandoned_builds(store):
     reaped = store.reap_expired_builds()
     assert reaped == [dead.id]
     assert store.get_build(dead.id).status == BuildStatus.failed
-    assert "stopped responding" in store.get_build(dead.id).error
+    reaped_failure = store.get_build(dead.id).failure
+    assert reaped_failure is not None
+    assert reaped_failure.subject == f"build:{dead.id}"
     # The healthy build is untouched.
     assert store.get_build(alive.id).status == BuildStatus.pending
 

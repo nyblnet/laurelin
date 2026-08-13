@@ -18,6 +18,7 @@ import pytest
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.failure import Failure, FailureCode
 from laurelin.core.models import Role, SourceInfo, User
 from laurelin.export import (
     ExportOptions,
@@ -76,8 +77,13 @@ def ws(tmp_path):
         },
         created_by="andy",
     ))
-    store.record_source_sync("feed", status="error", error="could not connect to "
-                             "postgresql://alice:p@sswd@db.internal/prod")
+    # R1: the store takes a Failure, not a string. There is no longer a
+    # parameter here that a driver's sentence fits into — which is the whole
+    # point, and is why this line changed shape rather than value.
+    store.record_source_sync("feed", status="error", failure=Failure(
+        code=FailureCode.AUTH_REJECTED, subject="source:feed",
+        endpoint="db.internal:5432", driver="psycopg",
+    ))
 
     store.upsert_engine(
         "trino", "flightsql", "grpc+tls://alice:p@sswd@db.internal:443",
@@ -153,15 +159,16 @@ def test_sessions_and_oidc_flows_have_no_member_in_the_archive(ws, store, tmp_pa
     assert b"verifier-hunter2" not in raw
 
 
-def test_an_error_message_is_nulled_because_no_redactor_covers_free_text(
+def test_a_failure_record_is_nulled_because_the_archive_needs_no_failure_history(
     ws, store, tmp_path
 ):
-    """starrocks.py:207 documents that driver error text carries connection
-    parameters, and a denylist over free-form prose is not a control."""
+    """Under R1 nothing free-form is stored to begin with — a `Failure` is safe
+    by construction. The export nulls it anyway, because the archive is a file
+    that leaves the building and a failure record is history, not state."""
     manifest = preview_manifest(ws, store, ExportOptions())
-    assert manifest.nulled_error_fields.get("sources.last_sync_error") == 1
+    assert manifest.nulled_error_fields.get("sources.last_sync_failure_json") == 1
     raw = _archive(ws, store, tmp_path)
-    assert b"could not connect" not in raw
+    assert b"auth_rejected" not in raw
 
 
 def test_the_manifest_names_every_withheld_field_and_where_to_resupply_it(ws, store):

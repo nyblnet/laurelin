@@ -6,15 +6,27 @@ import { useQuery } from "@tanstack/react-query";
 import { API, api } from "./api";
 import { useAuth } from "./auth";
 import { TreeGlyph } from "./brand";
-import type { WorkspaceInfo } from "./types";
+import type { Role, WorkspaceInfo } from "./types";
 import { Badge } from "./ui";
 
-const NAV = [
+// `needs` is the role the page's *own* endpoints require, so the sidebar never
+// offers a link whose only possible outcome is a 403 in a red box.
+//
+// R2 raised two of these. `/transforms` reads pipeline files, which are exec'd
+// Python — writing one is code-execution-equivalent, so reading one is now
+// editor-gated too. `/schedules` was always editor. `/audit` stays for
+// everyone because the viewer's half of it is real: `GET /audit/mine` shows
+// what *you* did, and you cannot learn a secret from a row you wrote.
+//
+// `/pipeline` deliberately stays viewer: lineage and build history are names,
+// edges and statuses — the viewer's legitimate need — and none of it is
+// authored prose.
+const NAV: { to: string; label: string; needs?: Role }[] = [
   { to: "/datasets", label: "Datasets" },
   { to: "/dashboards", label: "Dashboards" },
   { to: "/pipeline", label: "Pipeline" },
-  { to: "/schedules", label: "Schedules" },
-  { to: "/transforms", label: "Transforms" },
+  { to: "/schedules", label: "Schedules", needs: "editor" },
+  { to: "/transforms", label: "Transforms", needs: "editor" },
   { to: "/apps", label: "Apps" },
   { to: "/ontology", label: "Ontology" },
   { to: "/workbench", label: "SQL" },
@@ -56,7 +68,7 @@ export function Layout({ children }: { children: ReactNode }) {
         )}
 
         <nav className="nav">
-          {NAV.map((n) => (
+          {NAV.filter((n) => !n.needs || auth.can(n.needs)).map((n) => (
             <NavLink
               key={n.to}
               to={n.to}
@@ -84,7 +96,11 @@ export function Layout({ children }: { children: ReactNode }) {
           {ws && (
             <>
               <div className="ws-name">{ws.name}</div>
-              <div className="path">{ws.root}</div>
+              {/* Admin only. `root` is the server's filesystem layout —
+                  deployment information a viewer cannot act on and was never
+                  meant to have — so the API omits it and this row disappears
+                  rather than rendering an empty line. */}
+              {ws.root && <div className="path">{ws.root}</div>}
             </>
           )}
           <UserFooter />

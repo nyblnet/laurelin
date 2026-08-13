@@ -189,3 +189,94 @@ def test_app_objects_come_from_the_ordinary_ontology_endpoints(clients):
     assert r.status_code == 200
     tails = {o["tail_number"] for o in r.json()["objects"]}
     assert tails == {"N1", "N3"}, "the app's filter scopes it to maintenance"
+
+
+# -- the app's scope has to survive not being readable ---------------------------
+#
+# `ObjectAppInfo.filters` is a filter expression — an instruction, not a caption
+# — so R2 makes it OPERATIONAL on an admin-authored record and nobody below
+# admin receives it. The client was the thing applying it, by turning `filters`
+# into `?filter.status=...`. Found by opening the app as a viewer: with the
+# filters withheld, "Aircraft in maintenance" quietly listed every aircraft.
+#
+# The fix is the same shape as the dashboard panel's run route: the server holds
+# the instruction and applies it, and the caller's own permissions decide the
+# rows. Which is why these two tests are the pair — one proves the scope holds,
+# the other proves the app still grants nothing.
+
+def test_an_app_scopes_its_objects_for_a_reader_who_cannot_read_the_filters(clients):
+    admin, viewer, _ = clients
+    admin.put("/api/v1/apps/fleet_ops", json=APP)
+
+    # The premise: this reader is not given the rule.
+    assert "filters" not in viewer.get("/api/v1/apps/fleet_ops").json()
+    # ...and the generic route, which is what the client used to call, is
+    # unscoped. This is the wrong answer the app must not show.
+    unscoped = viewer.get("/api/v1/ontology/objects/aircraft").json()
+    assert {o["tail_number"] for o in unscoped["objects"]} == {"N1", "N2", "N3"}
+
+    scoped = viewer.get("/api/v1/apps/fleet_ops/objects").json()
+    assert {o["tail_number"] for o in scoped["objects"]} == {"N1", "N3"}
+    assert scoped["total"] == 2
+
+
+def test_the_app_objects_route_grants_no_access_of_its_own(clients):
+    """An app is a presentation of an object type, never a side door into it."""
+    admin, viewer, _ = clients
+    admin.put("/api/v1/apps/fleet_ops", json=APP)
+    admin.put("/api/v1/datasets/fleet/permissions", json={"grants": [
+        Grant(subject_kind=SubjectKind.user, subject="root",
+              can_view=True).model_dump(mode="json")
+    ]})
+    assert viewer.get("/api/v1/apps/fleet_ops/objects").status_code == 403
+
+
+def test_a_caller_cannot_widen_an_apps_scope_through_the_query_string(clients):
+    """The filters are read from the stored definition and from nowhere else, so
+    a hand-written request cannot reach past them."""
+    admin, viewer, _ = clients
+    admin.put("/api/v1/apps/fleet_ops", json=APP)
+    r = viewer.get("/api/v1/apps/fleet_ops/objects?filter.status=active")
+    assert {o["tail_number"] for o in r.json()["objects"]} == {"N1", "N3"}
+
+
+def test_search_within_an_app_composes_with_its_filters(clients):
+    """Narrowing is the user's half; scoping is the app's. Both apply."""
+    admin, viewer, _ = clients
+    admin.put("/api/v1/apps/fleet_ops", json=APP)
+    r = viewer.get("/api/v1/apps/fleet_ops/objects?search=N3")
+    assert {o["tail_number"] for o in r.json()["objects"]} == {"N3"}
+
+
+def test_a_stale_app_filter_is_not_quoted_back_to_a_viewer(clients):
+    """`GET /apps/{name}/objects` is VIEWER-gated and applies the app's stored,
+    ADMIN-authored filters server-side — which is why R2 added it. Its failure
+    path handed part of that instruction straight back.
+
+    Write-time validation rejects an unknown filter key with a 400, which closes
+    this on day one and not on day two: rename a property in `ontology/*.yml`
+    and the next viewer to open the app got
+
+        400 {"detail": "Unknown filter property 'acquisition_programme' for …"}
+
+    naming a filter the same viewer's `GET /apps/{name}` correctly omits. The
+    drift is simulated here the only way it happens in production: the stored
+    definition outlives the ontology it was validated against.
+    """
+    from laurelin.core.models import ObjectAppInfo
+
+    admin, viewer, store = clients
+    marker = "acquisition_programme_S3KRET"
+    store.upsert_object_app(ObjectAppInfo(
+        name="ops", title="Ops", object_type="aircraft",
+        columns=["tail_number"], filters={marker: "x"}, created_by="root",
+    ))
+    # The read path is right: the filter is OPERATIONAL on an admin-authored
+    # record, so a viewer never receives it.
+    assert marker not in viewer.get("/api/v1/apps/ops").text
+
+    r = viewer.get("/api/v1/apps/ops/objects")
+    assert r.status_code == 400, r.text
+    assert marker not in r.text, r.text[:300]
+    # An admin can repair it, so an admin is told which key is stale.
+    assert marker in admin.get("/api/v1/apps/ops/objects").text

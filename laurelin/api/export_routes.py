@@ -246,6 +246,8 @@ def preview_export(
         {"metadata_only": metadata_only, "datasets": len(manifest.datasets)},
         actor=actor,
     )
+    # serialize-ok: an export manifest is not a Governed record; every export
+    # route is AdminDep and `manifest.py` withholds credentials itself.
     return manifest.model_dump(mode="json") | {
         "estimated_parts": len(parts),
         "estimated_part_bytes": sum(parts.values()),
@@ -391,6 +393,7 @@ def _save_report(workspace: Workspace, report: ImportReport) -> None:
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}")
     fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as fh:
+        # serialize-ok: written 0600 to the operator's own filesystem, admin-gated.
         json.dump(report.model_dump(mode="json"), fh, indent=2)
     os.replace(tmp, path)
 
@@ -433,6 +436,7 @@ def _run_import(
             status_code=409, detail=_explain_refusal(workspace, store, exc)
         ) from None
     _save_report(workspace, report)
+    # serialize-ok: an import report, admin-gated, not a Governed record.
     return report.model_dump(mode="json")
 
 

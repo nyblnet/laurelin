@@ -25,6 +25,7 @@ import {
   ErrorBox,
   PageHeader,
   Spinner,
+  Withheld,
   fmtCount,
   fmtValue,
 } from "../ui";
@@ -128,20 +129,21 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
       api.get<ObjectTypeDetail>(`${API}/ontology/object-types/${app.object_type}`),
   });
 
-  const filterParams = Object.entries(app.filters)
-    .map(([k, v]) => `filter.${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-
   const objectsQ = useQuery({
     // Prefixed ["objects", <type>] so applying an action invalidates this list
     // too — otherwise an aircraft returned to service would linger in the
     // maintenance queue it no longer belongs to.
     queryKey: ["objects", app.object_type, app.name, debounced, offset],
+    // The app's own route, not the generic one. Its filters are OPERATIONAL
+    // under R2 and are not sent to anyone below admin — and this client used to
+    // be the thing applying them, so without them it would have shown the whole
+    // object type while still calling itself "Aircraft in maintenance".
+    // The server holds the filters and applies them; the caller's permissions
+    // still decide the rows.
     queryFn: () =>
       api.get<ObjectQueryResult>(
-        `${API}/ontology/objects/${app.object_type}?limit=${PAGE}&offset=${offset}` +
-          (debounced ? `&search=${encodeURIComponent(debounced)}` : "") +
-          (filterParams ? `&${filterParams}` : ""),
+        `${API}/apps/${encodeURIComponent(app.name)}/objects?limit=${PAGE}&offset=${offset}` +
+          (debounced ? `&search=${encodeURIComponent(debounced)}` : ""),
       ),
   });
 
@@ -162,7 +164,11 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
       ? type.links.filter((l) => app.links.includes(l.api_name))
       : type.links;
 
-  const activeFilters = Object.entries(app.filters);
+  // Present for an admin, absent for everyone else. Both cases have to say
+  // something: "this list is a slice" is a fact about what you are reading, and
+  // an unlabelled slice is worse than a labelled one you cannot fully read.
+  const activeFilters = Object.entries(app.filters ?? {});
+  const filtersWithheld = app.filters === undefined;
 
   return (
     <div>
@@ -174,18 +180,32 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
         subtitle={app.description || undefined}
       />
 
-      {activeFilters.length > 0 && (
-        <div
-          className="dim"
-          style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}
-        >
-          <span style={{ fontSize: 12.5 }}>Scoped to</span>
-          {activeFilters.map(([k, v]) => (
-            <Badge key={k} tone="blue">
-              {k} = {v}
-            </Badge>
-          ))}
-        </div>
+      {(filtersWithheld || activeFilters.length > 0) && (
+      <div
+        className="dim"
+        style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}
+      >
+        {filtersWithheld ? (
+          <>
+            <span style={{ fontSize: 12.5 }}>Scoped by this app</span>
+            <Withheld
+              what="An app's filter expressions"
+              role="admin"
+              label="filters not shown"
+              why="They are applied server-side, so this list is scoped whether or not you can read the rule."
+            />
+          </>
+        ) : (
+          <>
+            <span style={{ fontSize: 12.5 }}>Scoped to</span>
+            {activeFilters.map(([k, v]) => (
+              <Badge key={k} tone="blue">
+                {k} = {v}
+              </Badge>
+            ))}
+          </>
+        )}
+      </div>
       )}
 
       <div className="toolbar">

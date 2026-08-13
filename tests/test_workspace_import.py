@@ -20,6 +20,7 @@ import pytest
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.failure import Failure, FailureCode
 from laurelin.core.models import (
     EditKind,
     Grant,
@@ -323,7 +324,11 @@ def test_imported_schedules_land_disabled_and_keep_their_watermark(
         name="nightly", enabled=True, trigger="on_upstream",
         upstream_dataset="sales", action="build", targets=["derived"],
         watermark=7, created_at="2026-01-01T00:00:00Z", created_by="andy",
-        last_status="ok", last_error="connect failed to db.internal",
+        last_status="ok",
+        last_failure=Failure(
+            code=FailureCode.ENDPOINT_UNREACHABLE, subject="schedule:nightly",
+            endpoint="db.internal:5432",
+        ),
         next_run_at="2026-01-02T00:00:00Z",
     ))
     _roundtrip(source, target, tmp_path)
@@ -332,7 +337,9 @@ def test_imported_schedules_land_disabled_and_keep_their_watermark(
     assert landed.enabled is False
     assert landed.watermark == 7
     assert landed.next_run_at is None
-    assert landed.last_error is None
+    # A `Failure` is safe by construction, but the export is a file that leaves
+    # the building and there is no reason for it to carry failure history.
+    assert landed.last_failure is None
 
 
 def test_the_object_index_is_rebuilt_rather_than_imported(source, target, tmp_path):

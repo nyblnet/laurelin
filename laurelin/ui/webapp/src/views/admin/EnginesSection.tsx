@@ -9,7 +9,16 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
-import { Badge, EmptyState, ErrorBox, RedactedValue, Spinner } from "../../ui";
+import type { Failure } from "../../types";
+import {
+  Badge,
+  EmptyState,
+  ErrorBox,
+  FailureBadge,
+  FailureNote,
+  RedactedValue,
+  Spinner,
+} from "../../ui";
 import { InlineError } from "./shared";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -94,34 +103,33 @@ function TestButton({ name }: { name: string }) {
   // A "does it work" probe matters more here than anywhere: an engine's whole
   // job is to be reachable, and the alternative to testing it is finding out
   // when a 2am build fails.
+  //
+  // R1 changed what comes back. It used to be `redact_text(str(exc))` — a
+  // shape-matcher over a driver's prose that, when it could not tell, replaced
+  // the whole message with "***** (withheld)" and left the operator with no
+  // diagnostic at all. Now it is a classification plus a log reference: better
+  // in both directions, because nothing of the driver's is returned *and* the
+  // operator gets a code they can act on.
   const test = useMutation({
     mutationFn: () =>
-      api.post<{ ok: boolean; detail?: string; withheld?: boolean }>(
+      api.post<{ ok: boolean; failure?: Failure; detail?: string }>(
         `${API}/engines/${name}/test`,
         {},
       ),
   });
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-      <button className="small" disabled={test.isPending} onClick={() => test.mutate()}>
-        {test.isPending ? "Testing…" : "Test"}
-      </button>
-      {test.data?.ok && <Badge tone="green">reachable</Badge>}
-      {test.data && !test.data.ok && (
-        <span
-          // The driver's own words when they were safe to repeat. When they
-          // were not, the server says so rather than showing a half-read
-          // message — the full text is in the server log.
-          title={
-            test.data.withheld
-              ? "The engine's error text was withheld: it could not be redacted safely, so none of it was sent. The full message is in the server log."
-              : test.data.detail
-          }
-          className="mono"
-          style={{ color: "var(--red)", fontSize: 12 }}
-        >
-          unreachable{test.data.withheld ? " (details withheld)" : ""}
-        </span>
+    <span style={{ display: "grid", gap: 6, justifyItems: "start" }}>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <button className="small" disabled={test.isPending} onClick={() => test.mutate()}>
+          {test.isPending ? "Testing…" : "Test"}
+        </button>
+        {test.data?.ok && <Badge tone="green">reachable</Badge>}
+        {test.data && !test.data.ok && test.data.failure && (
+          <FailureBadge failure={test.data.failure} />
+        )}
+      </span>
+      {test.data && !test.data.ok && test.data.failure && (
+        <FailureNote failure={test.data.failure} />
       )}
     </span>
   );

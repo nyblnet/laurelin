@@ -35,6 +35,7 @@ from laurelin.core import clickhouse, federation, limits, metrics, starrocks
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.dialects import CLICKHOUSE, DUCKDB, STARROCKS
+from laurelin.core.failure import Failure, Phase
 from laurelin.core.models import ColumnSchema, DatasetInfo, DatasetVersionInfo
 from laurelin.core.permissions import PolicyRenderError
 from laurelin.core.storage import storage_for
@@ -1066,9 +1067,15 @@ class DatasetCatalog:
         except federation.FederationError:
             raise
         except duckdb.Error as exc:
-            raise federation.FederationError(
-                f"Scan of {name!r} failed: {exc}"
-            ) from exc
+            # `f"Scan of {name!r} failed: {exc}"` stood here. DuckDB's
+            # postgres extension echoes the offending statement in a `LINE 1:`
+            # block, so a DSN inside `postgres_scan(...)` appeared *twice* in
+            # that string — and nothing caught `FederationError` on
+            # `GET /datasets/{name}/rows`, so it 500'd for every role the moment
+            # an upstream table was renamed away. Structured, and handled.
+            raise federation.FederationError(failure=Failure.from_exception(
+                exc, phase=Phase.execute, driver="duckdb", subject=f"dataset:{name}",
+            )) from exc
         finally:
             reader.close()
 

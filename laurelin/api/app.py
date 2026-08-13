@@ -12,6 +12,7 @@ plain Starlette routes with no dependency hooks.
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import time
@@ -35,6 +36,7 @@ from laurelin.api.auth_routes import (
     users_router,
     workspaces_router,
 )
+from laurelin.api.context import WORKSPACE_COOKIE, WORKSPACE_HEADER
 from laurelin.api.engine_routes import engines_router
 from laurelin.api.export_routes import export_router
 from laurelin.api.routes import router
@@ -43,13 +45,21 @@ from laurelin.api.scim_routes import scim_router
 from laurelin.api.source_routes import sources_router
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import logging as laurelin_logging
-from laurelin.core import metrics, scheduler
+from laurelin.core import metrics, scheduler, serialize
 from laurelin.core.auth import AuthService
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
+from laurelin.core.failure import (
+    Failure,
+    Phase,
+    first_party_message,
+    is_first_party,
+)
+from laurelin.core.federation import FederationError
 from laurelin.core.fileperms import mkdir_private
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
+from laurelin.core.models import Role
 from laurelin.export import (
     ExportRefused,
     ImportRefused,
@@ -57,13 +67,35 @@ from laurelin.export import (
     require_pipelines_acknowledged,
 )
 
+log = logging.getLogger("laurelin.api")
+
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "ui" / "static"
 
 
-def _exc_message(exc: BaseException) -> str:
-    if exc.args and isinstance(exc.args[0], str):
-        return exc.args[0]
-    return str(exc)
+# Kept as a name because a dozen handlers below call it; the implementation
+# moved to core/failure.py so `routes.py` can share it without importing `app`.
+_exc_message = first_party_message
+
+
+def _catch_all_detail(exc: BaseException, phase: Phase) -> str:
+    """The body for an exception nobody caught. R1's backstop.
+
+    These two handlers exist so an ordinary `raise ValueError("...")` in a route
+    becomes a 400 with a useful message. They also, until this change, turned
+    **any** library's exception into a response body carrying that library's raw
+    words, because `pyarrow.lib.ArrowInvalid` is a `ValueError` and
+    `pyarrow.lib.ArrowKeyError` is a `KeyError`. Measured: an editor read the
+    operator's S3 warehouse credential out of a 400 on
+    `POST /datasets/{name}/iceberg`.
+
+    Catch sites are still where a failure should be classified — a `Failure`
+    built here knows nothing about which subject or which phase. This is the
+    net under them, and it fails closed: first-party message, or nothing but a
+    code and a `detail_ref`.
+    """
+    if is_first_party(exc):
+        return _exc_message(exc)
+    return Failure.from_exception(exc, phase=phase, subject="request").render_brief()
 
 
 def _scheduler_targets(app: FastAPI) -> list:
@@ -173,6 +205,57 @@ def _finalize(app: FastAPI) -> FastAPI:
         return st.control if st.mode == "multi" else st.store
 
     @app.middleware("http")
+    async def audience_middleware(request: Request, call_next):
+        """Publish the caller's effective role for the serializer. R2's plumbing.
+
+        Set here, in an async middleware, rather than in a dependency: FastAPI
+        runs sync dependencies and sync handlers in *separate* threadpool
+        context copies, so a ContextVar set in a dependency would not reach the
+        handler. Set in a middleware it propagates into every child context —
+        verified on this tree, including sync handlers, which is what all of
+        Laurelin's are.
+
+        Resolution failures are swallowed on purpose. The default is
+        `Role.viewer`, the lowest privilege, so a request whose role cannot be
+        worked out serializes the *least*. Forgetting redacts more, never less;
+        a rule whose failure mode is "too little disclosed" is the only kind
+        that survives a round of attackers.
+        """
+        token = serialize.set_effective_role(_effective_role_for(request))
+        try:
+            return await call_next(request)
+        finally:
+            serialize.reset_effective_role(token)
+
+    def _effective_role_for(request: Request) -> Role:
+        """The caller's role in the active workspace, or viewer if unknown.
+
+        Mirrors `auth_routes.require_user`: in single mode the account role, in
+        multi mode the membership role (admin for a superadmin). It runs before
+        the route's own gate, so it must not raise — a 401 or 403 is that gate's
+        job, and this only decides how much of a *successful* response to fill
+        in.
+        """
+        try:
+            st = request.app.state
+            if st.no_auth:
+                return Role.admin
+            user = resolve_credential(request)
+            if user is None:
+                return Role.viewer
+            if st.mode != "multi":
+                return user.role
+            if user.superadmin:
+                return Role.admin
+            slug = (request.headers.get(WORKSPACE_HEADER)
+                    or request.cookies.get(WORKSPACE_COOKIE))
+            if not slug:
+                return Role.viewer
+            return st.control.member_role(slug, user.username) or Role.viewer
+        except Exception:  # noqa: BLE001 - never fail a request over this
+            return Role.viewer
+
+    @app.middleware("http")
     async def observe(request: Request, call_next):
         """Assign a request id, time the request, and count it by route.
 
@@ -252,11 +335,34 @@ def _finalize(app: FastAPI) -> FastAPI:
 
     @app.exception_handler(KeyError)
     async def key_error_handler(request: Request, exc: KeyError):
-        return JSONResponse(status_code=404, content={"detail": _exc_message(exc)})
+        return JSONResponse(
+            status_code=404, content={"detail": _catch_all_detail(exc, Phase.describe)}
+        )
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError):
-        return JSONResponse(status_code=400, content={"detail": _exc_message(exc)})
+        return JSONResponse(
+            status_code=400, content={"detail": _catch_all_detail(exc, Phase.execute)}
+        )
+
+    @app.exception_handler(FederationError)
+    async def federation_error_handler(request: Request, exc: FederationError):
+        """A scan of a federated table failed and no route caught it.
+
+        `GET /datasets/{name}/rows` 500'd for every role when an upstream table
+        was renamed away — the ordinary case — because `FederationError` had no
+        handler anywhere. Starlette's bare 500 disclosed nothing, but the
+        message it would have carried interpolated DuckDB's sentence, including
+        the `LINE 1:` echo of the `postgres_scan(...)` call and therefore the
+        DSN. A 502 with a `Failure` is both the honest status and the safe body.
+        """
+        failure = getattr(exc, "failure", None) or Failure.from_exception(
+            exc, phase=Phase.execute, subject="dataset"
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"detail": serialize.detail_for(failure, Role.admin)},
+        )
 
     # Resource limits. These are distinguished from ordinary 400s because the
     # remedy differs: narrow the query, versus retry it unchanged.
@@ -331,7 +437,12 @@ def _finalize(app: FastAPI) -> FastAPI:
         try:
             _identity_store().count_users()
         except Exception as exc:  # noqa: BLE001
-            return JSONResponse(status_code=503, content={"status": "unavailable", "detail": str(exc)[:120]})
+            # R1, and this one is unauthenticated: `str(exc)[:120]` handed an
+            # anonymous caller the first 120 characters of whatever the store
+            # driver said, which on a Postgres control plane begins with the
+            # connection string. A readiness probe needs one bit.
+            log.warning("readiness probe failed", exc_info=exc)
+            return JSONResponse(status_code=503, content={"status": "unavailable"})
         return {"status": "ready"}
 
     app.include_router(auth_router, prefix="/api/v1")

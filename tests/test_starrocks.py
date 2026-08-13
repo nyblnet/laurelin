@@ -350,7 +350,11 @@ def test_an_unreachable_server_is_an_error_not_an_empty_read(env):
     catalog, _, _, source = env
     dead = dict(source, url=source["url"].replace(":9030/", ":9031/")
                 .replace(":59030/", ":59031/"))
-    with pytest.raises(starrocks.StarRocksError, match="Could not connect"):
+    # R1: `_redact(exc, password)` used to build this message by substring
+    # substitution, which only worked when the driver quoted the password back
+    # verbatim. Classified now, from the driver's own errno (2003 = refused,
+    # measured against live StarRocks).
+    with pytest.raises(starrocks.StarRocksError, match="Nothing accepted a connection"):
         catalog.register_starrocks("dead", dead)
 
 

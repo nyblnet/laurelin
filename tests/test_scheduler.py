@@ -123,7 +123,14 @@ def test_a_failing_action_is_recorded_and_still_reschedules(store):
 
     info = store.get_schedule("nightly")
     assert info.last_status == "failed"
-    assert "transform exploded" in info.last_error
+    # R1: `_redacted_failure` used to load the schedule's source config and
+    # substring-replace that source's password out of the driver's sentence
+    # before storing it — a correct implementation of a doomed idea, since a
+    # psycopg message can quote a password back *re-escaped*. There is no
+    # sentence now.
+    assert info.last_failure is not None
+    assert info.last_failure.subject == "schedule:nightly"
+    assert "transform exploded" not in info.last_failure.model_dump_json()
     assert info.next_run_at > utcnow_iso(), "must still be scheduled"
     assert "schedule_failed" in [e.action for e in store.list_audit()]
 

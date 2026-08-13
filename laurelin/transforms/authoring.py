@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from laurelin.core.failure import Failure, FailureCode, Phase
 from laurelin.transforms.api import (
     PipelineError,
     TransformRegistry,
@@ -39,8 +40,13 @@ def _validate_module_name(name: str) -> str:
     return stem
 
 
-def _collect_one(path: Path) -> tuple[list[str], Optional[str]]:
-    """Return (transform names declared in this file, error string or None)."""
+def _collect_one(path: Path) -> tuple[list[str], Optional[Failure]]:
+    """Return (transform names declared in this file, Failure or None).
+
+    R1: this used to return ``f"{type(exc).__name__}: {exc}"``. The file is
+    ``exec``-ed, so that string is whatever an arbitrary library chose to say
+    while a pipeline imported it — and it was served on a VIEWER-gated route.
+    """
     registry = TransformRegistry()
     try:
         with use_registry(registry):
@@ -51,7 +57,10 @@ def _collect_one(path: Path) -> tuple[list[str], Optional[str]]:
             }
             exec(compile(path.read_text(), str(path), "exec"), namespace)
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
-        return ([], f"{type(exc).__name__}: {exc}")
+        return ([], Failure.from_exception(
+            exc, code=FailureCode.TRANSFORM_FAILED, phase=Phase.compile,
+            subject=f"pipeline:{path.stem}", driver="python",
+        ))
     return ([s.name for s in registry.all()], None)
 
 
@@ -69,12 +78,16 @@ class PipelineFiles:
         for path in sorted(self.dir.glob("*.py")):
             if path.name.startswith("."):
                 continue  # never surface leaked temp / hidden files
-            transforms, error = _collect_one(path)
+            transforms, _failure = _collect_one(path)
+            # The listing drops the failure entirely, for everyone. A pipeline
+            # that will not import is an *authoring* fact; the detail belongs on
+            # the editor-gated detail route (`read`), not on a list one level
+            # down. `failed` is a boolean, which is as much as a list needs.
             out.append(
                 {
                     "name": path.stem,
                     "transforms": transforms,
-                    "error": error,
+                    "failed": _failure is not None,
                     "bytes": path.stat().st_size,
                 }
             )
@@ -84,7 +97,12 @@ class PipelineFiles:
         path = self._path(name)
         if not path.exists():
             raise KeyError(f"Pipeline file not found: {name!r}")
-        return {"name": path.stem, "content": path.read_text()}
+        _transforms, failure = _collect_one(path)
+        return {
+            "name": path.stem,
+            "content": path.read_text(),
+            "failure": failure.as_dict() if failure else None,
+        }
 
     def write(self, name: str, content: str) -> dict:
         """Validate and (atomically) write a pipeline file.
@@ -115,13 +133,27 @@ class PipelineFiles:
             raise
 
         transforms, own_error = _collect_one(path)
-        collect_error = own_error
+        collect_error: Optional[Failure] = own_error
         if collect_error is None:
             try:
                 collect_transforms(self.dir)
             except PipelineError as exc:
-                collect_error = str(exc)
-        return {"name": path.stem, "transforms": transforms, "collect_error": collect_error}
+                # PipelineError is Laurelin's own class, but its *message* is
+                # only first-party on some branches: a duplicate output or a
+                # cycle is our sentence, while a file that will not import
+                # produces `f"...{type(exc).__name__}: {exc}"` over whatever an
+                # arbitrary library raised, plus the server's absolute path.
+                # Which is why it goes through `from_exception` like any other
+                # third-party failure — the message is logged and not stored.
+                collect_error = Failure.from_exception(
+                    exc, code=FailureCode.TRANSFORM_FAILED, phase=Phase.compile,
+                    subject=f"pipeline:{path.stem}", driver="python",
+                )
+        return {
+            "name": path.stem,
+            "transforms": transforms,
+            "collect_error": collect_error.as_dict() if collect_error else None,
+        }
 
     def delete(self, name: str) -> None:
         path = self._path(name)

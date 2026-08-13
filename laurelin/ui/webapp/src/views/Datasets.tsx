@@ -29,6 +29,7 @@ import {
   PageHeader,
   RedactedValue,
   Spinner,
+  WithheldBox,
   fmtNum,
   fmtTime,
   fmtValue,
@@ -48,12 +49,12 @@ const PAGE_SIZE = 50;
  * product an empty result is indistinguishable from a working row policy. The
  * pill exists so that refusal is legible *before* someone clicks into it.
  */
-function needsCredentials(d: { source?: Record<string, unknown> }): boolean {
-  return d.source?.__laurelin_needs_credentials === true;
+function needsCredentials(d: { source_descriptor?: Record<string, unknown> }): boolean {
+  return d.source_descriptor?.needs_credentials === true;
 }
 
-function importedDataState(d: { source?: Record<string, unknown> }): string {
-  const state = d.source?.__laurelin_data_state;
+function importedDataState(d: { source_descriptor?: Record<string, unknown> }): string {
+  const state = d.source_descriptor?.data_state;
   return typeof state === "string" ? state : "elsewhere";
 }
 
@@ -600,7 +601,11 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
       {needsCredentials(detail) && <NeedsCredentialsBanner detail={detail} />}
 
       {atSource ? (
-        <FederatedSource source={detail.source} kind={detail.kind} />
+        <FederatedSource
+          source={detail.source}
+          descriptor={detail.source_descriptor}
+          kind={detail.kind}
+        />
       ) : auth.can("editor") ? (
         <UploadControl name={detail.name} iceberg={iceberg} />
       ) : (
@@ -655,6 +660,9 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
  */
 function NeedsCredentialsBanner({ detail }: { detail: DatasetDetail }) {
   const metadataOnly = importedDataState(detail) === "metadata_only";
+  // `source` is admin-only, so the itemised list of withheld keys is too. The
+  // banner itself is not: every role needs to know that reads will refuse,
+  // because an empty result and a working row policy look identical.
   const missing = Object.entries(detail.source ?? {})
     .filter(([k, v]) => v === null && !k.startsWith("__"))
     .map(([k]) => k);
@@ -689,11 +697,49 @@ function NeedsCredentialsBanner({ detail }: { detail: DatasetDetail }) {
  */
 function FederatedSource({
   source,
+  descriptor,
   kind,
 }: {
   source?: Record<string, unknown>;
+  descriptor?: Record<string, unknown>;
   kind?: DatasetKind;
 }) {
+  // R2: `source` is a connection config written by the three ADMIN registration
+  // routes, so it reaches admin and nobody else — an editor authors the
+  // *dataset*, not its endpoint. Below that the key is absent, and what an
+  // editor gets instead is `source_descriptor`: which table, in which format,
+  // built by Laurelin from an allowlist. The rest of this component would
+  // otherwise render a badge saying "external" over an
+  // empty location: a blank that reads as "misconfigured" about a dataset that
+  // is working perfectly. Say the true thing instead.
+  if (!source) {
+    // Not a blank, and not nothing either: `source_descriptor` is what Laurelin
+    // itself can say about the table — which one, in which format — assembled
+    // from an allowlist rather than by subtracting from the operator's config.
+    // Withholding a field is not a reason to withhold the screen.
+    const shape = Object.entries(descriptor ?? {}).filter(
+      ([k]) => k !== "needs_credentials" && k !== "data_state",
+    );
+    return (
+      <WithheldBox what="Where this dataset's rows actually live" role="admin">
+        <p style={{ marginTop: 8 }}>
+          It is scanned in place in a remote system, and the endpoint is part of
+          the connection config. Your access to the <em>rows</em> is unchanged —
+          the same ACLs, row policy and column masks apply as to any dataset,
+          and the preview below reads them.
+        </p>
+        {shape.length > 0 && (
+          <div className="mono" style={{ fontSize: 12.5, marginTop: 8 }}>
+            {shape.map(([k, v]) => (
+              <div key={k}>
+                <span className="faint">{k}</span> <span className="dim">{String(v)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </WithheldBox>
+    );
+  }
   const clickhouse = kind === "clickhouse";
   const starrocks = kind === "starrocks";
   // A StarRocks source's `type` is always the literal "table" — showing it

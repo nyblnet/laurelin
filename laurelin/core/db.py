@@ -11,6 +11,7 @@ is shared. Each operation opens a short-lived connection.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
 from laurelin.core.backend import Connection, make_backend
+from laurelin.core.failure import Failure, FailureCode, Phase
 from laurelin.core.models import (
     AuditEvent,
     BuildInfo,
@@ -38,6 +40,32 @@ from laurelin.core.models import (
     User,
     utcnow_iso,
 )
+
+log = logging.getLogger("laurelin.db")
+
+
+def _failure_json(failure: Optional[Failure]) -> Optional[str]:
+    return failure.model_dump_json() if failure is not None else None
+
+
+def _failure_of(row, column: str) -> Optional[Failure]:
+    """Read a stored Failure back.
+
+    A row that predates R1, or one written by a version that stored something
+    else, yields None rather than a half-parsed record: the point of the type is
+    that every field went through its gate, and a value that will not validate
+    never did.
+    """
+    try:
+        raw = row[column]
+    except (KeyError, IndexError):
+        return None
+    if not raw:
+        return None
+    try:
+        return Failure.model_validate_json(raw)
+    except Exception:  # noqa: BLE001 - a malformed record is simply absent
+        return None
 
 # How many matches a *search* counts before it stops counting and reports the
 # cap. Browsing is unaffected: an unfiltered count is a cheap indexed count and
@@ -223,7 +251,11 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at TEXT,
     last_run_at TEXT,
     last_status TEXT,
+    -- R1: a Laurelin-authored Failure, JSON. `last_error` is retained as a
+    -- dead column on databases that predate this and is nulled by the
+    -- migration -- it held a driver's own sentence.
     last_error TEXT,
+    last_failure_json TEXT,
     last_build_id TEXT,
     watermark INTEGER,
     created_at TEXT NOT NULL,
@@ -251,6 +283,7 @@ CREATE TABLE IF NOT EXISTS sources (
     last_sync_at TEXT,
     last_sync_status TEXT,
     last_sync_error TEXT,
+    last_sync_failure_json TEXT,
     last_sync_version INTEGER,
     last_sync_rows INTEGER,
     cursor_value TEXT
@@ -272,6 +305,7 @@ CREATE TABLE IF NOT EXISTS builds (
     started_at TEXT,
     finished_at TEXT,
     error TEXT,
+    failure_json TEXT,
     -- Cross-replica coordination: exactly one worker may own a build, and the
     -- lease expires so a dead replica's build can be reclaimed.
     claimed_by TEXT,
@@ -285,6 +319,7 @@ CREATE TABLE IF NOT EXISTS build_tasks (
     started_at TEXT,
     finished_at TEXT,
     error TEXT,
+    failure_json TEXT,
     rows_written INTEGER,
     output_version INTEGER,
     -- One JSON entry per declared expectation, pass or fail. A check that
@@ -326,7 +361,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp TEXT NOT NULL,
     actor TEXT NOT NULL DEFAULT 'anonymous',
     action TEXT NOT NULL,
-    details_json TEXT NOT NULL DEFAULT '{}'
+    details_json TEXT NOT NULL DEFAULT '{}',
+    -- The lowest role that may read this row's `details`. Defaults to 'admin'
+    -- so a new log_audit call site fails CLOSED: the writer has to say out loud
+    -- that a lower level may read what it just put in the bag.
+    min_read_role TEXT NOT NULL DEFAULT 'admin'
 );
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -493,6 +532,67 @@ class MetadataStore:
                 "TEXT NOT NULL DEFAULT '[]'"
             )
         self._migrate_object_store(c)
+        self._migrate_failures(c)
+
+    def _migrate_failures(self, c: Connection) -> None:
+        """R1: structured failures replace stored driver prose.
+
+        **This migration destroys data, deliberately.** The four `error`
+        columns hold prose of unknown provenance which can never be
+        re-classified; they are *known* to contain live credentials (reproduced
+        on this tree: a source whose password contained a space produced
+        `unexpected spaces found in "SUPER SEKRET"` and a plain viewer read it
+        off GET /audit); and they sit in a file whose permissions were
+        themselves a shipped bug (task #51). Leaving them readable-but-unserved
+        leaves credentials at rest for the next path that forgets to filter.
+
+        What is lost is diagnostics for builds that already finished. The row
+        counts are logged so an operator knows exactly what went.
+        """
+        added = False
+        for table, col in (
+            ("builds", "failure_json"),
+            ("build_tasks", "failure_json"),
+            ("sources", "last_sync_failure_json"),
+            ("schedules", "last_failure_json"),
+        ):
+            if not self._has_column(c, table, col):
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                added = True
+        if not self._has_column(c, "audit_log", "min_read_role"):
+            # Every pre-existing audit row becomes admin-only. Editors see
+            # fewer rows than before until each writer declares a lower level,
+            # and that is the correct direction: the rows were written by
+            # callers who had no idea who would read them.
+            c.execute(
+                "ALTER TABLE audit_log ADD COLUMN min_read_role TEXT NOT NULL "
+                "DEFAULT 'admin'"
+            )
+            added = True
+        if not added:
+            return
+        cleared = {}
+        for table, col in (
+            ("builds", "error"),
+            ("build_tasks", "error"),
+            ("sources", "last_sync_error"),
+            ("schedules", "last_error"),
+        ):
+            if not self._has_column(c, table, col):
+                continue
+            cur = c.execute(
+                f"UPDATE {table} SET {col} = NULL WHERE {col} IS NOT NULL"
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                cleared[f"{table}.{col}"] = cur.rowcount
+        if cleared:
+            log.warning(
+                "R1 migration cleared stored driver text: %s. These columns held "
+                "third-party exception messages that could contain credentials; "
+                "they are not recoverable and are replaced by structured "
+                "failures from now on.",
+                ", ".join(f"{k}={v}" for k, v in sorted(cleared.items())),
+            )
 
     def _migrate_object_store(self, c: Connection) -> None:
         """Turn the invalidation flag into a catch-up watermark."""
@@ -1170,7 +1270,7 @@ class MetadataStore:
             next_run_at=row["next_run_at"],
             last_run_at=row["last_run_at"],
             last_status=row["last_status"],
-            last_error=row["last_error"],
+            last_failure=_failure_of(row, "last_failure_json"),
             last_build_id=row["last_build_id"],
             watermark=row["watermark"],
             created_at=row["created_at"],
@@ -1224,20 +1324,24 @@ class MetadataStore:
         name: str,
         status: str,
         next_run_at: Optional[str] = None,
-        error: Optional[str] = None,
+        failure: Optional[Failure] = None,
         build_id: Optional[str] = None,
         watermark: Optional[int] = None,
     ) -> None:
         """Record an attempt and release the claim, so the next window is
-        free regardless of how this one went."""
+        free regardless of how this one went.
+
+        Takes a :class:`Failure`, not a string. That is the R1 boundary in the
+        type system: there is no parameter here a driver's sentence fits into.
+        """
         with self._conn() as c:
             c.execute(
                 """UPDATE schedules SET last_run_at = ?, last_status = ?,
-                     last_error = ?, last_build_id = ?, next_run_at = ?,
+                     last_failure_json = ?, last_build_id = ?, next_run_at = ?,
                      watermark = COALESCE(?, watermark),
                      claimed_by = NULL, lease_expires_at = NULL
                    WHERE name = ?""",
-                (utcnow_iso(), status, error, build_id, next_run_at,
+                (utcnow_iso(), status, _failure_json(failure), build_id, next_run_at,
                  watermark, name),
             )
 
@@ -1305,7 +1409,7 @@ class MetadataStore:
             created_by=row["created_by"],
             last_sync_at=row["last_sync_at"],
             last_sync_status=row["last_sync_status"],
-            last_sync_error=row["last_sync_error"],
+            last_sync_failure=_failure_of(row, "last_sync_failure_json"),
             last_sync_version=row["last_sync_version"],
             last_sync_rows=row["last_sync_rows"],
             cursor_value=row["cursor_value"],
@@ -1330,26 +1434,28 @@ class MetadataStore:
         self,
         name: str,
         status: str,
-        error: Optional[str] = None,
+        failure: Optional[Failure] = None,
         version: Optional[int] = None,
         rows: Optional[int] = None,
         cursor_value: Optional[str] = None,
     ) -> None:
+        """See `record_schedule_run` on why this takes a Failure, not a str."""
+        detail = _failure_json(failure)
         with self._conn() as c:
             if cursor_value is None:
                 # Leave the high-water mark untouched (failed or full-refresh sync).
                 c.execute(
                     """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
-                       last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?
-                       WHERE name = ?""",
-                    (utcnow_iso(), status, error, version, rows, name),
+                       last_sync_failure_json = ?, last_sync_version = ?,
+                       last_sync_rows = ? WHERE name = ?""",
+                    (utcnow_iso(), status, detail, version, rows, name),
                 )
             else:
                 c.execute(
                     """UPDATE sources SET last_sync_at = ?, last_sync_status = ?,
-                       last_sync_error = ?, last_sync_version = ?, last_sync_rows = ?,
-                       cursor_value = ? WHERE name = ?""",
-                    (utcnow_iso(), status, error, version, rows, cursor_value, name),
+                       last_sync_failure_json = ?, last_sync_version = ?,
+                       last_sync_rows = ?, cursor_value = ? WHERE name = ?""",
+                    (utcnow_iso(), status, detail, version, rows, cursor_value, name),
                 )
 
     # -- dashboards --------------------------------------------------------------
@@ -1464,13 +1570,22 @@ class MetadataStore:
             ).fetchall()
             ids = [r["id"] for r in rows]
             for build_id in ids:
+                # First-party fact, first-party shape. No exception was even
+                # caught here — the worker simply stopped renewing — so this is
+                # the easiest possible case to state structurally.
                 c.execute(
-                    """UPDATE builds SET status = ?, finished_at = ?, error = ?,
-                       claimed_by = NULL, lease_expires_at = NULL WHERE id = ?""",
+                    """UPDATE builds SET status = ?, finished_at = ?,
+                       failure_json = ?, claimed_by = NULL,
+                       lease_expires_at = NULL WHERE id = ?""",
                     (
                         BuildStatus.failed.value,
                         now,
-                        "Abandoned: the worker holding this build stopped responding",
+                        _failure_json(Failure(
+                            code=FailureCode.REMOTE_FAILED,
+                            phase=Phase.execute,
+                            subject=f"build:{build_id}",
+                            at=now,
+                        )),
                         build_id,
                     ),
                 )
@@ -1493,14 +1608,14 @@ class MetadataStore:
         status: Optional[BuildStatus] = None,
         started_at: Optional[str] = None,
         finished_at: Optional[str] = None,
-        error: Optional[str] = None,
+        failure: Optional[Failure] = None,
     ) -> None:
         sets, vals = [], []
         for col, val in (
             ("status", status.value if status else None),
             ("started_at", started_at),
             ("finished_at", finished_at),
-            ("error", error),
+            ("failure_json", _failure_json(failure)),
         ):
             if val is not None:
                 sets.append(f"{col} = ?")
@@ -1515,7 +1630,7 @@ class MetadataStore:
             c.execute(
                 """INSERT INTO build_tasks
                    (build_id, transform_name, output_dataset, status, started_at,
-                    finished_at, error, rows_written, output_version,
+                    finished_at, failure_json, rows_written, output_version,
                     expectations_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (build_id, transform_name) DO UPDATE SET
@@ -1523,7 +1638,7 @@ class MetadataStore:
                      status = excluded.status,
                      started_at = excluded.started_at,
                      finished_at = excluded.finished_at,
-                     error = excluded.error,
+                     failure_json = excluded.failure_json,
                      rows_written = excluded.rows_written,
                      output_version = excluded.output_version,
                      expectations_json = excluded.expectations_json""",
@@ -1534,7 +1649,7 @@ class MetadataStore:
                     task.status.value,
                     task.started_at,
                     task.finished_at,
-                    task.error,
+                    _failure_json(task.failure),
                     task.rows_written,
                     task.output_version,
                     json.dumps(task.expectations),
@@ -1555,7 +1670,7 @@ class MetadataStore:
             status=BuildStatus(row["status"]),
             started_at=row["started_at"],
             finished_at=row["finished_at"],
-            error=row["error"],
+            failure=_failure_of(row, "failure_json"),
             tasks=[
                 BuildTaskInfo(
                     transform_name=t["transform_name"],
@@ -1563,7 +1678,7 @@ class MetadataStore:
                     status=BuildStatus(t["status"]),
                     started_at=t["started_at"],
                     finished_at=t["finished_at"],
-                    error=t["error"],
+                    failure=_failure_of(t, "failure_json"),
                     rows_written=t["rows_written"],
                     output_version=t["output_version"],
                     expectations=json.loads(t["expectations_json"] or "[]"),
@@ -1753,11 +1868,27 @@ class MetadataStore:
 
     # -- audit ---------------------------------------------------------------------
 
-    def log_audit(self, action: str, details: dict[str, Any] | None = None, actor: str = "anonymous") -> None:
+    def log_audit(
+        self,
+        action: str,
+        details: dict[str, Any] | None = None,
+        actor: str = "anonymous",
+        min_read_role: Role = Role.admin,
+    ) -> None:
+        """Append one audit row, declaring who may read its ``details``.
+
+        ``min_read_role`` defaults to **admin**, so a writer that does not think
+        about disclosure discloses to nobody below admin. Rounds 2 and 3 of the
+        credential bug were both "a writer put driver text in the bag and a
+        VIEWER-gated route served it"; the bag is still open, but the audience
+        is now a column the writer has to argue down.
+        """
         with self._conn() as c:
             c.execute(
-                "INSERT INTO audit_log (timestamp, actor, action, details_json) VALUES (?, ?, ?, ?)",
-                (utcnow_iso(), actor, action, json.dumps(details or {})),
+                "INSERT INTO audit_log (timestamp, actor, action, details_json, "
+                "min_read_role) VALUES (?, ?, ?, ?, ?)",
+                (utcnow_iso(), actor, action, json.dumps(details or {}),
+                 Role(min_read_role).value),
             )
 
     def prune_audit(self, keep: int) -> int:
@@ -1779,10 +1910,64 @@ class MetadataStore:
             cur = c.execute("DELETE FROM audit_log WHERE id <= ?", (row["id"],))
             return cur.rowcount or 0
 
-    def list_audit(self, limit: int = 100) -> list[AuditEvent]:
+    def list_audit(
+        self,
+        limit: int = 100,
+        role: Role = Role.admin,
+        actor: Optional[str] = None,
+    ) -> list[AuditEvent]:
+        """Audit rows, each carrying the level its writer declared.
+
+        The ``actor`` branch — the one that serves the VIEWER-gated
+        ``GET /audit/mine`` — used to be exempt from the level filter *and* from
+        every other check, because the route then re-attached the raw bag by
+        hand. The exemption was
+        justified in this docstring by "their contents came from this person's
+        own request, so there is nothing here they did not already have", and
+        for a whole class of rows that is false by construction. A viewer
+        triggering a source sync supplies a *name*; every other field in the bag
+        is built server-side from an ADMIN-authored connector config. Worse for
+        migrated rows: ``_migrate_failures`` stamps every pre-existing row
+        ``admin`` precisely because "the rows were written by callers who had no
+        idea who would read them" — and then this branch handed them to a
+        viewer anyway. Reproduced: a user demoted from editor to viewer read a
+        live DSN and password out of ``/audit/mine``.
+
+        So the level rides on the row instead. ``AuditEvent.min_read_role``
+        becomes that record's author role, and :func:`serialize.dump` withholds
+        ``details`` from anyone below it — on every route, including any route
+        added tomorrow, and including a route that tries to re-attach the bag by
+        hand. What a caller below the level still gets is the row's *header*:
+        who did what, when. That is the audit trail's own vocabulary — an actor
+        and a first-party action name — and it is what "a user should see what
+        was done" always meant.
+
+        Two questions, two mechanisms, and they now compose instead of
+        cancelling:
+
+        * **which rows** a principal is offered — still ``role`` against
+          ``min_read_role`` on ``/audit``, so an undeclared row is not even
+          listed to an editor;
+        * **how much of a row** they receive — the serializer, from
+          ``AuditEvent.min_read_role``, on every route including this one's
+          ``actor`` branch.
+
+        The ``actor`` branch keeps its row exemption, because "show me what I
+        did" is the whole point of ``/audit/mine`` and a row you wrote going
+        missing is a worse answer than a row with its details withheld. What it
+        loses is the *content* exemption, which is what leaked.
+        """
+        if actor is not None:
+            where, params = "WHERE actor = ?", [actor]
+        else:
+            allowed = [r.value for r in Role if Role(role).covers(r)]
+            where = f"WHERE min_read_role IN ({', '.join('?' for _ in allowed)})"
+            params = list(allowed)
+        params.append(limit)
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM audit_log {where} ORDER BY id DESC LIMIT ?",
+                tuple(params),
             ).fetchall()
         return [
             AuditEvent(
@@ -1791,6 +1976,10 @@ class MetadataStore:
                 actor=r["actor"],
                 action=r["action"],
                 details=json.loads(r["details_json"]),
+                min_read_role=Role(
+                    (r["min_read_role"] if "min_read_role" in r.keys() else None)
+                    or Role.admin.value
+                ),
             )
             for r in rows
         ]

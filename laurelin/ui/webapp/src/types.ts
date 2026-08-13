@@ -51,7 +51,66 @@ export interface WorkspaceMember {
 export interface WorkspaceInfo {
   name: string;
   description: string;
-  root: string;
+  /** Admin only — the server's filesystem layout. Absent for everyone else,
+   *  which is why it is optional rather than "". */
+  root?: string;
+}
+
+// -- Structured failures (R1) -----------------------------------------------
+
+/**
+ * Laurelin's own vocabulary for why something failed. A driver's sentence is
+ * never persisted, so this closed set is what the UI has to speak. Each member
+ * maps to one operator action, which is the whole reason the set exists —
+ * `auth_rejected` means rotate the credential, `endpoint_unreachable` means
+ * open the firewall. See `laurelin/core/failure.py`.
+ */
+export type FailureCode =
+  | "credential_malformed"
+  | "endpoint_unresolvable"
+  | "endpoint_unreachable"
+  | "endpoint_timeout"
+  | "auth_rejected"
+  | "database_missing"
+  | "permission_denied"
+  | "relation_missing"
+  | "column_missing"
+  | "schema_incompatible"
+  | "statement_invalid"
+  | "resource_exhausted"
+  | "definition_stale"
+  | "transform_failed"
+  | "expectation_failed"
+  | "remote_failed";
+
+/**
+ * A failure as it arrives on the wire.
+ *
+ * Only `code` and `subject` are PRESENTATION, so a reader below the record's
+ * authoring role (a viewer looking at a build) receives exactly those two and
+ * nothing else. Every other field is optional here for that reason — this type
+ * describes both projections, and the UI must never assume the wide one.
+ */
+export interface Failure {
+  code: FailureCode;
+  subject: string;
+  phase?: string;
+  endpoint?: string;
+  driver?: string;
+  exc_class?: string;
+  vendor_code?: string;
+  counters?: Record<string, number>;
+  /** "err-<12 hex>" — the grep handle for the full text in the server log. */
+  detail_ref?: string;
+  at?: string;
+  /** Server-rendered sentence; present on `as_dict()` payloads. */
+  message?: string;
+}
+
+/** A non-blocking authoring hint. Explicitly not a security control. */
+export interface AuthoringWarning {
+  field: string;
+  hint: string;
 }
 
 export interface ColumnSchema {
@@ -89,11 +148,34 @@ export interface Dataset {
   kind?: DatasetKind;
   /**
    * The (redacted) source Laurelin scans, for anything it does not hold itself.
-   * On the *list* too, not only the detail: an imported dataset carries the
-   * `__laurelin_needs_credentials` sentinel here, and the list is where an
-   * operator first notices that a migrated table cannot be read yet.
+   *
+   * R2: OPERATIONAL **and `AuthoredBy(admin)`**. It is a connection config, and
+   * the only three routes that write it are admin-gated, so it reaches admin
+   * and nobody else — even though a *dataset* is editor-authored. It used to
+   * reach an editor with `redact_mapping` in front of it, and a plain editor
+   * read five live credentials through that: a quoted libpq conninfo, a quoted
+   * ODBC keyword string, a colon-delimited form, a bare AWS key pair and a
+   * positional JDBC URL.
    */
   source?: Record<string, unknown>;
+  /**
+   * Which table, in which format — Laurelin's own description of the source,
+   * built from an allowlist of shape keys with an identifier-shaped gate on
+   * every value. PRESENTATION: it is safe by construction rather than by
+   * recognition, so every role gets it, and the "needs credentials" pill an
+   * operator notices on the *list* rides here now that `source` does not.
+   */
+  source_descriptor?: {
+    type?: string;
+    table?: string;
+    format?: string;
+    catalog?: string;
+    database?: string;
+    namespace?: string;
+    branch?: string;
+    needs_credentials?: boolean;
+    data_state?: string;
+  };
   // Present on permission-aware responses (dataset list/detail): the current
   // user's effective access to this dataset.
   permissions?: ObjectTypePermission;
@@ -130,12 +212,22 @@ export interface ObjectApp {
   description: string;
   object_type: string;
   columns: string[];
-  filters: Record<string, string>;
+  /**
+   * OPERATIONAL, and absent below admin: a filter is an instruction, not a
+   * caption, even though it sits between two captions in the record.
+   *
+   * The app's object list is therefore fetched from
+   * `GET /apps/{name}/objects`, which applies the *stored* filters server-side
+   * — the same shape as a dashboard panel's run route. A client that had to
+   * hold the filters in order to apply them would either crash without them or,
+   * worse, quietly show the unscoped list.
+   */
+  filters?: Record<string, string>;
   search_placeholder: string;
   actions: string[];
   links: string[];
   created_at: string;
-  created_by: string;
+  created_by?: string;
   updated_at: string;
 }
 
@@ -153,11 +245,26 @@ export interface AggregateResult {
   truncated: boolean;
 }
 
+/**
+ * A panel, in both of the shapes the server sends.
+ *
+ * R2 splits a panel down the middle: `id`/`title`/`chart`/`x`/`y`/`width` are
+ * PRESENTATION — written for the person reading the picture — and everything
+ * that describes *how to get the numbers* is OPERATIONAL and reaches only a
+ * principal who could have written it. A viewer's panel therefore has no `sql`
+ * key at all (not `sql: ""`), which is deliberate on the server's side and
+ * load-bearing here: an absent key round-trips through a PUT as "leave it
+ * alone", an empty string round-trips as "erase it".
+ *
+ * Hence every operational field is optional. `hasSource()` below is the one
+ * place that asks whether this panel arrived whole.
+ */
 export interface DashboardPanel {
   id: string;
+  /** Always non-empty on a stored panel: the server fills "Panel {n}". */
   title: string;
-  /** Source A: raw SQL over datasets. Exactly one source is set. */
-  sql: string;
+  /** Source A: raw SQL over datasets. OPERATIONAL — absent below editor. */
+  sql?: string;
   /** Source B: an aggregation over ontology objects (sees the edit overlay). */
   object_type?: string;
   group_by?: string[];
@@ -170,15 +277,27 @@ export interface DashboardPanel {
   width: number; // 1..12 columns
 }
 
+/** True when this panel arrived with its operational half — i.e. we may edit
+ *  it. False for a viewer's projection, where editing would write back a hole. */
+export function panelIsWhole(p: DashboardPanel): boolean {
+  return p.sql !== undefined || p.object_type !== undefined;
+}
+
 export interface Dashboard {
   name: string;
   title: string;
   description: string;
   panels: DashboardPanel[];
   created_at: string;
-  created_by: string;
+  /** Editor+ only. */
+  created_by?: string;
   updated_at: string;
+  /** Present on write responses. Advisory; never a refusal. */
+  warnings?: AuthoringWarning[];
 }
+
+/** What POST /dashboards/{name}/panels/{id}/run returns: rows, nothing else. */
+export type PanelRunResult = QueryResult;
 
 export type SourceType = "postgres" | "http" | "file";
 
@@ -186,13 +305,20 @@ export interface Source {
   name: string;
   type: SourceType;
   dataset: string;
-  // Secret-bearing values arrive redacted ("*****") from the API.
-  config: Record<string, unknown>;
+  /**
+   * Admin only, and still redacted there. A source is admin-authored and
+   * editor-read, so R2 withholds the connector config from an editor entirely
+   * rather than running a key-name denylist over somebody else's vocabulary.
+   * Absent, not empty — an editor screen must say "admin only", not draw a
+   * blank that reads as "nothing configured".
+   */
+  config?: Record<string, unknown>;
   created_at: string;
-  created_by: string;
+  created_by?: string;
   last_sync_at: string | null;
   last_sync_status: "succeeded" | "failed" | null;
-  last_sync_error: string | null;
+  /** R1: replaced `last_sync_error`, which held the driver's own sentence. */
+  last_sync_failure: Failure | null;
   last_sync_version: number | null;
   last_sync_rows: number | null;
 }
@@ -222,9 +348,12 @@ export interface BuildTask {
   status: BuildStatus;
   started_at: string | null;
   finished_at: string | null;
-  error: string | null;
+  /** R1: replaced `error: string`, which held f"{type(exc).__name__}: {exc}". */
+  failure: Failure | null;
   rows_written: number | null;
   output_version: number | null;
+  /** OPERATIONAL: an expectation `message` is prose an editor wrote in a
+   *  pipeline file. Absent for a viewer — see `ExpectationsCell`. */
   expectations?: ExpectationResult[];
 }
 
@@ -242,7 +371,7 @@ export interface Build {
   status: BuildStatus;
   started_at: string | null;
   finished_at: string | null;
-  error: string | null;
+  failure: Failure | null;
   tasks: BuildTask[];
 }
 
@@ -393,10 +522,13 @@ export interface Schedule {
   next_run_at: string | null;
   last_run_at: string | null;
   last_status: "succeeded" | "failed" | null;
-  last_error: string | null;
+  /** R1: replaced `last_error`, which held the driver's own sentence. */
+  last_failure: Failure | null;
   last_build_id: string | null;
   created_at: string;
   created_by: string;
+  /** Present on the write response. Advisory; the save already succeeded. */
+  warnings?: AuthoringWarning[];
 }
 
 export interface AuditEvent {
@@ -404,7 +536,14 @@ export interface AuditEvent {
   timestamp: string;
   actor: string;
   action: string;
-  details: Record<string, unknown>;
+  /**
+   * The open bag. It is OPERATIONAL on an admin-authored record, so only an
+   * admin receives it on `GET /audit` — and everyone receives their own rows
+   * whole on `GET /audit/mine`, because you cannot learn a secret from a row
+   * you wrote. Absent, not `{}`: the difference is "you may not read this" vs
+   * "there was nothing to read", and the screen has to say which.
+   */
+  details?: Record<string, unknown>;
 }
 
 export interface ApiToken {
@@ -420,19 +559,24 @@ export interface ApiToken {
 export interface PipelineFileInfo {
   name: string;
   transforms: string[];
-  error: string | null;
+  /** The listing carries a boolean and no detail: "will not import" is an
+   *  authoring fact, the reason belongs on the detail route. */
+  failed: boolean;
   bytes: number;
 }
 
 export interface PipelineFileContent {
   name: string;
   content: string;
+  /** Why this file will not import, if it will not. */
+  failure: Failure | null;
 }
 
 export interface PipelineWriteResult {
   name: string;
   transforms: string[];
-  collect_error: string | null;
+  /** Non-fatal: the file was written, but the DAG does not collect. */
+  collect_error: Failure | null;
 }
 
 // -- Groups & ontology permissions ------------------------------------------

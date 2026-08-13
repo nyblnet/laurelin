@@ -15,8 +15,11 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  FailureBadge,
+  FailureNote,
   RedactedValue,
   Spinner,
+  Withheld,
   fmtNum,
   fmtTime,
 } from "../ui";
@@ -27,8 +30,19 @@ function typeTone(t: SourceType): "gold" | "blue" | "green" {
   return t === "postgres" ? "blue" : t === "http" ? "green" : "gold";
 }
 
-function configSummary(s: Source): string {
+/**
+ * Where this connector reads from, as much of it as this reader gets.
+ *
+ * `config` is admin-only under R2 — a source is admin-authored and editor-read,
+ * so the crossing runs through the middle of the record. Returning `null` here
+ * means "you were not sent it", which the caller renders as a statement rather
+ * than as an empty cell. It used to be a `redact_mapping` denylist over key
+ * names in the connector's own vocabulary, and round 3 read an ODBC keyword
+ * string out of a `path` key no denylist covered.
+ */
+function configSummary(s: Source): string | null {
   const c = s.config;
+  if (!c) return null;
   if (s.type === "postgres") {
     return String(c.table ?? c.query ?? "");
   }
@@ -292,9 +306,23 @@ export function SourcesSection() {
     {
       label: "From",
       className: "mono dim",
-      // A config value the API could not redact safely comes back withheld;
-      // blank here would read as "no source configured".
-      render: (s) => <RedactedValue value={configSummary(s)} />,
+      // Two different absences, and they must not look alike. `null` is "your
+      // role is not sent the connector config"; WITHHELD is "the server had it
+      // and could not redact it safely". Blank would read as "no source
+      // configured", and an operator's next move after reading that is to type
+      // the connection string in again.
+      render: (s) => {
+        const summary = configSummary(s);
+        return summary === null ? (
+          <Withheld
+            what="A connector's configuration"
+            role="admin"
+            why="It is the connection string, and it is the level that writes it that reads it."
+          />
+        ) : (
+          <RedactedValue value={summary} />
+        );
+      },
     },
     { label: "Dataset", className: "mono", render: (s) => s.dataset },
     {
@@ -311,8 +339,18 @@ export function SourcesSection() {
             </span>
           </span>
         ) : (
-          <span title={s.last_sync_error ?? undefined}>
-            <Badge tone="red">failed</Badge>{" "}
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {/* R1: this used to be `title={s.last_sync_error}` — the driver's
+                own sentence, which on a Postgres connect failure begins with
+                the connection string. The badge now names Laurelin's own
+                classification, which is what an operator was reading it for:
+                "auth rejected" means rotate the credential, "endpoint
+                unreachable" means the credential was never even tried. */}
+            {s.last_sync_failure ? (
+              <FailureBadge failure={s.last_sync_failure} />
+            ) : (
+              <Badge tone="red">failed</Badge>
+            )}
             <span className="dim">{fmtTime(s.last_sync_at!)}</span>
           </span>
         ),
@@ -359,7 +397,19 @@ export function SourcesSection() {
           No sources configured{isAdmin ? " — add one to pull external data." : "."}
         </EmptyState>
       ) : (
-        <DataTable columns={columns} rows={sourcesQ.data!} rowKey={(s) => s.name} />
+        <>
+          <DataTable columns={columns} rows={sourcesQ.data!} rowKey={(s) => s.name} />
+          {/* The badge is a status; this is the diagnosis. Spelled out under
+              the table rather than hidden in a tooltip, because deciding
+              between "rotate the credential" and "open the firewall" is the
+              whole reason anyone reads a failed sync. */}
+          {sourcesQ.data!.filter((s) => s.last_sync_failure).map((s) => (
+            <div key={s.name} style={{ marginTop: 10 }}>
+              <div className="mono dim" style={{ fontSize: 12 }}>{s.name}</div>
+              <FailureNote failure={s.last_sync_failure!} />
+            </div>
+          ))}
+        </>
       )}
     </section>
   );

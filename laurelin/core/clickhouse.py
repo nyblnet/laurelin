@@ -52,6 +52,7 @@ import pyarrow as pa
 
 from laurelin.core import federation
 from laurelin.core.dialects import CLICKHOUSE
+from laurelin.core.failure import Failure, Phase
 
 SOURCE_TYPES = ("parquet",)
 
@@ -140,7 +141,9 @@ def run(sql: str) -> pa.Table:
     except Exception as exc:  # noqa: BLE001
         # chdb raises a bare RuntimeError, not a chdb-specific class, so
         # `except chdb.ChdbError` would catch nothing at all.
-        raise ClickHouseError(f"ClickHouse query failed: {exc}") from exc
+        raise ClickHouseError(failure=Failure.from_exception(
+            exc, phase=Phase.execute, driver="chdb", subject="clickhouse:query",
+        )) from exc
     if not payload:
         return pa.table({})
     try:

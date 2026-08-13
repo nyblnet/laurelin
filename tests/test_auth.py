@@ -465,7 +465,17 @@ GET_PATHS = [
     "/api/v1/lineage",
     "/api/v1/ontology/object-types",
     "/api/v1/ontology/actions",
-    "/api/v1/audit",
+    # `/audit` is NOT here any more: R2 moved it to EDITOR. `log_audit` takes an
+    # open dict, and a viewer reading other people's bags is one careless call
+    # site from the next disclosure. `/audit/mine` below is the viewer's half.
+    "/api/v1/audit/mine",
+]
+
+# Read routes a VIEWER must not reach, with the reason each was raised. "If you
+# cannot write it, you cannot read it."
+EDITOR_ONLY_GET_PATHS = [
+    "/api/v1/audit",       # an open details bag written by admin-level callers
+    "/api/v1/pipelines",   # `exec`-ed Python; writing one is code execution
 ]
 
 
@@ -473,6 +483,12 @@ def test_rbac_all_roles_can_read(role_clients):
     for role, client in role_clients.items():
         for path in GET_PATHS:
             assert client.get(path).status_code == 200, (role, path)
+
+
+def test_rbac_a_viewer_cannot_read_what_only_an_editor_can_write(role_clients):
+    for path in EDITOR_ONLY_GET_PATHS:
+        assert role_clients["viewer"].get(path).status_code == 403, path
+        assert role_clients["editor"].get(path).status_code == 200, path
 
 
 def test_rbac_viewer_cannot_mutate(role_clients):
@@ -530,10 +546,15 @@ def test_actor_is_authenticated_username(role_clients):
         json={"name": "actor_ds"},
         headers={"X-Laurelin-User": "spoofed"},
     )
-    audit = editor.get("/api/v1/audit").json()
-    created = [e for e in audit if e["action"] == "dataset_created"
-               and e["details"].get("dataset") == "actor_ds"]
+    # `/audit/mine` returns the caller's own *rows* — who did what, when.
+    # Their `details` still ride on the level the writer declared, which is what
+    # this route stopped honouring and had to be given back: `dataset_created`
+    # declares nothing, so it is admin-only, and an editor reading their own row
+    # sees the header and not the bag. The invariant here is about the actor.
+    audit = editor.get("/api/v1/audit/mine").json()
+    created = [e for e in audit if e["action"] == "dataset_created"]
     assert created and created[0]["actor"] == "eddy"
+    assert all("details" not in e for e in created)
 
 
 # ---------------------------------------------------------------------------

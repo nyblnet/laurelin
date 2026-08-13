@@ -392,8 +392,14 @@ function ManifestReport({ manifest }: { manifest: ExportManifest }) {
 
       {Object.keys(manifest.nulled_error_fields).length > 0 && (
         <Section
-          title="Error text nulled"
-          hint="Driver and connector error messages are a documented credential channel and no redactor covers free-form text."
+          title="Failure history nulled"
+          // R1 means the newer `*_failure_json` columns are safe by
+          // construction — nothing of a driver's is in them. They are dropped
+          // anyway: an export is a file that leaves the building, and there is
+          // no reason for it to carry a history of which of your endpoints were
+          // unreachable. The older `*_error` columns are dropped because they
+          // held free-form driver text, which no redactor covers.
+          hint="Failure records and any legacy driver error text are dropped from an export."
         >
           <div className="mono dim" style={{ fontSize: 12 }}>
             {Object.entries(manifest.nulled_error_fields)

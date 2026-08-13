@@ -1,9 +1,23 @@
 // Dashboards: grids of saved queries rendered as charts.
 //
-// Every panel executes through POST /query with the *viewer's* credentials,
-// so RLS / ACLs / markings apply per user — a dashboard is presentation, not
-// a data grant. Editors can create dashboards and add panels (also directly
-// from the SQL workbench via "Add to dashboard").
+// R2 splits a dashboard down the middle. The *picture* is presentation and
+// everyone who can open the board gets it: the panel's title, chart kind, axes
+// and width. The *query* is an instruction an editor wrote, and it is served
+// only to a principal who could have written it — a viewer's panel arrives with
+// no `sql` key at all.
+//
+// A viewer still gets a working dashboard, because the rows now come from
+// POST /dashboards/{name}/panels/{id}/run, which loads the stored panel and
+// executes it **as the caller**. The old invariant — "storing a dashboard
+// grants nobody new read access" — holds for a new reason: it used to be true
+// because the browser ran the query with the viewer's credentials, and it is
+// true now because the server does, down the same ACL / row-security / masking
+// path. Two viewers with different row policies still see different rows in the
+// same panel. Neither of them ever receives the SQL.
+//
+// Editing goes through the per-panel routes rather than re-PUTting the board.
+// That is not tidiness: a read-modify-write client that ever holds a trimmed
+// panel would blank the query of every panel it did not touch.
 
 import { useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
@@ -12,13 +26,14 @@ import { API, api } from "../api";
 import { useAuth } from "../auth";
 import { Chart } from "../charts";
 import type {
-  AggregateResult,
+  AuthoringWarning,
   ChartKind,
   Dashboard,
   DashboardPanel,
   ObjectTypeDef,
-  QueryResult,
+  PanelRunResult,
 } from "../types";
+import { panelIsWhole } from "../types";
 import {
   Column,
   DataTable,
@@ -26,6 +41,8 @@ import {
   ErrorBox,
   PageHeader,
   Spinner,
+  WarningBox,
+  Withheld,
   fmtTime,
 } from "../ui";
 
@@ -150,39 +167,28 @@ function DashboardList() {
 // ------------------------------------------------------------------- panel
 
 /**
- * Both panel sources reduce to {columns, rows}, so the chart and table below
- * never learn which one they were fed. An object panel goes through
- * /aggregate rather than SQL over the backing dataset, which is what makes it
- * agree with the object list: aggregation sees the edit overlay, raw SQL
- * doesn't.
+ * One route runs both panel sources, and the client no longer knows or needs to
+ * know which one a panel is.
+ *
+ * This used to branch: SQL panels went to POST /query with the SQL the client
+ * was holding, object panels to /aggregate with the group_by the client was
+ * holding. Both required the client to have the instruction, which is exactly
+ * what a viewer no longer receives. The server holds it, applies the caller's
+ * permissions, and returns {columns, rows} either way.
  */
-async function fetchPanel(panel: DashboardPanel): Promise<QueryResult> {
-  if (!panel.object_type) {
-    return api.post<QueryResult>(`${API}/query`, { sql: panel.sql, max_rows: 1000 });
-  }
-  const agg = await api.post<AggregateResult>(
-    `${API}/ontology/objects/${panel.object_type}/aggregate`,
-    {
-      group_by: panel.group_by ?? [],
-      metrics: panel.metrics ?? [],
-      filters: panel.filters ?? {},
-      search: panel.search || null,
-      limit: 1000,
-    },
-  );
-  const columns = [
-    ...(panel.group_by ?? []),
-    ...(panel.metrics ?? []).map((m, i) => m.alias || m.op || `metric_${i}`),
-  ];
-  return { columns, rows: agg.groups, row_count: agg.groups.length, truncated: agg.truncated };
-}
-
-function PanelBody({ panel }: { panel: DashboardPanel }) {
+function PanelBody({ dashboard, panel }: { dashboard: string; panel: DashboardPanel }) {
   const q = useQuery({
-    queryKey: ["panel", panel.id, panel.sql, panel.object_type,
-               JSON.stringify(panel.metrics), JSON.stringify(panel.group_by),
-               JSON.stringify(panel.filters), panel.search],
-    queryFn: () => fetchPanel(panel),
+    // Keyed on identity, not contents. The key used to include the SQL, so
+    // editing a panel refetched it for free — and a viewer now has no contents
+    // to key on at all. Writes invalidate the `["panel-run", <dashboard>]`
+    // prefix instead (see `afterWrite`), which is the only thing that can still
+    // tell this cache the query changed.
+    queryKey: ["panel-run", dashboard, panel.id],
+    queryFn: () =>
+      api.post<PanelRunResult>(
+        `${API}/dashboards/${encodeURIComponent(dashboard)}/panels/${encodeURIComponent(panel.id)}/run`,
+        { max_rows: 1000 },
+      ),
     staleTime: 30_000,
   });
 
@@ -350,7 +356,7 @@ function PanelEditor({
   const types = typesQ.data ?? [];
   const complete = p.object_type
     ? Boolean(p.metrics?.length)
-    : Boolean(p.sql.trim());
+    : Boolean((p.sql ?? "").trim());
 
   return (
     <div className="modal-backdrop" onClick={onCancel}>
@@ -419,7 +425,12 @@ function PanelEditor({
             <textarea
               className="mono"
               rows={5}
-              value={p.sql}
+              // `?? ""` and not `|| ""`: the editor is only opened for a panel
+              // that arrived whole (see `canEditPanel`), so this coalesce is
+              // for a *new* panel, never for a withheld one. Prefilling a form
+              // from a value the server declined to send would write the hole
+              // back as if it were data.
+              value={p.sql ?? ""}
               onChange={(e) => set({ sql: e.target.value })}
               placeholder="SELECT region, sum(amount) AS total FROM sales GROUP BY region"
               style={{ width: "100%", resize: "vertical" }}
@@ -464,25 +475,44 @@ function DashboardPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [editing, setEditing] = useState<DashboardPanel | null>(null);
+  const [warnings, setWarnings] = useState<AuthoringWarning[]>([]);
 
   const dashQ = useQuery({
     queryKey: ["dashboard", name],
     queryFn: () => api.get<Dashboard>(`${API}/dashboards/${name}`),
   });
 
-  const save = useMutation({
-    mutationFn: (panels: DashboardPanel[]) => {
-      const d = dashQ.data!;
-      return api.put<Dashboard>(`${API}/dashboards/${name}`, {
-        title: d.title,
-        description: d.description,
-        panels,
-      });
+  // After any write, drop the cached rows for this board as well as the board
+  // itself — the panel's rows are keyed on its id, not on its SQL, so nothing
+  // else would tell the cache that the query changed.
+  const afterWrite = (d: Dashboard) => {
+    setWarnings(d.warnings ?? []);
+    qc.invalidateQueries({ queryKey: ["dashboard", name] });
+    qc.invalidateQueries({ queryKey: ["dashboards"] });
+    qc.invalidateQueries({ queryKey: ["panel-run", name] });
+  };
+
+  // One panel at a time. The whole-board PUT still exists for title and
+  // description, but it is never used to carry panels from a fetched record:
+  // a client that re-sends panels it was only shown is one demotion away from
+  // blanking the queries it was not shown.
+  const savePanel = useMutation({
+    mutationFn: (p: DashboardPanel) => {
+      const exists = (dashQ.data?.panels ?? []).some((q) => q.id === p.id);
+      const base = `${API}/dashboards/${encodeURIComponent(name)}/panels`;
+      return exists
+        ? api.put<Dashboard>(`${base}/${encodeURIComponent(p.id)}`, p)
+        : api.post<Dashboard>(base, p);
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dashboard", name] });
-      qc.invalidateQueries({ queryKey: ["dashboards"] });
-    },
+    onSuccess: afterWrite,
+  });
+
+  const deletePanel = useMutation({
+    mutationFn: (id: string) =>
+      api.del<Dashboard>(
+        `${API}/dashboards/${encodeURIComponent(name)}/panels/${encodeURIComponent(id)}`,
+      ),
+    onSuccess: afterWrite,
   });
 
   const del = useMutation({
@@ -499,11 +529,7 @@ function DashboardPage() {
   const canEdit = auth.can("editor");
 
   function upsertPanel(p: DashboardPanel) {
-    const exists = dash.panels.some((q) => q.id === p.id);
-    const panels = exists
-      ? dash.panels.map((q) => (q.id === p.id ? p : q))
-      : [...dash.panels, p];
-    save.mutate(panels);
+    savePanel.mutate(p);
     setEditing(null);
   }
 
@@ -546,7 +572,9 @@ function DashboardPage() {
           ) : undefined
         }
       />
-      {save.isError && <ErrorBox error={save.error} />}
+      {savePanel.isError && <ErrorBox error={savePanel.error} />}
+      {deletePanel.isError && <ErrorBox error={deletePanel.error} />}
+      <WarningBox warnings={warnings} />
 
       {dash.panels.length === 0 ? (
         <EmptyState>
@@ -575,24 +603,39 @@ function DashboardPage() {
                   marginBottom: 8,
                 }}
               >
-                <div style={{ fontWeight: 600, fontSize: 13.5 }}>
-                  {p.title || <span className="faint mono">{p.sql.slice(0, 48)}</span>}
-                </div>
+                {/* Always a label. The server fills "Panel {n}" at write time,
+                    so this never falls back to a slice of the query — which is
+                    what it used to do, and which is precisely the text a viewer
+                    is no longer given. */}
+                <div style={{ fontWeight: 600, fontSize: 13.5 }}>{p.title}</div>
                 {canEdit && (
                   <span style={{ display: "inline-flex", gap: 6, flexShrink: 0 }}>
-                    <button className="small" onClick={() => setEditing(p)}>
-                      Edit
-                    </button>
+                    {panelIsWhole(p) ? (
+                      <button className="small" onClick={() => setEditing(p)}>
+                        Edit
+                      </button>
+                    ) : (
+                      // Can happen to an editor only in an odd state (a demoted
+                      // session, a stale tab). Offering "Edit" would open a form
+                      // with an empty SQL box over a panel that has one.
+                      <Withheld
+                        what="This panel's query"
+                        role="editor"
+                        label="not editable"
+                        why="Reload the page; if it persists, your session's role changed."
+                      />
+                    )}
                     <button
                       className="small danger"
-                      onClick={() => save.mutate(dash.panels.filter((q) => q.id !== p.id))}
+                      disabled={deletePanel.isPending}
+                      onClick={() => deletePanel.mutate(p.id)}
                     >
                       ✕
                     </button>
                   </span>
                 )}
               </div>
-              <PanelBody panel={p} />
+              <PanelBody dashboard={dash.name} panel={p} />
             </div>
           ))}
         </div>

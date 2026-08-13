@@ -40,8 +40,12 @@ def test_write_read_list_delete(files):
 
     assert files.read("mypipe")["content"] == PY_TRANSFORM
     listing = files.list()
+    # R1: the listing carries a boolean, not a traceback. A pipeline file is
+    # `exec`-ed, so its import error is whatever an arbitrary library chose to
+    # say — the detail belongs on the detail route and in the log.
     assert listing == [
-        {"name": "mypipe", "transforms": ["clean"], "error": None, "bytes": len(PY_TRANSFORM)}
+        {"name": "mypipe", "transforms": ["clean"], "failed": False,
+         "bytes": len(PY_TRANSFORM)}
     ]
 
     files.delete("mypipe")
@@ -89,7 +93,10 @@ def test_collect_error_surfaced_for_duplicate_output(files):
     # the write succeeds (syntax ok) but collect_error reports the clash.
     result = files.write("second", PY_TRANSFORM.replace("def clean", "def clean2"))
     assert result["collect_error"] is not None
-    assert "clean" in result["collect_error"]
+    # A structured failure naming the file, not a formatted exception. It is
+    # returned only to the EDITOR who just wrote the file.
+    assert result["collect_error"]["code"] == "transform_failed"
+    assert result["collect_error"]["subject"] == "pipeline:second"
 
 
 def test_generate_sql_transform_detects_inputs(files):
@@ -140,6 +147,22 @@ def test_api_from_query(client):
     assert r.status_code == 200
     content = client.get("/api/v1/pipelines/raw_count").json()["content"]
     assert '"raw": Input("raw")' in content
+
+
+def test_a_pipelines_import_failure_is_structured_on_the_editor_only_detail_route(client):
+    """A pipeline file is `exec`-ed, so its import error can say anything at
+    all. Nothing of what it said is stored or served."""
+    client.put("/api/v1/pipelines/boom", json={
+        "content": 'raise RuntimeError("connect failed: password=S3KRET")\n'
+    })
+    listed = [p for p in client.get("/api/v1/pipelines").json() if p["name"] == "boom"]
+    assert listed and listed[0]["failed"] is True
+    assert "S3KRET" not in client.get("/api/v1/pipelines").text
+
+    detail = client.get("/api/v1/pipelines/boom").json()
+    assert detail["failure"]["code"] == "transform_failed"
+    assert detail["failure"]["subject"] == "pipeline:boom"
+    assert "S3KRET" not in str(detail["failure"])
 
 
 def test_api_lock_pipelines(ws):

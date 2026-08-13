@@ -184,7 +184,11 @@ def test_http_source_sync_and_failure(clients, http_dir):
     assert r.status_code == 502
     src = admin.get("/api/v1/sources/broken").json()
     assert src["last_sync_status"] == "failed"
-    assert src["last_sync_error"]
+    # R1: a structured failure, not the driver's sentence. The old column held
+    # `redact_driver_text(f"{type(exc).__name__}: {exc}", …)` and round 3 walked
+    # around that redactor twice.
+    assert src["last_sync_failure"]["subject"] == "source:broken"
+    assert src["last_sync_failure"]["detail_ref"].startswith("err-")
 
 
 def test_source_permissions_and_redaction(clients):
@@ -197,9 +201,23 @@ def test_source_permissions_and_redaction(clients):
     assert editor.put("/api/v1/sources/crm_pull", json=body).status_code == 403
     assert admin.put("/api/v1/sources/crm_pull", json=body).status_code == 200
 
+    # R2: a source is ADMIN-authored and EDITOR-read, which is a real privilege
+    # crossing. The editor gets the Laurelin-owned facts — which source, which
+    # kind, which dataset, whether it last worked — and no `config` at all. The
+    # old answer was a denylist over key names in the *connector's* vocabulary,
+    # and round 3 read an ODBC keyword string out of a `path` key.
+    seen = editor.get("/api/v1/sources/crm_pull").json()
+    assert seen["name"] == "crm_pull" and seen["type"] == "postgres"
+    assert "config" not in seen
+    assert "s3cret" not in editor.get("/api/v1/sources").text
+
     assert viewer.get("/api/v1/sources").status_code == 403
-    listed = editor.get("/api/v1/sources").json()
+    # The ADMIN who wrote the config still reads it back, still redacted: "the
+    # person who typed it" and "the admin reading this screen" need not be the
+    # same admin.
+    listed = admin.get("/api/v1/sources").json()
     assert "s3cret" not in listed[0]["config"]["url"]
+    assert "db" in listed[0]["config"]["url"]
 
     # Sync needs edit access on the target dataset: viewers are refused.
     assert viewer.post("/api/v1/sources/crm_pull/sync").status_code == 403
@@ -326,3 +344,72 @@ def test_postgres_incremental_sync_moves_only_the_delta(clients):
     assert admin.get("/api/v1/sources/incr").json()["cursor_value"] == "130"
     # The new version references the original part plus one small delta part.
     assert len(after["files"]) == 2
+
+
+def test_a_sync_failure_does_not_hand_an_editor_the_admins_endpoint(tmp_path):
+    """`POST /sources/{name}/sync` has **no** `dependencies=[...]`. Its only gate
+    is `_require_dataset_edit`, and `permissions._evaluate` grants edit from an
+    explicit dataset grant regardless of role, or from `role.covers(editor)`
+    when a dataset has no grants at all — so a plain editor always reaches it,
+    and a viewer holding a `can_edit` grant does too.
+
+    Measured before this fix, as a plain EDITOR with no dataset grants:
+
+        502 {"detail": "The host for source:crm could not be resolved at
+             secret-db.internal.corp:55999. (psycopg/OperationalError/ref …)"}
+
+    while the same editor's `GET /sources/crm` correctly carries no `config` at
+    all. `HTTPException(detail=...)` never passes through `serialize.dump`, so
+    R2 had no jurisdiction over the error path until it was asked to.
+    """
+    import pyarrow as pa
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core.config import Workspace
+    from laurelin.core.db import MetadataStore
+
+    creds = {"username": "root", "password": "trustno1!"}
+    ws = Workspace.init(tmp_path / "ws", name="sync")
+    DatasetCatalog(ws, MetadataStore(ws.metadata_path)).write(
+        "sales", pa.table({"a": [1]})
+    )
+    app = create_app(ws)
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=creds).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=creds).status_code == 200
+    for name, role in (("ed", "editor"), ("vic", "viewer")):
+        assert admin.post("/api/v1/users", json={
+            "username": name, "password": "password123", "role": role,
+        }).status_code in (200, 201)
+
+    host = "secret-db.internal.corp"
+    assert admin.put("/api/v1/sources/crm", json={
+        "type": "postgres", "dataset": "sales",
+        "config": {"url": f"postgresql://svc:hunter2@{host}:55999/crm",
+                   "table": "public.crm"},
+    }).status_code == 200
+
+    editor = TestClient(app)
+    assert editor.post("/api/v1/auth/login", json={
+        "username": "ed", "password": "password123"}).status_code == 200
+
+    r = editor.post("/api/v1/sources/crm/sync")
+    assert r.status_code == 502
+    assert host not in r.text, r.text
+    # They still learn which source failed, why in one word, and where the
+    # operator can read the rest.
+    assert "source:crm" in r.text and "err-" in r.text
+
+    # A viewer with an explicit dataset edit grant reaches the same route.
+    assert admin.put("/api/v1/datasets/sales/permissions", json={"grants": [
+        {"subject_kind": "user", "subject": "vic", "can_view": True,
+         "can_edit": True}]}).status_code == 200
+    viewer = TestClient(app)
+    assert viewer.post("/api/v1/auth/login", json={
+        "username": "vic", "password": "password123"}).status_code == 200
+    assert host not in viewer.post("/api/v1/sources/crm/sync").text
+
+    # ...and an admin, who wrote the config, still gets the operator sentence.
+    assert host in admin.post("/api/v1/sources/crm/sync").text

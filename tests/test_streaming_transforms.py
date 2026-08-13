@@ -160,7 +160,10 @@ def wrong_type(src):
         yield {"not": "a table"}
 """)
     assert result.status.value == "failed"
-    assert "must yield pyarrow" in result.tasks[0].error
+    # R1: the check's own message is in the log at `failure.detail_ref`; what is
+    # stored is Laurelin's classification of it.
+    assert result.tasks[0].failure.code.value == "transform_failed"
+    assert result.tasks[0].failure.subject == "transform:wrong_type"
 
 
 def test_yielding_nothing_fails(env):
@@ -176,7 +179,8 @@ def yields_nothing(src):
     yield  # pragma: no cover
 """)
     assert result.status.value == "failed"
-    assert "produced no batches" in result.tasks[0].error
+    assert result.tasks[0].failure.code.value == "transform_failed"
+    assert result.tasks[0].failure.subject == "transform:yields_nothing"
 
 
 def test_record_batches_are_accepted(env):

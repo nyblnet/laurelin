@@ -288,7 +288,12 @@ while the object panel reported 2 / 2.
 
 Both reduce to `{columns, rows}` in the client, so the chart never learns which
 source fed it. Panels still execute with the *viewer's* credentials, so an
-object panel is filtered per viewer exactly as a SQL one is.
+object panel is filtered per viewer exactly as a SQL one is — but the execution
+moved: `POST /dashboards/{name}/panels/{id}/run` runs the **stored** panel on
+the server **as the caller** rather than handing the client a query to POST.
+The privilege story is unchanged (same ACL, same row-level security, same
+masking, per caller); what changed is that the viewer no longer has to be given
+the query in order to see its result.
 
 ### `laurelin/transforms`
 
@@ -783,9 +788,105 @@ require auth (when enabled).
 cookie: if an `Origin` header is present it must match the request host, else
 403. Bearer-token requests are exempt (no ambient credential).
 
-**RBAC.** viewer: all GETs. editor: viewer + POST datasets / upload / builds /
-action apply. admin: editor + user & token management. Enforced via a
-`require_role(...)` dependency; violations → 403 `{"detail": ...}`.
+**RBAC.** viewer: most GETs. editor: viewer + POST datasets / upload / builds /
+action apply, plus the GETs listed below. admin: editor + user & token
+management. Enforced via a `require_role(...)` dependency; violations → 403
+`{"detail": ...}`.
+
+**Route gating is only half of it.** A route says who may call it; it does not
+say who may read each *field* of what comes back, and "viewer: all GETs" was how
+a dashboard panel's SQL and a driver's exception text reached people who could
+not have written them. Field audiences (`laurelin/core/audience.py`) are the
+other half, enforced at the single serialization point
+(`laurelin/core/serialize.py`):
+
+> A field is readable by a principal iff the principal's effective role is at
+> least the field's audience role. The audience role is `viewer` **iff** the
+> field is explicitly declared `PRESENTATION`; otherwise it is the authoring
+> role of the record type that contains it. **If you cannot write it, you
+> cannot read it.**
+
+Anything not annotated is `OPERATIONAL`, and any model that has not declared a
+`laurelin_author_role` is admin-only — so a field or model added tomorrow fails
+closed. The role reaches the serializer through a `ContextVar` set by
+`AudienceMiddleware`, whose default is `viewer`: a route that arranges nothing
+still gets filtering, and forgetting redacts more rather than less.
+
+Three refinements, each of which is a defect that was reproduced on a running
+server before it was a design note.
+
+**A field can be authored above its record.** `DatasetInfo` is editor-authored,
+but `DatasetInfo.source` is written only by the three ADMIN registration routes,
+so the *field* crosses a privilege boundary that its *record* does not — and
+until it said so, a plain editor read five live credentials out of
+`GET /datasets/{name}` with nothing but the free-text matcher in the way.
+`audience.AuthoredBy(Role.admin)` on the field is the declaration. It is not a
+third audience: there are still exactly two, and this is the same `Role`
+vocabulary already used for records, applied at the granularity the data has.
+A field cannot be made *more* readable by annotating it — only less. What a
+lower-privileged reader gets instead is `DatasetInfo.source_descriptor`, built
+by `models.source_descriptor` from an allowlist of shape keys with an
+identifier-shaped gate on every value: a key not on the list is absent whatever
+it is called, and a value that is not identifier-shaped is absent whatever it
+contains. Both questions are decidable, which is the entire point.
+
+**Recursion narrows; it must never widen.** A nested model re-evaluates its own
+author role on the way in, so it can be *stricter* than its parent — but if the
+reader could not author the parent, the nested record is forced to its
+projection regardless. Without that, a `Failure` (editor-authored) inside a
+`SourceInfo` (admin-authored) was dumped in full to an editor who had correctly
+been handed only the parent's projection, restoring the admin's `endpoint`
+through a field annotated `PRESENTATION`.
+
+**A record's author role can be per-instance.** `AuditEvent.min_read_role` is a
+level the row's *writer* declared, and it is the honest author role of that
+row's `details`. Before `laurelin_record_author_role` existed, two mechanisms
+answered the same question and the second cancelled the first: `list_audit`
+chose which rows an editor was offered, and then the serializer dropped
+`details` from every one of them because the class says `admin`. All five
+`min_read_role=Role.editor` declarations in the tree were dead code — while the
+VIEWER-gated `/audit/mine` re-attached the raw bag by hand and served it whole.
+`details` is an open `dict`, so the serializer cannot reach inside it; writers
+put `Failure.audit_projection()` there rather than the record.
+
+Three GET routes were raised out of "all GETs" by the audience rule:
+`/pipelines` and `/pipelines/{name}` (they return `exec`-ed Python) and `/audit`
+(an open details bag written by admin-level callers). `/audit/mine` and
+`GET /transforms` / `GET /lineage` serve the viewer's actual needs.
+
+**Error paths are read paths.** A route's `HTTPException(detail=…)` never
+travels through `serialize.dump`, so R2 has no jurisdiction over it unless the
+route asks. Three confirmed disclosures came back in **4xx bodies**, quoting the
+very stored instruction the read path withholds — a panel's `group_by`, an
+object app's `filters`, a connector's endpoint. Two helpers close it:
+
+- `serialize.detail_for(failure, author_role)` renders a `Failure` in full above
+  the level that authored the *configuration it describes*, and briefly below
+  it — `Failure.render_brief()` drops `endpoint`, the one field whose value
+  comes from somebody's config rather than a closed set.
+- `routes.stored_instruction_error(exc, subject=…, author=…)` decides who may
+  read the sentence that names a broken stored instruction. Above the authoring
+  level, the message — they can repair it, so they must be told which field.
+  Below it, a `Failure` with code `definition_stale` and a `detail_ref`.
+
+And a net under R1's catch sites, because `@app.exception_handler(ValueError)`
+turns anything uncaught into a body: `failure.is_first_party(exc)` decides on
+the **deepest traceback frame** — where the `raise` is written, a fact — rather
+than on the exception's type, which lies (`pyarrow.lib.ArrowInvalid` is a
+`ValueError`; `ArrowKeyError` is a `KeyError`). `failure.safe_detail(exc)` is
+that rule as a one-liner, and every route-level `except ValueError` that used to
+return `str(exc)` now calls it — a no-op when the exception is ours, and a
+`Failure` when it came out of pyiceberg, pyarrow or a driver.
+
+**The guard.** `tests/test_audience.py` drives **every method of every route at
+two privilege levels**, with sentinels planted at admin- and editor-authoring
+level in every stored operational field, and asserts on the response body
+whatever the status code is. The earlier version swept GET only, checked 200s
+only, and silently skipped any route that 404'd — 24 of 144 routes, with
+`GET /dashboards/{name}` never checked once because the fixture's dashboard had
+a different name from `PATH_PARAMS["name"]`. Every seeded record now shares one
+name, and a GET that 404s even for an admin fails a companion test unless it is
+listed with a reason.
 
 Auth endpoints (under `/api/v1/auth`, all except status/setup/login require a
 valid credential):
@@ -827,6 +928,10 @@ GET  /api/v1/workspace                        -> {name, description, root}
 GET  /api/v1/datasets                         -> [DatasetInfo]
 POST /api/v1/datasets                         {name, description?} -> DatasetInfo
 GET  /api/v1/datasets/{name}                  -> DatasetInfo + versions: [DatasetVersionInfo]
+                                 (`source` — the connection config — is ADMIN
+                                  only, via audience.AuthoredBy; everyone else
+                                  gets `source_descriptor`: which table, in
+                                  which format, from an allowlist)
 GET  /api/v1/datasets/{name}/schema?version=  -> [ColumnSchema]
 GET  /api/v1/datasets/{name}/rows?limit=&offset=&version= -> {"rows":[...],"row_count":N}
 POST /api/v1/query        {sql, max_rows?} -> {columns,rows,row_count,truncated}
@@ -859,15 +964,54 @@ GET  /api/v1/builds                           -> [BuildInfo]
 GET  /api/v1/builds/{id}                      -> BuildInfo
 GET  /api/v1/dashboards                       -> [DashboardInfo]  (viewer)
 GET  /api/v1/dashboards/{name}                -> DashboardInfo    (viewer)
+                                 (a viewer receives the LAYOUT — id, title,
+                                  chart, x/y, width — and not `sql` or the
+                                  object aggregation: those are OPERATIONAL,
+                                  see laurelin/core/audience.py)
+POST /api/v1/dashboards/{name}/panels/{id}/run {max_rows?}
+                                              -> {columns, rows, row_count, truncated}
+                                 (viewer; the server runs the STORED panel **as
+                                  the caller**, applying that caller's ACL /
+                                  row-level security / column masking. This is
+                                  how a viewer gets the data without the query,
+                                  and why "a stored dashboard grants nobody new
+                                  read access" still holds.
+                                  ONE shape for both panel kinds: an object
+                                  panel's `{groups, group_count}` is normalized
+                                  to `{columns, rows}` here, because the client
+                                  used to do that from the panel's own
+                                  `group_by`/`metrics` and no longer receives
+                                  them.)
 PUT  /api/v1/dashboards/{name}                {title?, description?, panels} -> DashboardInfo (editor)
-                                 (panels = saved SQL + chart config; the client
-                                  runs each panel through POST /query, so every
-                                  viewer sees their own filtered data)
+                                 (whole-board replace. An OPERATIONAL field left
+                                  absent or empty on a panel whose id already
+                                  exists inherits the stored value, so a
+                                  read-modify-write client cannot blank a query
+                                  it never received. Response carries
+                                  `warnings: [{field, hint}]` — non-blocking
+                                  authoring hints, NOT a security control.)
+POST   /api/v1/dashboards/{name}/panels             DashboardPanel -> DashboardInfo (editor)
+PUT    /api/v1/dashboards/{name}/panels/{id}        DashboardPanel -> DashboardInfo (editor)
+DELETE /api/v1/dashboards/{name}/panels/{id}        -> DashboardInfo (editor)
+                                 (per-panel edits, so a client never has to
+                                  re-PUT the whole board)
 DELETE /api/v1/dashboards/{name}              -> {deleted}  (editor)
 GET  /api/v1/apps                             -> [ObjectAppInfo]  (viewer; filtered
                                  to apps whose object type the caller may see)
 GET  /api/v1/apps/{name}                      -> ObjectAppInfo    (viewer; 403 mirrors
-                                 the object type's own permission)
+                                 the object type's own permission. `filters` is
+                                 OPERATIONAL and is not sent below admin.)
+GET  /api/v1/apps/{name}/objects?search=&limit=&offset=
+                                              -> ObjectQueryResult (viewer)
+                                 (the app's objects, scoped by its STORED
+                                  filters. Necessary because the client used to
+                                  apply them and no longer receives them —
+                                  without this an app shows its whole object
+                                  type. `filter.*` in the query string is
+                                  ignored: the scope comes from the definition
+                                  and nowhere else. Adds no access of its own —
+                                  the object type's permission, row policy and
+                                  column masks apply as on the generic route.)
 PUT  /api/v1/apps/{name}                      {object_type, columns?, filters?,
                                                actions?, links?, title?} (admin;
                                  validated against the live ontology on save)
@@ -879,8 +1023,8 @@ PUT  /api/v1/schedules/{name}                 {trigger, cron|upstream_dataset,
                                               -> ScheduleInfo (editor; validated on save)
 DELETE /api/v1/schedules/{name}               -> {deleted}  (editor)
 POST /api/v1/schedules/{name}/run             -> {queued, due_at}  (make it due now)
-GET  /api/v1/sources                          -> [SourceInfo]  (editor; secrets redacted)
-GET  /api/v1/sources/{name}                   -> SourceInfo    (editor; secrets redacted)
+GET  /api/v1/sources                          -> [SourceInfo]  (editor; `config` ADMIN only)
+GET  /api/v1/sources/{name}                   -> SourceInfo    (editor; `config` ADMIN only)
 PUT  /api/v1/sources/{name}                   {type, dataset, config} -> SourceInfo  (admin)
                                  (types: postgres {url, table|query, batch_size?},
                                   http {url, format?, headers?}, file {path, format?})
@@ -916,12 +1060,23 @@ GET  /api/v1/groups                           -> [{name, members:[username]}]  (
 POST /api/v1/groups                           {name} -> {name, members:[]}  (admin)
 PUT  /api/v1/groups/{name}/members            {members:[username]} -> {name,members}  (admin)
 DELETE /api/v1/groups/{name}                  -> {ok:true}  (admin)
-GET  /api/v1/pipelines                        -> [{name, transforms:[str], error, bytes}]  (viewer)
-GET  /api/v1/pipelines/{name}                 -> {name, content}  (viewer)
+GET  /api/v1/pipelines                        -> [{name, transforms:[str], failed, bytes}]  (editor)
+GET  /api/v1/pipelines/{name}                 -> {name, content, failure}  (editor)
+                                 (both raised from viewer: they return `exec`-ed
+                                  Python. A viewer's lineage need is served by
+                                  GET /transforms and GET /lineage, which stay
+                                  viewer — names and edges, not authored prose.)
 PUT  /api/v1/pipelines/{name}                 {content} -> {name,transforms,collect_error}  (editor)
 DELETE /api/v1/pipelines/{name}               -> {ok:true}  (editor)
 POST /api/v1/pipelines/from-query             {sql, output, name?} -> {name,...}  (editor)
-GET  /api/v1/audit?limit=                     -> [AuditEvent]
+GET  /api/v1/audit?limit=                     -> [AuditEvent]  (editor; rows are
+                                  further filtered by `audit_log.min_read_role`,
+                                  which defaults to admin so a new log_audit
+                                  call site discloses to nobody below admin)
+GET  /api/v1/audit/mine?limit=                -> [AuditEvent]  (viewer; only rows
+                                  this user is the actor of, returned whole —
+                                  you cannot learn a secret from a row you
+                                  wrote)
 ```
 
 **Grant** = `{subject_kind: "everyone"|"role"|"group"|"user", subject: str,

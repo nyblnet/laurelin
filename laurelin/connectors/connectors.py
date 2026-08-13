@@ -42,7 +42,14 @@ import pyarrow as pa
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import metrics, redaction
 from laurelin.core.db import MetadataStore
-from laurelin.core.models import DatasetVersionInfo, SourceInfo
+from laurelin.core.failure import (
+    Failure,
+    FailureCode,
+    Phase,
+    connect_failure,
+    driver_of,
+)
+from laurelin.core.models import DatasetVersionInfo, Role, SourceInfo
 
 log = logging.getLogger("laurelin.connectors")
 
@@ -307,31 +314,31 @@ def sync_source(
         info = writer(source.dataset, chunks, source=f"sync:{source.type}")
     except Exception as exc:
         metrics.syncs.labels(type=source.type, status="failed").inc()
-        # The driver's own words, with this source's own credentials taken out
-        # of them. Storing the raw string was a live disclosure: the same
-        # response object that masks `config.url` carried
-        # `last_sync_error: 'unexpected spaces found in "SUPER SEKRET"'` to
-        # every editor, and `log_audit` put it on the VIEWER-gated /audit
-        # route, where a user who is 403 on /sources read the password.
+        # R1. This used to store `redact_driver_text(f"{type(exc).__name__}:
+        # {exc}", secrets_in_config(config))` — a *redacted driver sentence*,
+        # which is still a driver sentence, and round 3 walked around the
+        # redactor twice (a libpq conninfo has no `://`; a password containing a
+        # space is quoted back by psycopg in a message the config's secret list
+        # does not match because the driver re-escaped it).
         #
-        # Redacted at the point of *record*, not at the point of display: it is
-        # written to two places read by two routes at two privilege levels, and
-        # a redactor bolted onto one of them is a redactor the next route to
-        # read this column will not have. The unredacted exception goes to the
-        # log, and is re-raised for the caller who is about to log it too.
-        detail = redaction.redact_driver_text(
-            f"{type(exc).__name__}: {exc}", redaction.secrets_in_config(source.config)
-        )
-        log.warning(
-            "sync of source %r failed: %s", source.name, exc,
-            extra={"source": source.name, "dataset": source.dataset},
-        )
-        store.record_source_sync(source.name, "failed", error=str(detail))
+        # What is stored now is a value Laurelin constructed. The driver's words
+        # go to the log inside `Failure.from_exception` and nowhere else, and
+        # the exception is re-raised for the caller.
+        failure = _sync_failure(exc, source)
+        store.record_source_sync(source.name, "failed", failure=failure)
         store.log_audit(
             "source_sync_failed",
             {"source": source.name, "dataset": source.dataset,
-             "error": str(detail)[:500]},
+             "failure": failure.audit_projection()},
             actor=actor,
+            # An editor owns sources and needs to see why a sync failed. Safe to
+            # lower *because* the bag holds the failure's PROJECTION and not the
+            # record: `as_dict()` stood here, and it carried `endpoint` —
+            # rebuilt from the connector's ADMIN-authored `url`, which is the
+            # one field `source_routes._public` exists to withhold from an
+            # editor. `details` is an open dict, so `serialize.dump` cannot
+            # reach inside it to fix that; the writer has to.
+            min_read_role=Role.editor,
         )
         raise
     metrics.syncs.labels(type=source.type, status="succeeded").inc()
@@ -370,3 +377,42 @@ def _refuse_without_credentials(source: SourceInfo) -> None:
             "Re-supply it (PUT /api/v1/sources/{name} or Admin -> Sources) "
             "before syncing; the manifest's withheld list says what is missing."
         )
+
+
+# Which library actually raised, per connector type. A closed map, because
+# `Failure.driver` is a closed set — it names the library whose log line an
+# operator should go read, and a value nobody put here is a value nobody
+# constructed.
+# `http` said "requests" and `_pull_http` uses `urllib.request`; `requests` is
+# not imported on that path at all, so a stored failure sent an operator to
+# a log that does not exist. Overridden per-exception by `driver_of` when
+# the raising library is known.
+_DRIVER_BY_TYPE = {"postgres": "psycopg", "http": "urllib", "file": "duckdb"}
+
+
+def _sync_failure(exc: BaseException, source: SourceInfo) -> Failure:
+    """One source sync's failure, as Laurelin records it.
+
+    On the postgres path this goes through the connect-phase pre-flight, because
+    psycopg gives ``sqlstate=None`` on **every** connect failure (measured on
+    this tree against live Postgres: wrong password, space-in-password, unknown
+    database, bad host and refused port are all `sqlstate=None`, and all are
+    `OperationalError` except space-in-password, which is `ProgrammingError`).
+    So the driver discriminates nothing at connect time and Laurelin does its
+    own DNS lookup and TCP connect to find out which of "unresolvable",
+    "unreachable", "timed out" and "rejected us" is true.
+    """
+    subject = f"source:{source.name}"
+    # The connector type says which library we *meant* to use; the raising
+    # class's module says which one actually did. Prefer the fact.
+    driver = driver_of(exc, _DRIVER_BY_TYPE.get(source.type, ""))
+    dsn = str(source.config.get("url") or "")
+    if driver == "psycopg" and dsn:
+        return connect_failure(
+            exc, subject=subject, driver=driver, dsn=dsn, config=source.config
+        )
+    return Failure.from_exception(
+        exc, phase=Phase.execute, subject=subject, driver=driver, dsn=dsn,
+        config=source.config,
+        code=None if driver in ("psycopg", "duckdb") else FailureCode.REMOTE_FAILED,
+    )

@@ -18,7 +18,8 @@ from laurelin.api.routes import (
     StoreDep,
     _dump,
 )
-from laurelin.core import redaction, scheduler
+from laurelin.core import authoring_hints, scheduler
+from laurelin.core.failure import safe_detail
 from laurelin.core.models import ScheduleInfo, utcnow_iso
 
 schedules_router = APIRouter(tags=["schedules"])
@@ -66,19 +67,21 @@ def upsert_schedule(
     # `s3://key:SCHEDSEKRET@bucket/t`, was refused as a target and accepted as
     # a `source`, then handed back in full by GET /schedules. A guard on one
     # field of a record is a guard on none of it.
+    #
+    # R2 demoted this from a 400 to a warning. Every ScheduleInfo field is
+    # OPERATIONAL and both schedule routes are editor-gated, so a credential
+    # pasted here is no longer readable one privilege level down — which is
+    # what the gate existed to prevent. What is left is an authoring hint, and
+    # `authoring_hints.credential_in_free_text` is explicitly not a boundary.
     checked = [("target", target) for target in body.targets]
     checked += [("source", body.source), ("upstream dataset", body.upstream_dataset)]
-    for label, value in checked:
-        if redaction.credential_in_free_text(value):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"A schedule {label} may not embed a credential: this one "
-                    "is stored and returned verbatim by GET /schedules. Put "
-                    "the credential in a registered source or an object-store "
-                    "profile and name that here."
-                ),
-            )
+    warnings = [
+        {"field": label,
+         "hint": f"this {label} looks like it embeds a credential. Put it in a "
+                 "registered source or an object-store profile and name that here."}
+        for label, value in checked
+        if authoring_hints.credential_in_free_text(value)
+    ]
     existing = store.get_schedule(name)
     info = ScheduleInfo(
         name=name,
@@ -96,7 +99,7 @@ def upsert_schedule(
     try:
         scheduler.validate(info)
     except scheduler.ScheduleError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=safe_detail(exc, subject="schedule"))
 
     # A cron schedule needs its first firing time, or it would never be due.
     if info.trigger == "cron" and info.enabled:
@@ -110,7 +113,7 @@ def upsert_schedule(
     )
     saved = store.get_schedule(name)
     assert saved is not None
-    return _dump(saved)
+    return _dump(saved) | {"warnings": warnings}
 
 
 @schedules_router.delete("/schedules/{name}", dependencies=[EDITOR])

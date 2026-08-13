@@ -86,7 +86,7 @@ So, concretely:
 | `sessions`, `oidc_flows` | The tables are not exported at all. |
 | `api_tokens` | `(id, name, user_id, created_at)` unless `--no-audit`; never `token_hash`. |
 | `audit_log.details_json` | Subjects (`username`, `dataset`, …) travel; credential-shaped keys, endpoint keys and free-form error text do not, and a row whose remaining values still look like a credential is withheld whole. |
-| `sources.last_sync_error`, `builds.error`, `build_tasks.error` | Nulled, with a count in the manifest. The API now redacts this text before storing it (substituting the credentials the config says we issued, then withholding whole if any survives), but the export stays stricter: an archive leaves the building, and a redactor that depends on knowing the secret cannot vouch for a message produced by a driver we did not configure. |
+| `sources.last_sync_failure_json`, `builds.failure_json`, `build_tasks.failure_json`, `schedules.last_failure_json` | Nulled, with a count in the manifest. Under R1 these hold a `Failure` — a closed-enum code and phase, our own subject, a `host:port` we rebuilt from our own config, integer counters — so nothing here *can* carry a credential, and the strictness is no longer about doubt. It is that an archive leaves the building and there is no reason for it to carry failure history at all. (The prose columns these replaced — `last_sync_error`, `builds.error`, `build_tasks.error`, `schedules.last_error` — are dropped to NULL by the upgrade migration itself; see CHANGELOG.) |
 
 **The export is deliberately stricter than the API.** `GET /sources` keeps
 `user@host:port/db`, and a test enforces that: an admin reading a live system

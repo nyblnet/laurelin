@@ -11,6 +11,7 @@ import pytest
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.failure import FailureCode
 from laurelin.core.models import BuildStatus
 from laurelin.transforms import (
     Builder,
@@ -328,7 +329,14 @@ def test_build_missing_input_fails_cleanly(workspace, catalog, store):
     assert build.status == BuildStatus.failed
     task = build.tasks[0]
     assert task.status == BuildStatus.failed
-    assert "never_created" in task.error
+    # R1: the stored record is Laurelin's, not the exception's. `task.error`
+    # used to hold f"{type(exc).__name__}: {exc}" and a plain VIEWER read a
+    # driver-authored sentinel out of GET /builds/{id}. The missing input's
+    # name is in the server log at `failure.detail_ref`.
+    assert task.failure is not None
+    assert task.failure.code is FailureCode.TRANSFORM_FAILED
+    assert task.failure.subject == "transform:needs_missing"
+    assert task.failure.detail_ref.startswith("err-")
 
 
 def test_build_non_table_return_fails(workspace, catalog, store):
@@ -343,7 +351,9 @@ def test_build_non_table_return_fails(workspace, catalog, store):
     build = Builder(workspace, catalog, store, registry).build()
     task = build.tasks[0]
     assert task.status == BuildStatus.failed
-    assert "must return a pyarrow.Table" in task.error
+    assert task.failure is not None
+    assert task.failure.code is FailureCode.TRANSFORM_FAILED
+    assert task.failure.subject == "transform:bad"
 
 
 def test_build_failure_isolation(workspace, catalog, store):
@@ -372,12 +382,17 @@ def test_build_failure_isolation(workspace, catalog, store):
     by_name = {t.transform_name: t for t in build.tasks}
 
     assert by_name["breaks"].status == BuildStatus.failed
-    assert "kaboom" in by_name["breaks"].error
+    assert by_name["breaks"].failure.code is FailureCode.TRANSFORM_FAILED
+    assert by_name["breaks"].failure.subject == "transform:breaks"
 
-    assert by_name["dependent"].status == BuildStatus.failed
-    assert "Skipped" in by_name["dependent"].error
-    assert by_name["transitively_dependent"].status == BuildStatus.failed
-    assert "Skipped" in by_name["transitively_dependent"].error
+    # A task that never ran because a named upstream failed. `blocked_by` is an
+    # integer, not the joined dataset names: a count cannot carry a password,
+    # and the names are already on the build's own task list.
+    for name in ("dependent", "transitively_dependent"):
+        skipped = by_name[name]
+        assert skipped.status == BuildStatus.failed
+        assert skipped.failure.phase.value == "plan"
+        assert skipped.failure.counters["blocked_by"] >= 1
 
     assert by_name["independent"].status == BuildStatus.succeeded
     assert catalog.read("independent").num_rows == 4
