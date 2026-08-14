@@ -75,11 +75,23 @@ classifications on every build, so a pipeline cannot launder classified data
 into an unmarked output.
 
 **The SQL surface is sandboxed.** Workbench and dashboard queries run with
-DuckDB external access disabled, over only the datasets the caller may view.
-`read_csv('/etc/passwd')`, `COPY … TO`, path traversal, and attempts to widen
-the sandbox with `SET` are all blocked, and there are regression tests for
-each. A dataset you can't see is an *unknown table*, not a permission error —
-no existence oracle.
+DuckDB external access disabled (`catalog.py`, `SET enable_external_access=false`),
+over only the datasets the caller may view. `read_csv('/etc/passwd')`,
+`COPY … TO`, path traversal, and attempts to widen the sandbox with `SET` are
+all blocked, and there are regression tests for each
+(`tests/test_query.py`, `tests/test_federation.py`). A dataset you can't see is
+an *unknown table*, not a permission error — no existence oracle.
+
+That is the sandbox around *caller-written* SQL, and it is not the same as a
+filesystem sandbox around the whole process. **Registering a federated or
+ClickHouse source whose path is local is a "read any file the server process
+can read" capability**, because `federation.connect` disables
+`LocalFileSystem` only for sources that are *not* local, and chdb has no
+filesystem restriction to disable at all. It is therefore admin-only, and
+exposing such datasets to ad-hoc SQL is additionally off by default behind
+`LAURELIN_FEDERATION_WORKBENCH=1`. This is a property of the registration
+route, not a hole in the workbench: callers receive an Arrow table, never a
+connection, so only server-generated SQL reaches those engines.
 
 **Secrets aren't echoed — and that no longer rests on recognising one.** Three
 rounds of attackers found credential disclosures in the module that tried to
@@ -293,7 +305,22 @@ above, the SQL sandbox, secret exposure, injection, path traversal, CSRF,
 privilege escalation between roles/workspaces, and marking/lineage bypass.
 
 **Out of scope:** anything requiring `--no-auth`; attacks by a user who
-already has pipeline-write access (see boundary 1); denial of service via
-deliberately expensive queries (the query engine is not resource-limited yet —
-a known gap, tracked on the roadmap); social engineering; and vulnerabilities
-in dependencies without a demonstrated exploit path through Laurelin.
+already has pipeline-write access (see boundary 1); social engineering; and
+vulnerabilities in dependencies without a demonstrated exploit path through
+Laurelin.
+
+**Resource exhaustion is partly in scope, and here is exactly how far it
+goes.** Interactive queries *are* budgeted — `laurelin/core/limits.py` applies
+a memory limit, a wall-clock timeout enforced by a watchdog that calls
+DuckDB's `interrupt()`, and a per-replica concurrency semaphore that refuses
+past its bound with `Retry-After` rather than queueing. All three are tunable
+(`LAURELIN_QUERY_MEMORY_LIMIT`, `LAURELIN_QUERY_TIMEOUT`,
+`LAURELIN_MAX_CONCURRENT_QUERIES`) and are translated into ClickHouse's and
+StarRocks' own settings for those engines. So one expensive query fails its
+own request rather than the replica. What is **not** bounded: builds get a
+looser budget and **no timeout by default** (`LAURELIN_BUILD_TIMEOUT=0`), and
+there is **no general request rate limiter** — the only throttle in the tree is
+on failed logins (5 consecutive failures per username → 30s lockout, 429), so a
+caller who issues many *cheap* authenticated requests is unbounded. Report a
+way to take a replica down *through* the query budget; a report that says
+"unbounded builds exist" is describing a documented default.

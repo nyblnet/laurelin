@@ -15,13 +15,13 @@ that module's docstring for what replaced each thing it used to protect. The
 split is deliberate: leaving the two halves in one file is what let a matcher
 that guesses at prose inherit the credibility of rules that read structure.
 
-Known residual, and it is real: ``redact_mapping`` is a **denylist** over key
-names in somebody else's config vocabulary. ``laurelin/export/secrets.py``
-already demonstrates the better posture (``NON_SECRET_SHAPE_KEYS``, an
-allowlist, with the comment that a denylist "is a list of the names we happened
-to think of"). Converting it is filed as task #54 and is deliberately out of
-scope here — it is not the free-text matcher, and it touches every connector's
-UI display.
+``redact_mapping`` **used to be a denylist** over key names in somebody else's
+config vocabulary: any key it did not recognise had its value disclosed unless
+a shape rule objected. Task #54 inverted it — see ``_DISCLOSABLE_KEYS`` below.
+A key that is not on that list is withheld whatever it is called, so
+``API_SECRET_KEY_RE`` is now a *readability* refinement (it picks ``*****`` over
+``***** (withheld)`` for a key that says what it is) and no longer decides
+whether anything is shown.
 
 **Measured, on this tree, before this module existed.** The three production
 redactors were attacked with the inputs below; ten leaks reproduced
@@ -72,12 +72,13 @@ admin route can still see:
 * the host and path of a URL with no query string, e.g. a webhook path of the
   form ``https://hooks.example.com/services/T00/B00/SECRET``, where the secret
   is *in the path* and nothing in the string says so;
-* any credential an operator pasted into a free-form value that is not itself a
-  URL and does not sit under a key that says it is one — a ``query`` holding
+* any credential an operator pasted into one of the handful of values
+  ``_DISCLOSABLE_KEYS`` still shows — a ``query`` holding
   ``SELECT ... 'postgres://a:p@h'`` is masked because the URL shape is
   recognisable inside it, but ``SELECT ... pwd='hunter2'``, or an ODBC keyword
   string filed under ``path``, is not, and this module does not pretend
-  otherwise.
+  otherwise. That residual is now bounded to fourteen key names instead of
+  every name a caller might invent.
 
 Closing the first two means answering the product question. The third is what
 ``export/pipeline_scan.py`` exists for, and it refuses rather than redacts.
@@ -123,13 +124,15 @@ _EMBEDDED_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>()\[\]{},;]+
 _HOST_RE = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._\-]+)(:[0-9]*)?")
 
 # The union of the three regexes this module replaces, plus the names they each
-# individually missed. It is a denylist, and a denylist is *not* what makes this
-# module safe — the shape rules above are. This survives for two reasons: it
-# masks a secret sitting under an obvious name in a config whose vocabulary is
-# the caller's (``SourceUpsertRequest.config`` is ``dict[str, Any]``), and a
-# response that says ``password: *****`` is more readable than one that says
-# ``password: ***** (withheld)`` for the same field. Nothing depends on it
-# being complete; the default for a container is withhold, not disclose.
+# individually missed. It is a denylist, and since task #54 it decides **only
+# how a withheld value is spelled**, never whether one is shown: a key that
+# matches nothing here and nothing in `_DISCLOSABLE_KEYS` is withheld anyway.
+# It survives because `password: *****` reads better than
+# `password: ***** (withheld)` for a field whose name already says what it held,
+# and because `MASK` is the honest marker there — the whole value *was* the
+# credential and the whole value is gone, so "we found it and removed it" is
+# exactly true. Being incomplete now costs readability, not confidentiality,
+# which is the only shape in which a name list is safe to keep.
 #
 # `key` on its own is here because federation and engines already matched it and
 # `access_key`/`secret_key` are the names that turn up in an S3-backed source.
@@ -157,6 +160,56 @@ API_SECRET_KEY_RE = re.compile(
 # far more often than it is a URL, and withholding every one of those would
 # empty the Sources screen to protect nothing.
 _URL_KEY_RE = re.compile(r"(^|_)(url|uri)$", re.I)
+
+
+# **The allowlist that decides whether a value is shown at all** (task #54).
+# Every key not named here — and not matched by `_URL_KEY_RE` — is withheld,
+# whatever it is called, whatever it holds, and whoever added it.
+#
+# This replaced the final `else` of :func:`redact_mapping`, which handed any
+# unrecognised key's value to :func:`redact_value`: *disclose it unless a shape
+# rule objects*. That is a denylist over somebody else's vocabulary, and it has
+# now lost twice here. Round 1: three redactors, ten measured leaks, the table
+# at the top of this module. Round 3: a source registered through the real front
+# door with `base_url`, `endpoint_url`, `hosts`, `bootstrap_servers`,
+# `connection` and `path` shipped all six verbatim, each carrying a password,
+# while the export manifest positively certified the endpoint was withheld.
+# `SourceUpsertRequest.config` is `dict[str, Any]` (source_routes.py:39), so the
+# vocabulary is the caller's; `export/secrets.py` puts it plainly — a denylist
+# over it "is a list of the names we happened to think of".
+#
+# These names are the *shape* of the registration — which table, in which
+# format, read how — not where it lives or how to log in. They are
+# `export/secrets.NON_SECRET_SHAPE_KEYS` verbatim, plus `snapshot_id` and the
+# two endpoint keys the export withholds and the API keeps:
+#
+# * `path` and the `url`/`uri` family are here because **an admin has to be able
+#   to tell one registration from another**, and for the three source types that
+#   is the only distinguishing value: `configSummary` in `views/Sources.tsx`
+#   renders `c.url` for http, `c.path` for file, and `FederatedSource` in
+#   `views/Datasets.tsx` renders `source.path ?? source.table ?? source.url`.
+#   Dropping them renders every source of a type identically, which trades a
+#   theoretical leak for a screen nobody can use. They are disclosed under the
+#   shape rules, not verbatim: `url`/`uri` go through `redact_dsn` (unparseable
+#   ⇒ withheld), `path` through `redact_value`, because `/mnt/land/*.csv` is a
+#   path far more often than it is a URL and withholding every one of those
+#   would empty the Sources screen to protect nothing.
+# * `query` is here for the same reason on the postgres type, and it is the
+#   riskiest name on this list — see the residual disclosure §3 above.
+#
+# The export answers the endpoint question the other way (it drops `path` and
+# `url` too) because a file that leaves the building is a different threat model
+# from a response an admin reads on a system they can already reach. That
+# disagreement is deliberate and is argued in both module docstrings.
+#
+# Adding a name here is a disclosure decision. A key that ought to be shown and
+# is not shows up as `***** (withheld)` on an admin's screen — visible, annoying
+# and fixed in one line. That is the failure direction this list is chosen for.
+_DISCLOSABLE_KEYS = frozenset({
+    "type", "table", "format", "catalog", "database", "schema", "namespace",
+    "mode", "query", "cursor_column", "batch_size", "branch", "snapshot_id",
+    "path",
+})
 
 
 # A credential written as `keyword=value` instead of as a URL. Nothing above
@@ -440,21 +493,45 @@ def withhold_values(value: Any) -> Any:
 def redact_mapping(config: Any) -> Any:
     """A config object as an API response may carry it.
 
-    Top level only is disclosed, and only scalars: a secret-named key is masked,
-    a URL-shaped value is DSN-redacted, any other scalar is shown as it is
-    stored, and anything nested keeps its names and loses its values.
+    **An allowlist over key names** (:data:`_DISCLOSABLE_KEYS`), not a denylist:
+    a key this module does not recognise has its value withheld, and the shape
+    rules then run over the few that survive. Top level only, and only scalars.
+
+    In order:
+
+    * a **secret-named** key is ``MASK`` — withheld like everything unlisted,
+      spelled the way a reader understands fastest;
+    * a **container** keeps its key names and loses every value, because the
+      shape an operator configured is the fact they are checking;
+    * a **``url``/``uri``** key takes the DSN rules — masked if the credential
+      is locatable, withheld whole if it is not;
+    * a key in :data:`_DISCLOSABLE_KEYS` takes :func:`redact_value`, which is
+      still a shape check and not a pass-through: a ``path`` holding an ODBC
+      keyword string or a ``query`` quoting a DSN is redacted;
+    * **everything else is withheld.** This is the branch task #54 inverted. It
+      used to be ``redact_value(value)`` — disclose unless a shape rule objects
+      — and it is where round 3's six keys walked out.
+
+    An empty or absent value passes through as itself rather than becoming
+    ``WITHHELD``: the UI reads that marker as "the server had this and could not
+    redact it safely" (``ui.tsx`` draws an explanation on an exact match), and
+    printing it over a ``null`` would be a claim about a value that never
+    existed.
     """
     if not isinstance(config, dict):
         # Not an object: there are no keys to judge and no shape to preserve.
         return WITHHELD if config not in (None, "") else config
     out: dict[str, Any] = {}
     for key, value in config.items():
-        if API_SECRET_KEY_RE.search(str(key)):
+        name = str(key)
+        if API_SECRET_KEY_RE.search(name):
             out[key] = MASK
         elif isinstance(value, (dict, list, tuple)):
             out[key] = withhold_values(value)
-        elif _URL_KEY_RE.search(str(key)) and isinstance(value, str):
+        elif _URL_KEY_RE.search(name) and isinstance(value, str):
             out[key] = redact_dsn(value)
-        else:
+        elif name.lower() in _DISCLOSABLE_KEYS:
             out[key] = redact_value(value)
+        else:
+            out[key] = WITHHELD if value not in (None, "") else value
     return out

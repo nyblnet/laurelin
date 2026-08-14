@@ -6,6 +6,7 @@ import { useAuth } from "../auth";
 import type { ObjectTypeDef, ObjectTypeDetail } from "../types";
 import { Badge, ErrorBox, PageHeader, Spinner } from "../ui";
 import { ObjectBrowser } from "./ontology/ObjectBrowser";
+import { EditLogPanel } from "./ontology/EditLogPanel";
 import { WritebackPanel } from "./ontology/WritebackPanel";
 
 /** Index: object types as clickable cards. */
@@ -74,9 +75,11 @@ function ObjectTypePage() {
       {q.data && (
         <>
           {/* The order is the story of the page: what the store knows, then how
-              to make it permanent, then the objects themselves. */}
+              to make it permanent, then what that permanence lets you throw
+              away, then the objects themselves. */}
           <ObjectStoreControl type={q.data} busy={folding} />
           <WritebackPanel type={q.data} onBusyChange={setFolding} />
+          <EditLogPanel type={q.data} />
           <ObjectBrowser detail={q.data} />
         </>
       )}

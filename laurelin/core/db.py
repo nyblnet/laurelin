@@ -1866,6 +1866,132 @@ class MetadataStore:
             )
             return int(cur.rowcount)
 
+    def list_folded_edits(self, object_type: str) -> list[dict]:
+        """Folded edits for a type, oldest first, with their bookkeeping columns.
+
+        ``list_object_edits`` returns :class:`ObjectEdit`, which deliberately
+        does not carry ``folded_into_version`` — it is a fact about the log
+        entry, not about the edit. Pruning is the one caller that has to reason
+        about it, so it gets rows rather than models.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, object_type, pk_value, kind, actor, created_at, edit_seq, "
+                "folded_at, folded_into_version, "
+                "length(payload_json) AS payload_bytes "
+                "FROM object_edits WHERE object_type = ? AND folded_at IS NOT NULL "
+                "ORDER BY edit_seq",
+                (object_type,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "object_type": r["object_type"],
+                "pk_value": r["pk_value"],
+                "kind": r["kind"],
+                "actor": r["actor"],
+                "created_at": r["created_at"],
+                "edit_seq": int(r["edit_seq"]),
+                "folded_at": r["folded_at"],
+                "folded_into_version": (
+                    None if r["folded_into_version"] is None
+                    else int(r["folded_into_version"])
+                ),
+                "payload_bytes": int(r["payload_bytes"] or 0),
+            }
+            for r in rows
+        ]
+
+    def object_edit_stats(self, object_type: Optional[str] = None) -> list[dict]:
+        """What the edit log costs, per object type.
+
+        ``payload_bytes`` sums ``length(payload_json)`` and nothing else: not
+        the other columns, not the row overhead, not the two indexes. It is a
+        *floor* on what the log occupies rather than a measurement of the
+        database file — deliberately, because the alternative is a number that
+        looks like a disk figure and is not one. What it does describe honestly
+        is the part that grows with edit count, which is the question being
+        asked when a workspace uses the ontology as an application database.
+
+        ``length`` counts *characters* in both dialects, and characters are
+        bytes here: payloads are written by ``json.dumps`` with the default
+        ``ensure_ascii=True``, so every payload in this column is ASCII.
+        """
+        where, params = "", ()
+        if object_type is not None:
+            where, params = "WHERE object_type = ?", (object_type,)
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT object_type, COUNT(*) AS edits, "
+                "  SUM(CASE WHEN folded_at IS NULL THEN 1 ELSE 0 END) AS live, "
+                "  SUM(CASE WHEN folded_at IS NULL THEN 0 ELSE 1 END) AS folded, "
+                "  COALESCE(SUM(length(payload_json)), 0) AS payload_bytes, "
+                "  COALESCE(MAX(edit_seq), 0) AS max_edit_seq, "
+                "  MIN(created_at) AS oldest, MAX(created_at) AS newest "
+                f"FROM object_edits {where} GROUP BY object_type ORDER BY object_type",
+                params,
+            ).fetchall()
+        return [
+            {
+                "object_type": r["object_type"],
+                "edits": int(r["edits"]),
+                "live": int(r["live"] or 0),
+                "folded": int(r["folded"] or 0),
+                "payload_bytes": int(r["payload_bytes"] or 0),
+                "max_edit_seq": int(r["max_edit_seq"] or 0),
+                "oldest": r["oldest"],
+                "newest": r["newest"],
+            }
+            for r in rows
+        ]
+
+    # SQLite's parameter limit was 999 before 3.32; chunking well under it keeps
+    # a prune of a large log from depending on the client library's build.
+    _DELETE_CHUNK = 400
+
+    def delete_object_edits(self, object_type: str, edit_ids: list[str]) -> int:
+        """Delete exactly these edits of one type. Returns how many went.
+
+        Two conditions are enforced *here*, in SQL, rather than trusted from
+        the caller, because both failure modes are silent and neither is
+        recoverable:
+
+        * ``folded_at IS NOT NULL`` — a live edit is not history, it is the
+          only copy of a change that every read path still replays. Deleting
+          one loses data with nothing to say so.
+        * ``edit_seq < MAX(edit_seq)`` for the type — the sequence allocator is
+          ``MAX(edit_seq) + 1`` and a materialization's watermark is compared
+          against ``max_edit_seq``. Delete the highest row and the next edit
+          re-uses a number the store already claims to have applied: ``catch_up``
+          skips it forever while ``_state_is_current`` reports "fresh". Keeping
+          one row is what makes that unreachable.
+
+        The maximum is read inside the same transaction as the delete. A
+        concurrent append can only raise it, so a stale value deletes *fewer*
+        rows — the safe direction.
+        """
+        if not edit_ids:
+            return 0
+        removed = 0
+        with self._conn() as c:
+            high = int(c.execute(
+                "SELECT COALESCE(MAX(edit_seq), 0) AS n FROM object_edits "
+                "WHERE object_type = ?",
+                (object_type,),
+            ).fetchone()["n"])
+            ids = list(edit_ids)
+            for start in range(0, len(ids), self._DELETE_CHUNK):
+                chunk = ids[start:start + self._DELETE_CHUNK]
+                placeholders = ", ".join("?" for _ in chunk)
+                cur = c.execute(
+                    f"DELETE FROM object_edits WHERE object_type = ? "
+                    f"AND id IN ({placeholders}) "
+                    f"AND folded_at IS NOT NULL AND edit_seq < ?",
+                    (object_type, *chunk, high),
+                )
+                removed += int(cur.rowcount or 0)
+        return removed
+
     # -- audit ---------------------------------------------------------------------
 
     def log_audit(

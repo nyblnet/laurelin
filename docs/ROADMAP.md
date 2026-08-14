@@ -121,16 +121,25 @@ Key bets, and why:
       or renaming requires `allow_breaking=True`, and the refusal names the
       transitive downstream datasets from lineage — the question is never "is
       this safe?" but "what breaks when I do it?"
-- [ ] **Iceberg tags, hidden partitioning, row-level deletes, small-file
-      compaction**. The Arrow read path also still materializes through
-      pyiceberg (the SQL path prunes via `iceberg_scan`).
-- [ ] **Branches & merges**: `laurelin branch create staging`, build against a
-      branch, diff datasets between branches, merge = atomic metadata swap.
-      (Iceberg refs make this cheap.)
-- [ ] **Transactions**: append / overwrite / upsert-by-key write modes, not just
-      snapshot replace.
-- [ ] **Schema evolution** with enforcement: additive by default, breaking
-      changes require explicit migration + downstream impact report from lineage.
+- [~] **Iceberg tags, hidden partitioning, row-level deletes, small-file
+      compaction**. *Compaction shipped* — but as a whole-table rewrite into one
+      new snapshot, not Iceberg's incremental `rewrite_data_files`, so it costs
+      the table and reclaims scan cost rather than disk (earlier snapshots keep
+      their files; nothing expires them yet). Tags, hidden partitioning and
+      row-level deletes are still open. The Arrow read path also still
+      materializes through pyiceberg (the SQL path prunes via `iceberg_scan`).
+- [~] **Branches & merges**: *partly done, and the checked "Iceberg branches"
+      item above is the part that shipped* — cut a branch, write to it, merge
+      as a fast-forward metadata swap. Still open: a `laurelin branch` CLI verb
+      (branches are API/UI only today), diffing datasets between branches, and
+      anything beyond fast-forward.
+- [~] **Transactions**: `append` shipped (a version is a manifest of parts, so
+      appending costs the delta) and `compact` merges them back. Still open:
+      overwrite and upsert-by-key write modes.
+- [x] **Schema evolution with enforcement**: *duplicate of the checked item
+      above and shipped with it* — additive by default; dropping or renaming
+      requires `allow_breaking=True` and the refusal names the transitive
+      downstream datasets from lineage.
 - [x] **External / federated tables**: register existing Postgres/S3
       parquet/Iceberg/Delta locations as read-only datasets (DuckDB attach),
       with the row policy and column masks compiled to SQL around the remote
@@ -389,9 +398,11 @@ panel"), keeping the current information-dense dark aesthetic:
 - [ ] **Data manager**: dataset browser w/ schema/version/lineage/expectation
       tabs, branch switcher, upload wizard, retention controls, column stats
       (null %, distinct, min/max, histograms — computed on write).
-- [ ] **SQL workbench**: monaco editor, DuckDB over any datasets, schema
-      sidebar, result grid (virtualized, millions of rows), EXPLAIN, save query
-      as a SQL transform or a chart in one click.
+- [~] **SQL workbench**: *shipped* — a **CodeMirror** editor (not monaco),
+      DuckDB over the datasets the caller may view, a result grid, charting the
+      result, and `POST /pipelines/from-query` to save a query as a
+      `@sql_transform`. Still open: virtualized paging over millions of result
+      rows, a schema sidebar, and EXPLAIN.
 - [ ] **Analysis boards** (Contour): notebook-of-panels over datasets/objects —
       filter, join, pivot, chart panels chained together; each board
       exportable as a pipeline; stored as YAML in the workspace.
@@ -444,13 +455,17 @@ panel"), keeping the current information-dense dark aesthetic:
 
 ### WS7 — Identity & authentication (Foundry: platform SSO)
 
-Baseline (already specced in ARCHITECTURE.md, partially underway):
+Baseline (specced in ARCHITECTURE.md, and **shipped** — these three were left
+unchecked long after the code landed):
 
-- [ ] **Local users**: scrypt-hashed passwords, httpOnly session cookies,
-      first-run admin setup, login throttling, password policy.
-- [ ] **API tokens**: per-user, named, hashed at rest, expiring, scoped
-      (read-only / read-write / admin).
-- [ ] **RBAC**: viewer/editor/admin baseline, then per-project roles (WS8).
+- [x] **Local users**: scrypt-hashed passwords (`laurelin/core/auth.py`),
+      httpOnly session cookies, first-run admin setup, login throttling
+      (≥5 consecutive failures per username → locked 30s), 8-character minimum.
+- [~] **API tokens**: per-user, named, hashed at rest (SHA-256) — shipped.
+      Still open: **expiry and scoping** (read-only / read-write / admin). A
+      token today carries its user's full role.
+- [x] **RBAC**: viewer/editor/admin baseline, enforced by `require_role`.
+      Per-project roles remain WS8.
 
 Enterprise:
 
@@ -461,7 +476,8 @@ Enterprise:
       metadata endpoint, group→role mapping. **done**
 - ✅ **SCIM 2.0 provisioning**: users + groups pushed from IdP; deprovisioning
       disables the account and immediately kills its sessions + tokens. **done**
-- [ ] **Groups**: local + IdP-synced; permissions bind to groups.
+- [x] **Groups**: local (admin-managed, `/api/v1/groups`) and IdP-synced via
+      SCIM `/Groups`; permissions bind to groups as a grant subject.
 - [ ] **MFA (TOTP)** for local accounts (SSO deployments delegate MFA to IdP).
 - [ ] **Service accounts**: non-interactive principals for pipelines/agents,
       token-only, ownable by teams.
@@ -550,11 +566,15 @@ The "you can put this on a server without embarrassment" release.
 - ✅ WS7: local auth (users, sessions, RBAC, API tokens, first-run setup, login UI) — **done**
 - ✅ WS5: React + TS shell replacing the vanilla SPA at feature parity + login/setup,
   SQL workbench (first new surface) — **done**
-- [ ] WS7: OIDC SSO + group→role mapping
+- [x] WS7: OIDC SSO + group→role mapping — **done** (also SAML and SCIM, which
+      the WS7 section marks ✅; this line had been left unchecked)
 - [ ] WS8: projects with per-project roles; audit v2 (structured, exportable)
 - [x] WS9: Postgres metadata backend (control plane *and* per-workspace
       schemas), Docker image + compose, migrations
-- [ ] WS3: scheduler (cron + on-upstream-update) with Postgres queue + workers
+- [~] WS3: scheduler — cron and on-upstream-update triggers shipped
+      (`laurelin/core/scheduler.py`), leased so firing is exactly-once across
+      replicas. **Not** a Postgres queue with separate worker processes: builds
+      run on a per-replica thread pool and are claimed by lease.
 - [x] WS1: object-storage backend (S3/GCS/Azure via pyarrow filesystems)
 
 ### Phase 2 — Pipeline platform (v0.3, ~3 months)
@@ -607,9 +627,26 @@ The differentiator: nobody open-source has a good ontology layer.
 
 ## Immediate next steps
 
-1. Finish Phase-1 local auth per the spec in ARCHITECTURE.md (underway).
-2. Decide React app scaffolding (Vite + React + TS, self-hosted fonts,
-   TanStack Router/Query, monaco, vega-lite) and port the four existing views.
-3. Introduce the storage/metadata abstraction seams (`MetadataStore` →
-   interface w/ SQLite + Postgres impls; `DatasetStorage` → local + fsspec)
-   before more features accrete on the SQLite-only paths.
+All three items that stood here are **done** and are recorded rather than
+deleted, because a roadmap that quietly loses its own history is not one:
+Phase-1 local auth shipped; the React app shipped (Vite + React + TS +
+TanStack Query + React Router, with **CodeMirror** rather than monaco and no
+vega-lite — charts are hand-rolled SVG); and the abstraction seams exist as
+`laurelin/core/backend.py` (SQLite + Postgres) and `laurelin/core/storage.py`
+(local + object store).
+
+What is actually next, verified against the tree:
+
+1. **Verify `StarRocksObjectStore` against a real server and make it
+   selectable.** It has only run against an in-memory double, and
+   `OntologyService` hard-constructs `MetadataObjectStore`, so no operator can
+   reach it. See the WS4 item below.
+2. **Run the opt-in ClickHouse/StarRocks CI jobs on GitHub Actions.** They have
+   never executed there; both engines' behaviour is written from a local
+   container.
+3. **Re-measure the published millisecond tables in `docs/SCALE.md`.** They
+   predate the audience-projection and ontology-policy work, which sits in read
+   paths. `bench/regression.py` guards the *shape* of six claims and passes,
+   but nothing guards the absolute numbers.
+4. **Token expiry and scoping** (WS7) — an API token currently carries its
+   user's full role forever.

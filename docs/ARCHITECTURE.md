@@ -7,12 +7,21 @@ pipelines, YAML ontology. Modules communicate through the models in
 
 ```
 laurelin/
-├── core/        models.py, config.py (Workspace), db.py (MetadataStore)   [DONE]
+├── core/        models.py, config.py (Workspace), db.py (MetadataStore),
+│                permissions.py, audience.py + serialize.py (field audiences),
+│                failure.py (structured failures), redaction.py, fileperms.py,
+│                dialects.py + clickhouse.py + starrocks.py + federation.py,
+│                limits.py, auth.py / oidc.py / saml.py, scheduler.py, iceberg.py
 ├── catalog/     versioned Parquet dataset storage + DuckDB access
-├── transforms/  @transform / @sql_transform, DAG builder, lineage
-├── ontology/    YAML loader, object queries, links, actions, edit overlay
+├── transforms/  @transform / @sql_transform, DAG builder, lineage, expectations
+├── ontology/    YAML loader, object queries, links, actions, edit overlay,
+│                store.py (the pluggable object materialization)
+├── connectors/  postgres / http / file source pulls
+├── export/      workspace export, import and the governance fingerprint
+├── mcp/         MCP server + the REST client it drives
 ├── api/         FastAPI app: REST + static UI mount
-├── ui/static/   vanilla-JS single-page UI (no CDN, self-contained)
+├── ui/          React + TS app (webapp/), built to one self-contained
+│                static/index.html — no CDN
 ├── demo.py      generates the aviation demo workspace
 └── cli.py       typer CLI (`laurelin` entry point = laurelin.cli:main)
 ```
@@ -58,7 +67,9 @@ Rules:
   references stay valid. An empty `files` list means the pre-manifest layout
   (glob the version dir) and is still read correctly.
 - `compact()` merges the latest version's parts back into one file; appends
-  are cheap but accumulate parts, and many small files slow scans.
+  are cheap but accumulate parts, and many small files slow scans. An Iceberg
+  dataset dispatches to the Iceberg path below — the layout being compacted is
+  the table's, not a directory of Laurelin parts.
 - `rows()` must convert non-JSON-safe values (timestamps, bytes, Decimal, NaN) to strings/None.
 - Schema captured as `ColumnSchema(name, type=str(arrow_type))`.
 
@@ -203,8 +214,18 @@ id and old snapshots stay readable. Dropping or renaming needs
 `allow_breaking=True`, and the refusal lists the transitive downstream
 datasets from lineage.
 
-Not implemented: tags, hidden partitioning, row-level deletes, small-file
-compaction.
+**Compaction** rewrites the whole table into one new snapshot and records it as
+a version pinned to that snapshot. It goes through `write_iceberg`, not the
+managed path: `write()` is exempted from the scanned-at-source refusal for
+Iceberg, so compacting an Iceberg dataset used to write a local Parquet part
+nothing reads and register a version with `snapshot_id = NULL` — which reads as
+"the table as it is now" forever, so time travel to a compacted version
+returned the rows there were *later*. It reclaims scan cost, not disk: earlier
+snapshots keep their data files, which is what keeps history readable.
+
+Not implemented: tags, hidden partitioning, row-level deletes, incremental
+`rewrite_data_files` (compaction reads the whole table), expiring old snapshots
+— so nothing here ever frees storage.
 
 #### StarRocks-backed datasets (`kind="starrocks"`)
 
@@ -632,8 +653,50 @@ latest: writeback stamps its own version `writeback` and compaction stamps
 exactly once per dataset.
 
 **NOT IMPLEMENTED:** automatic unfolding when a rebuild supersedes a folded
-version (which is *why* `folded_into_version` is a column), automatic writeback
-triggers, and `prune_object_edits`. Writeback bounds **read cost, not disk**.
+version (which is *why* `folded_into_version` is a column), and automatic
+writeback triggers. Writeback on its own bounds **read cost, not disk** —
+pruning is what bounds disk, and it is below.
+
+#### Pruning the edit log
+
+The log is truth and nothing trimmed it, so a workspace using the ontology as
+an application database grew `object_edits` forever. `prune_plan(type, keep)`
+and `prune_object_edits(type, keep)` bound it, and the accounting is the
+feature: the plan is pure, it names what would go and *why each retained edit
+stayed*, and the UI shows the size before it offers the button.
+
+An edit may be deleted only when five things hold, each checked against the
+world as it is now rather than inferred from how the edit got here:
+
+1. it is **folded** — an unfolded edit is not history, it is the current value
+   of those objects and every read replays it;
+2. the version it was folded into is **still in the backing dataset's history**
+   and its source is `writeback`. This is what ties the edit to *this* dataset:
+   rebind an object type and the fold's version number means something else in
+   the new one, so the check fails and nothing goes;
+3. **no version written since the fold could have superseded it.** `writeback`
+   builds on the previous version and `compact` rewrites the same rows, so both
+   carry a fold forward; anything else (a transform build, an upload, a sync, a
+   merge) may have replaced those rows, and then the log rows are the only
+   surviving record of the hand edits. This is the same hazard the unfolding
+   entry above is about — until unfolding exists, those edits are load-bearing;
+4. it is **not the row holding `MAX(edit_seq)`**. The allocator is `MAX + 1` and
+   a materialization's watermark is compared against `max_edit_seq`; delete the
+   top row and the next edit re-uses a number the store already claims to have
+   applied — `catch_up` skips it forever while the freshness check says fresh.
+   Enforced again in `MetadataStore.delete_object_edits`, next to the allocator;
+5. it is outside the operator's retention window (`keep` newest folded edits).
+
+Conditions 1 and 4 are re-checked in SQL inside the deleting transaction, so a
+plan that goes stale removes *fewer* rows rather than the wrong ones. What
+pruning costs is real and is not correctness: the answer to "what changed in
+version N and who did it" for the pruned window. `POST .../edit-log/prune` is
+ADMIN for that reason, a rank above the fold that made the edits redundant.
+
+Automatic pruning is off unless `LAURELIN_EDIT_LOG_MAX_FOLDED` is set, in which
+case a fold prunes to that many folded edits afterwards — the same convention
+as `LAURELIN_AUDIT_MAX_EVENTS`, and for the same reason. A prune that fails
+never fails the fold: the dataset already holds the edits.
 
 #### Aggregation
 
@@ -808,9 +871,22 @@ other half, enforced at the single serialization point
 
 Anything not annotated is `OPERATIONAL`, and any model that has not declared a
 `laurelin_author_role` is admin-only — so a field or model added tomorrow fails
-closed. The role reaches the serializer through a `ContextVar` set by
-`AudienceMiddleware`, whose default is `viewer`: a route that arranges nothing
-still gets filtering, and forgetting redacts more rather than less.
+closed. The role reaches the serializer through a `ContextVar`
+(`serialize._effective_role`) set by the `audience_middleware` HTTP middleware
+in `laurelin/api/app.py` — a middleware and not a dependency, because FastAPI
+runs sync dependencies and sync handlers in *separate* threadpool context
+copies. Its default is `viewer`: a route that arranges nothing still gets
+filtering, and forgetting redacts more rather than less.
+
+**This is not free, and the cost is published rather than assumed.** Running a
+per-field decision on every record of every response made serialization 3–11×
+more expensive than what it replaced; memoizing the decision on the shape it
+depends on recovered about half, and the residual — ~1.2× for a viewer, 2.9–4.9×
+for an admin, who pays more precisely because a viewer's projection drops fields
+before they are walked — is measured in
+[SCALE.md](SCALE.md#what-the-audience-projection-costs) and reproducible with
+`bench/serialize_cost.py`. Note the shape of that: the projection is *cheaper*
+the less it discloses.
 
 Three refinements, each of which is a defect that was reproduced on a running
 server before it was a design note.
@@ -924,7 +1000,10 @@ REST endpoints (all JSON; errors as `{"detail": str}` with 400/404):
 
 ```
 GET  /health                                  -> {"status":"ok","version":...}
-GET  /api/v1/workspace                        -> {name, description, root}
+GET  /api/v1/workspace                        -> {name, description} (+ `root`
+                                 for an ADMIN only: it is the server's
+                                 filesystem layout, which a viewer cannot act
+                                 on and was never meant to have)
 GET  /api/v1/datasets                         -> [DatasetInfo]
 POST /api/v1/datasets                         {name, description?} -> DatasetInfo
 GET  /api/v1/datasets/{name}                  -> DatasetInfo + versions: [DatasetVersionInfo]
@@ -1042,6 +1121,14 @@ POST /api/v1/ontology/object-types/{name}/writeback -> {object_type, folded:N,
                                  object type AND edit on the backing dataset —
                                  this rewrites a dataset, which is a different
                                  privilege from recording an edit)
+GET  /api/v1/ontology/object-types/{name}/edit-log?keep=N -> {edits,live,folded,
+                                 payload_bytes, prunable, prunable_bytes,
+                                 retained:[{reason,edits,bytes}], withheld}
+                                 (editor on the type; counters withheld from a
+                                 caller whose row policy narrows the dataset)
+POST /api/v1/ontology/object-types/{name}/edit-log/prune?keep=N&dry_run=
+                                 -> the same plan plus {pruned:N}  (ADMIN:
+                                 deletes the record of who changed what)
 GET  /api/v1/ontology/objects/{type}?search=&limit=&offset=&filter.<prop>=<val>
                                      -> {"objects":[...],"total":N,"total_capped":bool}  (403 if not viewable)
 POST /api/v1/ontology/objects/{type}/aggregate {group_by,metrics,filters,search,limit}
@@ -1161,7 +1248,11 @@ managed by admins via `/dataset-policies` + `/datasets/{name}/policy`.
 
 `PipelineFiles` reads/writes `pipelines/*.py`. **SECURITY:** writing a pipeline
 file is code-execution-equivalent (it is `exec`'d on every build/collection).
-Reads are viewer; writes/deletes are editor; the whole surface is disabled by
+Reads *and* writes/deletes are **editor** — `GET /pipelines` and
+`GET /pipelines/{name}` were raised out of viewer by the audience rule, because
+they return `exec`-ed Python that a viewer could not have authored; a viewer's
+lineage need is served by `GET /transforms` and `GET /lineage`. The whole
+surface is disabled by
 `serve --lock-pipelines` / `LAURELIN_LOCK_PIPELINES=1`. Writes validate syntax
 (`compile`) before an atomic write and return the file's transforms plus any
 cross-file `collect_error` (e.g. a duplicate output). Module names must match
@@ -1169,20 +1260,43 @@ cross-file `collect_error` (e.g. a duplicate output). Module names must match
 workbench SQL query as a `@sql_transform`, auto-detecting input datasets by
 name. Executed transform code is **not** sandboxed (a roadmap item).
 
-### `laurelin/ui/static` — single-page app
+### `laurelin/ui` — single-page app
 
-`index.html` + `app.css` + `app.js`, **zero external resources**. Dark, clean,
-information-dense. Sidebar navigation: **Datasets / Pipeline / Ontology /
-Audit**. Fetch from `/api/v1/...` (same origin).
+**React + TypeScript**, built with Vite (`laurelin/ui/webapp`) and emitted by
+`vite-plugin-singlefile` as one self-contained `laurelin/ui/static/index.html`
+— **zero external resources, no CDN**, which is why serving it needs no Node
+toolchain. Dark, clean, information-dense. Fetch from `/api/v1/...` (same
+origin) through `src/api.ts`.
+
+*(This section described a vanilla-JS `index.html` + `app.css` + `app.js` app
+until the React shell replaced it at feature parity — see the roadmap's Phase 1.
+`static/` now holds the built bundle and nothing else.)*
+
+Sidebar navigation (`src/Layout.tsx`, `NAV`), role-filtered:
+**Datasets / Dashboards / Pipeline / Schedules (editor) / Transforms (editor) /
+Apps / Ontology / SQL / Audit**, plus **Admin** for admins and **Workspaces**
+for superadmins. In multi-workspace mode a switcher sits above the nav.
+
 - Datasets: list w/ latest version + row counts; detail = schema table, version
-  history, paged row preview.
+  history, paged row preview, and the registration panels for federated /
+  Iceberg / ClickHouse / StarRocks kinds.
 - Pipeline: lineage graph (layered left-to-right SVG: dataset nodes as rounded
   rects, transform nodes as pills; simple longest-path layering), transforms
-  list, "Run build" button (POST /builds) + build history w/ per-task status.
+  list, "Run build" button (POST /builds) + build history w/ per-task status
+  and expectation results.
 - Ontology: object types; per type a searchable object table; object detail
   panel with properties, linked objects, action forms (inputs per parameter,
-  submit → POST apply, then refresh).
+  submit → POST apply, then refresh); object-store health and writeback.
+- Dashboards: SVG chart grid; a panel's rows come from
+  `POST /dashboards/{name}/panels/{id}/run`, not from the panel's query.
+- Admin: users, groups, dataset + ontology access, row & column security,
+  markings and clearances, workspace files on disk, and Portability
+  (export / import / governance fingerprint diff).
 - Audit: recent events table.
+
+**Every withheld value states that it is withheld and which role receives it.**
+A blank is the one rendering that is not allowed: an operator reads "nothing
+configured" from an empty field and retypes the credential.
 
 ### `laurelin/cli.py` — typer
 
@@ -1190,11 +1304,18 @@ Audit**. Fetch from `/api/v1/...` (same origin).
 
 ```
 laurelin init PATH [--name] [--description]
-laurelin serve [--workspace PATH] [--host 127.0.0.1] [--port 8787]
+laurelin serve [--workspace PATH | --root DIR] [--host 127.0.0.1] [--port 8787]
+               [--no-auth] [--secure-cookies] [--lock-pipelines] [--control-db URL]
 laurelin build [TARGETS...] [--workspace PATH]
 laurelin datasets list|show NAME [--workspace PATH]
 laurelin upload NAME FILE [--workspace PATH]
 laurelin demo [PATH=demo-workspace] [--build/--no-build]   # default: build
+laurelin mcp --url URL --token TOKEN                       # stdio MCP server
+laurelin export ARCHIVE|- [--fingerprint] [--metadata-only] [-w PATH]
+laurelin import ARCHIVE|- [-w PATH] [--merge --confirm SHA] [--rename-prefix P]
+laurelin verify-governance --baseline ARCHIVE [-w PATH]
+laurelin users create|list|passwd|role|disable|enable|delete ...
+laurelin tokens create|list|revoke ...
 ```
 
 `--workspace` defaults to `Workspace.find()` discovery.

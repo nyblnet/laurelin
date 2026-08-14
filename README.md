@@ -42,8 +42,9 @@ enforcement paths — and diffs it against the archive. "It still governs
 identically" is something you check, not something we assert.
 
 The export **withholds every credential** rather than redacting it (Laurelin's
-own API redactors were attacked with nine DSN shapes and eight leaked — those
-are fixed, by withholding rather than by a better regex), and the
+own API redactors were attacked with a corpus of 26 credential shapes and ten
+of them leaked — `tests/test_redaction.py`; those are fixed, by withholding
+rather than by a better regex), and the
 import **binds no principal**: rules land verbatim, users, group memberships and
 clearances do not, so a reconstruction can narrow access and never widen it. The
 manifest is a checklist of exactly what has to be re-supplied.
@@ -85,7 +86,7 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **MCP server** — `laurelin mcp` exposes datasets, SQL, the ontology, actions,
   and builds to AI agents over the Model Context Protocol. Agents authenticate
   with an API token and go through the same permission and audit path as any
-  user (`pip install laurelin[mcp]`).
+  user (needs the `mcp` extra — see Status below for how to install).
 - **Audit** — mutations through the API are written to an audit log.
 
 ## Where compute happens
@@ -298,10 +299,13 @@ and how to report a vulnerability.
 
 ## Status & scale
 
-**0.2.0** — the first published release; see [CHANGELOG.md](CHANGELOG.md).
-Early alpha: the core loop — ingest → transform → build → ontology → act —
-works end to end, with 1,256 tests run against both SQLite and PostgreSQL, but
-expect rough edges and breaking changes before 1.0.
+**0.2.0** — see [CHANGELOG.md](CHANGELOG.md). **Nothing has been released yet:**
+there is no git tag in this repository and nothing has been uploaded to PyPI
+(the release workflow is inert until trusted publishing is configured), so
+`pip install laurelin` does not work — install from a checkout. Early alpha:
+the core loop — ingest → transform → build → ontology → act — works end to
+end, with 1,931 tests run against both SQLite and PostgreSQL, but expect rough
+edges and breaking changes before 1.0.
 
 Laurelin runs as a single process on a laptop *or* as N stateless replicas
 behind a load balancer — identity, workspace metadata and build coordination in
@@ -314,14 +318,31 @@ StarRocks/ClickHouse table Laurelin reads but does not operate.
 [docs/SCALE.md](docs/SCALE.md) publishes measured numbers, including the
 unflattering ones: the SQL path stays comfortable into the tens of millions of
 rows, appends cost the delta rather than the dataset, and ontology queries run
-in DuckDB (~26× faster than they were). An object type can also be *indexed*,
-which makes key lookups constant-time (1.4 ms at a million objects) — but not
-substring search, which still scans. Reproduce them with
-`python bench/benchmark.py`, and note that CI re-checks those claims as ratios
-on every push, so they can't quietly rot. There is **no published number for
-the serving tier** — no benchmark, no latency, no comparison against DuckDB.
-Every figure above was produced by `bench/benchmark.py` on the managed DuckDB
-path and stays attached to it.
+in DuckDB (~26× faster than they were — 36 s to 1.37 s for a page over 5 M
+objects). An object type can also be *indexed*, which makes key lookups
+constant-time: **1.3 ms at both 200 K and 800 K objects**. What an index does
+**not** make cheap is a filter on a non-key property, or counting every match
+of a broad search.
+
+Those numbers were **re-measured on 2026-08-14**, after the security work that
+put an audience projection on every serialized response and a policy check on
+every ontology read. Three things that re-run found, all of them in
+[docs/SCALE.md](docs/SCALE.md):
+
+- **The service layer did not regress** — query, ingest, build and ontology
+  numbers all within 0.85–1.13× of the pre-security tree, benchmarked back to
+  back. All six ratio claims in `bench/regression.py` still pass; CI runs them
+  on every push and pull request.
+- **Serializing a response got 3–5× more expensive**, on a path no published
+  number covered. Half of that has been recovered; the remainder is documented
+  rather than hidden, along with why an *admin* pays more than a viewer.
+- **Two published numbers had already rotted** before this work, and are
+  corrected: the UI row page was never flat, and object get-by-key was
+  optimistic. The object-index table is now reported from a committed harness,
+  because the script that produced the old one never was.
+
+There is **no published number for the serving tier** — no benchmark, no
+latency, no comparison against DuckDB.
 
 ## License
 

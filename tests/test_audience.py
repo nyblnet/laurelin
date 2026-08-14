@@ -160,6 +160,102 @@ def test_an_editor_receives_the_whole_record_they_could_have_written():
     assert serialize.dump_as(dash, Role.editor)["panels"][0]["sql"] == "SELECT 1"
 
 
+def test_the_memoized_projection_still_answers_exactly_what_the_rules_answer():
+    """`_projection` is a cache in front of R2, so it must be R2.
+
+    Deciding which keys a reader gets was 68% of serialization time when it ran
+    per field per record, so it is memoized on
+    ``(class, reader role, author role, narrowed)``. That is only safe while the
+    answer depends on nothing else — no field *value*, no instance state — so
+    this recomputes the rule from `field_audience` / `field_author_role`
+    directly and demands the cache agree on every combination that exists.
+
+    Iterating *every* combination is the point rather than thoroughness for its
+    own sake: a cache keyed on too little returns whichever answer it computed
+    first to every colliding caller, so a dropped key component shows up here as
+    one combination answering with another's field list.
+    """
+    for model in _governed_models():
+        for reader in Role:
+            for author in Role:
+                for narrowed in (False, True):
+                    full, fields = serialize._projection(model, reader, author, narrowed)
+                    assert full == (not narrowed and reader.covers(author))
+                    expected = tuple(
+                        (name, f.alias or name)
+                        for name, f in model.model_fields.items()
+                        if (
+                            reader.covers(field_author_role(model, name, author))
+                            if full
+                            else field_audience(model, name) is Audience.PRESENTATION
+                        )
+                    )
+                    assert fields == expected, (
+                        f"{model.__name__} reader={reader.value} "
+                        f"author={author.value} narrowed={narrowed}"
+                    )
+
+
+def test_the_scalar_fast_path_answers_exactly_what_the_full_check_answers():
+    """`_holds_model` decides whether a value gets *projected* or copied raw.
+
+    It has an exact-type fast path in front of it for speed, and a fast path
+    that disagrees with the check it front-runs is a disclosure: a value wrongly
+    called scalar is copied from `model_dump` whole, which is precisely how a
+    nested operational field reaches a reader who may not have it. So the fast
+    path is asserted against the check without it — including the values that
+    make an exact-type test different from an isinstance test.
+    """
+    from pydantic import BaseModel
+
+    def reference(value):  # `_holds_model` as it reads with the fast path removed
+        if isinstance(value, BaseModel):
+            return True
+        if isinstance(value, (list, tuple)):
+            return any(reference(v) for v in value)
+        if isinstance(value, dict):
+            return any(reference(v) for v in value.values())
+        return False
+
+    class Sub(str):  # a str subclass is NOT the exact type `str`
+        pass
+
+    panel = DashboardPanel(id="p", sql="SELECT 1")
+    battery = [
+        "", "text", 0, 1, -1, 1.5, True, False, None,
+        Sub("subclassed"), Role.admin, BuildStatus.failed,  # str-valued enums
+        [], (), {}, [1, 2], {"a": "b"}, ("x",),
+        panel, [panel], {"p": panel}, [[panel]], {"k": [panel]},
+        [{"deep": {"deeper": [panel]}}],
+        [1, "two", None], {"a": {"b": {"c": 3}}},
+    ]
+    for value in battery:
+        assert serialize._holds_model(value) is reference(value), repr(value)
+
+
+def test_the_projection_cache_is_keyed_on_every_input_the_answer_turns_on():
+    """Each key component earns its place by changing an answer.
+
+    A component that never changes an answer is one somebody will drop from the
+    key during a later cleanup — and the collision it opens discloses a field,
+    silently, to a reader who should not have it. These are the concrete
+    disclosures each component prevents.
+    """
+    proj = serialize._projection
+    # reader: a viewer must not get what an editor gets (panels[].sql).
+    assert proj(DashboardPanel, Role.viewer, Role.editor, False) != \
+        proj(DashboardPanel, Role.editor, Role.editor, False)
+    # author: the same reader against a stricter record discloses less.
+    assert proj(DashboardPanel, Role.editor, Role.editor, False) != \
+        proj(DashboardPanel, Role.editor, Role.admin, False)
+    # narrowed: nesting inside an unauthorable record forces the projection.
+    assert proj(DashboardPanel, Role.editor, Role.editor, True) != \
+        proj(DashboardPanel, Role.editor, Role.editor, False)
+    # class: two classes with the same roles have different fields.
+    assert proj(DashboardPanel, Role.admin, Role.admin, False) != \
+        proj(DatasetInfo, Role.admin, Role.admin, False)
+
+
 def test_a_model_that_forgot_to_declare_an_author_role_is_admin_only():
     """New model ⇒ fails closed. Anything not Governed is treated as
     admin-authored, so a model added tomorrow discloses nothing by default."""
@@ -610,6 +706,8 @@ PATH_PARAM_OVERRIDES = {
     "/api/v1/ontology/object-types/{name}": {"name": "aircraft"},
     "/api/v1/ontology/object-types/{name}/permissions": {"name": "aircraft"},
     "/api/v1/ontology/object-types/{name}/grants": {"name": "aircraft"},
+    "/api/v1/ontology/object-types/{name}/edit-log": {"name": "aircraft"},
+    "/api/v1/ontology/object-types/{name}/edit-log/prune": {"name": "aircraft"},
 }
 
 

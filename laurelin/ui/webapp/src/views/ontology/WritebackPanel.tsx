@@ -83,6 +83,9 @@ export function WritebackPanel({
     onSuccess: () => {
       setOverride(false);
       qc.invalidateQueries({ queryKey: ["object-type", type.api_name] });
+      // A fold is the only thing that creates prunable history, so the edit-log
+      // panel below is stale the moment this succeeds.
+      qc.invalidateQueries({ queryKey: ["edit-log", type.api_name] });
       qc.invalidateQueries({ queryKey: ["objects", type.api_name] });
       qc.invalidateQueries({ queryKey: ["object", type.api_name] });
       qc.invalidateQueries({ queryKey: ["dataset", backing] });

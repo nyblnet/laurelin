@@ -7,10 +7,16 @@ Laurelin has two deployment shapes from one codebase.
 Local-first, zero infrastructure. Everything is files on disk.
 
 ```bash
-pip install laurelin
+pip install -e ".[dev]"                            # from a checkout — see below
 laurelin serve --workspace ./my-workspace          # single workspace
 laurelin serve --root ./workspaces                 # many workspaces (SQLite control plane)
 ```
+
+> **Laurelin is not on PyPI yet.** There is no git tag in the repository and
+> nothing has been uploaded; `.github/workflows/release.yml` fires on a `v*`
+> tag and is inert until trusted publishing is configured. So `pip install
+> laurelin` does not work today — install from a checkout. This note comes out
+> when the first release actually ships.
 
 Back it up with `cp -r` (or `pg_dump` for a Postgres control plane). This is the
 right shape for an analyst, a small team, or evaluation.
@@ -184,7 +190,7 @@ it is the metadata database.
 | `LAURELIN_CONTROL_DATABASE_URL` | Postgres URL for the multi-workspace control plane |
 | `LAURELIN_NO_AUTH=1` | Disable auth (local dev only) |
 | `LAURELIN_LOCK_PIPELINES=1` | Disable in-browser transform authoring (untrusted tenants) |
-| `LAURELIN_SECURE_COOKIES` via `--secure-cookies` | `Secure` flag on session cookies |
+| *(no env var)* — use the `--secure-cookies` flag | `Secure` flag on session cookies. There is deliberately no `LAURELIN_SECURE_COOKIES`; the flag is the only switch, and the Helm chart passes it. The flag is also implied per-request when `X-Forwarded-Proto: https` reaches the app |
 | `LAURELIN_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ROLE_MAP` | OIDC SSO |
 | `LAURELIN_SAML_IDP_METADATA` / `_SP_ENTITY_ID` / `_ROLE_MAP` | SAML SSO (needs `xmlsec1`) |
 | `LAURELIN_SCIM_TOKEN` | Enable SCIM provisioning (IdP bearer token) |
@@ -203,6 +209,7 @@ it is the metadata database.
 | `LAURELIN_BUILD_MEMORY_LIMIT` / `_TIMEOUT` / `_THREADS` | The same budget for builds (looser: default `4GB`, no timeout) |
 | `LAURELIN_AUDIT_MAX_EVENTS` | Trim the audit log to N most recent events after each build (default `0` = unlimited) |
 | `LAURELIN_AUTO_COMPACT_PARTS` | Compact a dataset once a version reaches N parts (default `0` = manual only) |
+| `LAURELIN_EDIT_LOG_MAX_FOLDED` | After a writeback, prune the ontology edit log to N folded edits (default unset = never prune automatically). Pruning only ever deletes edits it can prove are redundant, and a failed prune never fails the fold |
 | `LAURELIN_SCHEDULER=0` | Stop this replica running the scheduler (default on; leases make firing exactly-once, so every replica can) |
 | `LAURELIN_METRICS=0` | Disable `/metrics` (default on when `laurelin[metrics]` is installed) |
 | `LAURELIN_METRICS_PUBLIC=1` | Allow unauthenticated scraping — only when the port isn't reachable by users |

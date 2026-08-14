@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import lru_cache
 from typing import Any, Iterator
 
 from pydantic import BaseModel
@@ -106,13 +107,48 @@ def dump_as(model: BaseModel, role: Role, *, narrowed: bool = False) -> dict:
     disclose less.** A nested model with a stricter author role still narrows
     further, because ``dump_as`` re-evaluates its own author role on the way in.
     """
-    cls = type(model)
-    author = record_author_role(model)
-    full = not narrowed and role.covers(author)
+    full, fields = _projection(type(model), role, record_author_role(model), narrowed)
     raw = model.model_dump(mode="json", by_alias=True)
     out: dict[str, Any] = {}
+    nested = not full
+    for name, key in fields:
+        value = getattr(model, name, None)
+        out[key] = _value_as(value, role, narrowed=nested) if _holds_model(value) else raw.get(key)
+    if full:
+        _apply_dataset_source_rule(model, out, role)
+    return out
+
+
+@lru_cache(maxsize=None)
+def _projection(
+    cls: type[BaseModel], role: Role, author: Role, narrowed: bool
+) -> tuple[bool, tuple[tuple[str, str], ...]]:
+    """Which keys of ``cls`` this reader receives — computed once per shape.
+
+    **This decides nothing.** It is the same four lines that used to sit inline
+    in :func:`dump_as`, lifted out because their answer depends only on the
+    arguments: a model class, the reader's role, the record's author role, and
+    whether a parent already narrowed. No field *value* is consulted, which is
+    what makes memoizing it safe — and ``tests/test_audience.py`` asserts the
+    equivalence directly against the uncached rules rather than trusting that
+    sentence.
+
+    The cache is bounded in practice by its key space: ~25 governed classes x 3
+    roles x 3 author roles x 2 booleans. It is keyed on the class object, which
+    keeps a strong reference — fine, because every one of them is defined at
+    module scope and lives for the process anyway.
+
+    Why it exists: measured on this tree, deciding this per field per record
+    was **68% of serialization time** — ``field_author_role`` re-scanned
+    ``field.metadata`` and re-read ``cls.model_fields`` (a pydantic property,
+    not a plain dict) once per field per record, and ``Role.covers`` resolved
+    two dict lookups behind a property each time. Actual pydantic serialization
+    was 7%. A list of 1 000 datasets cost 14.5 ms to project and 2.7 ms to
+    serialize; see docs/SCALE.md, "What the audience projection costs".
+    """
+    full = not narrowed and role.covers(author)
+    fields: list[tuple[str, str]] = []
     for name, field in cls.model_fields.items():
-        key = field.alias or name
         if full:
             # A field authored above its record's level — DatasetInfo.source,
             # Failure.endpoint — is withheld even from a reader who can author
@@ -124,11 +160,8 @@ def dump_as(model: BaseModel, role: Role, *, narrowed: bool = False) -> dict:
             # value a read-modify-write client will happily PUT back over the
             # real one.
             continue
-        value = getattr(model, name, None)
-        out[key] = _value_as(value, role, narrowed=not full) if _holds_model(value) else raw.get(key)
-    if full:
-        _apply_dataset_source_rule(model, out, role)
-    return out
+        fields.append((name, field.alias or name))
+    return full, tuple(fields)
 
 
 def detail_for(failure, author_role_: Role = Role.admin) -> str:
@@ -167,7 +200,20 @@ def _value_as(value: Any, role: Role, *, narrowed: bool) -> Any:
     return value
 
 
+# Types that cannot be, and cannot contain, a BaseModel. Matched by *exact*
+# type, not isinstance: a `str` subclass — every `str`-valued Enum in models.py
+# is one — is deliberately not in here and falls through to the full check.
+# Widening this set to cover subclasses would be the bug; it is a fast path, and
+# a fast path that answers a question differently from the slow one is a hole.
+_NEVER_HOLDS_MODEL = frozenset({str, int, float, bool, type(None)})
+
+
 def _holds_model(value: Any) -> bool:
+    if type(value) in _NEVER_HOLDS_MODEL:
+        # 41% of serialization time after the projection was memoized, because
+        # most fields of most records are a string or a number and each one
+        # still paid three isinstance() calls to establish it. Exact-type first.
+        return False
     if isinstance(value, BaseModel):
         return True
     if isinstance(value, (list, tuple)):

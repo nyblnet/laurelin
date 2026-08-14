@@ -219,16 +219,152 @@ def test_every_engine_option_value_is_withheld_including_the_adbc_namespace():
     assert "adbc.flight.sql.rpc.call_header.authorization" in red["options"]
 
 
-def test_the_secret_name_list_does_not_mask_a_field_for_containing_three_letters():
-    """Unanchored, ``auth`` matches ``author`` and ``sig`` matches
-    ``assigned_to``. Masking a field because its name happens to contain a
-    substring is the imprecision that gets a redactor distrusted and then
-    worked around, and the *shape* rules — not this list — are what make the
-    module safe."""
+def test_the_secret_name_list_now_only_chooses_how_a_withheld_value_is_spelled():
+    """Task #54: ``API_SECRET_KEY_RE`` no longer decides whether anything is
+    shown, only which marker a reader sees.
+
+    It used to be the reason a value was hidden, so its imprecision was a
+    liability in both directions: unanchored, ``auth`` matches ``author`` and
+    ``sig`` matches ``assigned_to``, and this test used to require that those
+    two came back **verbatim** so the list stayed honest. Under the allowlist
+    they are withheld like every other unlisted name — the list being wrong now
+    costs a reader a less specific marker and costs confidentiality nothing,
+    which is the only shape in which keeping a name list is safe."""
     red = redacted_config({"author": "ann", "assigned_to": "bo", "auth": "x",
                            "signature": "x", "table": "orders"})
-    assert red["author"] == "ann" and red["assigned_to"] == "bo"
     assert red["auth"] == MASK and red["signature"] == MASK
+    assert red["author"] == WITHHELD and red["assigned_to"] == WITHHELD
+    assert red["table"] == "orders"  # on the allowlist, so it still reads
+
+
+# ------------------------------------------------ task #54: allowlist, not denylist
+
+# Key names a real registration carries, holding a credential with **no
+# recognisable shape** — no `://`, no `keyword=value` pair, nothing any rule in
+# `redaction.py` can see. That is the point: these survive every shape rule, so
+# the only thing that can decide them is the key name, and under a denylist the
+# key name decided "disclose".
+#
+# None of the six matches `API_SECRET_KEY_RE`, and each miss is a different way
+# for a name list to be incomplete: `^pwd$` is anchored and `pw` is not `pwd`;
+# `bearer`, `pem`, `sas` and `identity` name the credential by what it *is*
+# rather than by the word "secret"; `bootstrap_servers` is not a credential at
+# all but is an internal network map, which is the half of a DSN this module
+# argues about disclosing everywhere else.
+UNGUESSED_NAMES = [
+    ("pw", "hunter2"),
+    ("bearer", "eyJhbGciOiJIUzI1NiJ9.SEKRETPAYLOAD"),
+    ("pem", "-----BEGIN RSA PRIVATE SEKRET-----"),
+    ("sas", "sv=2021-06-08&sr=b&sp=r&sSEKRETSIGNATURE"),
+    ("identity", "AKIASEKRETAKIASEKRET"),
+    ("bootstrap_servers", "broker-1.internal:9092"),
+]
+
+
+@pytest.mark.parametrize("key, value", UNGUESSED_NAMES, ids=[k for k, _ in UNGUESSED_NAMES])
+def test_a_key_nobody_thought_of_is_withheld_rather_than_disclosed(key, value):
+    """The inversion, stated one key at a time.
+
+    ``redact_mapping``'s last branch used to be ``redact_value(value)``:
+    disclose unless a shape rule objects. None of these values has a shape to
+    object to, so each came back verbatim from ``GET /sources`` and ``GET
+    /datasets/{name}`` on an admin's screen — the same losing shape that shipped
+    ten credentials in round 1 and six keys in round 3. It is now an allowlist:
+    a name that is not in ``_DISCLOSABLE_KEYS`` is withheld whatever it holds.
+    """
+    for redactor in (redacted_config, federation.redacted_source):
+        red = redactor({"type": "postgres", key: value})
+        assert red[key] == WITHHELD, f"{key} was disclosed by {redactor.__name__}"
+        assert value not in _flat(red)
+
+
+def test_the_allowlist_covers_every_key_the_ui_reads_back_to_an_admin():
+    """The other direction, and it is the one that makes the allowlist usable.
+
+    An allowlist that renders every registration identically has traded a
+    theoretical leak for a screen nobody can use. These four names are not
+    decoration: ``configSummary`` in ``views/Sources.tsx`` renders
+    ``c.table ?? c.query`` for postgres, ``c.url`` for http and ``c.path`` for
+    file, and ``FederatedSource`` in ``views/Datasets.tsx`` renders
+    ``source.path ?? source.table ?? source.url`` beside ``source.type``.
+    Dropping any one of them blanks a whole source type's only distinguishing
+    column, so this test fails the day somebody trims the list.
+    """
+    for name in ("type", "table", "query", "path"):
+        assert name in redaction._DISCLOSABLE_KEYS
+    assert redaction._URL_KEY_RE.search("url") and redaction._URL_KEY_RE.search("uri")
+
+    # And the shape vocabulary agrees with the export's, which was measured
+    # against real registrations. The API adds `path`/`url` and `snapshot_id`;
+    # it may not quietly hold *less* than the module that argues for holding
+    # less. See both docstrings for why the endpoint keys differ.
+    from laurelin.export.secrets import NON_SECRET_SHAPE_KEYS
+
+    assert set(NON_SECRET_SHAPE_KEYS) <= redaction._DISCLOSABLE_KEYS
+
+
+def test_an_admin_can_still_tell_one_registration_from_another():
+    """The UI constraint, executed rather than asserted about.
+
+    This computes exactly what ``configSummary`` computes, over the shapes the
+    Add-source form can produce, and requires the answers to be distinct and
+    readable. A redactor that withholds every ``path`` passes every leak test
+    in this file and leaves an operator looking at three rows of
+    ``***** (withheld)`` with no way to tell which connector is broken — at
+    which point they re-type the connection string, which is strictly worse
+    than the disclosure the withholding avoided.
+    """
+    def summary(type_: str, config: dict) -> str:
+        red = redacted_config(config)
+        if type_ == "postgres":
+            return str(red.get("table") or red.get("query") or "")
+        if type_ == "http":
+            return str(red.get("url") or "")
+        return str(red.get("path") or "")
+
+    registrations = [
+        ("postgres", {"url": "postgresql://alice:hunter2@db.internal:5432/prod",
+                      "table": "public.orders"}),
+        ("postgres", {"url": "postgresql://alice:hunter2@db.internal:5432/prod",
+                      "table": "public.customers"}),
+        ("postgres", {"url": "postgresql://alice:hunter2@db.internal:5432/prod",
+                      "query": "SELECT * FROM shipments"}),
+        ("http", {"url": "https://exports.example.com/orders.csv", "format": "csv"}),
+        ("http", {"url": "https://exports.example.com/refunds.csv", "format": "csv"}),
+        ("file", {"path": "/mnt/landing/orders/*.parquet", "format": "parquet"}),
+        ("file", {"path": "/mnt/landing/refunds/*.parquet", "format": "parquet"}),
+    ]
+    summaries = [summary(t, c) for t, c in registrations]
+    assert all(s and s != WITHHELD for s in summaries), summaries
+    assert len(set(summaries)) == len(summaries), summaries
+    # …and none of that readability came from disclosing the credential.
+    assert all("hunter2" not in _flat(redacted_config(c)) for _, c in registrations)
+
+
+def test_the_allowlist_reaches_the_live_sources_route(tmp_path):
+    """End to end, because ``redact_mapping`` is only a boundary where it runs.
+
+    Two file sources that differ only in their path, each carrying an extra key
+    no denylist covers. The response must let an admin tell them apart and must
+    not carry either credential.
+    """
+    admin = _admin(tmp_path)
+    for name, path in (("landing_a", "/mnt/landing/a/*.csv"),
+                       ("landing_b", "/mnt/landing/b/*.csv")):
+        created = admin.put(f"/api/v1/sources/{name}", json={
+            "type": "file", "dataset": name,
+            "config": {"path": path, "format": "csv",
+                       "pw": "hunter2", "bearer": "SEKRETTOKEN"},
+        })
+        assert created.status_code == 200, created.text
+
+    body = admin.get("/api/v1/sources").text
+    assert "hunter2" not in body and "SEKRETTOKEN" not in body
+    rows = {s["name"]: s["config"] for s in admin.get("/api/v1/sources").json()}
+    assert rows["landing_a"]["path"] == "/mnt/landing/a/*.csv"
+    assert rows["landing_b"]["path"] == "/mnt/landing/b/*.csv"
+    assert rows["landing_a"]["pw"] == WITHHELD
+    assert rows["landing_a"]["bearer"] == WITHHELD
 
 
 def test_a_config_that_is_not_an_object_is_withheld():
@@ -245,8 +381,12 @@ def test_redaction_does_not_invent_values_for_the_boring_cases():
     assert redaction.redact_dsn(None) is None
     assert redaction.redact_dsn(7) == 7
     assert redacted_config({}) == {}
+    # `batch_size` is on the allowlist and reads as itself. `enabled` is not,
+    # so it is withheld — task #54 inverted that branch, and this line is what
+    # the inversion costs. `since` is absent, and "the server had this and
+    # could not redact it" is a false thing to print over a null.
     assert redacted_config({"batch_size": 500, "enabled": True, "since": None}) == {
-        "batch_size": 500, "enabled": True, "since": None
+        "batch_size": 500, "enabled": WITHHELD, "since": None
     }
 
 

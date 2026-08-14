@@ -1613,6 +1613,71 @@ def writeback_object_type(
                              allow_transform_backed=allow_transform_backed)
 
 
+def _edit_log_report(service, perms, user, name: str, keep: int) -> dict:
+    """Shared body of the two edit-log routes: gate, then plan.
+
+    The counters are write-volume numbers about a *shared* log, so they follow
+    the rule the index block above set: a caller whose row policy narrows the
+    backing dataset is told the log exists, not how much of it there is.
+    """
+    ot = service.ontology.object_type(name)
+    if ot is None:
+        raise KeyError(f"Unknown object type: {name!r}")
+    _require_ot_edit(perms, user, service, name)
+    if service._policy_for_dataset(ot.backing_dataset) is not None:
+        return {"object_type": name, "backing_dataset": ot.backing_dataset,
+                "withheld": True}
+    plan = service.prune_plan(name, keep)
+    plan.pop("prunable_ids")  # the count and the bytes are the answer; the
+    # id list is an implementation detail of executing the plan.
+    return {**plan, "withheld": False}
+
+
+@router.get("/ontology/object-types/{name}/edit-log", dependencies=[EDITOR])
+def object_edit_log(
+    name: str,
+    service: OntologyDep,
+    perms: PermDep,
+    user: UserDep,
+    keep: int = Query(0, ge=0),
+) -> dict:
+    """What this object type's edit log holds, and what pruning it would free.
+
+    Read-only, and the only way to see the log's size before deciding anything:
+    the log is never trimmed on its own, so a workspace using the ontology as
+    an application database grows this table forever. ``keep`` is a hypothesis
+    — "if I retained the newest N folded edits, what would go?" — so the same
+    plan can be inspected before it is executed.
+    """
+    return _edit_log_report(service, perms, user, name, keep)
+
+
+@router.post("/ontology/object-types/{name}/edit-log/prune", dependencies=[ADMIN])
+def prune_object_edit_log(
+    name: str,
+    service: OntologyDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+    keep: int = Query(..., ge=0),
+    dry_run: bool = False,
+) -> dict:
+    """Delete folded edits this type's log no longer needs. ADMIN.
+
+    A rank above writeback deliberately. Folding is a data operation an editor
+    performs and every effect of it stays visible; pruning deletes the record
+    of *who changed what*, and that record is the reason this system is worth
+    auditing. The safety condition is enforced in the service and again in the
+    store — see ``OntologyService.prune_plan`` — so the gate here is about
+    authority over history, not about correctness.
+    """
+    ot = service.ontology.object_type(name)
+    if ot is None:
+        raise KeyError(f"Unknown object type: {name!r}")
+    _require_ot_edit(perms, user, service, name)
+    return service.prune_object_edits(name, keep, actor=actor, dry_run=dry_run)
+
+
 @router.delete("/ontology/object-types/{name}/index", dependencies=[EDITOR])
 def drop_object_index(
     name: str,
@@ -1891,7 +1956,9 @@ def list_audit(
     4. *The honest counter.* "What was done *to* me" is not "what I did", and a
        viewer whose object an editor edited may want to know. Agreed — but that
        is a notification feature, and shipping it through a raw details bag is
-       precisely how three rounds of leaks happened. Filed as task #55.
+       precisely how three rounds of leaks happened. It is unbuilt; the task
+       number that used to be cited here now belongs to unrelated work, which
+       is the same reason the CHANGELOG stopped citing line numbers.
     5. *Why not keep VIEWER with structured details?* Because "structured" is
        not "non-sensitive": `parameters` was already structured. Structure fixes
        R1's problem; only privilege fixes R2's.

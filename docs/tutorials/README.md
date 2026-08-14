@@ -12,7 +12,7 @@ company's orders — and build on each other, but each stands alone.
 **Before you start**
 
 ```bash
-pip install laurelin          # or: pip install -e ".[dev]" from a checkout
+pip install -e ".[dev]"       # from a checkout: Laurelin is not on PyPI yet
 laurelin --help
 ```
 

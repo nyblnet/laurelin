@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import os
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, time
@@ -58,6 +60,8 @@ from laurelin.ontology.store import (
     digest_hex,
     digest_of_rows,
 )
+
+log = logging.getLogger("laurelin.ontology")
 
 # Cap on objects returned for one link traversal (the in-memory path was
 # unbounded; a cap keeps a fan-out link from materializing a whole dataset).
@@ -1691,8 +1695,190 @@ class OntologyService:
         # T4 — the new version invalidates the materialization the same way a
         # build does, so rebuild it now rather than leaving reads on the scan.
         objects = self.reindex(type_name) if self.object_store.state(type_name) else None
+        # T5 — housekeeping, off unless asked for. A fold is the only moment
+        # that creates prunable history, so it is the natural hook; the default
+        # is to do nothing, because deleting history by default is not a
+        # default anyone chose.
+        pruned = self._prune_after_fold(type_name, actor=actor)
         return {"object_type": type_name, "folded": marked, "version": result.version,
-                "row_count": result.row_count, "objects": objects}
+                "row_count": result.row_count, "objects": objects, "pruned": pruned}
+
+    # -- pruning the edit log ------------------------------------------------------
+    #
+    # The log is TRUTH: every read path replays it, and it is the only record
+    # of who changed what. So pruning is not a retention policy applied to a
+    # log, it is a proof obligation discharged per edit. An edit may go only
+    # when *all* of these hold, and each one is checked against the state of
+    # the world now rather than assumed from how the edit got here:
+    #
+    #  1. It is folded (`folded_at`). An unfolded edit is replayed on every
+    #     read — it is not history, it is the data.
+    #  2. The version it was folded into still exists in the backing dataset's
+    #     history, and that version's source is `writeback`. This is what ties
+    #     the edit to *this* dataset: rebind an object type to another dataset
+    #     and the fold's version number means nothing there, so the check
+    #     fails and nothing is deleted.
+    #  3. No version written after the fold could have superseded it. A
+    #     writeback builds on the previous version and a compaction rewrites
+    #     the same rows, so both carry the fold forward. Anything else — a
+    #     transform build, an upload, a sync, a branch merge — may have
+    #     replaced the rows the fold wrote, and then these edit rows are the
+    #     *only* surviving record of the hand edits. That is the case the
+    #     architecture doc names as "automatic unfolding, NOT IMPLEMENTED";
+    #     until it is, an edit in that state is load-bearing and stays.
+    #  4. It is not the highest `edit_seq` for its type. The allocator is
+    #     `MAX(edit_seq) + 1` and materialization watermarks are compared
+    #     against `max_edit_seq`; deleting the top row makes the next edit
+    #     re-use a number already claimed as applied. Enforced again in the
+    #     store, where the allocator lives.
+    #  5. It is outside the operator's retention window (`keep` newest folded
+    #     edits per type).
+    #
+    # What pruning still costs, and what the UI says out loud: the answer to
+    # "why does version N differ from N-1, and who did it" for the pruned
+    # window. That is a real loss. It is not a correctness loss.
+
+    #: Version sources that carry a fold forward instead of superseding it.
+    #: `writeback` reads the previous version and applies the overlay to it;
+    #: `compact` rewrites the same rows into fewer files. Every other source
+    #: is treated as "may have overwritten the fold" — including ones that
+    #: probably did not, because the cost of being wrong is asymmetric.
+    _FOLD_PRESERVING_SOURCES = frozenset({"writeback", "compact"})
+
+    def prune_plan(self, type_name: str, keep: int) -> dict:
+        """What pruning this type's edit log would delete, and what it would not.
+
+        Pure accounting — it deletes nothing, and :meth:`prune_object_edits`
+        executes exactly this plan. ``keep`` is the number of *folded* edits to
+        retain regardless, newest first; 0 keeps only what safety requires.
+
+        Every retained edit carries the reason it was retained, because "we
+        reclaimed less than you expected" is a question an operator will ask
+        and a number alone cannot answer.
+        """
+        if keep < 0:
+            raise ValueError("keep must be >= 0")
+        ot = self._require_object_type(type_name)
+        stats = self.store.object_edit_stats(type_name)
+        totals = stats[0] if stats else {
+            "edits": 0, "live": 0, "folded": 0, "payload_bytes": 0,
+            "max_edit_seq": 0, "oldest": None, "newest": None,
+        }
+        folded = self.store.list_folded_edits(type_name)
+        versions = {v.version: v for v in self.catalog.store.list_versions(ot.backing_dataset)}
+        # The newest version that could have overwritten a fold. An edit folded
+        # into a version at or above this line still has its rows in the
+        # dataset; one below it may not, and nothing else records what it did.
+        superseding = [
+            v for v in versions.values()
+            if v.source not in self._FOLD_PRESERVING_SOURCES
+        ]
+        supersedes_below = max((v.version for v in superseding), default=0)
+        supersedes_source = next(
+            (v.source for v in superseding if v.version == supersedes_below), None
+        )
+        high = int(totals["max_edit_seq"])
+        # Newest `keep` folded edits are retained whatever else is true; the
+        # list is in edit_seq order, so the window is its tail.
+        window = {e["id"] for e in folded[len(folded) - keep:]} if keep else set()
+
+        prunable: list[dict] = []
+        retained: dict[str, dict] = {}
+
+        def hold(edit: dict, reason: str) -> None:
+            slot = retained.setdefault(reason, {"reason": reason, "edits": 0, "bytes": 0})
+            slot["edits"] += 1
+            slot["bytes"] += edit["payload_bytes"]
+
+        for edit in folded:
+            version = edit["folded_into_version"]
+            recorded = versions.get(version) if version is not None else None
+            if version is None:
+                hold(edit, "folded with no version recorded")
+            elif recorded is None:
+                hold(edit, f"version {version} of {ot.backing_dataset} is no longer "
+                           f"in the dataset's history")
+            elif recorded.source != "writeback":
+                hold(edit, f"version {version} of {ot.backing_dataset} is not a "
+                           f"writeback version, so this fold cannot be located "
+                           f"in that dataset")
+            elif version < supersedes_below:
+                hold(edit, f"version {supersedes_below} of {ot.backing_dataset} "
+                           f"was written by {supersedes_source!r} after this fold "
+                           f"and may have overwritten it — these edits are the "
+                           f"only remaining record")
+            elif edit["edit_seq"] >= high:
+                hold(edit, "the newest entry anchors the edit sequence")
+            elif edit["id"] in window:
+                hold(edit, f"inside the {keep}-edit retention window")
+            else:
+                prunable.append(edit)
+
+        return {
+            "object_type": type_name,
+            "backing_dataset": ot.backing_dataset,
+            "keep": keep,
+            "edits": int(totals["edits"]),
+            "live": int(totals["live"]),
+            "folded": int(totals["folded"]),
+            "payload_bytes": int(totals["payload_bytes"]),
+            "oldest": totals["oldest"],
+            "newest": totals["newest"],
+            "prunable": len(prunable),
+            "prunable_bytes": sum(e["payload_bytes"] for e in prunable),
+            "prunable_ids": [e["id"] for e in prunable],
+            "retained": sorted(retained.values(), key=lambda r: -r["edits"]),
+        }
+
+    def prune_object_edits(
+        self, type_name: str, keep: int, actor: str = "anonymous", dry_run: bool = False
+    ) -> dict:
+        """Delete the folded edits :meth:`prune_plan` proves are safe to delete.
+
+        Returns the plan with ``pruned`` added: the number actually removed.
+        ``dry_run`` returns the plan with ``pruned = 0`` and touches nothing.
+
+        The store re-checks the two conditions it owns (folded, and not the
+        sequence anchor) against the same transaction that deletes, so a plan
+        that went stale between here and there removes fewer rows rather than
+        the wrong ones.
+        """
+        plan = self.prune_plan(type_name, keep)
+        ids = plan.pop("prunable_ids")
+        if dry_run or not ids:
+            plan["pruned"] = 0
+            plan["dry_run"] = dry_run
+            return plan
+        removed = self.store.delete_object_edits(type_name, ids)
+        self.store.log_audit(
+            "object_edits_pruned",
+            {"object_type": type_name, "dataset": plan["backing_dataset"],
+             "edits": removed, "payload_bytes": plan["prunable_bytes"],
+             "keep": keep, "folded_before": plan["folded"]},
+            actor=actor,
+        )
+        plan["pruned"] = removed
+        plan["dry_run"] = False
+        return plan
+
+    #: Newest folded edits per type to keep when the automatic hook is on.
+    #: Unset or 0 disables it — the same convention as
+    #: ``LAURELIN_AUDIT_MAX_EVENTS``, and for the same reason: housekeeping
+    #: that deletes history is something an operator asks for.
+    PRUNE_ENV = "LAURELIN_EDIT_LOG_MAX_FOLDED"
+
+    def _prune_after_fold(self, type_name: str, actor: str) -> int:
+        keep = int(os.environ.get(self.PRUNE_ENV, "0") or 0)
+        if keep <= 0:
+            return 0
+        try:
+            return self.prune_object_edits(type_name, keep, actor=actor)["pruned"]
+        except Exception:  # noqa: BLE001 - housekeeping never fails a fold
+            # The fold is committed and correct; a failed prune costs disk, and
+            # raising here would tell the caller their fold failed when the
+            # dataset already has their edits in it.
+            log.exception("edit-log prune after fold failed for %s", type_name)
+            return 0
 
     # -- the write path -----------------------------------------------------------
 

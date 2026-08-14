@@ -7,7 +7,107 @@ minor releases may break things.
 
 ## Unreleased
 
-## Security
+Nothing here has shipped: there is no git tag in this repository and nothing has
+been uploaded to PyPI. Everything below is in `main`.
+
+### Added: the ontology edit log can be pruned, and says what it costs first
+
+`object_edits` was never trimmed, so a workspace using the ontology as an
+application database accumulated edits forever: disk grew without limit and
+every rebuild replayed more. `prune_object_edits` had been specified and never
+built, and nothing in the product said how large the log was.
+
+The log is truth, so pruning is a proof obligation discharged per edit rather
+than a retention policy applied to a table. An edit may go only when it is
+folded; the version it was folded into is still in the backing dataset's
+history *and* is a `writeback` version (which is what ties it to this dataset
+rather than to a dataset the type used to be bound to); no version written
+since could have superseded the fold (only `writeback` and `compact` carry one
+forward — a transform build, upload, sync or merge may have overwritten it, and
+then those log rows are the only surviving record of the hand edits); it is not
+the row holding `MAX(edit_seq)`, which the sequence allocator and every
+materialization watermark depend on; and it is outside the operator's retention
+window. The last two are re-checked in SQL inside the deleting transaction, so
+a stale plan deletes fewer rows rather than the wrong ones.
+
+`GET /ontology/object-types/{name}/edit-log` reports the size and what pruning
+would reclaim — plus, for every retained edit, the reason it stayed, because
+"less than you expected" is a question a number alone cannot answer. The
+ontology page shows all of it. Pruning itself is ADMIN, a rank above the fold
+that made the edits redundant: it deletes the record of who changed what.
+Automatic pruning after a fold is off unless `LAURELIN_EDIT_LOG_MAX_FOLDED` is
+set, and a failed prune never fails the fold.
+
+Reported size is the stored JSON payloads only — a floor on what the log
+occupies, not a measurement of the database file, and it says so where it is
+shown.
+
+### Fixed: `compact()` corrupted Iceberg datasets instead of compacting them
+
+Pre-existing, and silent. `write()` is exempted from the scanned-at-source
+refusal for Iceberg — Laurelin really does write that table, via
+`write_iceberg` — so compaction took the managed path: it wrote a local Parquet
+part nothing ever reads and registered a version row with `snapshot_id = NULL`.
+The Iceberg table was untouched (the audit reported `parts_before: 0` on a
+two-file table), and a version with no snapshot pinned reads as *the table as it
+is now*, forever. Measured: compact, then append, and time travel to the
+compacted version returned five rows where its own version row said four.
+
+Compaction now rewrites the table into one new snapshot through
+`write_iceberg`, so the version pins the snapshot it made and the data files
+actually merge (2 → 1, audited both ways). It reclaims scan cost, not disk:
+earlier snapshots keep their files, which is what keeps history readable. The
+Compact button, previously hidden for Iceberg datasets, now sits in the
+snapshot-history panel where it belongs.
+
+### Performance: the audience projection cost 3–11× per response, and the published numbers were re-measured
+
+The security work below put a per-field disclosure decision on **every**
+serialized response, and nothing measured it: `bench/benchmark.py` exercises the
+service layer and never goes through serialization, so a large regression sat on
+the busiest path in the product with no number attached to it. Measured against
+the pre-security tree, benchmarked back to back: a 1 000-dataset response cost
+**5.2×** what it had, and a 100-dashboard response **11.3×**.
+
+Profiling rather than guessing put **68%** of the time in re-deciding per field
+what depends only on the *shape* — `field_author_role` rescanning
+`field.metadata`, pydantic's `model_fields` property re-entered once per field
+per record — against **7%** in actual pydantic serialization. That decision is
+now memoized on `(class, reader role, author role, narrowed)`, which is
+everything it depends on and no field value, and `_holds_model` gained an
+exact-type fast path. Neither changes a disclosure decision, and
+`tests/test_audience.py` asserts the memoized answer against the uncached rules
+rather than trusting that sentence.
+
+**What is left is published, not hidden.** A viewer's response now costs ~1.2×
+what it did and an admin's 2.9–4.9×, and an admin pays *more* than a viewer
+because a viewer's projection drops most fields before they are walked. Roughly
+half the residual `DatasetInfo` cost is `redacted_source` (0.90 → 3.55 ms per
+1 000), which its own docstring says is a courtesy and explicitly not a
+boundary — the obvious next cut, and not cut. Two other costs bought
+correctness and are stated where they are relevant rather than only here: a
+policied overlay read with pending edits is **1.18×** (the fix for the
+mask-exempt-editor plaintext read), and the rest of the service layer — query,
+ingest, build, incremental, ontology — is unchanged at 0.85–1.13×.
+
+`bench/serialize_cost.py` is new, and exists so this table cannot rot the way
+the index table did; `tests/test_bench.py` smoke-tests it for the same reason it
+smoke-tests `benchmark.py`. All six ratio claims in `bench/regression.py` still
+pass.
+
+Re-measuring also caught **numbers that had already rotted, before this
+session**, now corrected in [docs/SCALE.md](docs/SCALE.md): the UI row page was
+published as flat at 15 ms and is 50/73 ms at 1 M/5 M (it was never flat — the
+pre-security tree measures 45/86 ms); ontology get-by-key was published at
+75/279 ms and is 107/334 ms (the pre-security tree is *slower* at 117/345 ms).
+The object-index table was reported from a script **that was never committed**,
+so it could not be re-run at all; it now carries what a committed harness
+measures, and the "selective search is constant-time" claim is **withdrawn**
+rather than restated, because the probe available matches a fixed *fraction* of
+the type and so cannot test it. The README's headline 1.4 ms key lookup is
+true: 1.3 ms at both 200 K and 800 K.
+
+### Security — each entry below was reproduced on a running server before it was fixed
 
 Laurelin is a governance product, so the entries below are the ones that matter
 most: each was a live disclosure or a live bypass on a running server, each was
@@ -142,7 +242,52 @@ Driving it as a real viewer found three things reading it did not:
   authentication problem, and saying so would send an operator to rotate a
   credential that is fine.
 
-### Fixed: nineteen defects from a fourth adversarial pass, all in the R1/R2 change itself
+### Changed: the config redactor is an allowlist over key names, not a denylist
+
+`redaction.redact_mapping` — what an **admin** sees when a connector config or a
+federated dataset's source is read back — decided per key whether to disclose a
+value, and its last branch was "disclose unless a shape rule objects". So a key
+name it did not recognise was shown. Measured on this tree: a source registered
+through `PUT /api/v1/sources/{name}` with `pw`, `bearer`, `pem`, `sas`,
+`identity` or `bootstrap_servers` had every one of those values served verbatim
+from `GET /api/v1/sources`, because none of them matches `password|secret|token|
+…` and none of the values has a URL or `keyword=value` shape for the shape rules
+to catch.
+
+**Severity is low and it is worth saying why rather than leaving it implied.**
+After the R1/R2 split this path guards admin-authored config displayed back to
+admins — the same people who typed it, on a system they can already reach.
+Nothing's confidentiality depends on it; `DatasetInfo.source` is
+`AuthoredBy(Role.admin)` and `SourceInfo.config` is omitted entirely below
+admin, and those annotations, not this function, are the boundary. What this
+was is the same *losing shape* that produced criticals in rounds 1 and 3 — a
+denylist over a vocabulary Laurelin does not own, since
+`SourceUpsertRequest.config` is `dict[str, Any]`.
+
+It is now an allowlist of fourteen shape keys (`type`, `table`, `query`,
+`format`, `path`, the `url`/`uri` family, and the catalog/namespace/branch names
+a registration carries), matching `export/secrets.NON_SECRET_SHAPE_KEYS` plus
+the two endpoint keys the API keeps and a file export does not. Anything else is
+withheld whatever it is called. The existing secret-name regex survives as a
+*readability* choice — it picks `*****` over `***** (withheld)` for a key that
+says what it held — so being incomplete now costs a reader a less specific
+marker instead of costing disclosure.
+
+The cost is real and bounded: a config key nobody named renders as
+`***** (withheld)` until it is added to the list, which is a visible annoyance
+fixed in one line rather than a silent leak. What an admin needs to tell one
+registration from another is kept deliberately and tested against the two
+screens that read it — `configSummary` in `views/Sources.tsx` and
+`FederatedSource` in `views/Datasets.tsx` — because an allowlist that renders
+every source identically has traded a theoretical leak for a screen nobody can
+use.
+
+### Fixed: sixteen defects from a fourth adversarial pass, all in the R1/R2 change itself
+
+*(Sixteen is what this section enumerates: the fifteen bulleted defects plus the
+guard defect at the end. An earlier draft of this heading said nineteen, which
+counted the three UI defects recorded in the section above — those are listed
+there, not here, and are not double-counted.)*
 
 R1 and R2 were attacked by agents who had written neither. Every entry was
 reproduced on a running server before it was fixed, and every fix was reverted
@@ -267,8 +412,8 @@ cancelling the first.**
   `source_routes._public` exists to withhold. Descending into a record can now
   only ever disclose less, and `Failure.endpoint` declares `AuthoredBy(admin)`
   besides.
-- **The "one serialization point" was not one.** `routes.py:461` and five sites
-  in `auth_routes.py` called `model_dump` directly, and the guard meant to catch
+- **The "one serialization point" was not one.** One site in `routes.py` and
+  five in `auth_routes.py` called `model_dump` directly, and the guard meant to catch
   that allowlisted three files wholesale — including the two they were in.
   Nothing leaked, because every field involved happened to be PRESENTATION; both
   were unannotated paths where a field added tomorrow ships. The guard is
@@ -996,7 +1141,7 @@ configuration: `OntologyService` constructs `MetadataObjectStore`, so every
 deployment today runs the default store and the StarRocks one is a seam with
 an implementation behind it, not a switch an operator can throw.
 
-### Security
+### Security — three fail-open bugs that predate the new backends
 
 Three fixes in code that **predates both new backends** — they were found while
 building the dialect seam, not caused by it.
@@ -1042,7 +1187,7 @@ governance layer that quietly fixes its own fail-open bugs is not one.
   least-checked one, and `source_table`'s dialect-mismatch guard cannot catch
   that case: both sides would say "duckdb".
 
-### Fixed
+### Fixed: four defects in the object overlay — two governance, one paging, one that would have scaled badly
 
 - **Created objects bypassed row-level security on every read path.** The edit
   overlay was applied with no policy at all, so an object created with
@@ -1064,10 +1209,11 @@ governance layer that quietly fixes its own fail-open bugs is not one.
 
 ## 0.2.0 — 2026-07-27
 
-**The first published release.** `0.1.0` existed only in the source tree and
-was never tagged or uploaded, so there is nothing to upgrade from — this
-describes what Laurelin *is*, not what changed since something you could have
-installed.
+**The first release we intend to publish** — and, as of this writing, still
+unpublished: `0.2.0` has never been tagged or uploaded either, so nothing here
+has reached a user. `0.1.0` existed only in the source tree. There is nothing
+to upgrade from, and this describes what Laurelin *is* rather than what changed
+since something you could have installed.
 
 ### Storage
 

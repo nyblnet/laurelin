@@ -498,16 +498,66 @@ class DatasetCatalog:
         Appends are cheap but accumulate parts, and many small files make scans
         slower. Compaction trades one full rewrite for a tidy layout; earlier
         versions are untouched and still readable.
+
+        An Iceberg dataset takes a different route (:meth:`_compact_iceberg`),
+        because the layout being compacted is the Iceberg table's, not a
+        directory of Laurelin parts.
         """
         _validate_name(name)
+        dataset = self.store.get_dataset(name)
+        if dataset is not None and dataset.is_iceberg:
+            return self._compact_iceberg(name, description=description, auto=auto)
         info = self._version_info(name, None)
         parts = len(self._files_for(info))
         table = self.read(name)
         result = self.write(name, table, source="compact", description=description)
         self.store.log_audit(
             "dataset_compacted",
-            {"dataset": name, "parts_before": parts, "version": result.version,
+            {"dataset": name, "parts_before": parts,
+             "parts_after": len(self._files_for(result)), "version": result.version,
              "row_count": result.row_count, "automatic": auto},
+        )
+        return result
+
+    def _compact_iceberg(
+        self, name: str, description: str = "", auto: bool = False
+    ) -> DatasetVersionInfo:
+        """Compact an Iceberg dataset by rewriting its rows as one new snapshot.
+
+        The managed path did not merely fail to compact here, it corrupted the
+        dataset, and quietly. ``write()`` is exempted from
+        ``_refuse_write_at_source`` for Iceberg (Laurelin really does write
+        that table — via ``write_iceberg``), so compaction wrote a *local
+        Parquet part* and registered a version row with ``snapshot_id = NULL``
+        pointing at it. Measured on a two-snapshot table: the Iceberg table was
+        untouched (the audit dutifully reported ``parts_before: 0``), the part
+        on disk was never read by anything, and — the part that cannot be
+        noticed by looking — ``read(name, version=3)`` fell through to "no
+        snapshot pinned, read the current table". One later append and time
+        travel to the compacted version returned five rows where its own
+        version row said four. A version that silently means "now" is worse
+        than a version that errors.
+
+        So: read the table and overwrite it. That is a real compaction — one
+        snapshot whose data files are the merge of the old ones — and it goes
+        through ``write_iceberg``, which pins the new snapshot id to the new
+        version like every other Iceberg write. Earlier snapshots stay, which
+        is what keeps history readable, so this reclaims *scan* cost, not disk.
+        """
+        dataset = self.store.get_dataset(name)
+        if dataset is None or dataset.latest_version is None:
+            raise KeyError(f"Dataset {name!r} has no versions")
+        ice = self._iceberg()
+        before = ice.data_files(name)
+        table = self.read_iceberg(name)
+        result = self.write_iceberg(
+            name, table, mode="replace", source="compact", description=description
+        )
+        self.store.log_audit(
+            "dataset_compacted",
+            {"dataset": name, "parts_before": before, "parts_after": ice.data_files(name),
+             "version": result.version, "snapshot_id": result.snapshot_id,
+             "row_count": result.row_count, "automatic": auto, "format": "iceberg"},
         )
         return result
 

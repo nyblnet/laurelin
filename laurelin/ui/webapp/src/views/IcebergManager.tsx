@@ -6,6 +6,7 @@
 // snapshot list), and safe schema change (additive freely; breaking only after
 // seeing the downstream impact).
 
+import type { ReactNode } from "react";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
@@ -23,12 +24,21 @@ interface Snapshot {
 
 const COLUMN_TYPES = ["string", "integer", "float", "boolean", "timestamp"];
 
-export function IcebergManager({ name }: { name: string }) {
+export function IcebergManager({
+  name,
+  compact,
+}: {
+  name: string;
+  // The compaction control, passed in rather than imported: it lives on the
+  // dataset page beside the managed one, and importing it here would make the
+  // two modules import each other.
+  compact?: ReactNode;
+}) {
   return (
     <div style={{ marginTop: 8 }}>
       <BranchesPanel name={name} />
       <SchemaPanel name={name} />
-      <SnapshotsPanel name={name} />
+      <SnapshotsPanel name={name} compact={compact} />
     </div>
   );
 }
@@ -260,7 +270,7 @@ function DropColumnHint({ onDrop }: { onDrop: (column: string) => void }) {
 
 // ---------------------------------------------------------------- snapshots
 
-function SnapshotsPanel({ name }: { name: string }) {
+function SnapshotsPanel({ name, compact }: { name: string; compact?: ReactNode }) {
   const q = useQuery({
     queryKey: ["iceberg-snapshots", name],
     queryFn: () => api.get<Snapshot[]>(`${API}/datasets/${name}/iceberg/snapshots`),
@@ -268,7 +278,19 @@ function SnapshotsPanel({ name }: { name: string }) {
 
   return (
     <div className="card">
-      <label style={{ marginBottom: 4 }}>Snapshot history</label>
+      {/* Compaction belongs here rather than beside "Version history": for an
+          Iceberg dataset the snapshots *are* the history, and compaction adds
+          one — it rewrites the data files into a new snapshot and leaves every
+          earlier one readable. The button was hidden for Iceberg because the
+          server's compaction was broken here; now that it works, hiding it
+          would just be a capability nobody could reach. */}
+      <div
+        className="toolbar"
+        style={{ justifyContent: "space-between", alignItems: "center" }}
+      >
+        <label style={{ margin: 0 }}>Snapshot history</label>
+        {compact}
+      </div>
       {q.isLoading && <Spinner />}
       {q.isError && <ErrorBox error={q.error} />}
       {q.data &&

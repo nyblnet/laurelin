@@ -58,10 +58,13 @@ def _public(source: SourceInfo, role: Role) -> dict:
     and "the person reading this screen" are not necessarily the same admin.
 
     Note what is deliberately NOT here: a "redacted config" for editors. The old
-    shape ran `redact_mapping`, a denylist over key names in the *connector's*
-    vocabulary, and round 3 read an ODBC keyword string out of a `path` key that
-    no denylist covers. Not disclosing the dict is not a better denylist; it is
-    the absence of one.
+    shape ran `redact_mapping`, which was then a denylist over key names in the
+    *connector's* vocabulary, and round 3 read an ODBC keyword string out of a
+    `path` key that no denylist covers. Not disclosing the dict is not a better
+    denylist; it is the absence of one. (Task #54 has since inverted
+    `redact_mapping` itself to an allowlist. That is why it is still tolerable
+    on the admin branch above — it is not why editors are refused the dict, and
+    the two decisions are independent.)
     """
     out = _dump(source)
     if role.covers(Role.admin):

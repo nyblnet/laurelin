@@ -614,7 +614,12 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
         </p>
       )}
 
-      {iceberg && auth.can("editor") && <IcebergManager name={detail.name} />}
+      {iceberg && auth.can("editor") && (
+        <IcebergManager
+          name={detail.name}
+          compact={<CompactButton name={detail.name} iceberg />}
+        />
+      )}
 
       {!atSource && <SchemaSection version={schemaVersion} />}
 
@@ -800,20 +805,26 @@ function FederatedSource({
 // --------------------------------------------------------------- compaction
 
 /**
- * Merge a dataset's Parquet parts back into one file.
+ * Merge a dataset's parts back into one file.
  *
  * Appends are cheap but leave a version made of many small parts, and many
  * small files eventually slow scans. Compaction pays that cost once,
  * deliberately — which is why it's a button, not automatic (unless
  * LAURELIN_AUTO_COMPACT_PARTS is set on the server).
+ *
+ * `iceberg` changes only what the button *says*. The server rewrites the
+ * Iceberg table's data files into one new snapshot, so the layout gets tidier
+ * and history keeps every older snapshot — meaning it buys scan cost, not disk.
+ * Promising "one file" there would be true; promising space back would not.
  */
-function CompactButton({ name }: { name: string }) {
+export function CompactButton({ name, iceberg = false }: { name: string; iceberg?: boolean }) {
   const qc = useQueryClient();
   const m = useMutation({
     mutationFn: () => api.post<DatasetVersion>(`${API}/datasets/${name}/compact`, {}),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dataset", name] });
       qc.invalidateQueries({ queryKey: ["datasets"] });
+      qc.invalidateQueries({ queryKey: ["iceberg-snapshots", name] });
     },
   });
   return (
@@ -824,7 +835,12 @@ function CompactButton({ name }: { name: string }) {
         className="small"
         disabled={m.isPending}
         onClick={() => m.mutate()}
-        title="Merge the latest version's parts into one file"
+        title={
+          iceberg
+            ? "Rewrite this table's data files into one new snapshot. Earlier " +
+              "snapshots stay readable, so this buys scan cost rather than disk."
+            : "Merge the latest version's parts into one file"
+        }
       >
         {m.isPending ? "Compacting…" : "Compact"}
       </button>

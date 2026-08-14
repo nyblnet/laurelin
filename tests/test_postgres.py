@@ -147,6 +147,39 @@ def test_the_edit_watermark_survives_postgres_identity_visibility(store):
     assert [e.edit_seq for e in store.list_object_edits_since("widget", 1)] == [2, 3]
 
 
+def test_the_edit_log_accounts_and_prunes_on_postgres(store):
+    """Four bits of dialect-sensitive SQL in one path: a CASE-WHEN aggregate,
+    ``length()`` over the payload, a chunked ``IN`` list, and a DELETE whose
+    ``rowcount`` is the answer returned to the caller.
+
+    The two refusals are re-asserted here rather than trusted from the SQLite
+    suite, because they are enforced *in the statement*: a dialect that silently
+    dropped either predicate would delete a live edit, or the row the sequence
+    allocator reads, and nothing above this layer would notice.
+    """
+    for i in range(3):
+        store.add_object_edit(_edit(f"e{i}"))
+    assert store.mark_edits_folded(["e0", "e1"], 7) == 2
+
+    stats = store.object_edit_stats("widget")[0]
+    assert (stats["edits"], stats["live"], stats["folded"]) == (3, 1, 2)
+    assert stats["payload_bytes"] > 0 and stats["max_edit_seq"] == 3
+
+    folded = store.list_folded_edits("widget")
+    assert [e["edit_seq"] for e in folded] == [1, 2]
+    assert all(e["folded_into_version"] == 7 for e in folded)
+
+    assert store.delete_object_edits("widget", ["e2"]) == 0, "e2 is live"
+    assert store.delete_object_edits("widget", ["e0", "e1"]) == 2
+    assert store.max_edit_seq("widget") == 3, "the allocator's floor is untouched"
+
+    store.mark_edits_folded(["e2"], 8)
+    assert store.delete_object_edits("widget", ["e2"]) == 0, (
+        "folded, but it is the highest position — deleting it would let the "
+        "next edit re-use a number a materialization claims to have applied"
+    )
+
+
 ONTOLOGY = """
 object_types:
   - api_name: city

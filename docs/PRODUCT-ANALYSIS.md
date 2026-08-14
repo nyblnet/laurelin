@@ -1,10 +1,33 @@
 # Laurelin — product & adoption analysis
 
 *How potential users will use and perceive the platform, where adoption leaks,
-and what to improve. Grounded in the platform as actually built (not the
-roadmap). Living document.*
+and what to improve.*
 
-## TL;DR
+> **Read this as a dated snapshot, not as a description of the platform
+> today.** The analysis below was written against a much earlier tree, and the
+> two bottlenecks it identifies — no connectors, synchronous in-request builds
+> — were **both closed**, along with most of the "Remaining" list at the
+> bottom. The "Who actually shows up" table and "The adoption funnel" section
+> are preserved as the original diagnosis; every present-tense capability claim
+> in them is stale. What is still open, verified against the tree:
+>
+> - **A hosted live demo** — still nothing; needs hosting infrastructure.
+> - **Generated typed SDKs** — not built (`laurelin sdk generate` does not
+>   exist; `laurelin/mcp/client.py` is a hand-written client, not codegen).
+> - **App builder** — `ObjectAppInfo` is configured, not composed; there is no
+>   builder UI.
+> - **Dashboard v2** (cross-filtering, parameters) — not built.
+> - **More connectors** — still exactly three: postgres, http, file
+>   (`laurelin/connectors/connectors.py`).
+>
+> Everything else in "Remaining" shipped: query resource limits and admission
+> control (`laurelin/core/limits.py`), streaming transforms, a real ontology
+> index (`laurelin/ontology/store.py`), cron and on-upstream schedules,
+> scheduled syncs, incremental builds, and an object-storage data plane
+> (`LAURELIN_DATA_URI`). Anyone using this page to plan work should check the
+> tree first.
+
+## TL;DR *(as originally written — see the note above)*
 
 Laurelin is **unusually complete on governance and identity** for an
 open-source project — multi-workspace tenancy, local + OIDC + SAML SSO, SCIM
@@ -129,13 +152,25 @@ RLS predicate pushdown also landed: row policies are applied with
 `Dataset.filter()` inside the scan, so the 3.6× tax is gone (1.0× at 5 M
 rows) and policied users get the fast ontology path too.
 
-**Remaining (the "opener" + scale):** more connectors; scheduled syncs;
-cron/event-triggered + incremental builds and a multi-process worker/queue;
-a true ontology *index* (queries are fast now but still linear); query
-resource limits + admission control; streaming Python transforms; dashboard
-v2 (cross-filtering, parameters) + app builder; generated typed SDKs;
-object-storage-backed workspaces (for a fully stateless data plane and true
-data-plane HA); a hosted demo.
+**Remaining, re-checked against the tree** (the list that follows this
+paragraph was written before most of it shipped; struck items are done):
+
+- ~~scheduled syncs; cron/event-triggered + incremental builds~~ — shipped
+  (`laurelin/core/scheduler.py`, leased so firing is exactly-once).
+- ~~a true ontology *index*~~ — shipped (`laurelin/ontology/store.py`), with
+  key lookups and selective search constant-time.
+- ~~query resource limits + admission control~~ — shipped
+  (`laurelin/core/limits.py`).
+- ~~streaming Python transforms~~ — shipped (`streaming=True`).
+- ~~object-storage-backed workspaces~~ — shipped (`LAURELIN_DATA_URI`).
+- **More connectors** — still open. Exactly three:
+  `CONNECTOR_TYPES = ("postgres", "http", "file")`.
+- **A multi-process worker/queue** — still open. Builds run on a per-replica
+  `ThreadPoolExecutor`, coordinated across replicas by leases, not by a queue.
+- **Dashboard v2** (cross-filtering, parameters) **and an app builder** —
+  still open.
+- **Generated typed SDKs** — still open; there is no `laurelin sdk generate`.
+- **A hosted demo** — still open.
 
 ## The one strategic call
 

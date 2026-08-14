@@ -25,11 +25,18 @@ snapshot history, so cutting one copies no data, and Iceberg tracks columns by
 id rather than position, so adding one leaves every existing snapshot
 readable.
 
+Compaction is a whole-table rewrite into one new snapshot
+(``DatasetCatalog._compact_iceberg``), not Iceberg's incremental
+``rewrite_data_files``: it reads every row, so it costs the table, and it
+reclaims *scan* cost rather than disk, because every earlier snapshot keeps its
+own data files. That is the honest shape of what is implemented.
+
 What this still does *not* do, stated plainly because the Iceberg name implies
-all of it: no tags, no hidden partitioning, no row-level deletes, no
-compaction of small files, and merges are **fast-forward only** — a three-way
-merge of two diverged histories needs a row-level conflict policy, and
-guessing one would silently pick a winner between two people's writes.
+all of it: no tags, no hidden partitioning, no row-level deletes, no expiry of
+old snapshots (so nothing here ever frees storage), and merges are
+**fast-forward only** — a three-way merge of two diverged histories needs a
+row-level conflict policy, and guessing one would silently pick a winner
+between two people's writes.
 """
 
 from __future__ import annotations
@@ -215,6 +222,19 @@ class IcebergTables:
             }
             for s in tbl.metadata.snapshots
         ]
+
+    def data_files(self, name: str, snapshot_id: Optional[int] = None) -> int:
+        """How many data files a scan of this table would open.
+
+        The number compaction exists to reduce, and therefore the number it
+        has to report before and after — Laurelin's own ``version.files``
+        describes a directory of Parquet parts and says nothing about an
+        Iceberg table's layout, which is how compaction here once audited
+        ``parts_before: 0`` while doing nothing at all.
+        """
+        tbl = self.catalog.load_table(self._identifier(name))
+        scan = tbl.scan(snapshot_id=snapshot_id) if snapshot_id else tbl.scan()
+        return sum(1 for _ in scan.plan_files())
 
     def read(self, name: str, snapshot_id: Optional[int] = None,
              branch: Optional[str] = None) -> pa.Table:

@@ -184,7 +184,7 @@ pip install 'laurelin[mcp]'
 laurelin mcp --url http://127.0.0.1:8787 --token <your-api-token>
 ```
 
-That serves 17 MCP tools — `search_objects`, `get_object`,
+That serves 18 MCP tools — `search_objects`, `get_object`,
 `get_linked_objects`, `apply_action`, `query_sql`, and more. Point Claude or
 any MCP client at it and the agent can answer "which gold-tier customers have
 open orders in EU?" and act on the answer.

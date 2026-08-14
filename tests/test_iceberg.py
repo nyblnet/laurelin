@@ -160,6 +160,77 @@ def test_a_row_policy_still_applies(cat):
     assert scanned.num_rows == 2
 
 
+# -- compaction ---------------------------------------------------------------
+#
+# `compact()` on an Iceberg dataset did not fail, which is why nobody noticed.
+# `write()` is exempted from the scanned-at-source refusal for Iceberg (Laurelin
+# really does write that table, via `write_iceberg`), so compaction wrote a
+# local Parquet part nothing reads and registered a version row with no
+# snapshot id. Three consequences, measured on a two-snapshot table: the Iceberg
+# table was untouched, the audit reported `parts_before: 0`, and reading that
+# version fell through to "no snapshot pinned, read the table as it is now".
+
+
+def test_compacting_an_iceberg_dataset_merges_its_data_files(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+    ice = cat._iceberg()
+    assert ice.data_files("orders") == 2, "two appends, two data files"
+
+    result = cat.compact("orders")
+
+    assert ice.data_files("orders") == 1, "compaction has to compact something"
+    assert result.row_count == 4 and cat.read("orders").num_rows == 4
+    assert result.source == "compact"
+
+
+def test_a_compacted_iceberg_version_pins_the_snapshot_it_made(cat):
+    """The bug that cannot be seen by looking: a version row with
+    `snapshot_id = NULL` reads as "now" forever, so time travel to it returns
+    whatever the table holds later — five rows from a version whose own row
+    says four."""
+    cat.write_iceberg("orders", FIRST)
+    compacted = cat.compact("orders")
+    assert compacted.snapshot_id is not None
+
+    cat.write_iceberg("orders", MORE, mode="append")
+
+    assert cat.read("orders").num_rows == 4
+    assert cat.read("orders", version=compacted.version).num_rows == 3, (
+        "a compacted version means the rows it compacted, not the rows there are now"
+    )
+    assert cat.read("orders", version=1).num_rows == 3, "history still readable"
+
+
+def test_compacting_an_iceberg_dataset_writes_no_laurelin_parts(cat, tmp_path):
+    """An Iceberg dataset's bytes live in the warehouse. A Parquet part under
+    `data/` would be a dataset half managed and half remote — exactly what
+    `_refuse_write_at_source` exists to prevent everywhere else."""
+    cat.write_iceberg("orders", FIRST)
+    cat.compact("orders")
+
+    parts = list((tmp_path / "ws" / "data" / "orders").rglob("*.parquet"))
+    assert parts == [], f"compaction left orphan parts: {parts}"
+
+
+def test_the_iceberg_compaction_audit_counts_real_files(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+    cat.compact("orders")
+
+    entry = next(e for e in cat.store.list_audit(limit=20)
+                 if e.action == "dataset_compacted")
+    assert entry.details["parts_before"] == 2, "0 was the old lie"
+    assert entry.details["parts_after"] == 1
+    assert entry.details["format"] == "iceberg"
+
+
+def test_compacting_a_dataset_with_no_versions_is_an_error(cat):
+    cat.create_iceberg_dataset("orders")
+    with pytest.raises(KeyError, match="no versions"):
+        cat.compact("orders")
+
+
 # -- configuration ------------------------------------------------------------
 
 def test_the_warehouse_defaults_into_the_workspace(tmp_path, monkeypatch):
@@ -404,3 +475,17 @@ def test_schema_evolution_over_http(tmp_path):
                json={"drop": ["region"], "allow_breaking": True})
     assert r.status_code == 200
     assert "region" not in r.json()["columns"]
+
+
+def test_compaction_over_http_reaches_the_iceberg_path(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/v1/datasets/orders/iceberg", files=_csv())
+    c.post("/api/v1/datasets/orders/iceberg?mode=append",
+           files=_csv("id,region\n4,apac\n"))
+
+    r = c.post("/api/v1/datasets/orders/compact")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["version"] == 3 and body["row_count"] == 4
+    snaps = c.get("/api/v1/datasets/orders/iceberg/snapshots").json()
+    assert len(snaps) > 2, "compaction is a snapshot on the table, not a local part"

@@ -56,14 +56,16 @@ archive taken from SQLite restores onto PostgreSQL and back.
 `--with-secrets` flag and there will not be one.
 
 The reason is measured, not theoretical. Laurelin's three API redactors were
-attacked with nine credential shapes and eight of them leaked — including
-`postgresql://alice:p/w@db.internal:5432/prod`, which passed through the
-production dataset redactor completely untouched. Every miss produced output
-that *looked* redacted. A denylist over free-form values fails invisibly; an
-allowlist fails as loud absence, which is what an operator can act on.
+attacked with a corpus of 26 credential shapes and ten of them leaked
+(`tests/test_redaction.py`, whose module docstring records the run) — including
+`postgresql://alice:pa/ss@db:5432/prod`, which passed through the production
+dataset redactor completely untouched. Every miss produced output that *looked*
+redacted. A denylist over free-form values fails invisibly; an allowlist fails
+as loud absence, which is what an operator can act on.
 
 Those particular leaks are fixed (see `laurelin/core/redaction.py`, and the
-CHANGELOG entry that lists all ten), and the argument is unchanged: the fix
+CHANGELOG entry that groups them into the eight input classes they fall into),
+and the argument is unchanged: the fix
 holds because it *withholds* every value whose shape it cannot read, not
 because a better denylist was found. It is worth saying that a second round of
 attacks on that module found seven more disclosures — a password containing a
@@ -225,10 +227,18 @@ download button; a portability guarantee has a proof you can look at.
 ## The unsupported escape hatch
 
 You can always `tar czf` the workspace directory. It is a **worse** artifact and
-you should know why: `metadata.db` is mode 0644 (measured) and carries live
-session tokens, plaintext PKCE verifiers, scrypt password hashes and every
-connector DSN in the clear. It also cannot be restored onto a different metadata
-backend.
+you should know why: `metadata.db` carries live session tokens, plaintext PKCE
+verifiers, scrypt password hashes and every connector DSN in the clear, and a
+tarball of it hands all of that to whoever receives the file. It also cannot be
+restored onto a different metadata backend.
+
+The *mode* argument that used to be here is out of date and is worth stating
+plainly rather than deleting: `metadata.db` was 0644, and is not any more. A
+workspace Laurelin creates today is 0700 with `metadata.db` and `laurelin.yml`
+at 0600 (measured on this tree). A workspace **upgraded** from an older release
+keeps group read — 0640 — unless `LAURELIN_STRICT_FILE_MODE=1` is set; see the
+checklist in [SECURITY.md](../SECURITY.md). So the file is no longer
+world-readable, and every other reason above still stands.
 
 If you want the bytes, take them — it is your directory, and that is the point.
 The supported path exists because it is the one that does not hand somebody a
