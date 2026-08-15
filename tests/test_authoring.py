@@ -170,3 +170,138 @@ def test_api_lock_pipelines(ws):
     assert locked.get("/api/v1/pipelines").status_code == 200  # read still allowed
     assert locked.put("/api/v1/pipelines/x", json={"content": "x=1"}).status_code == 403
     assert locked.delete("/api/v1/pipelines/x").status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# generate_sql_transform: the SQL an author wrote must be the SQL that runs
+#
+# Two measured defects, one loud and one silent. The silent one is the reason
+# this matters: `write()` compiles the generated file before saving it, which
+# catches a file that will not parse — and cannot catch a file that parses
+# perfectly while holding SQL nobody wrote.
+# ---------------------------------------------------------------------------
+
+# Shared with tests/test_flow_compile.py: a value that breaks one SQL-generating
+# surface is worth trying against the others.
+from tests.test_flow_compile import HOSTILE  # noqa: E402
+
+
+def test_generate_sql_transform_round_trips_a_triple_quote_instead_of_failing_to_parse(
+    tmp_path,
+):
+    """REVERT `_py_string` to the f-string into `query=\"\"\"…\"\"\"` and this
+    fails with, measured verbatim on this tree:
+
+        ValueError: Syntax error: unterminated triple-quoted string literal
+        (detected at line 12) (outa.py, line 9)
+
+    An author who wrote SQL was shown a Python line number, for a file they
+    never saw and cannot open.
+    """
+    files = PipelineFiles(tmp_path / "pipelines")
+    sql = 'SELECT """ FROM raw'
+    files.generate_sql_transform(sql, "outa", ["raw"])
+
+    registry = collect_transforms(tmp_path / "pipelines")
+    assert registry.get("outa").query == sql
+
+
+def test_generate_sql_transform_round_trips_a_backslash_byte_for_byte(tmp_path):
+    """The SILENT half, and the reason this is a correctness fix.
+
+    REVERT `_py_string` to the f-string and this fails: the authored query
+
+        SELECT * FROM raw WHERE path = 'C:\\temp\\new' AND re = '\\d+'
+
+    came back out of `collect_transforms` holding a real TAB (from `\\t`) and a
+    real NEWLINE (from `\\n`) — `IDENTICAL: False`. The file was written, it
+    compiled, the build ran, and every layer reported success while executing
+    SQL the author never wrote.
+    """
+    files = PipelineFiles(tmp_path / "pipelines")
+    sql = r"SELECT * FROM raw WHERE path = 'C:\temp\new' AND re = '\d+'"
+    files.generate_sql_transform(sql, "outb", ["raw"])
+
+    stored = collect_transforms(tmp_path / "pipelines").get("outb").query
+    assert stored == sql
+    assert "\t" not in stored  # the corruption, named
+    assert "\n" not in stored
+
+
+@pytest.mark.parametrize("value", HOSTILE, ids=repr)
+def test_generate_sql_transform_round_trips_every_hostile_string_exactly(
+    tmp_path, value
+):
+    files = PipelineFiles(tmp_path / "pipelines" / value.encode().hex()[:16])
+    sql = f"SELECT * FROM raw WHERE note = {value}"
+    files.generate_sql_transform(sql, "outc", ["raw"])
+    # `sql.strip()` because `generate_sql_transform` has always stripped
+    # surrounding whitespace before storing — that predates this fix and is
+    # not what it is about. Everything *inside* must survive byte for byte.
+    assert collect_transforms(files.dir).get("outc").query == sql.strip()
+
+
+def test_a_multi_line_query_stays_readable_in_the_editor(tmp_path):
+    """`repr` per LINE, not one escaped blob.
+
+    A 30-line query collapsed onto a single escaped line is technically correct
+    and unusable — and the CodeMirror editor is where an ejected flow is edited
+    from then on.
+    """
+    files = PipelineFiles(tmp_path / "pipelines")
+    files.generate_sql_transform("SELECT a\nFROM raw\nWHERE b = 1", "outd", ["raw"])
+    content = (files.dir / "outd.py").read_text()
+    assert "'SELECT a\\n'" in content
+    assert "'FROM raw\\n'" in content
+
+
+def test_a_generated_pipeline_can_be_given_its_inputs_explicitly(tmp_path):
+    """Flow ejection supplies inputs from the IR, where they are a structural
+    fact. The word-boundary regex cannot tell a table name from the same word
+    inside a string literal, and is only a fallback."""
+    files = PipelineFiles(tmp_path / "pipelines")
+    files.generate_sql_transform(
+        "SELECT 1 AS x", "oute", dataset_names=["never_mentioned"],
+        inputs=["explicit_one"],
+    )
+    spec = collect_transforms(files.dir).get("oute")
+    assert list(spec.inputs) == ["explicit_one"]
+
+
+def test_a_pipeline_generated_from_a_query_cannot_declare_an_input_its_author_cannot_view(
+    ws,
+):
+    """The regex used to run over EVERY dataset name in the workspace.
+
+    A generated pipeline could therefore declare an input its author cannot
+    view — and a transform builds as the *system*, so that input would then be
+    read and its rows landed in a new, unrestricted dataset.
+    """
+    from laurelin.core.db import MetadataStore
+    from laurelin.core.models import Role, User
+
+    store = MetadataStore(ws.metadata_path)
+    cat = DatasetCatalog(ws, store)
+    cat.write("classified", pa.table({"x": [1]}))
+    store.set_grants_for_dataset("classified", [
+        {"subject_kind": "user", "subject": "someone_else",
+         "can_view": True, "can_edit": True},
+    ])
+    store.create_user(User(id="7", username="ed", role=Role.editor), _pw("pw"))
+
+    app = create_app(ws)
+    editor = TestClient(app)
+    editor.post("/api/v1/auth/login", json={"username": "ed", "password": "pw"})
+
+    r = editor.post("/api/v1/pipelines/from-query", json={
+        "sql": "SELECT * FROM classified", "output": "sneaky",
+    })
+    assert r.status_code == 200, r.text
+    content = editor.get("/api/v1/pipelines/sneaky").json()["content"]
+    assert "classified" not in content.split("query=")[0]  # not in inputs={...}
+
+
+def _pw(password: str) -> str:
+    from laurelin.core.auth import hash_password
+
+    return hash_password(password)

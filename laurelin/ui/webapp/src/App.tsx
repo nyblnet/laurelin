@@ -20,6 +20,7 @@ import { AppsView } from "./views/Apps";
 import { PipelineView } from "./views/Pipeline";
 import { SchedulesView } from "./views/Schedules";
 import { TransformsView } from "./views/Transforms";
+import { FlowsView } from "./views/Flows";
 import { OntologyView } from "./views/Ontology";
 import { WorkbenchView } from "./views/Workbench";
 import { AuditView } from "./views/Audit";
@@ -75,6 +76,7 @@ export function App() {
             <Route path="/dashboards/*" element={scoped(<DashboardsView />)} />
             <Route path="/pipeline" element={scoped(<PipelineView />)} />
             <Route path="/schedules" element={scoped(<SchedulesView />)} />
+            <Route path="/flows/*" element={scoped(<FlowsView />)} />
             <Route path="/transforms" element={scoped(<TransformsView />)} />
             <Route path="/apps/*" element={scoped(<AppsView />)} />
             <Route path="/ontology/*" element={scoped(<OntologyView />)} />

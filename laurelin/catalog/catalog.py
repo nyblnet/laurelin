@@ -1053,6 +1053,66 @@ class DatasetCatalog:
         assert info is not None
         return info
 
+    def column_names(self, name: str) -> list[str]:
+        """The column names of ``name``, whichever kind of dataset it is.
+
+        There was no shared accessor covering both kinds, and the gap was
+        load-bearing: ``GET /datasets/{name}/schema`` resolves the schema
+        through the dataset's *version* row, and a source-scanned dataset
+        (federated, ClickHouse, StarRocks, Iceberg) has no version row — so
+        that route raises "has no versions" for exactly the datasets a
+        remotely-backed flow wants to read.
+
+        This returns names only, not types. Names are what an identifier is
+        validated against (``flow_compile.resolve_column``), and asking a
+        remote system to describe a table is cheap in a way that reading it is
+        not.
+
+        Raises ``KeyError`` if the dataset does not exist or has no schema yet.
+        Callers must have already established that the caller may view it —
+        a column list is a schema, and a schema is information.
+        """
+        info = self.store.get_dataset(name)
+        if info is None:
+            raise KeyError(f"No dataset named {name!r}")
+        if info.scans_at_source:
+            return list(self._source_reader(info).schema().names)
+        version = self.store.get_version(name, None)
+        if version is None:
+            raise KeyError(
+                f"Dataset {name!r} has no versions yet, so it has no columns "
+                "to read."
+            )
+        return [c.name for c in version.schema_]
+
+    def column_types(self, name: str) -> dict[str, str]:
+        """Column name -> Arrow type name, whichever kind of dataset ``name`` is.
+
+        The sibling of :meth:`column_names`, and it exists for the flow builder:
+        without a type, the builder offers "Total of" for a column of names, the
+        flow saves, and the mistake surfaces as a failed build with no sentence
+        in it. The type is already sitting in ``ColumnSchema.type`` (managed) or
+        in the source reader's Arrow schema (federated / ClickHouse / StarRocks
+        / Iceberg) — it was only ever being thrown away.
+
+        Same contract as ``column_names``: raises ``KeyError`` when there is no
+        schema, and the caller must already have established view rights, since
+        a type list is a schema and a schema is information.
+        """
+        info = self.store.get_dataset(name)
+        if info is None:
+            raise KeyError(f"No dataset named {name!r}")
+        if info.scans_at_source:
+            schema = self._source_reader(info).schema()
+            return {f.name: str(f.type) for f in schema}
+        version = self.store.get_version(name, None)
+        if version is None:
+            raise KeyError(
+                f"Dataset {name!r} has no versions yet, so it has no columns "
+                "to read."
+            )
+        return {c.name: c.type for c in version.schema_}
+
     def source_table(
         self,
         name: str,
@@ -1194,6 +1254,8 @@ class DatasetCatalog:
         plan_for=None,
         sql_policy_for=None,
         federated_scan_limit: int = 1_000_000,
+        params: Optional[list] = None,
+        server_authored: bool = False,
     ) -> dict:
         """Run a read-only SQL query with each dataset's latest version exposed
         as a view named after the dataset. Returns
@@ -1216,6 +1278,11 @@ class DatasetCatalog:
         (no read_csv('/etc/passwd'), no COPY ... TO, no path traversal).
         ``max_rows`` caps the result; ``truncated`` reports whether more rows
         were available.
+
+        ``params`` are bound positionally to ``?`` placeholders. It exists for
+        the flow builder's preview, whose compiled statement carries every
+        author-supplied value as a parameter and none as text — see
+        ``laurelin.transforms.flow_compile``. The workbench passes none.
         """
         con = duckdb.connect()
         try:
@@ -1242,10 +1309,33 @@ class DatasetCatalog:
                     # and be read as local Parquet parts it does not have. Both
                     # conditions below must hold, so an unpolicied registration
                     # is impossible.
-                    if not federation.workbench_enabled() or sql_policy_for is None:
+                    if (
+                        not (federation.workbench_enabled() or server_authored)
+                        or sql_policy_for is None
+                    ):
                         # Off by default: enabling federation must not silently
                         # widen what ad-hoc SQL can reach. Unregistered means
                         # "unknown table", the same as any dataset you can't see.
+                        #
+                        # `server_authored` is the flow builder's preview, and it
+                        # is the case `federation.workbench_enabled`'s own
+                        # docstring already carves out: "Transforms can always
+                        # use federated datasets, because their SQL is
+                        # server-authored". A compiled flow is more strictly
+                        # server-authored than a Python transform — nobody typed
+                        # any of it, it comes out of a closed IR — and the
+                        # identical statement runs against the identical source
+                        # at build time. `sql_policy_for` is still required, so
+                        # an unpolicied registration remains impossible.
+                        #
+                        # Measured before this: a flow over a federated dataset
+                        # could be saved, compiled and BUILT, `GET /flows/schema`
+                        # listed its columns — and the preview alone answered
+                        # "The table does not exist", which was not merely
+                        # unhelpful but false. "Every step shows you the result
+                        # as you go" is this feature's own onboarding promise,
+                        # and it was unavailable for the entire delegated-engine
+                        # tier.
                         continue
                     con.register(
                         ds.name,
@@ -1266,7 +1356,7 @@ class DatasetCatalog:
             metrics.queries.labels(surface="workbench").inc()
             _started = _time.perf_counter()
             with limits.limited(con, limits.QueryLimits.interactive()):
-                cur = con.execute(sql)
+                cur = con.execute(sql, params) if params else con.execute(sql)
                 columns = [d[0] for d in cur.description] if cur.description else []
                 data = cur.fetchmany(max_rows + 1)
                 truncated = len(data) > max_rows

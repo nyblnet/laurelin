@@ -407,7 +407,14 @@ export function PipelineView() {
     {
       label: "Kind",
       render: (t) => (
-        <Badge tone={t.kind === "sql" ? "gold" : "blue"}>{t.kind}</Badge>
+        // `flow` gets its own tone rather than sharing `python`'s. The
+        // distinction a reader needs from this column is what they would have
+        // to be able to *do* to have written the row: `python` and `sql` are
+        // authored code, `flow` is a declarative artifact that is never
+        // exec'd, and that is the whole point of the kind existing.
+        <Badge tone={t.kind === "sql" ? "gold" : t.kind === "flow" ? "green" : "blue"}>
+          {t.kind}
+        </Badge>
       ),
     },
     {

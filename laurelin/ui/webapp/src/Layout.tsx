@@ -26,6 +26,11 @@ const NAV: { to: string; label: string; needs?: Role }[] = [
   { to: "/dashboards", label: "Dashboards" },
   { to: "/pipeline", label: "Pipeline" },
   { to: "/schedules", label: "Schedules", needs: "editor" },
+  // Flows sits ABOVE Transforms: the no-code builder is the front door and
+  // the Python editor is the advanced surface, not the other way round.
+  // Editor-gated for the same reason /transforms is — a flow authors a
+  // transform that runs as the system and reads datasets.
+  { to: "/flows", label: "Flows", needs: "editor" },
   { to: "/transforms", label: "Transforms", needs: "editor" },
   { to: "/apps", label: "Apps" },
   { to: "/ontology", label: "Ontology" },

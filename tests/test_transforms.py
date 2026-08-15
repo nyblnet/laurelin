@@ -398,3 +398,156 @@ def test_build_failure_isolation(workspace, catalog, store):
     assert catalog.read("independent").num_rows == 4
     with pytest.raises(KeyError):
         catalog.read("broken")
+
+
+# ---------------------------------------------------------------------------
+# The build connection's sandbox, and the kind guard
+# ---------------------------------------------------------------------------
+
+
+def test_a_sql_transform_cannot_read_a_file_off_the_server(
+    workspace, catalog, store, tmp_path
+):
+    """REVERT the `SET enable_external_access=false` in `_register_inputs` and
+    this build SUCCEEDS — measured on this tree before the pragma was added:
+
+        catalog.read("stolen")  ->  [{'stolen': 'HUNTER2'}]
+
+    An arbitrary server-side file, published as a governed dataset, with
+    lineage claiming it came from nowhere. `catalog.query`, `catalog.read` and
+    both ontology query paths already issued this pragma; the two *build*
+    connections were the only ones that did not, and one of them is where a
+    compiled flow now runs.
+    """
+    secret = tmp_path / "secret.csv"
+    secret.write_text("a\nHUNTER2\n")
+    catalog.write("raw", pa.table({"x": [1]}))
+
+    registry = TransformRegistry()
+    registry.register(TransformSpec(
+        name="stolen", output=Output("stolen"),
+        inputs={"r": Input("raw")}, kind="sql",
+        query=(
+            f"SELECT (SELECT a FROM read_csv_auto('{secret}') LIMIT 1) "
+            f"AS stolen FROM r LIMIT 1"
+        ),
+    ))
+    build = Builder(workspace, catalog, store, registry).build(["stolen"])
+
+    assert build.status == BuildStatus.failed
+    with pytest.raises(KeyError):
+        catalog.read("stolen")
+
+
+def test_a_sql_transform_can_still_read_every_input_it_declared(
+    workspace, catalog, store
+):
+    """The sandbox must not break the thing it sits in front of.
+
+    Every managed / object-store / federated / Iceberg input arrives as an
+    already-registered Arrow object, so DuckDB performs no I/O of its own on
+    this connection and the pragma is a no-op for legitimate work.
+    """
+    catalog.write("raw", pa.table({"x": [1, 2, 3]}))
+    registry = TransformRegistry()
+    registry.register(TransformSpec(
+        name="doubled", output=Output("doubled"),
+        inputs={"r": Input("raw")}, kind="sql",
+        query="SELECT x * 2 AS x FROM r ORDER BY x",
+    ))
+    build = Builder(workspace, catalog, store, registry).build(["doubled"])
+    assert build.status == BuildStatus.succeeded
+    assert catalog.read("doubled").column("x").to_pylist() == [2, 4, 6]
+
+
+def test_an_incremental_sql_transform_is_refused_at_registration_not_at_runtime():
+    """REVERT the kind guard in `TransformRegistry.register` and this spec
+    reaches `builder.py`'s `result = spec.fn(**{param: delta})` with `fn=None`,
+    dying as:
+
+        TypeError: 'NoneType' object is not callable
+
+    — a build-time crash with no useful sentence in it. The decorators cannot
+    produce this combination, so it was unreachable until specs could come from
+    somewhere other than a decorator (a stored flow). Enforced in `register`
+    rather than in the flow loader so it holds for every producer.
+    """
+    registry = TransformRegistry()
+    with pytest.raises(ValueError) as exc:
+        registry.register(TransformSpec(
+            name="bad", output=Output("bad"), inputs={"r": Input("raw")},
+            kind="sql", query="SELECT * FROM r", incremental=True,
+        ))
+    assert "incremental" in str(exc.value)
+    assert "python" in str(exc.value)
+
+    with pytest.raises(ValueError):
+        registry.register(TransformSpec(
+            name="bad2", output=Output("bad2"), inputs={"r": Input("raw")},
+            kind="sql", query="SELECT * FROM r", streaming=True,
+        ))
+
+    # A python transform is unaffected.
+    registry.register(TransformSpec(
+        name="fine", output=Output("fine"), inputs={"r": Input("raw")},
+        kind="python", fn=lambda r: r, incremental=True,
+    ))
+
+
+def test_a_duckdb_failure_in_a_build_is_recorded_as_duckdbs_not_as_our_own_code(
+    tmp_path,
+):
+    """`_task_failure` decided the driver with
+    `type(exc).__module__.split(".")[0] == "duckdb"`.
+
+    DuckDB defines its exception classes in `_duckdb`, so that comparison never
+    matched: every binder error was recorded as `driver="python"` with
+    `code=TRANSFORM_FAILED`, which the UI renders as "Laurelin's own code raised
+    … the traceback is in the server log". Measured on a no-code flow summing a
+    column of text — an analyst's own mistake, shown to them as an internal
+    Laurelin fault, with no server log to read.
+
+    `failure.driver_of` already owned the `_duckdb` mapping.
+    """
+    from laurelin.catalog import DatasetCatalog
+    from laurelin.core.config import Workspace
+    from laurelin.core.db import MetadataStore
+    from laurelin.core.models import BuildStatus
+    from laurelin.transforms import (
+        Builder,
+        Input,
+        Output,
+        TransformRegistry,
+        TransformSpec,
+    )
+
+    ws = Workspace.init(tmp_path / "ws", name="drv")
+    store = MetadataStore(ws.metadata_path)
+    catalog = DatasetCatalog(ws, store)
+    catalog.write("raw", pa.table({"name": ["a", "b"]}))
+
+    registry = TransformRegistry()
+    registry.register(TransformSpec(
+        name="totals", output=Output("totals"), inputs={"raw": Input("raw")},
+        kind="sql", query='SELECT sum("name") AS total FROM raw',
+    ))
+    build = Builder(ws, catalog, store, registry).build(["totals"])
+    assert build.status == BuildStatus.failed
+
+    failure = store.get_build(build.id).tasks[0].failure
+    assert failure.driver == "duckdb"
+    assert failure.code.value != "transform_failed"
+
+
+def test_a_query_failure_does_not_claim_a_remote_system_that_is_not_there(tmp_path):
+    """The failure templates for a *query* must not assert a remote system: the
+    engine is embedded DuckDB as often as it is a federated cluster. Measured, a
+    flow summing a column of text was told "A column referenced does not exist
+    on the remote system" — false in three ways at once, and about a column
+    visibly present in the picker below it."""
+    from laurelin.core.failure import Failure, FailureCode
+
+    for code in (FailureCode.RELATION_MISSING, FailureCode.COLUMN_MISSING,
+                 FailureCode.SCHEMA_INCOMPATIBLE):
+        rendered = Failure(code=code, subject="query", driver="duckdb").render()
+        assert "remote" not in rendered.lower(), (code, rendered)

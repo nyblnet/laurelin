@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Iterable
 
 from laurelin.export.manifest import PipelineWarning
+from laurelin.transforms.flow_files import PIPELINE_FILE_SUFFIXES
 
 _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("password", re.compile(r"password|passwd|\bpwd\b", re.I)),
@@ -124,7 +125,7 @@ def _scan_dir(directory: Path, suffixes: tuple[str, ...], prefix: str) -> list[P
 
 def scan_pipelines(pipelines_dir: Path) -> list[PipelineWarning]:
     """Every credential-shaped line in every pipeline file, in file order."""
-    return _scan_dir(Path(pipelines_dir), (".py",), "pipelines/")
+    return _scan_dir(Path(pipelines_dir), PIPELINE_FILE_SUFFIXES, "pipelines/")
 
 
 def scan_ontology(ontology_dir: Path) -> list[PipelineWarning]:

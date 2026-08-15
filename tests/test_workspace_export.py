@@ -335,3 +335,43 @@ def test_the_spool_never_lands_in_the_system_temp_directory(ws, store, tmp_path)
     finally:
         _tempfile.SpooledTemporaryFile = real
     assert seen and all(d == str(ws.root) for d in seen), seen
+
+
+def test_a_flow_travels_in_the_export_like_any_other_pipeline_file(ws, store):
+    """A flow is a FILE in `pipelines/`, and that is the whole reason it is one.
+
+    A `pipeline_specs` table in `metadata.db` would have needed a new
+    `TABLE_POLICY` entry — class, columns, conflict key, on-conflict, order,
+    scan columns — before it could leave the workspace. A file needed one
+    suffix added to a tuple that three call sites already share.
+    """
+    (ws.pipelines_dir / "sales_by_region.flow.json").write_text(
+        '{"name": "sales_by_region", "output": "sales_by_region", '
+        '"author": "root", "terminal": "n0", "nodes": [{"id": "n0", '
+        '"kind": "source", "inputs": [], "params": {"dataset": "sales"}}]}'
+    )
+    sink = _Unseekable()
+    stream_export(ws, store, sink, ExportOptions())
+    assert "pipelines/sales_by_region.flow.json" in _members(bytes(sink.buffer))
+
+
+def test_export_refuses_when_a_flow_looks_like_it_holds_a_credential(ws, store):
+    """The credential scanner walks whole file bytes, so it covers a flow's
+    JSON without being taught the schema.
+
+    That is the second reason flows are files: a table would have meant
+    choosing *which columns* get scanned, and omitting one silently regresses
+    coverage. Nothing first-party in a flow should hold a DSN — but a
+    `description` is free text an author types, and this is the surface where
+    that has gone wrong before.
+    """
+    (ws.pipelines_dir / "leaky.flow.json").write_text(
+        '{"description": "postgresql://svc:hunter2@db.internal/prod"}\n'
+    )
+    with pytest.raises(ExportRefused, match="credential"):
+        preview_manifest(ws, store, ExportOptions())
+
+    manifest = preview_manifest(ws, store, ExportOptions(allow_content_warnings=True))
+    assert ("pipelines/leaky.flow.json", 1) in [
+        (w.file, w.line) for w in manifest.content_warnings
+    ]

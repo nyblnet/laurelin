@@ -328,16 +328,19 @@ class Output: dataset: str; description: str = ""
 
 @dataclass
 class TransformSpec:
-    name: str                    # function name
+    name: str                    # function name, or a flow's name
     output: Output
     inputs: dict[str, Input]     # param name -> Input
-    kind: str                    # "python" | "sql"
+    kind: str                    # "python" | "sql" | "remote" | "flow"
     fn: Callable | None          # python transforms: fn(**{param: pa.Table}) -> pa.Table
     query: str | None            # sql transforms: SELECT over input aliases as table names
+    params: list                 # sql transforms: values bound to `query`'s `?`
+    flow: FlowDef | None         # flow transforms: the declarative IR (see below)
     expectations: list[Expectation]   # assertions the output must satisfy
 
 def transform(output: Output, **inputs: Input)   # decorator for python transforms
-def sql_transform(output: Output, inputs: dict[str, Input], query: str)  # decorator (fn body ignored)
+def sql_transform(output: Output, inputs: dict[str, Input], query: str,
+                  params: list | None = None)    # decorator (fn body ignored)
 def expect(*expectations: Expectation)           # applied ABOVE @transform
 
 class TransformRegistry:
@@ -348,6 +351,8 @@ def collect_transforms(pipelines_dir: Path) -> TransformRegistry
     # exec each *.py in pipelines_dir (sorted); decorators register into the
     # *active* registry via a module-level context (use a contextvar or module
     # global set/reset around exec). Files import `from laurelin.transforms import ...`.
+    # THEN load each *.flow.json into the SAME registry as kind="flow". A
+    # .flow.json is never exec'd — that is the whole point of it.
 
 class Builder:
     def __init__(self, workspace, catalog, store, registry): ...
@@ -399,6 +404,120 @@ materialize what streaming just avoided materializing.
 
 Results are stored per build task (`build_tasks.expectations_json`), passes
 included, and rendered on the pipeline page.
+
+#### Flows: transforms without code
+
+`laurelin/transforms/flow_{ir,compile,files,governance}.py`, and
+`laurelin/ui/webapp/src/views/Flows.tsx` — for this feature the screen is the
+product, and the Python below it is plumbing for it.
+
+A **flow** is a declarative pipeline stored as `pipelines/<name>.flow.json`: a
+small DAG of steps (`source`, `filter`, `select`, `rename`, `derive`, `cast`,
+`join`, `aggregate`, `dedupe`, `sort`) over a closed expression IR of exactly
+three node types — `col`, `lit`, `op` — with every enum drawn from a fixed
+vocabulary. There is no node that carries free text destined for SQL, at any
+nesting depth.
+
+**A file in `pipelines/`, not a row in `metadata.db`,** and that is a deliberate
+trade. It inherits workspace export, workspace import, credential scanning and
+the imported-pipelines acknowledgement gate by extending one suffix tuple at
+three call sites; a table would have to re-derive all four, and omitting one
+silently regresses coverage. It is also git-diffable.
+
+**It compiles onto the existing build path, not beside it.** `collect_transforms`
+puts flows into the same `TransformRegistry` as `pipelines/*.py`, so duplicate
+name / duplicate output detection, planning, cycle detection, lineage, marking
+propagation, expectations-before-publish, build leases, scheduler targets,
+`GET /transforms`, `GET /lineage` and `--lock-pipelines` all cover flows without
+knowing they exist. `Builder._execute_flow` compiles and then hands the result
+to the *same* DuckDB executor `kind="sql"` uses.
+
+Two tiers of validation, split by cost:
+
+* **Tier A — structural, schema-free.** Enum membership, literal type coercion,
+  arity, node-id syntax, DAG shape, invented-identifier syntax. Runs on every
+  registry collection, which happens on every API request, so it must not touch
+  a remote system. This tier alone determines `spec.inputs`, and therefore
+  lineage and markings — derived from the IR's `source` nodes, never by scanning
+  generated text.
+* **Tier B — schema binding.** Every referenced column and dataset checked for
+  membership in the *live* schema, plus a coarse type check. Runs at
+  `PUT /flows/{name}`, at `POST /flows/preview`, and inside `Builder`
+  immediately before execution. A schema that drifts after authoring therefore
+  fails the build, loudly, rather than being caught only at edit time.
+
+##### The compiler's contract
+
+> The compiled SQL text is a pure function of the flow's structure — node kinds,
+> enum choices, and identifiers resolved against a live schema — and contains
+> not one byte derived from any author-supplied value.
+
+Asserted directly: two flows differing only in their literal values compile to
+byte-identical SQL, with different parameter lists. Every position is one of
+three things and there is no fourth:
+
+* a **bound value** (`?`) — filter and formula literals, `IN` elements, `LIKE`
+  patterns, `date_trunc` units, expectation values, the preview `LIMIT`;
+* a **closed enum** — cast targets, aggregate functions, join types, sort
+  directions and null placement, all keywords this module already contains
+  (measured: `CAST(x AS ?)` is a parser error and `ORDER BY ?` is refused, so
+  these genuinely cannot be bound);
+* an **identifier** — checked for membership in the live schema and only then
+  quoted. Membership, never a regex: `a"b` and `total (USD)` are legal Parquet
+  column names, and a regex would both reject those and admit names the data
+  does not have.
+
+`flow_compile.py` contains **no function that converts a value to SQL text** —
+no `literal()`, no escaper, no quote-doubling on a value. That is a stronger
+property than "our escaper is correct", and it is why `StarRocksDialect.
+literal()` raising is not a hazard here: there is nothing to call it from.
+
+Identifier *collisions* are folded with `permissions.confusable_identifier` —
+NFKC, strip, casefold — the same function the policy resolver uses. This is
+load-bearing rather than tidy: DuckDB resolves identifiers case-insensitively
+and binds the first match, so a name the compiler thought was new could be a
+name the engine thought it already had, and a mask on `pay` was laundered by a
+derived column called `PAY`. One fold, shared, so the two cannot drift.
+
+##### Governance (`flow_governance.py`)
+
+Stricter than the Python transform path, deliberately — the point of the feature
+is to make *every analyst* an editor, and the Python path launders ACLs, row
+policies and column masks (documented, tested-as-stated, unchanged). A flow:
+
+* may only read datasets its recorded **author** can view, re-checked at build
+  time against that author, because a scheduled build has no request user;
+* is refused if any source carries a **row policy** — there is no policy algebra
+  that survives an aggregate, and inventing one silently is worse than refusing;
+* is refused if any source carries a **column mask** on a column the flow reads
+  or emits, matched under the same fold as above;
+* may only replace an **output dataset** its author can view *and* edit, which is
+  also what stops a flow being re-pointed at a public source to declassify what
+  it used to produce;
+* produces an output granted to its **author alone** when any source is
+  restricted — never the union of the inputs' grants, which would hand each
+  input's readers the other's data.
+
+`POST /flows/{name}/eject` runs every one of those checks and applies the author
+restriction itself, because after ejecting there is no flow left for the Builder
+to apply it for.
+
+##### Preview
+
+`POST /flows/preview` runs the draft IR through `_execute_sql` — the one SQL
+execution path — so it inherits ACL-as-unknown-table, row-level security, column
+masks, the sandbox pragma and admission control with no new policy code. Three
+consequences the UI states permanently rather than leaving to be discovered:
+preview is policied and the build is not (fail-safe direction, but they can
+differ); a masked column previews as `'***'`, so arithmetic over one is nonsense
+in the preview and correct in the build; and preview reads the latest version
+now while the build reads whatever is latest then.
+
+The preview `LIMIT` is appended **only at the previewed terminal node**, never
+pushed into an upstream CTE: an aggregate over a limited input is not the
+build's aggregate, and a preview that quietly answers a different question is
+worse than a slow one. It asks for one row more than it shows, so "this is all
+of it" and "this is the first page" are distinguishable.
 
 ### `laurelin/ontology`
 

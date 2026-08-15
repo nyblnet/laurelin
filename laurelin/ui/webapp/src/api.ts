@@ -68,7 +68,11 @@ async function request<T>(path: string, opts: Options = {}): Promise<T> {
 
 export const api = {
   get: <T>(path: string, signal?: AbortSignal) => request<T>(path, { signal }),
-  post: <T>(path: string, body?: unknown) => request<T>(path, { method: "POST", body }),
+  // `signal` matters for the flow builder's preview: the canvas re-previews as
+  // the author edits, and an abandoned preview still holds one of the eight
+  // process-wide query admission slots that dashboards and object reads share.
+  post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
+    request<T>(path, { method: "POST", body, signal }),
   put: <T>(path: string, body?: unknown) => request<T>(path, { method: "PUT", body }),
   patch: <T>(path: string, body?: unknown) => request<T>(path, { method: "PATCH", body }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),

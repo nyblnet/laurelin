@@ -103,6 +103,25 @@ def _confusable(name: str) -> str:
     return unicodedata.normalize("NFKC", name).strip().casefold()
 
 
+#: Public name for the same fold, used by `laurelin.transforms.flow_compile`
+#: and `flow_governance`.
+#:
+#: Those two need "would a query engine, or a person, treat these two
+#: identifiers as the same name?" and they must answer it *identically to this
+#: module*, because a divergence is a laundering hole rather than an
+#: inconsistency. Measured on this tree, before the flow compiler used it: a
+#: mask on `pay` and a flow deriving a column called `PAY` produced a built
+#: dataset holding real salaries, because the compiler compared names with
+#: Python `in` (case-sensitive) while DuckDB resolves identifiers
+#: case-insensitively and takes the first match.
+#:
+#: DuckDB's own fold is ASCII-only (measured: it treats `pay`/`PAY` as one name
+#: but `à`/`À`, `σ`/`Σ` and `K`/`K` as two). This fold is strictly *more*
+#: aggressive than that, which is the safe direction: it can refuse a flow the
+#: engine would have run, and never the reverse.
+confusable_identifier = _confusable
+
+
 def _reject_case_mismatch(column: str, available) -> None:
     """Refuse a mask whose column name differs from a real one only in typo.
 

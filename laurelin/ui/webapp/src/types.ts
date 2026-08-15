@@ -861,3 +861,170 @@ export interface WorkspaceFileSecurity {
   files: FileSecurityEntry[];
   note: string | null;
 }
+
+// ---------------------------------------------------------------- flows
+//
+// The no-code pipeline builder. These mirror `laurelin/transforms/flow_ir.py`
+// exactly — every union below is a *closed vocabulary* on the server, and the
+// server refuses anything outside it. Keeping them closed here too means the
+// builder can only ever offer a `<select>`, which is the whole point: there is
+// no position in a flow, at any nesting depth, that takes free text destined
+// for SQL. A literal is bound; an identifier is checked against the live
+// schema; everything else is one of these keywords.
+
+export type FlowNodeKind =
+  | "source"
+  | "filter"
+  | "select"
+  | "rename"
+  | "derive"
+  | "cast"
+  | "join"
+  | "aggregate"
+  | "dedupe"
+  | "sort";
+
+export type FlowLitType =
+  | "string"
+  | "bigint"
+  | "double"
+  | "boolean"
+  | "date"
+  | "timestamp"
+  | "null";
+
+export type FlowOp =
+  | "and" | "or" | "not"
+  | "eq" | "ne" | "lt" | "lte" | "gt" | "gte"
+  | "is_null" | "is_not_null"
+  | "in" | "not_in" | "like"
+  | "add" | "sub" | "mul" | "div"
+  | "if_else" | "coalesce"
+  | "upper" | "lower" | "trim" | "length" | "abs" | "round" | "concat"
+  | "date_trunc";
+
+export type FlowCastType =
+  | "varchar" | "bigint" | "double" | "boolean" | "date" | "timestamp";
+
+export type FlowAggFn =
+  | "count_star" | "count" | "count_distinct"
+  | "sum" | "avg" | "min" | "max" | "any_value";
+
+export type FlowSortDir = "asc" | "desc";
+export type FlowNulls = "first" | "last";
+
+export type FlowExpr =
+  | { t: "col"; name: string }
+  | { t: "lit"; type: FlowLitType; value: unknown }
+  | { t: "op"; op: FlowOp; args: FlowExpr[] };
+
+export interface FlowOrderEntry {
+  column: string;
+  dir: FlowSortDir;
+  nulls?: FlowNulls;
+}
+
+export interface FlowNode {
+  id: string;
+  kind: FlowNodeKind;
+  /** Step ids, in order. `join` is the only 2-ary kind and its order matters. */
+  inputs: string[];
+  /** Kind-specific; see `flow_ir._validate_params` for the exact shape. */
+  params: Record<string, any>;
+}
+
+export type FlowExpectationKind =
+  | "not_null" | "unique" | "accepted_values" | "row_count_between";
+
+export interface FlowExpectation {
+  kind: FlowExpectationKind;
+  column?: string;
+  values?: string[];
+  min?: number | null;
+  max?: number | null;
+  severity?: "error" | "warn";
+}
+
+export interface FlowDef {
+  name: string;
+  /** Always equal to `name`: a flow's output dataset is its own name, and
+   *  there is no rename (lineage is keyed on it and nothing deletes lineage). */
+  output: string;
+  author: string;
+  description: string;
+  terminal: string;
+  nodes: FlowNode[];
+  expectations: FlowExpectation[];
+}
+
+export interface FlowListEntry {
+  name: string;
+  output: string;
+  sources: string[];
+  nodes: number;
+  author: string;
+  description: string;
+  /** The file is on disk but will not validate. Open it to see why. */
+  failed: boolean;
+}
+
+export interface FlowReadResult {
+  name: string;
+  /** Echoed back even when `error` is set, as long as the file is parseable
+   *  JSON, so a broken flow can be opened and repaired rather than locking its
+   *  author out of their own work. */
+  flow: FlowDef | null;
+  error: string | null;
+  /** The step the refusal is about, when the server could name one. */
+  node: string;
+  output_will_be_restricted?: boolean;
+}
+
+export interface FlowWriteResult {
+  name: string;
+  flow: FlowDef;
+  /** The compiled output schema — the columns the built dataset will have. */
+  schema: string[];
+  output_will_be_restricted: boolean;
+}
+
+/** What a column holds, coarsely — the server's answer, not a guess from the
+ *  preview's values. `""` means Laurelin has no opinion about that column. */
+export type FlowKind = "number" | "text" | "boolean" | "time" | "";
+
+export interface FlowPreviewResult extends QueryResult {
+  schema: string[];
+  /** Column -> kind, for this step's result. Drives which columns "Total of"
+   *  and "Average of" offer: the form used to offer every column regardless of
+   *  type, and a total of a column of names then saved cleanly and failed its
+   *  build. */
+  kinds: Record<string, FlowKind>;
+  node_id: string;
+  /** dataset -> columns masked *for the caller*. A redact mask renders as the
+   *  string '***', so arithmetic over one is nonsense in the preview and
+   *  correct in the build. */
+  masked_columns: Record<string, string[]>;
+  max_rows: number;
+}
+
+export interface FlowCompiledSql {
+  name: string;
+  sql: string;
+  /** A COUNT, never the values: a filter constant can be a customer name. */
+  params: number;
+  inputs: string[];
+  schema: string[];
+}
+
+export interface FlowSchemaResult {
+  dataset: string;
+  columns: string[];
+  kinds: Record<string, FlowKind>;
+}
+
+export interface FlowEjectResult {
+  name: string;
+  ejected: boolean;
+  inputs: string[];
+  collect_error: Failure | null;
+}

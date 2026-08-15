@@ -22,10 +22,20 @@ from laurelin.transforms.expectations import (
     row_count,
     unique,
 )
+from laurelin.transforms.flow_compile import CompiledFlow, compile_flow
+from laurelin.transforms.flow_files import FlowFiles, collect_flows
+from laurelin.transforms.flow_ir import FlowDef, FlowNode, FlowRefused
 
 __all__ = [
+    "CompiledFlow",
     "Expectation",
     "ExpectationError",
+    "FlowDef",
+    "FlowFiles",
+    "FlowNode",
+    "FlowRefused",
+    "collect_flows",
+    "compile_flow",
     "Input",
     "Output",
     "PipelineError",

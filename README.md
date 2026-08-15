@@ -68,6 +68,13 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Transforms** — Python functions (or SQL) declared with `@transform`,
   reading input datasets and producing an output dataset. Laurelin resolves the
   DAG, executes builds, and records **lineage** automatically.
+- **Flows** — the same thing, built without code. Pick a dataset, then add
+  steps: filter rows, combine two datasets, group and summarise, sort. A flow is
+  stored as `pipelines/<name>.flow.json` and compiled to SQL in memory, so it is
+  a *transform* — same build, same lineage, same permissions, same schedules —
+  and not a second engine. There is no free-text SQL box anywhere in it: every
+  value you type is bound as a query parameter and every column name is checked
+  against the live schema. See [what a flow cannot do](#what-a-flow-cannot-do).
 - **Ontology** — YAML-defined *object types* (e.g. `aircraft`, `flight`) backed by
   datasets, with typed properties, *link types* between them, and *actions* —
   validated write-back operations recorded as an edit overlay and audit log.
@@ -212,7 +219,7 @@ my-workspace/
 ├── laurelin.yml      # workspace config
 ├── metadata.db       # SQLite: versions, builds, lineage, edits, audit
 ├── data/             # <dataset>/parts/*.parquet  (immutable; a version is a manifest of parts)
-├── pipelines/        # your transform code (plain Python)
+├── pipelines/        # transforms: *.py (code) and *.flow.json (no-code flows)
 └── ontology/         # object types, links, actions (plain YAML)
 ```
 
@@ -240,6 +247,52 @@ The four compute roles are [below](#where-compute-happens); DuckDB embedded is
 the default and the only one you need to start.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module-level detail.
+
+### What a flow cannot do
+
+The no-code builder covers the shape of pipeline most analysts write, and stops
+there on purpose — a builder that half-supports a feature is worse than one that
+does not offer it. It has ten step kinds (start from a dataset, filter, choose
+columns, rename, add a column, change type, combine with another dataset, group
+and summarise, remove duplicates, sort) and it deliberately has no:
+
+- **union** — "stack this month onto last month" has no expression in the
+  builder. This is the likeliest first complaint and the likeliest first
+  addition.
+- **window functions**, pivot/unpivot, subqueries, correlated predicates, or
+  non-equi / right / full / cross joins.
+- **`case` beyond a single if/else**, regex, or date parsing with a format
+  string.
+- **incremental or streaming flows.** Both are single-input and row-wise by
+  construction, so a joined or summarised flow could never be one, and offering
+  the checkbox only to degrade it silently to a full rebuild would be worse than
+  not offering it.
+
+Two things it *can* do but awkwardly, so you know before you start:
+
+- **An aggregate cannot be wrapped in a calculation.** `round(avg(x), 1)` is
+  three steps — summarise, add a column, drop the scratch column — where SQL
+  writes one expression.
+- **A join refuses two inputs sharing a column name**, even one the pipeline
+  never uses, and the fix is a "Choose columns" step on one side first. The
+  refusal names every clashing column.
+
+Two behaviours differ from SQL on purpose, because the screen says words rather
+than operators:
+
+- **"is not" and "is not one of" keep empty values.** `v is not 5` returns the
+  rows where `v` is empty, which is what the sentence means to somebody who does
+  not write SQL; `IS NOT NULL` (`is not empty`) is the explicit way to ask about
+  them. `is` is unchanged and excludes empties.
+- **A preview runs as *you*** — with your row policy and column masks — while
+  the build runs as the system. A preview can never show more than you may read,
+  so a policied analyst may preview twelve rows and build twelve million.
+
+**Ejecting a flow to Python is one-way.** It writes `pipelines/<name>.py` and
+deletes the flow; the visual builder cannot reopen it. There is no import in the
+other direction, and there is not going to be: re-parsing Python into an IR is a
+Python-source analyser, and it is wrong the first time somebody writes a helper
+function.
 
 ## Security
 

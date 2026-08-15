@@ -185,6 +185,16 @@ export function TransformsView() {
         }
       />
 
+      {/* The pointer has to go both ways. Someone who cannot write Python
+          lands here first — it is the older, better-known screen — and their
+          whole experience of it is a blank editor. Flows is the screen that
+          was built for them, and nothing on this page used to say so. */}
+      <div className="tf-crosslink faint">
+        Not a Python programmer? <Link to="/flows">Flows</Link> builds the same kind of transform
+        step by step — pick a dataset, filter, combine, summarise — with a preview at every step.
+        A flow can be converted to Python here later; the reverse is not possible.
+      </div>
+
       <ImportedPipelinesNotice />
 
       {/* R2 raised the *read* here to editor, and the page has to say so
@@ -395,6 +405,15 @@ export function TransformsView() {
         .tf-note.ok { color: var(--text-dim); background: var(--bg-1); }
         .tf-note.bad { color: var(--red); background: rgba(224,102,95,0.08); border-color: #6b3330; }
         .tf-cm .cm-editor { height: 60vh; min-height: 360px; }
+        .tf-crosslink {
+          font-size: 12px;
+          line-height: 1.5;
+          margin-bottom: 12px;
+          padding: 8px 11px;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          background: var(--bg-1);
+        }
         .tf-hint {
           margin-top: 12px;
           font-size: 11.5px;

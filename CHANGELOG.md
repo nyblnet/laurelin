@@ -10,6 +10,263 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Fixed: Flows — a review pass, and what it found
+
+Every item below was reproduced end to end before it was changed, and each has a
+regression test that fails when the fix is reverted.
+
+**A masked column could be read through a name the database could not tell
+apart.** The compiler compared column names with Python `in` (case-sensitive)
+while DuckDB resolves identifiers case-insensitively and binds the first match.
+So `derive PAY = 'x'` then `select keep [PAY]`, over a dataset with a redact
+mask on `pay`, passed every governance check — `referenced_columns` saw `PAY`,
+the mask named `pay` — and published real salaries into a world-readable
+dataset. Two dropdowns, no hostile string, no admin involved. Identifier
+collisions are now folded with `permissions.confusable_identifier`, the same
+function `_reject_case_mismatch` uses, so the compiler and the mask checker
+cannot hold two opinions of "the same name"; and a schema holding two confusable
+names is refused rather than guessed at. The same defect let a data supplier
+choose which row a `dedupe` kept, by shipping a column called `_Laurelin_Rn`.
+
+**The mask check itself disagreed with the policy resolver.** It compared
+`mask.column in touched`, where `permissions.py` compares under NFKC + strip +
+casefold precisely so a mask spelled `SSN` against a column `ssn` fails closed.
+Measured: with such a near-miss spelling nobody but an admin could read the
+dataset at all, and a one-step flow copied it out verbatim.
+
+**`POST /flows/{name}/eject` was a one-click way out of every flow protection.**
+It ran `check_flow_sources` alone. So a flow the platform refuses to save *and*
+refuses to build — masked column, row-policied source — ejected happily, and
+the resulting Python transform read the data in plaintext; and a flow that
+promised `output_will_be_restricted: true` produced a dataset with no grants at
+all. Eject now runs the full `check_flow_governance` and applies the author
+restriction itself, since after ejecting there is no flow left for the Builder
+to apply it for.
+
+**A flow's output dataset was never authorized.** A flow's name *is* its output
+dataset's name, so claiming somebody else's dataset was one text field: an
+editor overwrote a dataset she could not read. The same gap laundered
+classification markings — an uncleared editor could not name a marked dataset as
+a source, but could edit a flow that read one to read a public dataset instead,
+which replaced the lineage edge and declassified every downstream dataset while
+the classified rows stayed in them. The author must now be able to view and edit
+the output dataset when it already exists.
+
+**"Derived from restricted ⇒ restricted to the author" never fired for a flow
+pointed at an already-shared dataset.** `restrict_output_to_author` leaves
+existing grants alone, deliberately, so an administrator's widening survives a
+rebuild — but it read *any* pre-existing grant as that decision, including the
+ordinary ACL of whatever dataset the author chose to overwrite. Choosing an
+output shared more widely than a restricted source is now refused at authoring
+time; widening a flow's own output afterwards is still an administrator's call.
+
+**`GET /flows` and `GET /flows/{name}` disclosed the IR to anyone with the
+editor role.** `GET /flows/{name}/sql` withholds the bound values on purpose —
+"a filter constant can be a customer name" — and its sibling read routes handed
+over the source names, the column names and the values. Both are now gated on
+view rights for every source.
+
+**A self-referential flow saved happily and wedged every build in the
+workspace**: the cycle was only found in `Builder.plan`, which runs for *every*
+build, so `POST /builds` with no targets — the scheduler's path — 400'd until
+somebody found and deleted the flow. `PUT` now walks `registry.by_output` and
+refuses.
+
+**A join whose two inputs were the same step** compiled to a duplicate-alias
+self-join and reached the author as DuckDB's `Ambiguous reference to table`.
+
+### Fixed: Flows — the parts that made it unusable
+
+A compiler that is perfectly safe and unusable by analysts has missed the point
+of the feature. These were measured by driving the real screen.
+
+**Filtering on a date lost the flow.** `_coerce_literal` returns a real
+`datetime.date`; `as_json()` passed it to `json.dumps`; the `TypeError` was not
+a `FlowRefused`, so `PUT /flows/{name}` returned **500** and the screen said
+"Error 500: Internal Server Error". `POST /flows/preview` returned 200 with
+correct rows for the same literal, so the step visibly worked and then Save
+destroyed it, naming no control. Dates and timestamps now round-trip through the
+file as ISO 8601.
+
+**Type mistakes — the commonest thing an analyst does — had no route to
+discovery.** Asking for the total of a column of text saved cleanly (`GET
+/flows/{name}` reported `error: null`), previewed as *"A column referenced does
+not exist on the remote system"* — false in three ways at once, about a column
+visibly present in the picker below — and then failed its build as *"Laurelin's
+own code raised … the traceback is in the server log"*, to a person with neither
+code nor a server. Three changes: the IR now carries a coarse type per column
+(number / text / true-false / date-or-time) and refuses the mistake at save time
+naming the column and the remedy; the "Total of" and "Average of" pickers offer
+only columns that hold numbers; and `_task_failure` classifies DuckDB errors as
+DuckDB's — it compared `type(exc).__module__` against `"duckdb"`, but DuckDB
+defines its exceptions in `_duckdb`, so every one of them was recorded as
+Laurelin's own code raising. The failure templates for a *query* no longer claim
+a remote system either: the engine is embedded DuckDB as often as it is a
+federated cluster.
+
+**The preview was not honest about being a sample.** `truncated` was
+structurally always false — the SQL `LIMIT` and the fetch used the same number —
+so the panel read "50 rows · 7 columns" for a 56-row dataset and "200 rows ·
+2 columns" for a 5,000-group aggregate, with the number looking like the size of
+the answer. The banner also quoted 200 while the panel requested 50.
+
+**"is not" silently dropped empty rows.** Over a column holding
+`[null, null, null, 5]`, *"keep rows where v is not 5"* returned nothing:
+correct SQL, and the opposite of what the words on the screen mean to somebody
+who does not write SQL. `is not` and `is not one of` now keep empty values —
+`IS DISTINCT FROM` and `NOT coalesce(… IN …, false)` — and say so under the
+picker. `is` is unchanged.
+
+**Ejecting was refused for any flow containing a filter value**, which is to say
+every flow that filters anything, with the whole explanation in a tooltip on a
+disabled button. `sql_transform` now takes a `params` list bound to the query's
+placeholders, so an ejected pipeline binds exactly what the flow bound and
+nothing is written into the SQL text. This makes the *Python* path able to bind
+values too.
+
+**A flow over a federated / ClickHouse / StarRocks / Iceberg dataset could never
+be previewed**, and the error said the table did not exist — immediately after
+`GET /flows/schema` had listed its columns. `catalog.query` skips registering a
+source-scanned dataset unless the ad-hoc workbench is enabled; a compiled flow
+is server-authored SQL over a closed IR, which is the case that gate's own
+docstring carves out, so it is now registered for a preview without opening the
+workbench to ad-hoc queries.
+
+**A join was refused over columns the pipeline never uses.** This repo's own
+demo pipeline, `clean_flights` joined to `clean_aircraft` on `tail_number`, was
+refused over `status` — and told to *rename* it, which produces a worse result
+than dropping it, one collision per round trip. The refusal now names every
+clashing column and offers "Choose columns" first.
+
+### Added: the Flows screen — pipelines without code
+
+The builder itself, at **Flows** in the sidebar, above Transforms: for this
+feature the screen *is* the product, and a no-code backend behind a JSON editor
+would have served nobody.
+
+A flow is a vertical list of step cards — *Start from a dataset*, *Filter rows*,
+*Combine with another dataset*, *Group and summarise*, *Add a column* — never
+`WHERE`, `JOIN` or `GROUP BY`. Every control is a `<select>` over a closed
+vocabulary or a column picked from the live schema; the condition and formula
+editors are nested dropdowns, so the "no free-text SQL anywhere" property the
+compiler guarantees is one the UI cannot violate either. A `join`'s second input
+is drawn as its own chain inside the card that consumes it, with the same
+add/remove affordances, because the server's advice for a column collision names
+a step to add to one side and the screen has to offer that gesture.
+
+A **preview runs on every committed change**, debounced, cancellable, capped at
+50 rows, and pinned under a banner saying what it is: *"Preview runs as you.
+Your row and column policy is applied. The build runs as the system and will see
+at least as many rows."* Where a source has a masked column, the panel
+distinguishes a mask you are looking at from one the flow does not include.
+
+Refusals are attached to the step that caused them. `FlowRefused` names a step
+by its internal id and a remedy by its node kind; the screen rewrites both into
+what the author sees — *"Step 3 (Combine with another dataset) … add a “Choose
+columns” step"* — and lights up that card.
+
+The relationship to code is stated in both directions. **Open in Python…** is a
+type-to-confirm modal that says ejecting is one-way before the click. **Show
+SQL** is a read-only `<pre>`. The Transforms screen now points back: *"Not a Python
+programmer? Flows builds the same kind of transform step by step."* There is no
+**Rename** — lineage is keyed on the name — so **Duplicate…** is offered in its
+place and says why.
+
+### Added: no-code pipelines ("Flows") — backend
+
+Laurelin's Transforms screen is a Python editor. Anyone who cannot write Python
+could not author a transform at all, which excludes most of the people the tool
+exists to serve. A *flow* is a declarative pipeline — pick a dataset, filter,
+join, group, sort — stored as `pipelines/<name>.flow.json` and compiled to SQL
+in memory.
+
+It compiles onto the **existing** build path rather than beside it.
+`collect_transforms` puts flows into the same `TransformRegistry` as
+`pipelines/*.py`, so duplicate-output detection, planning, cycle detection,
+lineage, marking propagation, expectations-before-publish, build leases,
+scheduler targets, the imported-pipelines acknowledgement gate and
+`--lock-pipelines` all cover flows without knowing they exist. A flow appears in
+`GET /transforms` and `GET /lineage` as a transform with `kind: "flow"`.
+
+**No value an author supplies is ever rendered into SQL.** Every filter
+constant, formula literal, `IN` element and `LIKE` pattern is *bound* as a query
+parameter; every column and dataset name is checked for membership in the live
+schema before it is quoted; everything else — cast targets, aggregate functions,
+join types, sort directions — comes from a closed enum the compiler already
+contains. There is no free-text SQL or expression box anywhere in a flow, at any
+nesting depth. `laurelin/transforms/flow_compile.py` contains no function that
+converts a value to SQL text at all, which is a stronger property than "our
+escaper is correct". The invariant is asserted directly: two flows differing
+only in their literal values compile to *byte-identical* SQL.
+
+Flows are also **stricter than the Python transform path, deliberately.** A
+flow's sources must be viewable by its recorded author (re-checked at build
+time, since a scheduled build has no request user); a source carrying a row
+policy is refused outright; a source with a column mask on a column the flow
+reads or emits is refused naming the column; and a flow over a restricted input
+produces an output granted to its author alone, never the union of the inputs'
+grants. The Python path still launders all three — that is unchanged here, and
+is now pinned by a test that states it rather than left to be discovered.
+
+### Fixed: `generate_sql_transform` corrupted the SQL it was given
+
+Two defects, one loud and one silent, both measured:
+
+* SQL containing `"""` produced a file that would not parse, and the author saw
+  `Syntax error: unterminated triple-quoted string literal … (outa.py, line 9)`
+  — a Python line number for a file they never saw.
+* SQL containing a backslash was **silently corrupted**. An authored
+  `WHERE path = 'C:\temp\new'` came back out of `collect_transforms` holding a
+  real TAB and a real NEWLINE. The file was written, it compiled, the build ran,
+  and every layer reported success while executing SQL nobody wrote.
+
+`write()`'s compile-before-save guard catches the first and cannot catch the
+second. The query is now rendered with `repr` per line, which round-trips every
+input byte for byte and keeps a multi-line query readable in the editor.
+
+`POST /pipelines/from-query` also now filters the candidate dataset list through
+the caller's view rights before the input-inference regex runs, so a generated
+pipeline can no longer declare an input its author cannot view.
+
+### Changed (behaviour): builds can no longer read the server's filesystem
+
+**This may break an existing `@sql_transform` that reads a file or a URL through
+DuckDB.** The build's DuckDB connection, and the expectation validator's, now
+issue `SET enable_external_access=false` — which `catalog.query`, `catalog.read`
+and both ontology query paths already did. The two build connections were the
+only ones that did not.
+
+Measured before the change: a `kind="sql"` transform running
+`SELECT (SELECT a FROM read_csv_auto('<path>') LIMIT 1) AS stolen` built
+successfully and published the file's contents as a governed dataset, with
+lineage claiming it came from nowhere.
+
+A Python transform that wants a file uses pyarrow, which this does not touch,
+and every managed / object-store / federated / Iceberg input arrives at the
+build connection as an already-registered Arrow object, so DuckDB performs no
+I/O of its own there.
+
+### Fixed: `accepted_values` escaped its values instead of binding them
+
+`expectations.accepted_values` built its `IN` list by doubling quotes — a second
+SQL-generation surface with its own escaper, evaluated on the build connection.
+`Expectation` now carries `params` and the values are bound.
+
+### Fixed: an incremental non-Python transform crashed the build
+
+`incremental=True` with `kind != "python"` reached `spec.fn(**{param: delta})`
+with `fn=None` and died as `TypeError: 'NoneType' object is not callable`. The
+decorators cannot produce that combination, so it was unreachable until specs
+could come from somewhere other than a decorator. `TransformRegistry.register`
+now refuses it, for every producer.
+
+### Added: `DatasetCatalog.column_names`
+
+There was no accessor covering both dataset kinds. `GET /datasets/{name}/schema`
+resolves through the *version* row, and a source-scanned dataset (federated,
+ClickHouse, StarRocks, Iceberg) has none — so that route answered "has no
+versions" for exactly the datasets a remotely-backed flow needs to read.
+
 ### Added: the ontology edit log can be pruned, and says what it costs first
 
 `object_edits` was never trimmed, so a workspace using the ontology as an

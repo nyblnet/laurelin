@@ -30,12 +30,32 @@ class TransformSpec:
     name: str
     output: Output
     inputs: dict[str, Input] = field(default_factory=dict)
-    kind: str = "python"  # "python" | "sql" | "remote"
+    kind: str = "python"  # "python" | "sql" | "remote" | "flow"
     # remote: the engine that executes `query`. Laurelin submits it and stores
     # the (reduced) result; the cluster does the work.
     engine: Optional[str] = None
     fn: Optional[Callable] = None  # python: fn(**{param: pa.Table}) -> pa.Table
     query: Optional[str] = None  # sql: SELECT over input aliases as table names
+    # sql: values bound positionally to `query`'s `?` placeholders.
+    #
+    # Added so that ejecting a flow is possible at all. A compiled flow puts
+    # every author-supplied value in this list and none in the text; before
+    # this field existed, `eject_sql` had nowhere to put them and refused every
+    # flow containing a single filter constant — which is to say, every flow
+    # that filters anything, on a feature whose defining operation is
+    # filtering. The alternative, rendering the values into the query text, is
+    # the one thing this whole feature is built not to do.
+    params: list = field(default_factory=list)
+    # flow: the declarative IR a no-code author built (laurelin.transforms.
+    # flow_ir.FlowDef). It is compiled to SQL + bound parameters by the Builder
+    # immediately before execution — not here, and not at collection time,
+    # because compilation needs the *live* schema of every input and a bare
+    # registry collection happens on every API request.
+    #
+    # `query` stays None for a flow. There is deliberately no place to cache
+    # compiled text on the spec: a cached statement is one that can be executed
+    # against a schema it was not checked against.
+    flow: Optional[object] = None
     # Streaming python transforms receive an *iterator* of pa.Table batches for
     # their single input and yield pa.Tables, so neither the input nor the
     # output is ever held whole in memory.
@@ -56,6 +76,24 @@ class TransformRegistry:
         self._by_output: dict[str, TransformSpec] = {}
 
     def register(self, spec: TransformSpec) -> None:
+        if (spec.incremental or spec.streaming) and spec.kind != "python":
+            # Measured on this tree: a spec with `incremental=True` and
+            # `kind="sql"` reaches `builder.py`'s `result = spec.fn(**{param:
+            # delta})` with `fn=None` and dies as
+            # `TypeError: 'NoneType' object is not callable` — a build-time
+            # crash with no useful sentence in it.
+            #
+            # The decorators cannot produce that combination (`@sql_transform`
+            # takes no such argument), so it was unreachable until specs could
+            # come from somewhere other than a decorator. Enforced here rather
+            # than in the flow loader so it holds for *every* producer, present
+            # and future.
+            raise ValueError(
+                f"Transform {spec.name!r} is kind={spec.kind!r}; incremental "
+                f"and streaming require a python transform. Both are "
+                f"single-input and row-wise by construction — see the arity "
+                f"checks in `transform()` above."
+            )
         if spec.name in self._by_name:
             raise ValueError(f"Duplicate transform name: {spec.name!r}")
         existing = self._by_output.get(spec.output.dataset)
@@ -171,10 +209,18 @@ def transform(
 
 
 def sql_transform(
-    output: Output, inputs: dict[str, Input], query: str
+    output: Output, inputs: dict[str, Input], query: str,
+    params: Optional[list] = None,
 ) -> Callable[[Callable], Callable]:
     """Declare a SQL transform. The decorated function body is ignored; the
-    query runs in DuckDB with each input alias registered as a table name."""
+    query runs in DuckDB with each input alias registered as a table name.
+
+    ``params`` are bound positionally to the ``?`` placeholders in ``query``.
+    Use them for every value: an interpolated value is a value the database
+    may re-read as syntax, and a bound one never is. An ejected flow is written
+    this way, which is the only reason ejecting a flow with a filter in it is
+    possible at all.
+    """
 
     def decorator(fn: Callable) -> Callable:
         spec = TransformSpec(
@@ -184,6 +230,7 @@ def sql_transform(
             kind="sql",
             fn=None,
             query=query,
+            params=list(params or []),
         )
         fn.__transform_spec__ = spec  # type: ignore[attr-defined]
         _register(spec)
@@ -260,15 +307,36 @@ class PipelineError(RuntimeError):
 
 
 def collect_transforms(pipelines_dir: Path) -> TransformRegistry:
-    """Execute every ``*.py`` in `pipelines_dir` (sorted) into a fresh registry.
+    """Execute every ``*.py`` in `pipelines_dir` (sorted) into a fresh registry,
+    then add every ``*.flow.json`` to the **same** registry.
 
-    Each file runs in its own module namespace with the returned registry
-    active, so `@transform` / `@sql_transform` decorators register into it.
+    Each Python file runs in its own module namespace with the returned
+    registry active, so `@transform` / `@sql_transform` decorators register into
+    it. Flow files are *not* executed — they are parsed as JSON and turned into
+    specs (see `laurelin.transforms.flow_files`).
+
+    One registry for both producers is the whole design of the no-code builder.
+    Everything downstream is keyed on `spec.name` / `spec.output.dataset` and
+    therefore covers flows without knowing they exist: duplicate-name and
+    duplicate-output detection (`register` below), planning and cycle detection
+    (`Builder.plan`), lineage, marking recompute, expectations-before-publish,
+    build leases, object-index refresh, scheduler targets, and the
+    imported-pipelines acknowledgement gate, which wraps this function.
+
+    A second execution path for no-code pipelines would mean re-proving every
+    one of those properties, and on this codebase's evidence it would fail
+    somewhere nobody checked.
     """
     registry = TransformRegistry()
     pipelines_dir = Path(pipelines_dir)
     if not pipelines_dir.is_dir():
         return registry
+    _collect_python(pipelines_dir, registry)
+    _collect_flow_files(pipelines_dir, registry)
+    return registry
+
+
+def _collect_python(pipelines_dir: Path, registry: TransformRegistry) -> None:
     with use_registry(registry):
         # Skip dotfiles so a leaked ".<name>-*.py.tmp" style temp from an
         # interrupted write is never compiled/exec'd.
@@ -287,4 +355,30 @@ def collect_transforms(pipelines_dir: Path) -> TransformRegistry:
                     f"Error in pipeline file {path}: {type(exc).__name__}: {exc}",
                     pipeline=path.stem,
                 ) from exc
-    return registry
+
+
+def _collect_flow_files(pipelines_dir: Path, registry: TransformRegistry) -> None:
+    """Add every ``*.flow.json`` to `registry`, Tier A only.
+
+    Imported here rather than at module scope so `flow_files` (and through it
+    `flow_ir`) is not a hard import cost on every consumer of this module.
+
+    A malformed flow raises `PipelineError`, exactly as a `.py` that will not
+    import does. Skipping it instead would make the dataset it produces
+    silently vanish from the plan, and "the build stopped producing this table
+    and nothing said so" is the failure this codebase is least able to notice.
+    """
+    from laurelin.transforms.flow_files import _stem, flow_paths, flow_spec, load_flow
+
+    for path in flow_paths(pipelines_dir):
+        try:
+            registry.register(flow_spec(load_flow(path)))
+        except Exception as exc:
+            # Unlike the `.py` branch, the message here is genuinely
+            # first-party: `FlowRefused` and `register`'s duplicate errors are
+            # both Laurelin's own sentences, and nothing arbitrary was
+            # executed to produce them. It still travels as `PipelineError` so
+            # every caller keeps one exception type to catch.
+            raise PipelineError(
+                f"Error in flow {_stem(path)!r}: {exc}", pipeline=_stem(path),
+            ) from exc

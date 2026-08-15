@@ -251,3 +251,33 @@ def test_expectations_survive_a_column_named_with_a_quote(env):
     _, info = build(env, registry_with(declare))
     assert info.tasks[0].status.value == "failed"
     assert [r["passed"] for r in info.tasks[0].expectations] == [False]
+
+
+def test_accepted_values_binds_its_values_instead_of_escaping_them():
+    """REVERT `accepted_values` to the quote-doubling IN-list and the value
+    appears in `exp.sql` instead of `exp.params`.
+
+    This was a second SQL-generation surface with its own escaper —
+    `"'" + str(v).replace("'", "''") + "'"` — evaluated on the build
+    connection. A flow author reaches this function through the builder's
+    `accepted_values` check, which is why it stopped being allowed to
+    interpolate.
+    """
+    import duckdb
+    import pyarrow as pa
+
+    from laurelin.transforms.expectations import accepted_values, check
+
+    hostile = "'); DROP TABLE t; --"
+    exp = accepted_values("status", ["ok", hostile])
+
+    assert hostile not in exp.sql
+    assert exp.sql.count("?") == 2
+    assert list(exp.params) == ["ok", hostile]
+
+    # …and it still evaluates correctly, hostile value included.
+    con = duckdb.connect()
+    con.register("t", pa.table({"status": ["ok", hostile, "bad"]}))
+    results = check(con, [exp], "out")
+    con.close()
+    assert results[0]["measured"] == 1  # only "bad" violates

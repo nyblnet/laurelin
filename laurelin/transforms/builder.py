@@ -18,7 +18,7 @@ from laurelin.catalog import DatasetCatalog
 from laurelin.core import engines, limits, metrics
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
-from laurelin.core.failure import Failure, FailureCode, Phase
+from laurelin.core.failure import Failure, FailureCode, Phase, driver_of
 from laurelin.core.models import (
     BuildInfo,
     BuildStatus,
@@ -31,6 +31,35 @@ from laurelin.transforms.expectations import ExpectationError
 from laurelin.transforms.expectations import check as check_expectations
 
 log = logging.getLogger("laurelin.builder")
+
+
+def _sandbox(con) -> None:
+    """Cut off the filesystem and the network for a build's DuckDB connection.
+
+    This closes an outlier rather than inventing a policy: ``catalog.query``,
+    ``catalog.read`` and the two ontology query paths all already issue this
+    pragma. The two *build* connections — here and in the expectation validator
+    — were the only ones that did not, and one of them is where a compiled flow
+    now runs.
+
+    Measured on this tree before the pragma was added: a ``kind="sql"``
+    transform whose query was
+    ``SELECT (SELECT a FROM read_csv_auto('<tmp>/secret.csv') LIMIT 1) AS stolen``
+    built successfully, and ``catalog.read("stolen")`` returned
+    ``[{'stolen': 'HUNTER2'}]`` — an arbitrary server-side file published as a
+    governed dataset, with lineage claiming it came from nowhere.
+
+    This is a **behaviour change for existing @sql_transform pipelines** that
+    read a file or a URL through DuckDB, and it is accepted: a Python transform
+    that wants a file uses pyarrow, which this does not touch, and every
+    managed / object-store / federated / Iceberg input arrives here as an
+    already-registered Arrow object, so DuckDB itself performs no I/O on this
+    connection. See the CHANGELOG entry.
+
+    A closed IR cannot emit ``read_csv`` in the first place. The pragma is here
+    so that a future compiler defect is a bug and not a breach.
+    """
+    con.execute("SET enable_external_access=false")
 
 
 class Builder:
@@ -49,6 +78,10 @@ class Builder:
         # Injectable so the orchestration around delegated compute — lineage,
         # policy, limits, error handling — is testable without a cluster.
         self._engine_factory = engine_factory or engines.connect
+        # transform name -> the compiled output schema of a flow, published by
+        # `_execute_flow` so `_expectation_validator` can resolve the flow's
+        # expectations against the columns it actually produced.
+        self._flow_schemas: dict[str, list[str]] = {}
 
     # -- planning -------------------------------------------------------------
 
@@ -330,9 +363,68 @@ class Builder:
             return self._execute_python(spec)
         if spec.kind == "sql":
             return self._execute_sql(spec)
+        if spec.kind == "flow":
+            return self._execute_flow(spec)
         if spec.kind == "remote":
             return self._execute_remote(spec)
         raise ValueError(f"Unknown transform kind {spec.kind!r} for {spec.name!r}")
+
+    def _execute_flow(self, spec: TransformSpec) -> pa.Table:
+        """Compile a no-code flow and run it down the *same* executor as SQL.
+
+        Everything a flow-specific check needs happens here, immediately before
+        execution, and deliberately not at authoring time:
+
+        * **Governance** (`check_flow_governance`) is re-evaluated against the
+          flow's recorded author, because a scheduled build has no request user
+          and because a grant or a policy can be added after a flow was saved.
+        * **Tier B** (schema binding, inside `compile_flow`) resolves every
+          identifier against the schema the input has *now*. A flow whose
+          upstream dropped a column fails the build with our sentence naming
+          the column, rather than a DuckDB binder error.
+
+        The compiled statement is never cached on the spec: a cached statement
+        is one that can be executed against a schema it was not checked
+        against.
+        """
+        from laurelin.core.permissions import PermissionService
+        from laurelin.transforms.flow_files import compile_flow_now
+        from laurelin.transforms.flow_governance import (
+            check_flow_governance,
+            check_flow_sources,
+            restrict_output_to_author,
+        )
+
+        flow = spec.flow
+        assert flow is not None
+        perms = PermissionService(self.store)
+        # Sources first, before anything reads a schema: `resolve_column`'s
+        # refusal names a dataset's columns, and those are a schema the author
+        # may not be entitled to.
+        check_flow_sources(self.store, perms, flow.author, flow)
+        compiled = compile_flow_now(self.catalog, flow)
+        check_flow_governance(
+            self.store, perms, flow.author, flow, output_columns=compiled.schema
+        )
+        self._flow_schemas[spec.name] = compiled.schema
+
+        con = duckdb.connect()
+        try:
+            self._register_inputs(con, spec)
+            limits.apply(con, limits.QueryLimits.build())
+            result = con.execute(compiled.sql, compiled.params).arrow()
+        finally:
+            con.close()
+        if isinstance(result, pa.RecordBatchReader):
+            result = result.read_all()
+        # Derived-from-restricted => restricted-to-author. Written before the
+        # output exists, which is safe (a grant on a dataset with no versions
+        # denies everyone but admins) and closes the window in which a freshly
+        # created derived dataset is readable by all: `catalog.write` publishes
+        # the version the moment it returns, but `recompute_all_markings` only
+        # runs at the end of the whole build.
+        restrict_output_to_author(self.store, flow, flow.author)
+        return result
 
     def _execute_remote(self, spec: TransformSpec) -> pa.Table:
         """Submit the query to a delegated engine and keep what comes back.
@@ -390,8 +482,28 @@ class Builder:
         after the commit would mean deciding what to do about data people can
         already see.
         """
-        if not spec.expectations:
-            return None
+        if spec.kind == "flow":
+            flow = spec.flow
+            assert flow is not None
+            if not flow.expectations:
+                return None
+
+            def resolve() -> list:
+                # Resolved here, not at collection time, because a flow's
+                # expectations are checked against its *output* schema and that
+                # is only known once the flow has been compiled. `_execute_flow`
+                # has already run by the time this callback fires: DuckDB's
+                # result is an argument to `catalog.write`, so it is evaluated
+                # before `write` invokes the validator.
+                from laurelin.transforms.flow_compile import flow_expectations
+
+                return flow_expectations(flow, self._flow_schemas[spec.name])
+        else:
+            if not spec.expectations:
+                return None
+
+            def resolve() -> list:
+                return spec.expectations
 
         def validate(files: list[str]) -> None:
             con = duckdb.connect()
@@ -400,9 +512,16 @@ class Builder:
                 # is lazy, so a count over a billion rows is a scan, not a
                 # materialization — a streaming transform stays streaming.
                 con.register("t", self.catalog.storage.dataset(files))
+                # The second build-path connection, sandboxed for the same
+                # reason as the first: `expectations.expression()` interpolates
+                # a raw predicate from a pipeline file straight into
+                # `WHERE NOT (...)`, so this connection evaluates author text.
+                # (A flow can never reach that function — flows expose a closed
+                # subset — but a Python pipeline can.)
+                _sandbox(con)
                 with limits.limited(con, limits.QueryLimits.build()):
                     results = check_expectations(
-                        con, spec.expectations, spec.output.dataset
+                        con, resolve(), spec.output.dataset
                     )
             finally:
                 con.close()
@@ -531,38 +650,51 @@ class Builder:
             )
         return result
 
+    def _register_inputs(self, con, spec: TransformSpec) -> None:
+        """Register every input as a table named after its alias, then sandbox.
+
+        Shared by `_execute_sql` and `_execute_flow` so the two cannot drift:
+        a flow's preview and its build must run the same statement against the
+        same table names, and that only holds if registration is one function.
+        """
+        for alias, inp in spec.inputs.items():
+            try:
+                info = self.store.get_dataset(inp.dataset)
+                if info is not None and info.scans_at_source:
+                    # Reduce at the boundary: a transform may read a table
+                    # scanned at the source (federated, Iceberg, ClickHouse)
+                    # and write a managed one. This is the intended path for
+                    # large data. Iceberg reached here through arrow_dataset()
+                    # before, which has no local parts to scan — a latent bug
+                    # this fixes.
+                    scan = self.catalog.source_table(inp.dataset)
+                else:
+                    scan = self.catalog.arrow_dataset(inp.dataset)
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Input {alias}={inp.dataset!r} of transform "
+                    f"{spec.name!r} is not available and no transform "
+                    f"produces it: {exc.args[0]}"
+                ) from exc
+            # Register the lazy Arrow dataset rather than file paths: it keeps
+            # scan pushdown, covers multi-part (appended) versions, and works
+            # when the parts live in object storage.
+            con.register(alias, scan)
+        _sandbox(con)
+
     def _execute_sql(self, spec: TransformSpec) -> pa.Table:
         assert spec.query is not None
         con = duckdb.connect()
         try:
-            for alias, inp in spec.inputs.items():
-                try:
-                    info = self.store.get_dataset(inp.dataset)
-                    if info is not None and info.scans_at_source:
-                        # Reduce at the boundary: a transform may read a table
-                        # scanned at the source (federated, Iceberg,
-                        # ClickHouse) and write a managed one. This is the
-                        # intended path for large data. Iceberg reached here
-                        # through arrow_dataset() before, which has no local
-                        # parts to scan — a latent bug this fixes.
-                        scan = self.catalog.source_table(inp.dataset)
-                    else:
-                        scan = self.catalog.arrow_dataset(inp.dataset)
-                except KeyError as exc:
-                    raise RuntimeError(
-                        f"Input {alias}={inp.dataset!r} of transform "
-                        f"{spec.name!r} is not available and no transform "
-                        f"produces it: {exc.args[0]}"
-                    ) from exc
-                # Register the lazy Arrow dataset rather than file paths: it
-                # keeps scan pushdown, covers multi-part (appended) versions,
-                # and works when the parts live in object storage.
-                con.register(alias, scan)
+            self._register_inputs(con, spec)
             # Builds are allowed to be slow — nobody is waiting on a browser —
             # but must still not exhaust the machine. No admission slot: the
             # worker pool already bounds how many builds run at once.
             limits.apply(con, limits.QueryLimits.build())
-            result = con.execute(spec.query).arrow()
+            result = (
+                con.execute(spec.query, spec.params) if spec.params
+                else con.execute(spec.query)
+            ).arrow()
         finally:
             con.close()
         if isinstance(result, pa.RecordBatchReader):
@@ -593,7 +725,15 @@ def _task_failure(exc: BaseException, spec) -> Failure:
             subject=subject, driver="python",
             counters={"failed_expectations": len(getattr(exc, "failures", []))},
         )
-    driver = "duckdb" if type(exc).__module__.split(".")[0] == "duckdb" else "python"
+    # `driver_of`, not a hand-rolled module check. Measured: DuckDB's exception
+    # classes are defined in `_duckdb`, so `type(exc).__module__.split(".")[0]`
+    # returned "_duckdb", missed the comparison, and recorded every DuckDB
+    # binder error as `driver="python"` with `code=TRANSFORM_FAILED` — which
+    # the UI renders as "Laurelin's own code raised … the traceback is in the
+    # server log". An analyst was shown that for their own mistake, having
+    # neither code nor a server. `driver_of` already owned the `_duckdb`
+    # mapping; this just uses it.
+    driver = driver_of(exc, "python")
     return Failure.from_exception(
         exc, phase=Phase.execute, subject=subject, driver=driver,
         code=None if driver == "duckdb" else FailureCode.TRANSFORM_FAILED,

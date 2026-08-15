@@ -40,6 +40,15 @@ class Expectation:
     name: str
     description: str
     sql: str
+    # Values bound to `?` placeholders in `sql`, positionally.
+    #
+    # This exists because `accepted_values` used to build its IN-list by
+    # doubling quotes — `"'" + str(v).replace("'", "''") + "'"` — which is an
+    # escaper, in a second SQL-generation surface, evaluated on the build
+    # connection. It is now bound. The field is on the dataclass rather than
+    # only inside that one function so that any future check has somewhere to
+    # put a value that is not the query text.
+    params: tuple = ()
     # A check that isn't about individual rows (row_count) reports differently:
     # its measurement is the value itself, bounded by lo/hi, not a violation count.
     aggregate: bool = False
@@ -98,7 +107,13 @@ def accepted_values(column: str, values, severity: str = "error") -> Expectation
     allowed = list(values)
     if not allowed:
         raise ValueError("accepted_values needs at least one permitted value")
-    literals = ", ".join("'" + str(v).replace("'", "''") + "'" for v in allowed)
+    # BOUND, not escaped. The values reach DuckDB through the parameter
+    # channel, so a permitted value containing a quote is a value and not
+    # syntax — and there is no escaper here to get wrong. A flow author can
+    # reach this function through the builder's `accepted_values` check, which
+    # is why it stopped being allowed to interpolate.
+    placeholders = ", ".join("?" for _ in allowed)
+    params = tuple(str(v) for v in allowed)
     shown = ", ".join(repr(str(v)) for v in allowed[:5])
     if len(allowed) > 5:
         shown += f", … ({len(allowed)} total)"
@@ -107,8 +122,9 @@ def accepted_values(column: str, values, severity: str = "error") -> Expectation
         description=f"{column!r} must be one of {shown}",
         sql=(
             f"SELECT count(*) FROM t WHERE {_q(column)} IS NOT NULL "
-            f"AND CAST({_q(column)} AS VARCHAR) NOT IN ({literals})"
+            f"AND CAST({_q(column)} AS VARCHAR) NOT IN ({placeholders})"
         ),
+        params=params,
         severity=severity,
     )
 
@@ -176,7 +192,11 @@ def check(conn, expectations: list[Expectation], dataset: str) -> list[dict]:
     """
     results = []
     for exp in expectations:
-        measured = int(conn.execute(exp.sql).fetchone()[0])
+        measured = int(
+            conn.execute(exp.sql, list(exp.params)).fetchone()[0]
+            if exp.params
+            else conn.execute(exp.sql).fetchone()[0]
+        )
         ok = exp.holds(measured)
         results.append({
             "expectation": exp.name,

@@ -83,6 +83,7 @@ from laurelin.export.manifest import (
     exported_tables,
     origin_slug,
 )
+from laurelin.transforms.flow_files import PIPELINE_FILE_SUFFIXES
 
 COPY_CHUNK = 1 << 20
 
@@ -275,7 +276,7 @@ def target_is_pristine(store: MetadataStore, workspace: Workspace) -> tuple[bool
             if n:
                 counts[table] = n
     for directory, suffixes in (
-        (workspace.pipelines_dir, (".py",)),
+        (workspace.pipelines_dir, PIPELINE_FILE_SUFFIXES),
         (workspace.ontology_dir, (".yml", ".yaml")),
     ):
         if directory.is_dir():

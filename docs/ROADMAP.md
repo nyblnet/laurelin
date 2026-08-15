@@ -269,9 +269,47 @@ Key bets, and why:
 - ✅ **In-browser transform authoring** — a code editor over `pipelines/*.py`
       (Python + `@sql_transform`), "save query as transform" from the workbench;
       editor-gated, disableable with `--lock-pipelines`. **done**
-- [ ] **Visual pipeline builder** (later phase): node/edge canvas that emits the
-      same Python/SQL files — the visual layer is a *view over code*, never a
-      proprietary format.
+- ✅ **Visual pipeline builder ("Flows")** — backend and UI landed. **done**
+      A flow is a declarative artifact (`pipelines/<name>.flow.json`) compiled
+      to bound SQL in memory and registered into the *same* `TransformRegistry`
+      as `pipelines/*.py`, so lineage, markings, expectations, build leases,
+      the acknowledgement gate and `--lock-pipelines` all cover it unchanged.
+
+      **This bullet used to promise the builder would "emit the same Python/SQL
+      files — the visual layer is a *view over code*, never a proprietary
+      format." That promise is deliberately broken, for three measured
+      reasons**, and the amendment is the honest version:
+
+      1. Generating Python is a *correctness* bug, not an ergonomics one.
+         `generate_sql_transform` interpolated SQL into a `"""…"""` literal:
+         SQL containing a triple quote produced a file that would not parse,
+         and SQL containing a backslash was silently **corrupted** — an
+         authored `'C:\temp\new'` came back holding a real TAB and a real
+         NEWLINE, with no error at any layer. `write()`'s compile-before-save
+         guard catches the first and cannot catch the second. (Both are now
+         fixed for the Python path too, via `_py_string`.)
+      2. Round-tripping through generated Python has no honest answer to "the
+         user edited the generated file": either silently overwrite their work,
+         or build a Python-source analyser, which is unbounded in scope.
+      3. A generated `.py` is `exec`-ed on every registry collection. The whole
+         security argument for a no-code builder is that its author does *not*
+         get code execution; compiling to a file hands it back.
+
+      What survives of the original intent: the artifact is still an
+      inspectable, git-diffable text file in the workspace — not a blob in a
+      database — and it still travels through workspace export/import and the
+      credential scanner. Ejection (flow → Python) is offered and is one-way;
+      import (Python → flow) is permanently out of scope.
+
+      What v1 deliberately does **not** cover, so that the next person deciding
+      to add one is making a decision rather than discovering a hole: `union`
+      (the likeliest first complaint — "stack this month onto last month" has no
+      expression in the builder), window functions, pivot/unpivot, subqueries and
+      correlated predicates, non-equi / right / full / cross joins, `case` beyond
+      one if/else, regex, date parsing with a format string, wrapping an
+      aggregate in a calculation (`round(avg(x), 1)` is three steps), and
+      incremental or streaming flows — both are single-input and row-wise by
+      construction, so a joined or summarised flow could never be one.
 - [x] **Batch-streaming transforms**: `@transform(streaming=True)` receives an
       iterator of Arrow batches and yields batches, so peak memory tracks one
       batch rather than the dataset (121 MB -> 21 MB on a 3 M-row filter).

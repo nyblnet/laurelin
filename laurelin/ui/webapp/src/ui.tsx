@@ -175,17 +175,23 @@ const FAILURE_TEXT: Record<FailureCode, FailureText> = {
     label: "The remote system refused for lack of privilege",
     advice: "The credential is valid but the account cannot do this. Grant it on the remote side.",
   },
+  // These three classify a *query* failure, and the engine is embedded DuckDB
+  // as often as it is a federated cluster — so none of them may assert a
+  // remote system. Measured: a no-code flow summing a column of text rendered
+  // "A column referenced does not exist on the remote system", naming nothing,
+  // about a column visibly present in the picker directly below it, on a
+  // statement that never left the process.
   relation_missing: {
     label: "The table does not exist",
     advice: "It was dropped or renamed upstream, or the schema qualifier is wrong.",
   },
   column_missing: {
-    label: "A referenced column does not exist",
-    advice: "The remote schema changed under the query. Compare it with what the query expects.",
+    label: "A referenced column does not exist, or holds a different kind of value",
+    advice: "The schema changed under the query, or a step combines columns whose types do not fit together. Compare the query with the columns the data has now.",
   },
   schema_incompatible: {
-    label: "The remote schema is not what Laurelin expected",
-    advice: "Types or columns moved underneath a registered dataset. Re-register it, or fix the remote.",
+    label: "The schema is not what Laurelin expected",
+    advice: "Types or columns moved underneath a registered dataset. Re-register it, or fix the source.",
   },
   statement_invalid: {
     label: "The statement was rejected as invalid",

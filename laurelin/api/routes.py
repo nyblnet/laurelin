@@ -69,6 +69,16 @@ from laurelin.transforms import (
     TransformRegistry,
     collect_transforms,
 )
+from laurelin.transforms.flow_compile import kind_of
+from laurelin.transforms.flow_files import FlowFiles, compile_flow_now, eject_sql
+from laurelin.transforms.flow_governance import (
+    check_flow_governance,
+    check_flow_sources,
+    masked_columns_for,
+    output_will_be_restricted,
+    restrict_output_to_author,
+)
+from laurelin.transforms.flow_ir import FlowDef, FlowRefused
 
 log = logging.getLogger("laurelin.api")
 
@@ -568,6 +578,8 @@ def _execute_sql(
     user: User,
     sql: str,
     max_rows: int,
+    params: Optional[list] = None,
+    server_authored: bool = False,
 ) -> dict:
     """Run one read-only query **as this user**. The only SQL execution path.
 
@@ -576,6 +588,12 @@ def _execute_sql(
     to fix only one of them. Datasets the user cannot view are not registered,
     so referencing one fails as an unknown table; row-level security and column
     masking are applied to every dataset that is.
+
+    ``params`` are bound positionally. The flow builder's preview is the only
+    caller that passes any: a compiled flow carries every author-supplied value
+    as a parameter and none as text, and routing it through *this* function
+    rather than a second one is what keeps preview on the same ACL / row-level
+    security / column-masking path as the workbench.
     """
     allowed = perms.viewable_datasets(user, [d.name for d in store.list_datasets()])
     try:
@@ -583,6 +601,8 @@ def _execute_sql(
             sql, max_rows=max_rows, allowed=allowed,
             plan_for=perms.arrow_policy_fn(user),
             sql_policy_for=perms.sql_policy_fn(user),
+            params=params,
+            server_authored=server_authored,
         )
     except (QueryTimeout, QueryTooLarge, QueryRejected):
         # Resource limits carry their own status codes and their own
@@ -601,9 +621,16 @@ def _execute_sql(
         # `detail_for`, because a query over a *federated* dataset fails inside
         # a scan whose endpoint was rebuilt from an ADMIN-authored source
         # config, and this route is viewer-reachable.
-        raise HTTPException(
+        http = HTTPException(
             status_code=400, detail=serialize.detail_for(failure, Role.admin)
-        ) from None
+        )
+        # The exception's *class name* — the same fact `Failure.exc_class`
+        # already stores, and never its message — so `_flow_execution` can
+        # substitute a sentence written for someone who does not write SQL.
+        # Attached rather than passed back, so this function keeps exactly one
+        # return shape for its other callers.
+        http._flow_exc_class = type(exc).__name__  # type: ignore[attr-defined]
+        raise http from None
 
 
 @router.post("/query")
@@ -2052,10 +2079,20 @@ def pipeline_from_query(
     body: QueryTransformRequest,
     files: PipelineFilesDep,
     store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
     actor: ActorDep,
 ) -> dict:
     """Create a pipeline file wrapping a workbench query as a SQL transform."""
-    dataset_names = [d.name for d in store.list_datasets()]
+    # Filtered through the caller's view rights before the regex sees it. The
+    # inference is a word-boundary match over the query text, so an unfiltered
+    # list let a generated pipeline *declare an input its author cannot view* —
+    # which then builds as the system and lands the data in a new dataset. The
+    # regex is still a guess (see generate_sql_transform); this at least bounds
+    # what it can guess at.
+    dataset_names = sorted(
+        perms.viewable_datasets(user, [d.name for d in store.list_datasets()])
+    )
     result = files.generate_sql_transform(
         body.sql, body.output, dataset_names, name=body.name
     )
@@ -2063,3 +2100,609 @@ def pipeline_from_query(
         "pipeline_written", {"name": result["name"], "source": "query"}, actor=actor
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Flows: the no-code pipeline builder
+#
+# A flow is a declarative artifact (`pipelines/<name>.flow.json`) compiled to
+# SQL in memory. It is NOT exec'd — that is the whole point, and the reason an
+# analyst may author one where they may not author Python.
+#
+# Every route here is EDITOR, not VIEWER, for the same reason the pipeline
+# routes above are: if you cannot write it, you cannot read it. A viewer's
+# legitimate need is lineage, and `GET /transforms` and `GET /lineage` already
+# serve that structurally — a flow appears there as a transform with
+# `kind: "flow"`, with no change to either route.
+#
+# Writes are additionally gated on `--lock-pipelines`. The flag's contract is
+# "no authoring on this server", and a flow authors a transform that runs as
+# the system and reads datasets. Making flows the exception would silently
+# widen what a hardened deployment permits. If operators later want "flows but
+# not Python", that is a new flag and a new decision.
+# ---------------------------------------------------------------------------
+
+def get_flow_files(workspace: WorkspaceDep) -> FlowFiles:
+    return FlowFiles(workspace.pipelines_dir)
+
+
+FlowFilesDep = Annotated[FlowFiles, Depends(get_flow_files)]
+
+#: Flow previews are capped far below the workbench's 1000/100000. A canvas
+#: that previews as you build competes for the same process-wide admission
+#: semaphore (`limits.py`: 8 slots) as dashboards, object reads and row pages,
+#: and the failure mode of losing that race is `QueryRejected` + `Retry-After`
+#: for *everyone else on the replica*. 200 rows is enough to see the shape of
+#: an answer, which is what a preview is for.
+FLOW_PREVIEW_MAX_ROWS = 200
+
+
+class FlowWriteRequest(BaseModel):
+    flow: dict
+
+
+class FlowPreviewRequest(BaseModel):
+    # The DRAFT flow, not a saved one. Previewing an unsaved draft is the whole
+    # interaction; requiring a save first would make the canvas useless.
+    flow: dict
+    node_id: Optional[str] = None
+    max_rows: int = 50
+
+
+def _flow_or_400(fn, *args, **kwargs):
+    """Run a flow operation, converting `FlowRefused` to a 400.
+
+    `FlowRefused`'s message is first-party by construction (see its docstring):
+    it is Laurelin's own sentence, it names the author's own step and column,
+    and it is raised *before* any SQL exists — so unlike the DuckDB errors that
+    `_execute_sql` has to launder through `Failure`, it can be served verbatim.
+    That is the whole point: a non-programmer needs to be told what to fix.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except FlowRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+def _compiled_flow(catalog, store, perms, author: str, flow, **kwargs):
+    """Sources-check, then compile. The ordering is a disclosure control.
+
+    `flow_compile.resolve_column` names a dataset's available columns when an
+    identifier misses — deliberately, because that is the single most useful
+    thing to tell an author who mistyped one. Those names are a schema, and a
+    schema is information. Checking view rights *first* means the compiler is
+    only ever pointed at datasets this author may read.
+    """
+    check_flow_sources(store, perms, author, flow)
+    return compile_flow_now(catalog, flow, **kwargs)
+
+
+#: Exception class -> what to tell a person who does not write SQL, when a
+#: compiled flow still fails inside DuckDB.
+#:
+#: The static checks in `flow_compile` catch the mistakes that were actually
+#: measured, before the flow is even saved. This is the residue, and it exists
+#: because the generic pipe is *false* here: `_execute_sql` classifies a
+#: DuckDB binder error as `column_missing`, whose Laurelin-authored sentence
+#: was "A column referenced does not exist on the remote system" — about a
+#: column visibly present in the picker directly below, on a query that ran in
+#: embedded DuckDB, where there is no remote system at all.
+#:
+#: Keyed on `type(exc).__name__`, which is the same fact `Failure.exc_class`
+#: records, and mapped to text Laurelin wrote. No driver prose is read, kept or
+#: returned; R1 is intact.
+_FLOW_EXEC_ADVICE: dict[str, str] = {
+    "ConversionException": (
+        "One of the values in this data could not be converted to the type a "
+        "step asked for. Check any 'cast' step: converting a column to a "
+        "number or a date only works if every value in it really is one."
+    ),
+    "BinderException": (
+        "A step combines columns whose kinds do not fit together — summing "
+        "text, or comparing text with a number or a date. Check the columns "
+        "the last step uses, and add a 'cast' step if one of them needs "
+        "converting."
+    ),
+    "InvalidInputException": (
+        "A step was given a value it cannot use. Check the values in the last "
+        "step you changed."
+    ),
+    "OutOfRangeException": (
+        "A number in this data is too large or too small for the type a step "
+        "asked for. Check any 'cast' step converting to a whole number."
+    ),
+}
+
+
+def _flow_execution(run, *args, **kwargs):
+    """Run a compiled flow, translating engine errors into flow language.
+
+    Wraps the shared `_execute_sql` rather than replacing it: preview must stay
+    on the one policy path (ACL-as-unknown-table, row-level security, column
+    masks, the sandbox pragma, admission control), and the only thing that
+    differs for a flow is who is reading the error. An operator debugging a
+    federated connector wants the failure code; an analyst who has never seen
+    SQL wants to know which step to change.
+    """
+    try:
+        return run(*args, **kwargs)
+    except HTTPException as exc:
+        advice = _FLOW_EXEC_ADVICE.get(getattr(exc, "_flow_exc_class", ""))
+        if advice is None:
+            raise
+        raise HTTPException(status_code=400, detail=advice) from None
+
+
+def _flow_sources_of(entry: dict) -> list[str]:
+    """The datasets a flow reads, from a listing entry *or* a raw read result.
+
+    Walks the raw node list rather than `FlowDef.source_datasets()`, because
+    `FlowFiles.read` deliberately echoes back a structurally-invalid flow so
+    the builder can repair it — and a broken flow must still be gated on what
+    it names. Anything unparseable yields the sentinel below, which no caller
+    can be granted, so a file we cannot read the sources of is a file nobody
+    but an admin sees.
+    """
+    if entry.get("sources") is not None:
+        return list(entry["sources"])
+    flow = entry.get("flow")
+    if not isinstance(flow, dict):
+        return ["\0unreadable"]
+    nodes = flow.get("nodes")
+    if not isinstance(nodes, list):
+        return ["\0unreadable"]
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or n.get("kind") != "source":
+            continue
+        dataset = (n.get("params") or {}).get("dataset")
+        out.append(dataset if isinstance(dataset, str) else "\0unreadable")
+    return out
+
+
+def _may_read_flow(store, perms, user, entry: dict) -> bool:
+    """May this caller see a flow's *definition*?
+
+    A flow's IR is not metadata about a dataset, it is a description of one:
+    the source dataset names, the column names it picks, and the literal values
+    it filters on. `GET /flows/{name}/sql` already withholds the values —
+    "a filter constant can be a customer name … a different entitlement from
+    reading the dataset", in its own docstring — and orders `check_flow_sources`
+    before compilation for the same reason.
+
+    Its two sibling read routes did neither, so the protection was decorative.
+    Measured: `merger_targets` granted to alice; bob was 403 on the dataset's
+    rows, 403 on its schema, 403 on `/flows/schema`, and 400 on `/flows/{name}/
+    sql` — and `GET /flows/{name}` handed him the column name `codename` and
+    the filter value `'PROJECT ORCHID'` in a 200.
+    """
+    return all(
+        perms.can_view_dataset(user, dataset)
+        for dataset in _flow_sources_of(entry)
+    )
+
+
+def _reject_workspace_cycle(registry, flow) -> None:
+    """Refuse a flow that would put a cycle into the *workspace's* DAG.
+
+    `_validate_graph` checks the shape of the flow's own steps; this checks the
+    edge the flow adds to everything else, by walking `registry.by_output` from
+    each source the way `Builder.plan` does.
+
+    It matters because the failure is not local. Measured: an editor saved a
+    flow named `loop_ds` whose only source was `loop_ds`. `PUT` returned 200
+    happily; the cycle was then detected in `Builder.plan`, which runs for
+    *every* build — so `POST /builds` with no targets, the path the scheduler
+    takes, returned `400 Cycle detected in transform DAG` and every unrelated
+    transform in the workspace stopped building until somebody found and
+    deleted the flow. `registry.by_output` was already being consulted three
+    lines above, for the duplicate-producer check.
+    """
+    seen = set()
+
+    def walk(name: str, path: list[str]) -> None:
+        producer = (
+            flow if name == flow.output else None
+        ) or registry.by_output(name)
+        if producer is None:
+            return
+        producer_name = getattr(producer, "name", None)
+        if producer_name in seen:
+            return
+        seen.add(producer_name)
+        if producer is flow:
+            sources = flow.source_datasets()
+        else:
+            sources = [i.dataset for i in producer.inputs.values()]
+        for source in sources:
+            if source == flow.output:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This flow's result would feed back into itself, "
+                        "through " + " -> ".join([*path, source]) + ". A "
+                        "dataset cannot be built from itself, and saving this "
+                        "would stop every build in the workspace, not just "
+                        "this one."
+                    ),
+                )
+            walk(source, [*path, source])
+
+    walk(flow.output, [flow.output])
+
+
+@router.get("/flows", dependencies=[EDITOR])
+def list_flows(files: FlowFilesDep, store: StoreDep, perms: PermDep,
+               user: UserDep) -> list[dict]:
+    """Flows this caller may read the definition of. See `_may_read_flow`.
+
+    Filtered rather than redacted: an entry's `sources` and `name` are the two
+    things a listing is *for*, and a flow's name is also the name of the
+    dataset it produces, so a redacted row would still be an answer to "what
+    restricted datasets exist here". A caller who cannot see a flow still gets
+    a clear 409 if they try to claim its output name.
+    """
+    return [e for e in files.list() if _may_read_flow(store, perms, user, e)]
+
+
+# Declared before `/flows/{name}`: FastAPI matches in declaration order, and a
+# literal path segment registered after a parameterised one never wins.
+@router.get("/flows/schema", dependencies=[EDITOR])
+def flow_dataset_schema(
+    dataset: str, catalog: CatalogDep, perms: PermDep, user: UserDep
+) -> dict:
+    """Column names of one dataset, for the builder's column picker.
+
+    Gated on view rights for that specific dataset, because a column list is a
+    schema. This is also the only route that serves a *source-scanned*
+    dataset's schema: `GET /datasets/{name}/schema` resolves through the
+    version row, and a federated / ClickHouse / StarRocks / Iceberg dataset has
+    none — so that route answers "has no versions" for exactly the datasets a
+    remotely-backed flow wants to read.
+    """
+    _require_dataset_view(perms, user, dataset)
+    try:
+        types = catalog.column_types(dataset)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from None
+    # `kinds` alongside the names, so the step forms can offer "Total of" only
+    # for columns that hold numbers. The information was always available in
+    # `ColumnSchema.type`; the form offering `sum` over a column of names, and
+    # the flow then saving and failing its build, was a UI that had not been
+    # given it.
+    return {
+        "dataset": dataset,
+        "columns": list(types),
+        "kinds": {name: kind_of(t) for name, t in types.items()},
+    }
+
+
+@router.post("/flows/preview", dependencies=[EDITOR])
+def preview_flow(
+    body: FlowPreviewRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """Run a draft flow (or a prefix of it) **as the caller**.
+
+    Preview is not an oracle for the build, and the UI says so permanently:
+
+    * **Preview is policied; the build is not.** This runs through
+      `_execute_sql` with the caller's row-level security and column masks
+      applied; the build runs as the system with `sql_policy_for=None`, which
+      `catalog.source_table` documents as deliberately fail-open. The direction
+      is fail-safe — a preview can never show *more* than the caller may read —
+      but a policied analyst previewing 12 rows and building 12 million is the
+      default experience, not an edge case.
+    * **Masked columns break preview arithmetic.** A `redact` mask renders as
+      the string `'***'`, so a sum over it errors or returns nonsense for
+      exactly the authors who most need the preview. `masked_columns` says
+      which ones, per source, so the UI can annotate rather than let DuckDB
+      surface a binder error.
+    * Preview reads the latest version now; the build reads whatever is latest
+      then.
+
+    Governance here is checked WITHOUT the output-column rule that `PUT` and
+    the build apply. Previewing a prefix whose masked column the finished flow
+    drops is legitimate — the caller sees `***`, which is the mask working —
+    whereas letting that column reach a *built output* is the laundering this
+    feature refuses. Strict at save and at build, permissive-but-policied here.
+    """
+    flow = _flow_or_400(FlowDef.from_json, body.flow, name=body.flow.get("name"))
+    max_rows = max(1, min(int(body.max_rows), FLOW_PREVIEW_MAX_ROWS))
+    compiled = _flow_or_400(
+        _compiled_flow, catalog, store, perms, user, flow,
+        upto=body.node_id,
+        # One more than we will show, so `truncated` can be *true*. The limit
+        # goes into the SQL (spec 5.3: at the previewed terminal only, never
+        # pushed upstream), and `catalog.query` independently fetches
+        # `max_rows + 1` and compares — so with a limit of exactly `max_rows`
+        # the comparison could never fire and `truncated` was structurally
+        # always false. Measured on this repo's own demo data: a 56-row
+        # dataset previewed as "50 rows · 7 columns", no marker; a 5,000-group
+        # aggregate as "200 rows · 2 columns", with 4,800 groups missing and
+        # the number reading as the size of the answer.
+        limit=max_rows + 1,
+    )
+    _flow_or_400(check_flow_governance, store, perms, user, flow)
+    result = _flow_execution(
+        _execute_sql, catalog, store, perms, user, compiled.sql, max_rows,
+        params=compiled.params,
+        # A compiled flow is server-authored SQL over a closed IR, so a
+        # federated / ClickHouse / StarRocks / Iceberg source is registered for
+        # it even when the ad-hoc workbench is not allowed to reach one. See
+        # `catalog.query`.
+        server_authored=True,
+    )
+    masked: dict[str, list[str]] = {}
+    for ds in flow.source_datasets():
+        columns = sorted(masked_columns_for(perms, user, ds))
+        if columns:
+            masked[ds] = columns
+    return result | {
+        "schema": compiled.schema,
+        "kinds": compiled.kinds,
+        "node_id": body.node_id or flow.terminal,
+        "masked_columns": masked,
+        "max_rows": max_rows,
+    }
+
+
+@router.get("/flows/{name}", dependencies=[EDITOR])
+def read_flow(
+    name: str, files: FlowFilesDep, store: StoreDep, perms: PermDep,
+    user: UserDep,
+) -> dict:
+    try:
+        result = _flow_or_400(files.read, name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from None
+    if not _may_read_flow(store, perms, user, result):
+        # 403, not 404: the caller already learnt the flow exists by asking for
+        # it by name, and pretending otherwise would only make the 409 they get
+        # from `PUT` inexplicable.
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This flow reads a dataset {user.username!r} cannot read, so "
+                "its definition — the columns it picks and the values it "
+                "filters on — is not available here."
+            ),
+        )
+    result["output_will_be_restricted"] = False
+    # Only for a flow that actually validates. `read()` deliberately echoes back
+    # a flow that is parseable JSON but structurally invalid, so the builder can
+    # open it and repair it rather than being locked out of its own file — and
+    # re-validating it here would turn that repair path into a 500.
+    if result.get("flow") and not result.get("error"):
+        result["output_will_be_restricted"] = output_will_be_restricted(
+            store, FlowDef.from_json(result["flow"], name=name)
+        )
+    return result
+
+
+@router.put("/flows/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+def write_flow(
+    name: str,
+    body: FlowWriteRequest,
+    files: FlowFilesDep,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+    registry: RegistryDep,
+) -> dict:
+    """Validate a flow completely, then save it.
+
+    Tier A (structure), Tier B (every identifier against the live schema) and
+    governance all run *before* the write, so a flow that cannot build is
+    refused rather than saved. That mirrors `PipelineFiles.write`, which
+    compiles Python before saving, and for the same reason: the alternative is
+    a workspace whose registry collection fails, which 409s every route that
+    touches it.
+    """
+    flow = _flow_or_400(FlowDef.from_json, dict(body.flow), name=name)
+    existing = registry.by_output(flow.output)
+    if existing is not None and existing.name != flow.name:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Dataset {flow.output!r} is already produced by transform "
+                f"{existing.name!r}. Each dataset may have only one producing "
+                "transform."
+            ),
+        )
+    _reject_workspace_cycle(registry, flow)
+    compiled = _flow_or_400(
+        _compiled_flow, catalog, store, perms, user, flow
+    )
+    _flow_or_400(
+        check_flow_governance, store, perms, user, flow,
+        output_columns=compiled.schema, authoring=True,
+    )
+    saved = _flow_or_400(files.write, name, body.flow, user.username)
+    store.log_audit(
+        "flow_written",
+        {"name": saved.name, "output": saved.output,
+         "sources": saved.source_datasets()},
+        actor=actor,
+    )
+    return {
+        "name": saved.name,
+        "flow": saved.as_json(),
+        "schema": compiled.schema,
+        "output_will_be_restricted": output_will_be_restricted(store, saved),
+    }
+
+
+@router.delete("/flows/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+def delete_flow(
+    name: str, files: FlowFilesDep, store: StoreDep, actor: ActorDep
+) -> dict:
+    try:
+        files.delete(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from None
+    except FlowRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    store.log_audit("flow_deleted", {"name": name}, actor=actor)
+    return {
+        "ok": True,
+        # Stated in the response because it is surprising and deliberate.
+        # Nothing in this tree deletes lineage except
+        # `replace_lineage_for_transform`, and deleting it here would
+        # *declassify* every downstream dataset that inherited a marking
+        # through this flow. Retaining it is fail-closed.
+        "lineage_retained": True,
+        "detail": (
+            f"Flow {name!r} is deleted. Its lineage and any classification "
+            "markings it propagated are kept, so nothing downstream is "
+            "declassified. The dataset it produced is not deleted."
+        ),
+    }
+
+
+@router.get("/flows/{name}/sql", dependencies=[EDITOR])
+def flow_sql(
+    name: str,
+    files: FlowFilesDep,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """The compiled SQL, read-only. Not a round trip.
+
+    The UI renders this in a `<pre>`, labelled "generated from this flow; not
+    editable". There is no path from edited SQL back into a flow — that
+    direction is a Python-source analyser, unbounded in scope, and it is where
+    the silent-overwrite data loss lives.
+
+    `params` is a **count**, never the values. The values are the author's
+    data — a filter constant can be a customer name — and this is a different
+    entitlement from reading the dataset.
+    """
+    try:
+        flow = _flow_or_400(files.read, name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from None
+    if not flow.get("flow"):
+        raise HTTPException(status_code=400, detail=flow.get("error") or "Invalid flow")
+    parsed = FlowDef.from_json(flow["flow"], name=name)
+    compiled = _flow_or_400(
+        _compiled_flow, catalog, store, perms, user, parsed
+    )
+    return {
+        "name": name,
+        "sql": compiled.sql,
+        "params": len(compiled.params),
+        "inputs": compiled.inputs,
+        "schema": compiled.schema,
+    }
+
+
+@router.post("/flows/{name}/eject", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+def eject_flow(
+    name: str,
+    files: FlowFilesDep,
+    pipelines: PipelineFilesDep,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+    actor: ActorDep,
+    workspace: WorkspaceDep,
+) -> dict:
+    """Convert a flow to a Python pipeline. **One way.**
+
+    The UI gates this behind a type-to-confirm modal saying so. There is no
+    un-eject and no import: re-parsing Python into an IR is a Python-source
+    analyser, and it is wrong the first time someone writes a helper function.
+
+    Ordering is load-bearing. Write the `.py`, verify it collects, and only
+    then unlink the flow — and if the unlink fails, unlink the `.py` again.
+    Two producers of one output dataset is a hard `TransformRegistry.register`
+    failure, which 409s *every* route that collects the registry: the whole
+    workspace, not just this flow.
+
+    **Governance is checked here in full, not just view rights on the sources.**
+    It used to call `check_flow_sources` alone, and that made eject a one-click
+    downgrade out of every protection flows add. Three measured sequences, all
+    API-only, all as a plain editor:
+
+    * Author a flow; an admin later masks a column it reads. `PUT` now 400s and
+      the build fails `FlowRefused` — and `eject` returned 200, wrote the .py,
+      and the rebuild read the column in plaintext.
+    * The same with a row policy: the ejected transform's output handed both
+      regions to an editor with no grant at all, where the policied source
+      returns one row to its own author.
+    * A flow over a granted source promised `output_will_be_restricted: true`;
+      ejecting it produced a dataset with `grants: []`, world-readable.
+
+    So: the same `check_flow_governance` the save path and the build path run,
+    and `restrict_output_to_author` applied *here*, because after this call
+    there is no flow left for `Builder._execute_flow` to apply it for.
+    """
+    try:
+        stored = _flow_or_400(files.read, name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from None
+    if not stored.get("flow"):
+        raise HTTPException(status_code=400, detail=stored.get("error") or "Invalid flow")
+    flow = FlowDef.from_json(stored["flow"], name=name)
+    check_flow_sources(store, perms, user, flow)
+    sql, inputs, params = _flow_or_400(eject_sql, flow, catalog)
+    _flow_or_400(
+        check_flow_governance, store, perms, user, flow,
+        output_columns=compile_flow_now(catalog, flow).schema, authoring=True,
+    )
+
+    if pipelines.exists_py(name):
+        raise HTTPException(
+            status_code=409,
+            detail=f"A Python pipeline named {name!r} already exists.",
+        )
+    # Before the .py exists, so a crash between the two leaves the grant on
+    # rather than off.
+    restricted = restrict_output_to_author(store, flow, user.username)
+    try:
+        # `inputs` from the IR, exactly — bypassing generate_sql_transform's
+        # word-boundary regex, which cannot tell a table name from the same
+        # word inside a string literal. `params` likewise: the values stay
+        # bound, and the generated file binds them too.
+        result = pipelines.generate_sql_transform(
+            sql, name, dataset_names=[], inputs=inputs, params=params
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    try:
+        files.delete(name)
+    except Exception:
+        # Roll the .py back rather than leave two producers of one dataset.
+        pipelines.delete(name)
+        raise
+    store.log_audit(
+        "flow_ejected",
+        {"name": name, "inputs": inputs, "output_restricted": restricted},
+        actor=actor,
+    )
+    # `generate_sql_transform` re-collects the workspace as part of writing, and
+    # at that instant BOTH the .py and the .flow.json exist and claim the same
+    # output — so its `collect_error` is a duplicate-producer complaint about a
+    # collision this request is halfway through resolving. Recomputed after the
+    # unlink so the response describes the workspace as it now is, rather than
+    # reporting a transient state as a defect the author has to act on.
+    result = result | {"collect_error": None}
+    try:
+        collect_transforms(workspace.pipelines_dir)
+    except PipelineError as exc:
+        result["collect_error"] = Failure.from_exception(
+            exc, code=FailureCode.TRANSFORM_FAILED, phase=Phase.compile,
+            subject=f"pipeline:{name}", driver="python",
+        ).as_dict()
+    return result | {
+        "ejected": True, "inputs": inputs, "output_restricted": restricted,
+    }

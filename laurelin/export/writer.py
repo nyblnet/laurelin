@@ -65,6 +65,7 @@ from laurelin.export.pipeline_scan import (
     scan_pipelines,
 )
 from laurelin.export.secrets import strip_secrets, withheld_field
+from laurelin.transforms.flow_files import PIPELINE_FILE_SUFFIXES
 
 # 1 MiB. The only buffer a multi-terabyte export is allowed to hold.
 COPY_CHUNK = 1 << 20
@@ -602,7 +603,7 @@ def stream_export(
 
         for path in _sorted_files(workspace.ontology_dir, (".yml", ".yaml")):
             _add_path(tar, digests, f"ontology/{path.name}", path, mtime)
-        for path in _sorted_files(workspace.pipelines_dir, (".py",)):
+        for path in _sorted_files(workspace.pipelines_dir, PIPELINE_FILE_SUFFIXES):
             _add_path(tar, digests, f"pipelines/{path.name}", path, mtime)
 
         for table in exported_tables(include_audit=options.include_audit):

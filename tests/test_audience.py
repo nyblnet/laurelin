@@ -562,6 +562,25 @@ def sentinel_workspace(tmp_path):
         f'raise RuntimeError("connect failed: password={SENTINEL_EDITOR}_PIPE")\n'
     )
 
+    # A no-code flow, so `/flows`, `/flows/{name}` and `/flows/{name}/sql` are
+    # addressable and the sweep actually reaches them. A flow is a *file* in
+    # pipelines/, not a row in metadata.db, so nothing else here would seed one.
+    #
+    # No sentinel goes in it, and that is the finding rather than an omission:
+    # a flow has no operational free-text field to leak. Every value an author
+    # supplies is a bound parameter, every identifier is a schema-validated
+    # column name, and everything else is a closed enum — so there is no
+    # equivalent of `panel.sql` or a pipeline's source to withhold. Its one
+    # free-text field, `description`, is a *caption*: it becomes the output
+    # dataset's description exactly as `Output(..., description=...)` does for
+    # a Python transform, and reaches a viewer by design, like `panel.title`.
+    (ws.pipelines_dir / f"{SEEDED}.flow.json").write_text(json.dumps({
+        "name": SEEDED, "output": SEEDED, "author": "root",
+        "description": "Sales, by region", "terminal": "n0",
+        "nodes": [{"id": "n0", "kind": "source", "inputs": [],
+                   "params": {"dataset": SEEDED}}],
+    }))
+
     # A failed build, so `builds.failure_json` and its task are populated.
     build = store.create_build([SEEDED])
     store.update_build(build.id, status=BuildStatus.failed, failure=Failure(

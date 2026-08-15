@@ -541,12 +541,20 @@ _TEMPLATES: dict[FailureCode, str] = {
         "The database named in the connection{what} does not exist{where}.",
     FailureCode.PERMISSION_DENIED:
         "The remote system refused the operation{what} for lack of privilege.",
+    # No "remote system" in these three. They classify a *query* failure, and
+    # the query engine is embedded DuckDB as often as it is a federated
+    # cluster: a no-code flow summing a column of text was told "A column
+    # referenced does not exist on the remote system", about a column visibly
+    # present in the picker below it, on a statement that never left the
+    # process. `{where}` still names an endpoint when there is one, which is
+    # how an operator tells the two apart.
     FailureCode.RELATION_MISSING:
-        "The table{what} does not exist on the remote system{where}.",
+        "The table{what} does not exist{where}.",
     FailureCode.COLUMN_MISSING:
-        "A column referenced{what} does not exist on the remote system.",
+        "A column referenced{what} does not exist, or holds a different kind "
+        "of value than the query expects.",
     FailureCode.SCHEMA_INCOMPATIBLE:
-        "The remote schema{what} does not match what Laurelin expected.",
+        "The schema{what}{where} does not match what Laurelin expected.",
     FailureCode.DEFINITION_STALE:
         "The saved definition{what} refers to something that no longer exists; "
         "whoever can edit it can see which.",
