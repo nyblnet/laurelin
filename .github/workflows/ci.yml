@@ -27,7 +27,15 @@ jobs:
       # The floor advertised in pyproject. vermin reads the AST, so it catches
       # syntax we could only run on a newer interpreter — the matrix below
       # catches everything else.
-      - run: pip install vermin==1.6.0
+      #
+      # 1.8.0, not 1.6.0: vermin 1.6.0 calls `ast.Str`, which was removed in
+      # Python 3.12, so it dies with `AttributeError: module 'ast' has no
+      # attribute 'Str'` on the very interpreter this job pins. Measured by
+      # running both locally — 1.6.0 tracebacks, 1.8.0 reports "Minimum
+      # required versions: 3.9" and exits 0. This job had never been executed,
+      # so the crash sat here unseen: a linter that cannot start is
+      # indistinguishable from one that finds nothing until you read the log.
+      - run: pip install vermin==1.8.0
       - run: vermin --no-parse-comments --target=3.11- --violations laurelin/
 
   # ---------------------------------------------------------------- tests
