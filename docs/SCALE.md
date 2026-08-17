@@ -68,7 +68,7 @@ governs the table without holding it, and you reduce at the boundary.
   server executes; an editor who can write a pipeline has code execution.
   `--lock-pipelines` exists for exactly this, but the honest posture is:
   editors are trusted colleagues. See [SECURITY.md](../SECURITY.md).
-- **Not battle-tested.** It is early. It has 1,931 tests, run against both
+- **Not battle-tested.** It is early. It has 3,132 tests, run against both
   SQLite and PostgreSQL, and a coherent design; it does not have years of
   production hours behind it.
 

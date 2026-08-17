@@ -357,7 +357,7 @@ there is no git tag in this repository and nothing has been uploaded to PyPI
 (the release workflow is inert until trusted publishing is configured), so
 `pip install laurelin` does not work — install from a checkout. Early alpha:
 the core loop — ingest → transform → build → ontology → act — works end to
-end, with 1,931 tests run against both SQLite and PostgreSQL, but expect rough
+end, with 3,132 tests run against both SQLite and PostgreSQL, but expect rough
 edges and breaking changes before 1.0.
 
 Laurelin runs as a single process on a laptop *or* as N stateless replicas
