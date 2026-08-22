@@ -47,7 +47,7 @@ import {
 } from "../ui";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const CHART_KINDS: ChartKind[] = ["table", "bar", "line", "area", "stat"];
+const CHART_KINDS: ChartKind[] = ["table", "bar", "line", "area", "stat", "pie", "scatter"];
 
 export function DashboardsView() {
   return (
@@ -197,18 +197,77 @@ function PanelBody({ dashboard, panel }: { dashboard: string; panel: DashboardPa
   const result = q.data!;
 
   if (panel.chart === "table" || result.columns.length === 0) {
-    return (
+    return <PanelTable result={result} />;
+  }
+  return (
+    <Chart
+      data={result}
+      kind={panel.chart}
+      x={panel.x}
+      y={panel.y}
+      series={panel.series}
+      stacked={panel.stacked}
+    />
+  );
+}
+
+/**
+ * The table panel, honest about what it holds. It used to slice the first 100
+ * rows silently — a 1000-row result rendered 100 with nothing anywhere saying
+ * so, which for a table (the one kind whose whole job is showing the rows) is
+ * a wrong answer, not a style choice. Every fetched row renders now, the
+ * count is stated, a server-side truncation gets a badge, and header-click
+ * sorting is client-side over the loaded rows — which is exactly why the
+ * badge exists: "sorted within the first 1000" is only honest if the reader
+ * can see the "first 1000" part.
+ */
+function PanelTable({ result }: { result: PanelRunResult }) {
+  const [sort, setSort] = useState<{ column: string; dir: 1 | -1 } | null>(null);
+
+  const rows = result.rows;
+  const sorted =
+    sort === null
+      ? rows
+      : [...rows].sort((a, b) => {
+          const va = a[sort.column];
+          const vb = b[sort.column];
+          if (va == null) return 1;
+          if (vb == null) return -1;
+          if (typeof va === "number" && typeof vb === "number")
+            return (va - vb) * sort.dir;
+          return String(va).localeCompare(String(vb)) * sort.dir;
+        });
+
+  return (
+    <div>
       <div className="table-wrap" style={{ maxHeight: 280, overflowY: "auto" }}>
         <table>
           <thead>
             <tr>
               {result.columns.map((c) => (
-                <th key={c} className="mono">{c}</th>
+                <th
+                  key={c}
+                  className="mono"
+                  style={{ cursor: "pointer", userSelect: "none" }}
+                  title="Sort by this column (within the loaded rows)"
+                  onClick={() =>
+                    setSort((s) =>
+                      s?.column === c
+                        ? s.dir === 1
+                          ? { column: c, dir: -1 }
+                          : null
+                        : { column: c, dir: 1 },
+                    )
+                  }
+                >
+                  {c}
+                  {sort?.column === c ? (sort.dir === 1 ? " ▲" : " ▼") : ""}
+                </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {result.rows.slice(0, 100).map((row, i) => (
+            {sorted.map((row, i) => (
               <tr key={i}>
                 {result.columns.map((c) => (
                   <td key={c} className="mono">{String(row[c] ?? "")}</td>
@@ -218,9 +277,20 @@ function PanelBody({ dashboard, panel }: { dashboard: string; panel: DashboardPa
           </tbody>
         </table>
       </div>
-    );
-  }
-  return <Chart data={result} kind={panel.chart} x={panel.x} y={panel.y} />;
+      <div className="faint" style={{ fontSize: 11, marginTop: 6, display: "flex", gap: 8, alignItems: "center" }}>
+        {result.row_count.toLocaleString("en-US")} row{result.row_count === 1 ? "" : "s"}
+        {result.truncated && (
+          <span
+            className="badge badge-gold"
+            title="The result is larger than what was fetched. Sorting here reorders only the loaded rows."
+          >
+            first {result.row_count.toLocaleString("en-US")} of a larger result
+          </span>
+        )}
+        {sort && result.truncated && <span>· sorted within loaded rows</span>}
+      </div>
+    </div>
+  );
 }
 
 // ------------------------------------------------- object panel source fields
@@ -455,6 +525,27 @@ function PanelEditor({
               placeholder="all numeric columns"
             />
           </div>
+          <div className="field">
+            <label>Split by (optional)</label>
+            <input
+              className="mono"
+              value={p.series ?? ""}
+              onChange={(e) => set({ series: e.target.value })}
+              placeholder="a category column"
+              title="A result column whose values become the series"
+              style={{ width: 140 }}
+            />
+          </div>
+          {p.chart === "bar" && (
+            <label className="check-inline" style={{ alignSelf: "flex-end", paddingBottom: 8 }}>
+              <input
+                type="checkbox"
+                checked={p.stacked ?? false}
+                onChange={(e) => set({ stacked: e.target.checked })}
+              />
+              <span>stacked</span>
+            </label>
+          )}
         </div>
         <div className="toolbar" style={{ marginTop: 12, justifyContent: "flex-end" }}>
           <button onClick={onCancel}>Cancel</button>
@@ -578,7 +669,15 @@ function DashboardPage() {
 
       {dash.panels.length === 0 ? (
         <EmptyState>
-          No panels yet{canEdit ? " — add one, or send a query here from the SQL workbench." : "."}
+          No panels yet
+          {canEdit ? (
+            <>
+              {" "}— add one, shape a chart in <Link to="/explore">Explore</Link>, or send a
+              query here from the SQL workbench.
+            </>
+          ) : (
+            "."
+          )}
         </EmptyState>
       ) : (
         <div
@@ -611,9 +710,29 @@ function DashboardPage() {
                 {canEdit && (
                   <span style={{ display: "inline-flex", gap: 6, flexShrink: 0 }}>
                     {panelIsWhole(p) ? (
-                      <button className="small" onClick={() => setEditing(p)}>
-                        Edit
-                      </button>
+                      // A *flow* panel has nodes; a SQL panel serializes
+                      // `flow: {}` (the model's default), and `!== undefined`
+                      // once sent SQL panels into Explore, which crashed the
+                      // whole app trying to read `.nodes` of undefined.
+                      Array.isArray((p.flow as any)?.nodes) && (p.flow as any).nodes.length > 0 ? (
+                        // A flow panel was shaped in Explore, so it is edited
+                        // there — one shaping UI, not two drifting copies.
+                        <button
+                          className="small"
+                          title="Reopens this panel's shaping in Explore"
+                          onClick={() =>
+                            navigate(
+                              `/explore?dashboard=${encodeURIComponent(dash.name)}&panel=${encodeURIComponent(p.id)}`,
+                            )
+                          }
+                        >
+                          Edit in Explore
+                        </button>
+                      ) : (
+                        <button className="small" onClick={() => setEditing(p)}>
+                          Edit
+                        </button>
+                      )
                     ) : (
                       // Can happen to an editor only in an odd state (a demoted
                       // session, a stale tab). Offering "Edit" would open a form

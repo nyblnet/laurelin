@@ -10,6 +10,76 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Added: Explore — point-and-click data-to-chart
+
+The Contour/Quiver half of the product. An analyst who cannot write SQL picks a
+dataset or an object type, shapes it by clicking (filter with value
+suggestions, group by — including date buckets, "read as dates" for text
+timestamp columns, and numeric bins — summarise, order, top-N), watches the
+chart update live, and saves it to a dashboard. New chart kinds: pie and
+scatter; bar/line/area gained split-by-series and stacked bars.
+
+Explore has no query representation of its own: the screen synthesizes a
+`FlowDef` and everything below that seam is the Flow stack — one compiler,
+every value bound, every identifier checked against the live schema, preview
+under the caller's own ACL/row policy/masks. A saved panel stores the flow
+(withheld from viewers exactly like `sql`) and re-runs per viewer.
+`POST /explore/preview` skips exactly one Flow check — the materialization
+guard — because Explore materializes nothing; that divergence is pinned by a
+test so it cannot be rediscovered as a bug. Deliberately absent: heatmaps,
+dual axes, KPI deltas, maps, percentiles beyond median, viewer-facing Explore.
+
+### Fixed: charts that stopped telling the truth — a review pass
+
+An attacker-style pass rendered the real `charts.tsx` against adversarial
+data and drove the Explore screen end to end. Every item below was reproduced
+before it was changed and has a regression test that fails when the fix is
+reverted (`tests/test_charts_render.py` renders the shipped component under
+node; no chart claim is left untested because "it's frontend").
+
+- **NULL was drawn as a measured zero** — a revenue line plunged to the
+  baseline for a month with no data, the tooltip asserting "0"; bars drew
+  0.5px zero-bars for NULLs the table showed as blank. NULL now renders as a
+  gap, counted in a visible "n missing values shown as gaps, not zero" note.
+- **The series pivot could falsify a trend**: rows sorted by (series, x)
+  rendered a strictly rising series as a peak-and-decline because x labels
+  were ordered by first encounter. The pivot now merges each series' own
+  order (topological), falling back to encounter order only on conflict.
+- **Histogram bins were index-spaced**, so eight empty bins' worth of gap drew
+  identically to one bin's width; bins also rendered in arbitrary order by
+  default. Numeric x axes now sort ascending and materialize empty grid
+  positions as visible empty width (never as fabricated zero marks), and
+  choosing a bin or date bucket defaults the order to ascending, visibly.
+- **Small numbers rounded to lies**: a stat panel showed "0" for 0.004; four
+  distinct nonzero gridlines all labeled "0.00". Formatting now derives
+  decimals from the tick step and switches small KPIs to significant digits;
+  billions get a "B" tier instead of "3900.0M".
+- **Scatter hid structure**: forced zero-anchoring collapsed a tight cluster
+  into less than one pixel; NULL rows vanished uncounted; tooltips omitted
+  which category a point was. Axes now fit the data, skipped rows are
+  counted, and the first categorical column names each point.
+- **Assorted honesty fixes**: grouped bars can no longer overflow into the
+  neighbouring group's band; pie color cycling can't give the closing slice
+  the first slice's color; 100+-slice pies fold their tail into "other";
+  midnight timestamps label as dates; truncated labels stay distinguishable;
+  binding inference scans past a NULL in row 0; wildly mismatched measure
+  scales get a visible warning instead of an invisible series.
+
+And on the Explore screen itself: "Edit in Explore" on a raw-SQL panel no
+longer white-screens the app (and the button no longer appears on SQL
+panels); text-typed timestamp columns can be bucketed by month via a
+synthesized cast — "read as dates" — instead of silently offering nothing;
+compiler refusals are rewritten into the screen's own card vocabulary and the
+two easiest ways to trigger them (duplicate group columns, punctuation in a
+summary name) are refused in plain English before any preview fires; shaping
+state survives a reload (sessionStorage); the sort direction defaults by what
+the column is, so a fresh time series never runs backwards; filter values get
+suggestions drawn through the same governed preview path, and an empty result
+behind a filter says "no rows matched" instead of looking like empty data;
+the object path's pickers grey out properties your masks cover (the aggregate
+API now reports `masked_properties`) instead of offering a chart whose only
+bar is `"***"`.
+
 ### Fixed: Flows — a review pass, and what it found
 
 Every item below was reproduced end to end before it was changed, and each has a

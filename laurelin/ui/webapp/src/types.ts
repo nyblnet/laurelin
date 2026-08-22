@@ -231,7 +231,14 @@ export interface ObjectApp {
   updated_at: string;
 }
 
-export type ChartKind = "table" | "bar" | "line" | "area" | "stat";
+export type ChartKind =
+  | "table"
+  | "bar"
+  | "line"
+  | "area"
+  | "stat"
+  | "pie"
+  | "scatter";
 
 export interface AggregateMetric {
   op: string;
@@ -243,6 +250,9 @@ export interface AggregateResult {
   groups: Record<string, unknown>[];
   group_count: number;
   truncated: boolean;
+  /** Properties this caller's column masks cover — grouping by one collapses
+   *  every object into a single "***" group, so pickers grey them out. */
+  masked_properties?: string[];
 }
 
 /**
@@ -271,16 +281,26 @@ export interface DashboardPanel {
   metrics?: AggregateMetric[];
   filters?: Record<string, string>;
   search?: string;
+  /** Source C: a Flow IR document, what Explore saves. OPERATIONAL — absent
+   *  below editor for exactly the reason `sql` is: the node list names source
+   *  datasets, columns and the author's filter constants. */
+  flow?: Record<string, any>;
+  /** Top-N carried to the compiler as a bound LIMIT. OPERATIONAL. */
+  top?: number | null;
   chart: ChartKind;
   x: string;
   y: string[];
+  /** A categorical result column whose *values* become the series — the
+   *  client pivots long results to wide before rendering. PRESENTATION. */
+  series?: string;
+  stacked?: boolean; // bar only
   width: number; // 1..12 columns
 }
 
 /** True when this panel arrived with its operational half — i.e. we may edit
  *  it. False for a viewer's projection, where editing would write back a hole. */
 export function panelIsWhole(p: DashboardPanel): boolean {
-  return p.sql !== undefined || p.object_type !== undefined;
+  return p.sql !== undefined || p.object_type !== undefined || p.flow !== undefined;
 }
 
 export interface Dashboard {
@@ -900,7 +920,7 @@ export type FlowOp =
   | "in" | "not_in" | "like"
   | "add" | "sub" | "mul" | "div"
   | "if_else" | "coalesce"
-  | "upper" | "lower" | "trim" | "length" | "abs" | "round" | "concat"
+  | "upper" | "lower" | "trim" | "length" | "abs" | "round" | "floor" | "concat"
   | "date_trunc";
 
 export type FlowCastType =
@@ -908,7 +928,7 @@ export type FlowCastType =
 
 export type FlowAggFn =
   | "count_star" | "count" | "count_distinct"
-  | "sum" | "avg" | "min" | "max" | "any_value";
+  | "sum" | "avg" | "min" | "max" | "any_value" | "median";
 
 export type FlowSortDir = "asc" | "desc";
 export type FlowNulls = "first" | "last";

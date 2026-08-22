@@ -394,6 +394,11 @@ class ChartKind(str, Enum):
     line = "line"
     area = "area"
     stat = "stat"  # single big number (first cell of the result)
+    pie = "pie"  # x = label column, y[0] = value column
+    scatter = "scatter"  # x and y[0] both numeric
+    # There is deliberately no `histogram`: a histogram is `bar` over a query
+    # that already binned (floor(col / width) * width in the Flow IR), so the
+    # binning stays inside the governed statement rather than in a renderer.
 
 
 class DashboardPanel(Governed):
@@ -411,7 +416,7 @@ class DashboardPanel(Governed):
     storing a dashboard still grants nobody any new read access, because the
     server, not the browser, is the thing running the query.
 
-    A panel draws from exactly one of two sources:
+    A panel draws from exactly one of three sources:
 
     ``sql``
         Arbitrary SQL over datasets. Maximum power, and it sees raw rows.
@@ -422,6 +427,15 @@ class DashboardPanel(Governed):
         *backing dataset* misses the edit overlay — it answers from rows an
         action has already changed, and the chart gives no hint that it
         disagrees with the object list beside it.
+
+    ``flow``
+        A Flow IR document (`FlowDef.as_json()` shape), what Explore saves.
+        Stored as IR and compiled per run against the live schema — never as
+        compiled SQL, because the run route's SQL branch carries no parameter
+        list, so stored compiled text would silently drop its bound values.
+        Exactly as OPERATIONAL as ``sql``: the node list names source
+        datasets, columns and the author's filter constants, and a filter
+        constant can be a customer name.
     """
 
     laurelin_author_role: ClassVar[Role] = Role.editor
@@ -449,24 +463,42 @@ class DashboardPanel(Governed):
     metrics: list[dict[str, Any]] = Field(default_factory=list)
     filters: dict[str, str] = Field(default_factory=dict)
     search: str = ""
+    # -- source C: a Flow IR document, what Explore saves. OPERATIONAL by
+    # having no annotation, for exactly the reason `sql` is.
+    flow: dict[str, Any] = Field(default_factory=dict)
+    # Top-N carried to `compile_flow(limit=...)` — a bound LIMIT at the
+    # terminal, never a mid-flow node. OPERATIONAL: it is part of the query.
+    top: Optional[int] = Field(default=None, ge=1, le=10_000)
 
     chart: Annotated[ChartKind, Audience.PRESENTATION] = ChartKind.table
     # Column bindings (empty = infer: first text column as x, numeric as y).
     x: Annotated[str, Audience.PRESENTATION] = ""
     y: Annotated[list[str], Audience.PRESENTATION] = Field(default_factory=list)
+    # A categorical result column whose *values* become the series: the client
+    # pivots long results to wide before rendering. PRESENTATION for the same
+    # reason `x`/`y` are — it names a column of a result the viewer receives.
+    series: Annotated[str, Audience.PRESENTATION] = ""
+    stacked: Annotated[bool, Audience.PRESENTATION] = False  # bar only
     width: Annotated[int, Audience.PRESENTATION] = Field(default=6, ge=1, le=12)
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "DashboardPanel":
-        has_sql, has_object = bool(self.sql.strip()), bool(self.object_type.strip())
-        if has_sql and has_object:
+        present = [
+            name for name, filled in (
+                ("sql", bool(self.sql.strip())),
+                ("object_type", bool(self.object_type.strip())),
+                ("flow", bool(self.flow)),
+            ) if filled
+        ]
+        if len(present) > 1:
             raise ValueError(
-                "A panel draws from either sql or object_type, not both — "
-                "two sources would make it ambiguous which one the chart shows."
+                "A panel draws from exactly one of sql, object_type or flow, "
+                f"not {' and '.join(present)} at once — two sources would make "
+                "it ambiguous which one the chart shows."
             )
-        if not has_sql and not has_object:
-            raise ValueError("A panel needs either sql or object_type")
-        if has_object and not self.metrics:
+        if not present:
+            raise ValueError("A panel needs one of sql, object_type or flow")
+        if self.object_type.strip() and not self.metrics:
             raise ValueError(
                 "An object panel needs at least one metric (e.g. "
                 '{"op": "count", "alias": "count"})'
@@ -476,6 +508,10 @@ class DashboardPanel(Governed):
     @property
     def is_object_panel(self) -> bool:
         return bool(self.object_type.strip())
+
+    @property
+    def is_flow_panel(self) -> bool:
+        return bool(self.flow)
 
 
 class DashboardInfo(Governed):

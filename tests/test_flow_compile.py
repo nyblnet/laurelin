@@ -116,6 +116,10 @@ LITERAL_POSITIONS = {
     "in_element": lambda v: _with_in_element(v),
     "like_pattern": lambda v: _with_like_pattern(v),
     "derive_literal": lambda v: _with_derive_literal(v),
+    # The histogram composition Explore emits: bin = floor(col / width) * width.
+    # The width is an author value and appears in TWO positions of the same
+    # expression, so this sweeps both at once.
+    "bin_width_literal": lambda v: _with_bin_width(v),
 }
 
 
@@ -183,6 +187,19 @@ def _with_derive_literal(value):
     return _flow(nodes, "n2")
 
 
+def _with_bin_width(value):
+    nodes = base_nodes()
+    nodes.append({"id": "n2", "kind": "derive", "inputs": ["n1"], "params": {
+        "name": "bin",
+        "expr": {"t": "op", "op": "mul", "args": [
+            {"t": "op", "op": "floor", "args": [
+                {"t": "op", "op": "div",
+                 "args": [col("amount"), lit("string", value)]}]},
+            lit("string", value)]},
+    }})
+    return _flow(nodes, "n2")
+
+
 # ---------------------------------------------------------------------------
 # Identifiers
 # ---------------------------------------------------------------------------
@@ -190,7 +207,8 @@ def _with_derive_literal(value):
 IDENTIFIER_POSITIONS = (
     "source_dataset", "filter_column", "select_column", "rename_from",
     "derive_column_ref", "cast_column", "join_key_left", "join_key_right",
-    "group_by_column", "agg_source_column", "dedupe_key",
+    "group_by_column", "agg_source_column", "median_source_column",
+    "floor_column_ref", "dedupe_key",
     "dedupe_order_column", "sort_column",
 )
 
@@ -234,6 +252,14 @@ def _flow_with_identifier(position, value):
         nodes.append({"id": "n1", "kind": "aggregate", "inputs": ["n0"], "params": {
             "group_by": ["region"],
             "aggs": [{"fn": "sum", "column": value, "as": "total"}]}})
+    elif position == "median_source_column":
+        nodes.append({"id": "n1", "kind": "aggregate", "inputs": ["n0"], "params": {
+            "group_by": ["region"],
+            "aggs": [{"fn": "median", "column": value, "as": "mid"}]}})
+    elif position == "floor_column_ref":
+        nodes.append({"id": "n1", "kind": "derive", "inputs": ["n0"], "params": {
+            "name": "binned",
+            "expr": {"t": "op", "op": "floor", "args": [col(value)]}}})
     elif position == "dedupe_key":
         nodes.append({"id": "n1", "kind": "dedupe", "inputs": ["n0"], "params": {
             "keys": [value], "keep": "first",
@@ -1041,6 +1067,86 @@ def test_a_cast_updates_the_kind_so_the_step_after_it_is_allowed():
                                       "as": "total"}]}},
     ]
     assert _typed(nodes, "n2").schema == ["total"]
+
+
+def test_median_is_an_aggregate_and_is_refused_over_a_text_column_at_compile():
+    """Parity with the ontology aggregate, which has offered `median` since
+    aggregations shipped — an object panel could chart one and a dataset panel
+    could not. Behind the same numeric gate as `sum`/`avg`: a median over text
+    is a BinderException at run, and this is a sentence at compile instead."""
+    def agg(column):
+        return [
+            {"id": "n0", "kind": "source", "inputs": [],
+             "params": {"dataset": "orders"}},
+            {"id": "n1", "kind": "aggregate", "inputs": ["n0"], "params": {
+                "group_by": ["region"],
+                "aggs": [{"fn": "median", "column": column, "as": "mid"}]}},
+            {"id": "n2", "kind": "sort", "inputs": ["n1"], "params": {
+                "by": [{"column": "region", "dir": "asc", "nulls": "last"}]}},
+        ]
+
+    with pytest.raises(FlowRefused) as exc:
+        _typed(agg("status"), "n2")
+    message = str(exc.value)
+    assert "'status'" in message and "median" in message and "text" in message
+
+    # And over a number it compiles, runs, and answers as DuckDB's median.
+    assert _typed(agg("amount"), "n2").kinds["mid"] == "number"
+    _compiled, rows = _run(_flow(agg("amount"), "n2"), {"orders": ORDERS})
+    assert rows == [("eu", 12.5), ("us", 54.5)]
+
+
+def test_floor_compiles_from_the_closed_vocabulary_and_takes_exactly_one_argument():
+    def derive(args):
+        return [
+            {"id": "n0", "kind": "source", "inputs": [],
+             "params": {"dataset": "orders"}},
+            {"id": "n1", "kind": "derive", "inputs": ["n0"], "params": {
+                "name": "f", "expr": {"t": "op", "op": "floor", "args": args}}},
+        ]
+
+    with pytest.raises(FlowRefused) as exc:  # Tier A arity, our sentence
+        _flow(derive([col("amount"), lit("bigint", 2)]), "n1")
+    assert "1 argument" in str(exc.value)
+
+    with pytest.raises(FlowRefused):  # the numeric gate `abs`/`round` share
+        _typed(derive([col("status")]), "n1")
+
+    compiled = compile_flow(_flow(derive([col("amount")]), "n1"), SCHEMAS)
+    assert "floor(" in compiled.sql  # the compiler's own keyword, never a value
+    assert compiled.kinds["f"] == "number"
+
+
+def test_a_histogram_bin_is_a_pure_function_of_the_flow_shape_and_bins_correctly():
+    """The Explore "Histogram" preset: bin = floor(col / width) * width as a
+    `derive`, grouped. The width is an author value, bound in both positions —
+    two widths compile to byte-identical SQL — and the binning happens inside
+    the governed statement, never in a client over raw rows."""
+    def hist(width):
+        return _flow([
+            {"id": "n0", "kind": "source", "inputs": [],
+             "params": {"dataset": "orders"}},
+            {"id": "n1", "kind": "derive", "inputs": ["n0"], "params": {
+                "name": "bin",
+                "expr": {"t": "op", "op": "mul", "args": [
+                    {"t": "op", "op": "floor", "args": [
+                        {"t": "op", "op": "div",
+                         "args": [col("amount"), lit("bigint", width)]}]},
+                    lit("bigint", width)]}}},
+            {"id": "n2", "kind": "aggregate", "inputs": ["n1"], "params": {
+                "group_by": ["bin"],
+                "aggs": [{"fn": "count_star", "as": "n"}]}},
+            {"id": "n3", "kind": "sort", "inputs": ["n2"], "params": {
+                "by": [{"column": "bin", "dir": "asc", "nulls": "last"}]}},
+        ], "n3")
+
+    ten, fifty = compile_flow(hist(10), SCHEMAS), compile_flow(hist(50), SCHEMAS)
+    assert ten.sql == fifty.sql
+    assert ten.params == [10, 10] and fifty.params == [50, 50]
+
+    _compiled, rows = _run(hist(50), {"orders": ORDERS})
+    # amounts [10, 99, 20, 5] with width 50 -> bins 0 (three) and 50 (one).
+    assert rows == [(0, 3), (50, 1)]
 
 
 def test_a_flow_compiled_without_type_information_keeps_every_other_check():

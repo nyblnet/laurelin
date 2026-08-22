@@ -84,9 +84,18 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Schedules** — cron or on-upstream-changed triggers drive builds and
   connector syncs, so pipelines keep themselves current. Exactly-once across
   replicas, with no leader election.
+- **Explore** — point-and-click analysis (Foundry's Contour/Quiver): pick a
+  dataset or object type, shape it by clicking — filter, group (with date
+  buckets and numeric bins), summarise, order, top-N — watch the chart update
+  live, save it to a dashboard. There is no query language anywhere in it:
+  the screen synthesizes a flow, so it rides the Flow compiler's bound
+  parameters, schema-checked identifiers and your own data access. What it
+  won't do (yet): heatmaps, dual axes, maps, percentiles beyond median, or a
+  viewer-facing mode — viewers see the saved panels.
 - **Dashboards** — grids of saved queries rendered as charts (zero-dependency
-  SVG). Panels execute with the *viewer's* credentials, so row-level security
-  and ACLs apply per user.
+  SVG: table, bar, line, area, stat, pie, scatter). Panels execute with the
+  *viewer's* credentials, so row-level security and ACLs apply per user — the
+  query itself never leaves the server.
 - **Apps** — a curated view over one object type: the columns that matter, the
   filters that scope it, the actions an operator should reach for. Configured,
   not coded, and it grants no access the ontology doesn't already.

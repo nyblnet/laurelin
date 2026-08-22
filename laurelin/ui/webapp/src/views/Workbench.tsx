@@ -23,7 +23,7 @@ import {
 } from "../ui";
 import { useAuth } from "../auth";
 
-const RESULT_VIEWS: ChartKind[] = ["table", "bar", "line", "area", "stat"];
+const RESULT_VIEWS: ChartKind[] = ["table", "bar", "line", "area", "stat", "pie", "scatter"];
 
 const MAX_ROWS = 1000;
 const PLACEHOLDER = "-- Write SQL over your datasets. Ctrl+Enter to run.\n";
@@ -65,6 +65,11 @@ export function WorkbenchView() {
   const [dashOpen, setDashOpen] = useState(false);
   const [dashName, setDashName] = useState("");
   const [panelTitle, setPanelTitle] = useState("");
+  // Chart bindings for the saved panel, offered from the just-run result's
+  // columns — the panel used to be saved with x:"", y:[] unconditionally,
+  // leaving every workbench panel on inference forever.
+  const [panelX, setPanelX] = useState("");
+  const [panelY, setPanelY] = useState<string[]>([]);
   const [dashDone, setDashDone] = useState<string | null>(null);
 
   const dashboardsQ = useQuery({
@@ -83,8 +88,8 @@ export function WorkbenchView() {
         title: panelTitle.trim(),
         sql: sqlText,
         chart: view === "table" ? ("table" as const) : view,
-        x: "",
-        y: [],
+        x: panelX,
+        y: panelY,
         width: 6,
       };
       // Append through the per-panel route instead of re-PUTting the board.
@@ -308,6 +313,8 @@ export function WorkbenchView() {
                       onClick={() => {
                         setDashDone(null);
                         addToDash.reset();
+                        setPanelX("");
+                        setPanelY([]);
                         setDashOpen(true);
                       }}
                     >
@@ -424,6 +431,40 @@ export function WorkbenchView() {
                     placeholder="Revenue by region"
                   />
                 </div>
+                {view !== "table" && result && result.columns.length > 0 && (
+                  <>
+                    <div className="field">
+                      <label>X column</label>
+                      <select value={panelX} onChange={(e) => setPanelX(e.target.value)}>
+                        <option value="">(infer)</option>
+                        {result.columns.map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="field">
+                      <label>Y columns (none = all numeric)</label>
+                      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        {result.columns.map((c) => (
+                          <label key={c} className="check-inline">
+                            <input
+                              type="checkbox"
+                              checked={panelY.includes(c)}
+                              onChange={(e) =>
+                                setPanelY((y) =>
+                                  e.target.checked
+                                    ? [...y.filter((x) => x !== c), c]
+                                    : y.filter((x) => x !== c),
+                                )
+                              }
+                            />
+                            <span className="mono" style={{ fontSize: 11.5 }}>{c}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
                 {addToDash.error != null && <ErrorBox error={addToDash.error} />}
                 <div className="toolbar" style={{ marginTop: 16, justifyContent: "flex-end" }}>
                   <button

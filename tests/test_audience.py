@@ -152,7 +152,12 @@ def test_the_projection_omits_operational_keys_rather_than_blanking_them():
     dash = DashboardInfo(name="d", panels=[DashboardPanel(id="p", sql="SELECT 1")])
     panel = serialize.dump_as(dash, Role.viewer)["panels"][0]
     assert "sql" not in panel and "object_type" not in panel
-    assert set(panel) == {"id", "title", "chart", "x", "y", "width"}
+    # `flow` and `top` are the Explore panel's query half; absent for the same
+    # mechanical reason `sql` is — no annotation, no field.
+    assert "flow" not in panel and "top" not in panel
+    assert set(panel) == {
+        "id", "title", "chart", "x", "y", "series", "stacked", "width",
+    }
 
 
 def test_an_editor_receives_the_whole_record_they_could_have_written():

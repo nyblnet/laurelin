@@ -519,6 +519,66 @@ build's aggregate, and a preview that quietly answers a different question is
 worse than a slow one. It asks for one row more than it shows, so "this is all
 of it" and "this is the first page" are distinguishable.
 
+#### Explore: point-and-click data-to-chart
+
+`laurelin/ui/webapp/src/views/Explore.tsx`, `views/explore/model.ts`, one route
+(`POST /explore/preview`), and two `DashboardPanel` fields (`flow`, `top`).
+This is the Contour/Quiver half of the product: an analyst who cannot write SQL
+picks a dataset or an object type, shapes it by clicking — filter, group by
+(with date buckets and numeric bins), summarise, order, top-N — watches the
+chart update live, and saves it to a dashboard.
+
+**Explore has no representation of its own.** There is no ExploreSpec type on
+the server, on the wire, or in storage. The screen's state is synthesized into
+a linear `FlowDef` (`exploreFlow` in `model.ts`:
+source → [filter] → [cast]\* → [derive]\* → aggregate → [sort]) and that
+FlowDef is both the preview's wire format and the saved panel's stored format.
+Everything below the synthesis seam is the Flow stack byte for byte: Tier-A
+validation, the one compiler with every value bound, `_execute_sql`. A date
+bucket over a *text* column — the single most common shape real data arrives
+in — synthesizes the compiler's own `cast` step to timestamp first; a numeric
+bin is `mul(floor(div(col, w)), w)` as a derive. No new IR either way.
+
+`POST /explore/preview` is `/flows/preview` minus exactly one call:
+`check_flow_governance` is **not** run, because its row-policy and
+referenced-mask refusals guard *materialization* ("a flow's result is a new
+dataset without that policy") and Explore materializes nothing — every result
+is computed by `_execute_sql` under the caller's own ACL, row policy and
+masks, and a saved flow panel re-compiles and re-executes per **viewer**, so
+two viewers get different rows from the same panel. That divergence is pinned
+by `test_explore_preview_allows_a_row_policied_source_because_nothing_is_materialized`
+so it cannot later be "discovered" as a bug. Everything else is inherited:
+sources are view-checked before the compiler can name a column, 200-row cap
+with an honest `truncated` flag, first-party refusal sentences, laundered
+engine errors, the shared admission slots.
+
+A saved panel's `flow` and `top` are OPERATIONAL like `sql`: a viewer's `GET`
+carries only the presentation half, and the chart arrives via `/run`. Saving
+a panel validates the bindings (`x`/`y`/`series`) against the compiled schema,
+which is what catches drift after a dataset changes. The object-type path
+saves today's object panel verbatim and involves no SQL synthesis at all; its
+aggregate response names `masked_properties` so the pickers can grey out what
+the caller's masks cover instead of offering a property whose only group is
+`"***"`.
+
+**Charts are hand-rolled SVG** (`src/charts.tsx` — the zero-CDN single-file
+bundle forbids a chart library, permanently) with one governing rule: a mark
+is a claim about a measured value. NULL renders as a gap and is counted in a
+note, never coerced to a zero the tooltip then asserts; numeric bins sit on a
+numeric axis so empty bins are visible width; scatter axes fit the data
+instead of forcing zero; sub-0.01 domains get tick labels derived from the
+tick step rather than a fixed two decimals; a nonzero KPI never rounds to
+"0"; pies fold their tail into "other" past 12 slices.
+
+**What Explore deliberately cannot do:** no heatmap, dual axes, KPI deltas,
+boxplots, or maps (tiles fight the zero-CDN constraint — a separate future
+decision); no percentiles beyond median; no viewer-facing Explore (viewers
+consume saved panels); no pushdown of Explore/flow SQL to StarRocks or
+ClickHouse; and a flow whose shape the Flow builder authored beyond Explore's
+linear grammar reopens with "cannot edit here" rather than being silently
+flattened. Two measures of very different scales share one axis and get a
+visible warning, not a second axis.
+
 ### `laurelin/ontology`
 
 `laurelin/ontology/__init__.py` re-exports `load_ontology, OntologyService`.
@@ -1392,9 +1452,10 @@ until the React shell replaced it at feature parity — see the roadmap's Phase 
 `static/` now holds the built bundle and nothing else.)*
 
 Sidebar navigation (`src/Layout.tsx`, `NAV`), role-filtered:
-**Datasets / Dashboards / Pipeline / Schedules (editor) / Transforms (editor) /
-Apps / Ontology / SQL / Audit**, plus **Admin** for admins and **Workspaces**
-for superadmins. In multi-workspace mode a switcher sits above the nav.
+**Datasets / Dashboards / Explore (editor) / Pipeline / Schedules (editor) /
+Flows (editor) / Transforms (editor) / Apps / Ontology / SQL / Audit**, plus
+**Admin** for admins and **Workspaces** for superadmins. In multi-workspace
+mode a switcher sits above the nav.
 
 - Datasets: list w/ latest version + row counts; detail = schema table, version
   history, paged row preview, and the registration panels for federated /
@@ -1406,8 +1467,13 @@ for superadmins. In multi-workspace mode a switcher sits above the nav.
 - Ontology: object types; per type a searchable object table; object detail
   panel with properties, linked objects, action forms (inputs per parameter,
   submit → POST apply, then refresh); object-store health and writeback.
-- Dashboards: SVG chart grid; a panel's rows come from
+- Dashboards: SVG chart grid (table / bar / line / area / stat / pie /
+  scatter); a panel's rows come from
   `POST /dashboards/{name}/panels/{id}/run`, not from the panel's query.
+- Explore: the point-and-click data-to-chart screen (see the Flows section's
+  Explore subsection) — source rail, shaping cards, live preview, save to
+  dashboard. Its shaping state survives a reload via sessionStorage; a saved
+  flow panel's "Edit in Explore" reopens the exact state.
 - Admin: users, groups, dataset + ontology access, row & column security,
   markings and clearances, workspace files on disk, and Portability
   (export / import / governance fingerprint diff).

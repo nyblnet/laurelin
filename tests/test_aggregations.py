@@ -271,3 +271,44 @@ def test_aggregate_over_http(tmp_path):
                       json={"metrics": [{"op": "nope"}]})
     assert bad.status_code == 400
     assert "Unknown aggregation" in bad.json()["detail"]
+
+
+def test_the_aggregate_names_the_callers_masked_properties(tmp_path):
+    """Grouping by a masked property is allowed — the mask holds and every
+    object lands in one "***" group — but that chart is inexplicable unless
+    the picker can say "masked for you" the way the dataset path's pickers
+    do. `masked_properties` is disclosure only: which of *your* masks cover
+    declared properties. Enforcement stays in the scan, and a caller with no
+    masks gets an empty list, not an enumeration of anyone else's policy."""
+    from fastapi.testclient import TestClient
+
+    from laurelin.api import create_app
+    from laurelin.core.auth import hash_password
+    from laurelin.core.models import Role, User
+
+    ws = Workspace.init(tmp_path / "ws", name="mask")
+    store = MetadataStore(ws.metadata_path)
+    DatasetCatalog(ws, store).write("orders", orders())
+    (ws.ontology_dir / "o.yml").write_text(ONTOLOGY)
+    store.create_user(User(id="a", username="ana", role=Role.editor),
+                      hash_password("pw"))
+    app = create_app(ws)
+    ana = TestClient(app)
+    assert ana.post("/api/v1/auth/login",
+                    json={"username": "ana", "password": "pw"}).status_code == 200
+
+    body = {"group_by": ["region"], "metrics": [{"op": "count", "alias": "n"}]}
+    r = ana.post("/api/v1/ontology/objects/order/aggregate", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["masked_properties"] == []  # no policy, nothing to report
+
+    store.set_dataset_policy("orders", {
+        "row_policy": None,
+        "column_masks": [{"column": "region", "mode": "redact"}],
+    })
+    r = ana.post("/api/v1/ontology/objects/order/aggregate", json=body)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["masked_properties"] == ["region"]
+    # The mask itself still holds: one group, the sentinel.
+    assert {g["region"] for g in out["groups"]} == {"***"}

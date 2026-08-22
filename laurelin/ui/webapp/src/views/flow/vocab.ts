@@ -143,6 +143,7 @@ export const OPS: Record<FlowOp, OpMeta> = {
   length: { label: "how many characters", form: "call" },
   abs: { label: "without the minus sign", form: "call" },
   round: { label: "rounded", form: "call" },
+  floor: { label: "rounded down to a whole number", form: "call" },
   date_trunc: { label: "rounded down to a whole", form: "call" },
 };
 
@@ -157,7 +158,7 @@ export const COMBINE_OPS: FlowOp[] = ["and", "or", "not"];
 
 /** Value-producing operations, for "Add a column". */
 export const VALUE_OPS: FlowOp[] = [
-  "add", "sub", "mul", "div", "round", "abs",
+  "add", "sub", "mul", "div", "round", "floor", "abs",
   "concat", "upper", "lower", "trim", "length",
   "coalesce", "if_else", "date_trunc",
 ];
@@ -209,13 +210,16 @@ export const AGG_FNS: Record<FlowAggFn, string> = {
   count_distinct: "Number of different values",
   sum: "Total",
   avg: "Average",
+  // "Middle value", not "median": half the audience for this menu knows the
+  // word, and the half that doesn't is exactly who the menu is for.
+  median: "Middle value (median)",
   min: "Smallest",
   max: "Largest",
   any_value: "Any one value",
 };
 
 export const AGG_FN_ORDER: FlowAggFn[] = [
-  "count_star", "sum", "avg", "min", "max",
+  "count_star", "sum", "avg", "median", "min", "max",
   "count", "count_distinct", "any_value",
 ];
 

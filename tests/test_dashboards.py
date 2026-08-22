@@ -370,12 +370,18 @@ def test_per_panel_routes_edit_one_panel_without_touching_the_others(clients):
 # the chart says it disagrees with the object list beside it. An object panel
 # goes through /aggregate instead, which sees the overlay.
 
-def test_a_panel_needs_exactly_one_source():
-    with pytest.raises(ValidationError, match="either sql or object_type"):
+def test_a_panel_draws_from_exactly_one_of_sql_object_type_or_flow():
+    with pytest.raises(ValidationError, match="one of sql, object_type or flow"):
         DashboardPanel(id="p")
-    with pytest.raises(ValidationError, match="not both"):
+    with pytest.raises(ValidationError, match="exactly one"):
         DashboardPanel(id="p", sql="SELECT 1", object_type="order",
                        metrics=[{"op": "count"}])
+    with pytest.raises(ValidationError, match="exactly one"):
+        DashboardPanel(id="p", sql="SELECT 1", flow={"name": "explore"})
+    with pytest.raises(ValidationError, match="exactly one"):
+        DashboardPanel(id="p", object_type="order", metrics=[{"op": "count"}],
+                       flow={"name": "explore"})
+    assert DashboardPanel(id="p", flow={"name": "explore"}).is_flow_panel
 
 
 def test_an_object_panel_needs_a_metric():
@@ -430,7 +436,7 @@ def test_a_panel_with_both_sources_is_rejected_by_the_api(clients):
                     "metrics": [{"op": "count"}]}],
     })
     assert r.status_code == 400
-    assert "not both" in r.json()["detail"]
+    assert "exactly one" in r.json()["detail"]
 
 
 # -- the two panel kinds have to look the same on the wire ----------------------
@@ -672,3 +678,244 @@ def test_a_panels_column_labels_are_captions_and_reach_the_viewer_by_design(
 
     run = viewer.post("/api/v1/dashboards/labels/panels/o/run", json={}).json()
     assert run["columns"] == ["status", "how many"]
+
+
+# -- flow-backed panels (source C: what Explore saves) -------------------------
+#
+# A flow panel stores the Flow IR — never compiled SQL, because this run route's
+# SQL branch carries no parameter list, so stored compiled text would silently
+# drop its bound values — and compiles it per run against the live schema, then
+# executes as the CALLER down the same `_execute_sql` path as a SQL panel.
+
+
+def _explore_flow(filter_value=None, aggs=None):
+    """The flow Explore synthesizes over `sales`: group by region, sum amount."""
+    nodes = [
+        {"id": "n0", "kind": "source", "inputs": [],
+         "params": {"dataset": "sales"}},
+        {"id": "n1", "kind": "aggregate", "inputs": ["n0"], "params": {
+            "group_by": ["region"],
+            "aggs": aggs or [{"fn": "sum", "column": "amount", "as": "total"}]}},
+        {"id": "n2", "kind": "sort", "inputs": ["n1"], "params": {
+            "by": [{"column": "region", "dir": "asc", "nulls": "last"}]}},
+    ]
+    if filter_value is not None:
+        nodes.insert(1, {"id": "nf", "kind": "filter", "inputs": ["n0"], "params": {
+            "predicate": {"t": "op", "op": "ne", "args": [
+                {"t": "col", "name": "region"},
+                {"t": "lit", "type": "string", "value": filter_value}]}}})
+        nodes[2]["inputs"] = ["nf"]
+    return {"name": "explore", "output": "explore", "terminal": "n2",
+            "nodes": nodes}
+
+
+FLOW_PANEL = {
+    "id": "f1", "title": "Revenue by region", "flow": _explore_flow(),
+    "chart": "bar", "x": "region", "y": ["total"],
+}
+
+
+def test_a_viewer_sees_flow_panel_rows_for_a_flow_they_never_received(clients):
+    """The SQL-panel invariant, carried onto source C: the viewer gets the
+    rows from the run route and never the instruction that produced them."""
+    admin, viewer = clients
+    assert admin.put("/api/v1/dashboards/rev",
+                     json={"title": "Rev", "panels": []}).status_code == 200
+    r = admin.post("/api/v1/dashboards/rev/panels", json=FLOW_PANEL)
+    assert r.status_code == 200, r.text
+
+    run = viewer.post("/api/v1/dashboards/rev/panels/f1/run", json={})
+    assert run.status_code == 200, run.text
+    body = run.json()
+    assert sorted(body) == ["columns", "row_count", "rows", "truncated"]
+    assert body["columns"] == ["region", "total"]
+    assert body["rows"] == [{"region": "eu", "total": 7.0},
+                            {"region": "us", "total": 15.0}]
+
+
+def test_a_flow_panels_flow_and_top_are_withheld_from_a_viewer(clients):
+    """R2 for source C. The flow's node list names source datasets, columns and
+    the author's filter constants — a filter constant can be a customer name —
+    so it is exactly as OPERATIONAL as `sql`, and `top` is part of the query."""
+    admin, viewer = clients
+    sentinel = "FLOWSECRET-CUSTOMER-NAME"
+    panel = {**FLOW_PANEL, "flow": _explore_flow(filter_value=sentinel),
+             "top": 5, "series": "", "stacked": True}
+    assert admin.put("/api/v1/dashboards/rev2",
+                     json={"title": "Rev", "panels": []}).status_code == 200
+    assert admin.post("/api/v1/dashboards/rev2/panels",
+                      json=panel).status_code == 200
+
+    seen = viewer.get("/api/v1/dashboards/rev2").json()["panels"][0]
+    for presentation in ("id", "title", "chart", "x", "y", "series",
+                         "stacked", "width"):
+        assert presentation in seen, presentation
+    assert "flow" not in seen and "top" not in seen
+    assert sentinel not in viewer.get("/api/v1/dashboards/rev2").text
+    assert sentinel not in viewer.get("/api/v1/dashboards").text
+
+    # The editor who could have authored it still round-trips the whole panel.
+    mine = admin.get("/api/v1/dashboards/rev2").json()["panels"][0]
+    assert mine["flow"] == _explore_flow(filter_value=sentinel)
+    assert mine["top"] == 5
+
+
+def test_two_viewers_with_different_row_policies_get_different_rows_from_the_same_flow_panel(ws):
+    """A stored flow compiles per run and executes as the caller, so the
+    caller's row policy decides what the aggregate sums — the same guarantee
+    the SQL branch carries, on the same `_execute_sql` path."""
+    app = create_app(ws)
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=CREDS).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=CREDS).status_code == 200
+    for name in ("eve", "uma"):
+        assert admin.post(
+            "/api/v1/users",
+            json={"username": name, "password": "password123", "role": "viewer"},
+        ).status_code in (200, 201)
+    assert admin.put("/api/v1/datasets/sales/policy", json={
+        "row_policy": {"column": "region", "rules": [
+            {"subject_kind": "user", "subject": "eve", "values": ["eu"]},
+            {"subject_kind": "user", "subject": "uma", "values": ["us"]},
+        ]},
+        "column_masks": [],
+    }).status_code == 200
+    assert admin.put("/api/v1/dashboards/rev",
+                     json={"title": "Rev", "panels": []}).status_code == 200
+    assert admin.post("/api/v1/dashboards/rev/panels",
+                      json=FLOW_PANEL).status_code == 200, "admin saves as admin"
+
+    def rows_for(username):
+        c = _client(app, username)
+        r = c.post("/api/v1/dashboards/rev/panels/f1/run", json={})
+        assert r.status_code == 200, r.text
+        return {row["region"]: row["total"] for row in r.json()["rows"]}
+
+    assert rows_for("eve") == {"eu": 7.0}
+    assert rows_for("uma") == {"us": 15.0}
+
+
+def test_a_flow_panels_refusal_or_engine_error_never_reaches_the_viewer_verbatim(clients):
+    """`FlowRefused` names steps, columns and — on a missing reference — the
+    dataset's available schema. That is authoring text: the editor who could
+    fix the panel reads it; the viewer running the panel gets the laundered
+    `Failure` brief, exactly as the object branch launders its ontology
+    sentences. The stale panel is planted through the whole-board PUT, which
+    does not compile-validate — the drift case the run route must survive."""
+    admin, viewer = clients
+    stale = _explore_flow()
+    stale["nodes"][1]["params"]["group_by"] = ["dropped_upstream"]
+    assert admin.put("/api/v1/dashboards/stale", json={
+        "title": "S",
+        "panels": [{"id": "f1", "title": "t", "flow": stale}],
+    }).status_code == 200, "the whole-board PUT stores without compiling"
+
+    r = viewer.post("/api/v1/dashboards/stale/panels/f1/run", json={})
+    assert r.status_code == 400
+    assert "dropped_upstream" not in r.text          # the stored instruction
+    assert "'region'" not in r.text and "'amount'" not in r.text  # the schema
+    assert "definition_stale" in r.text or "no longer" in r.text
+
+    mine = admin.post("/api/v1/dashboards/stale/panels/f1/run", json={})
+    assert mine.status_code == 400
+    assert "dropped_upstream" in mine.json()["detail"]
+
+
+def test_a_flow_panels_top_n_travels_as_a_bound_limit_at_the_terminal(clients):
+    """`top` is part of the question — bar chart of the top N — not a
+    truncation: with `top` under the run's `max_rows` the compiled LIMIT is
+    exactly `top` (`test_the_preview_limit_is_bound_and_applied_only_at_the_previewed_node`
+    pins that it binds, terminally, as `?`), and `truncated` stays false."""
+    admin, viewer = clients
+    assert admin.put("/api/v1/dashboards/topn",
+                     json={"title": "T", "panels": []}).status_code == 200
+    assert admin.post("/api/v1/dashboards/topn/panels",
+                      json={**FLOW_PANEL, "top": 1}).status_code == 200
+
+    run = viewer.post("/api/v1/dashboards/topn/panels/f1/run", json={}).json()
+    assert run["rows"] == [{"region": "eu", "total": 7.0}]  # sorted, then LIMIT 1
+    assert run["truncated"] is False  # the author asked for 1; nothing was cut
+
+    assert admin.put("/api/v1/dashboards/topn/panels/f1",
+                     json={**FLOW_PANEL, "top": None}).status_code == 200
+    assert viewer.post("/api/v1/dashboards/topn/panels/f1/run",
+                       json={}).json()["row_count"] == 2
+
+
+def test_saving_a_flow_panel_refuses_bindings_absent_from_the_compiled_schema(clients):
+    """The drift guard only the server can hold: x/y/series must name columns
+    the compiled flow really produces. Client dropdowns pick from a preview;
+    a flow edited later can leave a stale binding behind, and this is what
+    catches it at the write."""
+    admin, _viewer = clients
+    assert admin.put("/api/v1/dashboards/bind",
+                     json={"title": "B", "panels": []}).status_code == 200
+
+    for field, broken in (
+        ("x", {**FLOW_PANEL, "x": "regionn"}),
+        ("y", {**FLOW_PANEL, "y": ["total", "no_such"]}),
+        ("series", {**FLOW_PANEL, "series": "status"}),
+    ):
+        r = admin.post("/api/v1/dashboards/bind/panels", json=broken)
+        assert r.status_code == 400, (field, r.text)
+        detail = r.json()["detail"]
+        assert "'region'" in detail and "'total'" in detail  # what IS available
+
+    assert admin.post("/api/v1/dashboards/bind/panels",
+                      json=FLOW_PANEL).status_code == 200
+    # …and the update route holds the same line.
+    r = admin.put("/api/v1/dashboards/bind/panels/f1",
+                  json={**FLOW_PANEL, "x": "nope"})
+    assert r.status_code == 400
+
+
+def test_saving_a_flow_panel_checks_the_authors_view_rights_on_its_sources(ws):
+    """The same source gate `/flows/preview` runs, at the same place in the
+    order: before compilation, so the refusal cannot enumerate a schema the
+    author may not read."""
+    app = create_app(ws)
+    admin = TestClient(app)
+    assert admin.post("/api/v1/auth/setup", json=CREDS).status_code == 200
+    assert admin.post("/api/v1/auth/login", json=CREDS).status_code == 200
+    assert admin.post("/api/v1/users", json={
+        "username": "ned", "password": "password123", "role": "editor",
+    }).status_code in (200, 201)
+    # Grant sales to nobody but root by granting it to a third user.
+    assert admin.put("/api/v1/datasets/sales/permissions", json={"grants": [{
+        "subject_kind": "user", "subject": "root",
+        "can_view": True, "can_edit": True,
+    }]}).status_code == 200
+    assert admin.put("/api/v1/dashboards/gated",
+                     json={"title": "G", "panels": []}).status_code == 200
+
+    ned = _client(app, "ned")
+    r = ned.post("/api/v1/dashboards/gated/panels", json=FLOW_PANEL)
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "cannot read" in detail and "sales" in detail
+    assert "'region'" not in detail and "'amount'" not in detail
+
+
+def test_saving_an_explore_over_an_object_type_is_exactly_an_object_panel(object_clients):
+    """The object half of Explore adds NO representation: saving one is
+    today's object panel verbatim — `object_type`/`group_by`/`metrics`/
+    `filters` — through the same per-panel route, run by the same overlay-aware
+    branch. `filters` is exercised because Explore is the first UI that writes
+    it."""
+    admin, viewer = object_clients
+    assert admin.put("/api/v1/dashboards/exp",
+                     json={"title": "E", "panels": []}).status_code == 200
+    r = admin.post("/api/v1/dashboards/exp/panels", json={
+        "id": "o1", "title": "Maintenance by status", "object_type": "aircraft",
+        "group_by": ["status"], "metrics": [{"op": "count", "alias": "n"}],
+        "filters": {"status": "maintenance"}, "chart": "bar",
+        "x": "status", "y": ["n"],
+    })
+    assert r.status_code == 200, r.text
+    stored = admin.get("/api/v1/dashboards/exp").json()["panels"][0]
+    assert stored["flow"] == {} and stored["top"] is None
+    assert stored["filters"] == {"status": "maintenance"}
+
+    run = viewer.post("/api/v1/dashboards/exp/panels/o1/run", json={}).json()
+    assert run["columns"] == ["status", "n"]
+    assert run["rows"] == [{"status": "maintenance", "n": 2}]

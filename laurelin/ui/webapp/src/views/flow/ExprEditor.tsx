@@ -419,7 +419,7 @@ const ARITY: Record<FlowOp, [number, number | null]> = {
   add: [2, 2], sub: [2, 2], mul: [2, 2], div: [2, 2],
   if_else: [3, 3], coalesce: [2, null],
   upper: [1, 1], lower: [1, 1], trim: [1, 1], length: [1, 1], abs: [1, 1],
-  round: [1, 2], concat: [2, null], date_trunc: [2, 2],
+  round: [1, 2], floor: [1, 1], concat: [2, null], date_trunc: [2, 2],
 };
 
 // ------------------------------------------------------------------ conditions

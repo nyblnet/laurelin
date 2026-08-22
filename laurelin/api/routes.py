@@ -772,12 +772,93 @@ def run_dashboard_panel(
             "row_count": len(groups),
             "truncated": bool(agg.get("truncated", False)),
         }
+    if panel.is_flow_panel:
+        # Source C: a stored Flow IR document, compiled per run against the
+        # live schema and executed **as the caller** down the same
+        # `_execute_sql` path as a SQL panel — the caller's ACL (an unviewable
+        # source fails as an unknown table), row-level security and column
+        # masks apply on every run, so two viewers get different rows from the
+        # same panel. Stored as IR rather than compiled SQL deliberately: this
+        # route's SQL branch carries no parameter list, so stored compiled
+        # text would silently drop its bound values.
+        try:
+            flow = FlowDef.from_json(panel.flow)
+            # Sources are view-checked against the CALLER before the compiler
+            # can name a column — the same disclosure ordering as
+            # `_compiled_flow` — because `resolve_column`'s refusal enumerates
+            # a schema, and an editor-role caller may read this panel's
+            # refusal text (`stored_instruction_error` below) without being
+            # able to read the dataset it describes.
+            check_flow_sources(store, perms, user, flow)
+            # `top` is the panel's own top-N — part of the question, bound as
+            # `LIMIT ?` at the terminal only. When it fits under `max_rows`
+            # the limit is exactly `top` and `truncated` stays false;
+            # otherwise `max_rows + 1`, so `catalog.query`'s independent
+            # fetch-and-compare can actually fire (see preview_flow).
+            top = panel.top
+            limit = (top if top is not None and top <= body.max_rows
+                     else body.max_rows + 1)
+            compiled = compile_flow_now(catalog, flow, limit=limit)
+        except Exception as exc:
+            # `FlowRefused` included: its message names steps, columns and —
+            # on a source refusal — dataset schemas, which is authoring text.
+            # The editor who could have written this panel gets the sentence;
+            # a viewer gets the laundered `Failure` brief.
+            raise stored_instruction_error(
+                exc, subject=f"panel:{panel_id}", author=Role.editor
+            ) from None
+        return _execute_sql(
+            catalog, store, perms, user, compiled.sql, body.max_rows,
+            params=compiled.params, server_authored=True,
+        )
     return _execute_sql(catalog, store, perms, user, panel.sql, body.max_rows)
+
+
+def _check_flow_panel(
+    catalog: DatasetCatalog,
+    store: MetadataStore,
+    perms: PermissionService,
+    user: User,
+    panel: DashboardPanel,
+) -> None:
+    """Validate a *flow* panel at save time; a no-op for the other two kinds.
+
+    Tier A, the author's view rights on the sources (before compilation — the
+    same disclosure ordering as `_compiled_flow`), Tier B against the live
+    schema, and then the chart bindings against the compiled result schema.
+    The binding check is the one only the server can hold: the Explore UI's
+    dropdowns are populated from a preview, but a flow edited later can drift
+    away from bindings saved earlier, and a client picker cannot see that.
+
+    These are EDITOR routes and the flow is the caller's own submission, so
+    `FlowRefused` is served verbatim (`_flow_or_400`) exactly as the authoring
+    routes under /flows serve it. (SQL panels stay unvalidated — their text
+    cannot be checked without executing it — and object panels are validated
+    by the ontology at run time.)
+    """
+    if not panel.is_flow_panel:
+        return
+    flow = _flow_or_400(FlowDef.from_json, panel.flow)
+    compiled = _flow_or_400(_compiled_flow, catalog, store, perms, user, flow)
+    produced = set(compiled.schema)
+    bindings = [("x", panel.x), ("series", panel.series)]
+    bindings += [("y", column) for column in panel.y]
+    for label, bound in bindings:
+        if bound and bound not in produced:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This panel binds {label} to column {bound!r}, but the "
+                    "flow's result does not produce it. Its columns are: "
+                    + ", ".join(repr(c) for c in compiled.schema) + "."
+                ),
+            )
 
 
 @router.post("/dashboards/{name}/panels", dependencies=[EDITOR])
 def add_dashboard_panel(
-    name: str, panel: DashboardPanel, store: StoreDep, actor: ActorDep
+    name: str, panel: DashboardPanel, catalog: CatalogDep, store: StoreDep,
+    perms: PermDep, user: UserDep, actor: ActorDep
 ) -> dict:
     """Append one panel. Exists so a client never has to re-PUT the whole board.
 
@@ -794,15 +875,18 @@ def add_dashboard_panel(
         )
     if len(dash.panels) >= 50:
         raise HTTPException(status_code=400, detail="A dashboard is limited to 50 panels")
+    _check_flow_panel(catalog, store, perms, user, panel)
     return _save_panels(store, dash, [*dash.panels, panel], actor)
 
 
 @router.put("/dashboards/{name}/panels/{panel_id}", dependencies=[EDITOR])
 def update_dashboard_panel(
-    name: str, panel_id: str, panel: DashboardPanel, store: StoreDep, actor: ActorDep
+    name: str, panel_id: str, panel: DashboardPanel, catalog: CatalogDep,
+    store: StoreDep, perms: PermDep, user: UserDep, actor: ActorDep
 ) -> dict:
     dash, _existing = _stored_panel(store, name, panel_id)
     updated = panel.model_copy(update={"id": panel_id})
+    _check_flow_panel(catalog, store, perms, user, updated)
     return _save_panels(
         store, dash,
         [updated if p.id == panel_id else p for p in dash.panels],
@@ -2705,4 +2789,90 @@ def eject_flow(
         ).as_dict()
     return result | {
         "ejected": True, "inputs": inputs, "output_restricted": restricted,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Explore: point-and-click data-to-chart
+#
+# Explore has NO representation of its own — not on the wire, not in storage.
+# The UI synthesizes a FlowDef (source → filter → derive → aggregate → sort)
+# and this route runs it through the exact stack `/flows/preview` runs:
+# `FlowDef.from_json` (Tier A), `_compiled_flow` (view rights, then Tier B
+# against the live schema, every value bound), `_execute_sql` (the only SQL
+# execution path, as the caller). A second, "lighter" query language here
+# would be a second compiler, and a second compiler is a second injection and
+# governance surface — the mistake this seam exists to prevent.
+#
+# EDITOR, matching /flows: the shaping vocabulary and `/flows/schema` (which
+# feeds Explore's pickers) are authoring surfaces. Viewers consume saved
+# panels, which run server-side as themselves.
+# ---------------------------------------------------------------------------
+
+
+class ExplorePreviewRequest(BaseModel):
+    # A FlowDef, exactly as /flows/preview takes one. The only query-shaped
+    # type this route parses is the one the Flow compiler already validates.
+    flow: dict
+    max_rows: int = 50
+
+
+@router.post("/explore/preview", dependencies=[EDITOR])
+def preview_explore(
+    body: ExplorePreviewRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """Run an Explore query — a synthesized flow — **as the caller**.
+
+    `preview_flow` minus exactly one call, and the difference is deliberate:
+    **`check_flow_governance` is not run here.** Its row-policy and
+    referenced-mask refusals guard *materialization* — "a flow's result is a
+    new dataset without that policy" (flow_governance.py) — and Explore
+    materializes nothing. Every result is computed by `_execute_sql` under
+    the caller's own ACL, row-level security and column masks (the same way
+    the workbench and SQL panels already serve row-policied datasets), and a
+    saved flow panel re-compiles and re-executes per viewer. Refusing here
+    would make Explore unable to chart exactly the governed datasets it
+    exists for, while protecting nothing. A referenced masked column is not
+    refused either: the mask renders `***` in the scan — the caller watching
+    the mask work — and `masked_columns` lets the UI grey those columns out
+    of the measure pickers instead of letting DuckDB surface a binder error.
+
+    Everything else is inherited, not re-solved: sources are view-checked
+    *before* the compiler can name a column (`_compiled_flow`'s disclosure
+    ordering); the limit is bound at the terminal as `max_rows + 1` so
+    `truncated` can actually fire; errors are first-party sentences
+    (`FlowRefused` verbatim — this is the author's own draft) or
+    `_FLOW_EXEC_ADVICE`, never driver echo; and the 200-row / 2GB / 60s /
+    8-slot admission posture is `FLOW_PREVIEW_MAX_ROWS` and `limits.py`,
+    shared with every other interactive surface.
+
+    `schema` + `kinds` in the response are what drive the UI's binding
+    dropdowns (x/y/series), so a chart can only ever be bound to columns the
+    compiled result really has.
+    """
+    flow = _flow_or_400(FlowDef.from_json, body.flow, name=body.flow.get("name"))
+    max_rows = max(1, min(int(body.max_rows), FLOW_PREVIEW_MAX_ROWS))
+    compiled = _flow_or_400(
+        _compiled_flow, catalog, store, perms, user, flow,
+        limit=max_rows + 1,
+    )
+    result = _flow_execution(
+        _execute_sql, catalog, store, perms, user, compiled.sql, max_rows,
+        params=compiled.params,
+        server_authored=True,
+    )
+    masked: dict[str, list[str]] = {}
+    for ds in flow.source_datasets():
+        columns = sorted(masked_columns_for(perms, user, ds))
+        if columns:
+            masked[ds] = columns
+    return result | {
+        "schema": compiled.schema,
+        "kinds": compiled.kinds,
+        "masked_columns": masked,
+        "max_rows": max_rows,
     }

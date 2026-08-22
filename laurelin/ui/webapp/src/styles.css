@@ -16,6 +16,9 @@
   --green: #5fb87a;
   --red: #e0665f;
   --blue: #5b9bd5;
+  /* Sixth categorical series color. Charts must reference tokens, never hex,
+     so a future light theme is one :root away. */
+  --series-6: #8a7fd6;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --sidebar-w: 232px;

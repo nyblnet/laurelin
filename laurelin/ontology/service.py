@@ -1031,6 +1031,20 @@ class OntologyService:
         if not specs:
             raise ValueError("At least one metric is required")
 
+        # Which properties this caller's masks cover, so the UI can grey them
+        # out of its pickers instead of offering them normally. Grouping by a
+        # masked property is *allowed* — the mask holds, every object lands in
+        # one "***" group — but without this annotation that chart was
+        # inexplicable: the dataset path's pickers say "masked for you" and
+        # the object path said nothing. Disclosure only; enforcement stays in
+        # the scan.
+        decision = self._decision_for(ot.backing_dataset)
+        masked_properties = sorted(
+            column
+            for column, _mode in (decision.masks if decision is not None else [])
+            if column in declared
+        )
+
         with self._object_scan(ot, search, filters) as (con, sql, params, cols, _pk):
             if con is not None:
                 missing = [p for p in group_by if p not in cols]
@@ -1041,11 +1055,15 @@ class OntologyService:
                         f"Property {missing[0]!r} is not present in dataset "
                         f"{ot.backing_dataset!r}"
                     )
-                return self._aggregate_sql(con, sql, params, group_by, specs, limit)
+                out = self._aggregate_sql(con, sql, params, group_by, specs, limit)
+                out["masked_properties"] = masked_properties
+                return out
 
         # No faithful pushdown (hash masking, an untypeable overlay): compute
         # over the exact in-memory objects instead. Slower, never wrong.
-        return self._aggregate_python(ot, group_by, specs, filters, search, limit)
+        out = self._aggregate_python(ot, group_by, specs, filters, search, limit)
+        out["masked_properties"] = masked_properties
+        return out
 
     def _metric_spec(self, metric: dict, declared: set[str], type_name: str) -> dict:
         op = str(metric.get("op", "")).lower()

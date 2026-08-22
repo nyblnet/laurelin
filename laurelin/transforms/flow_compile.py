@@ -367,7 +367,7 @@ _POSTFIX: dict[str, str] = {"is_null": " IS NULL", "is_not_null": " IS NOT NULL"
 _FUNCS: dict[str, str] = {
     "coalesce": "coalesce", "upper": "upper", "lower": "lower",
     "trim": "trim", "length": "length", "abs": "abs", "round": "round",
-    "concat": "concat",
+    "concat": "concat", "floor": "floor",
 }
 
 
@@ -379,6 +379,7 @@ _FUNCS: dict[str, str] = {
 _NUMBER_OPS: dict[str, str] = {
     "add": "adds", "sub": "subtracts from", "mul": "multiplies",
     "div": "divides", "abs": "takes the size of", "round": "rounds",
+    "floor": "rounds down",
 }
 
 
@@ -750,15 +751,18 @@ def _compile_node(
                 continue
             col = resolve_column(a["column"], schema, node=nid, field="aggs")
             source_kind = kinds.get(a["column"], "")
-            if a["fn"] in ("sum", "avg") and source_kind in ("text", "boolean"):
+            if a["fn"] in ("sum", "avg", "median") and source_kind in ("text", "boolean"):
                 # The single most common first mistake, and until this check
                 # existed the flow SAVED and then failed its build with
                 # "Laurelin's own code raised". `count` is named in the remedy
-                # because it is almost always what was meant.
+                # because it is almost always what was meant. `median` sits
+                # behind the same gate as `sum`/`avg`: a median over text is a
+                # BinderException at run, and a sentence here instead.
                 raise _refuse_kind(
                     node=nid, field="aggs", column=a["column"], actual=source_kind,
                     wanted="number",
-                    doing="totals" if a["fn"] == "sum" else "averages",
+                    doing={"sum": "totals", "avg": "averages",
+                           "median": "takes the median of"}[a["fn"]],
                     remedy=(
                         "Use 'Number of rows with a value' to count them "
                         "instead, or add a 'cast' step converting the column "

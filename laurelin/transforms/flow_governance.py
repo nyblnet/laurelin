@@ -419,5 +419,18 @@ def masked_columns_for(perms, user: Optional[User], dataset: str) -> set[str]:
     columns = {m.column for m in policy.column_masks}
     if not columns:
         return set()
-    decision = perms.decide(dataset, columns, user)
+    probe = set(columns)
+    if policy.row_policy is not None:
+        # `decide()` fails closed — denies everything, masks included — when
+        # the row-policy column is absent from the projection it is asked
+        # about. Right for a read; wrong for this question, which is only
+        # "which columns are masked". Measured through `/explore/preview` (the
+        # first caller that reaches a row-policied dataset: `/flows/preview`
+        # refuses those outright before ever asking): a dataset with a row
+        # policy AND a redact mask served `***` in the rows while
+        # `masked_columns` said nothing was masked, so the UI offered the
+        # masked column in its measure pickers. Include the row column in the
+        # probe so the decision is about the masks.
+        probe.add(policy.row_policy.column)
+    decision = perms.decide(dataset, probe, user)
     return {column for column, _mode in decision.masks}

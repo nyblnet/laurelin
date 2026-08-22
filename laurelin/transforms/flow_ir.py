@@ -114,6 +114,12 @@ CAST_TYPES: dict[str, str] = {
 AGG_FNS: tuple[str, ...] = (
     "count_star", "count", "count_distinct", "sum", "avg", "min", "max",
     "any_value",
+    # Parity with the ontology aggregate (`OntologyService.AGGREGATIONS`),
+    # which has offered `median` since aggregations shipped: an object-backed
+    # dashboard panel could chart a median while a dataset-backed one could
+    # not. Spelled the same in DuckDB, so the aggregate compiler's generic
+    # `fn(col)` branch renders it; the numeric gate lives beside sum/avg.
+    "median",
 )
 
 JOIN_HOWS: dict[str, str] = {"inner": "INNER JOIN", "left": "LEFT JOIN"}
@@ -150,6 +156,11 @@ OPS: dict[str, tuple[int, Optional[int]]] = {
     "if_else": (3, 3), "coalesce": (2, None),
     "upper": (1, 1), "lower": (1, 1), "trim": (1, 1),
     "length": (1, 1), "abs": (1, 1), "round": (1, 2),
+    # `floor` exists for numeric histograms: bin = mul(floor(div(col, width)),
+    # width) as a `derive`, then group by the derived column — so the binning
+    # runs inside the governed, parameter-bound query instead of shipping raw
+    # rows to a client to bucket. Rendered from `_FUNCS` like `abs`/`round`.
+    "floor": (1, 1),
     "concat": (2, None),
     "date_trunc": (2, 2),
 }

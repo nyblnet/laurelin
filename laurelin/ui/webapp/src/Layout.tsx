@@ -24,6 +24,10 @@ import { Badge } from "./ui";
 const NAV: { to: string; label: string; needs?: Role }[] = [
   { to: "/datasets", label: "Datasets" },
   { to: "/dashboards", label: "Dashboards" },
+  // Beside Dashboards, because it is how dashboards get made: point-and-click
+  // shaping into a chart. Editor-gated like Flows — its preview compiles and
+  // runs queries, an authoring act.
+  { to: "/explore", label: "Explore", needs: "editor" },
   { to: "/pipeline", label: "Pipeline" },
   { to: "/schedules", label: "Schedules", needs: "editor" },
   // Flows sits ABOVE Transforms: the no-code builder is the front door and
