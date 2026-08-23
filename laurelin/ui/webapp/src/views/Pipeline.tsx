@@ -435,6 +435,20 @@ export function PipelineView() {
 
       <ImportedPipelinesNotice />
 
+      {/* The lock posture, said where builders look. Builds themselves are
+          unaffected — the lock closes *authoring* Python, not running what
+          exists on disk. */}
+      {auth.pipelinesLocked && auth.can("editor") && (
+        <div className="withheld-box">
+          <div className="withheld-head">Python authoring is locked on this server</div>
+          <p>
+            Pipeline files are managed on disk (<code>--lock-pipelines</code>); existing
+            transforms still build. Flows and Explore remain available for authoring without
+            code.
+          </p>
+        </div>
+      )}
+
       {runBuild.isError && <ErrorBox error={runBuild.error} />}
 
       {/* ----------------------------------------------------- lineage */}

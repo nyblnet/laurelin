@@ -66,8 +66,10 @@ governs the table without holding it, and you reduce at the boundary.
   CDC, no Kafka, no sub-second freshness.
 - **Not a multi-tenant SaaS with hostile tenants.** Pipelines are Python the
   server executes; an editor who can write a pipeline has code execution.
-  `--lock-pipelines` exists for exactly this, but the honest posture is:
-  editors are trusted colleagues. See [SECURITY.md](../SECURITY.md).
+  `--lock-pipelines` exists for exactly this — and editors keep Flows and
+  Explore, no-code authoring that cannot reach `exec` — but the honest
+  posture is: editors are trusted colleagues. See
+  [SECURITY.md](../SECURITY.md).
 - **Not battle-tested.** It is early. It has 3,132 tests, run against both
   SQLite and PostgreSQL, and a coherent design; it does not have years of
   production hours behind it.
@@ -693,7 +695,7 @@ What it does **not** do, and will not pretend to:
 | 1–50 M rows/dataset, entities modeled separately | Works well. Sync incrementally (`mode: append`), use `streaming=True` for row-wise transforms, SQL transforms for aggregation. |
 | A large table with a small daily delta | Fine — appends cost the delta, not the dataset. Compact periodically. |
 | > 100 M rows, or > 5 M objects/type | Not in the embedded role. Federate or delegate it, or serve it from StarRocks/ClickHouse and govern the read; then use Laurelin over the reduced result. |
-| Hostile multi-tenancy | Use `--lock-pipelines` and separate workspaces — or wait for stronger isolation. |
+| Hostile multi-tenancy | Use `--lock-pipelines` (and `--lock-flows` if even no-code authoring is too much) and separate workspaces — or wait for stronger isolation. |
 | Sub-second streaming freshness | Wrong tool. |
 
 **Concurrency and resource limits.** Each query occupies a worker for its

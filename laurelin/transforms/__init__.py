@@ -11,7 +11,7 @@ from laurelin.transforms.api import (
     use_registry,
 )
 from laurelin.transforms.authoring import PipelineFiles
-from laurelin.transforms.builder import Builder
+from laurelin.transforms.builder import Builder, TransformRefused
 from laurelin.transforms.expectations import (
     Expectation,
     ExpectationError,
@@ -41,6 +41,7 @@ __all__ = [
     "PipelineError",
     "PipelineFiles",
     "TransformRegistry",
+    "TransformRefused",
     "TransformSpec",
     "Builder",
     "accepted_values",

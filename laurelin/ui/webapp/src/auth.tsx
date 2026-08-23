@@ -25,6 +25,11 @@ interface AuthContextValue {
   role: Role;
   /** viewer < editor < admin */
   can: (role: Role) => boolean;
+  // Server lock posture (from /auth/status): which authoring surfaces an
+  // operator disabled. Distinct from `can(...)` — a lock is server-wide and
+  // no role or administrator can save through it without a restart.
+  pipelinesLocked: boolean;
+  flowsLocked: boolean;
   // Multi-workspace:
   multi: boolean;
   isSuperadmin: boolean;
@@ -54,7 +59,11 @@ function writeWsCookie(slug: string): void {
   document.cookie = `${WS_COOKIE}=${encodeURIComponent(slug)}; path=/; SameSite=Lax; Max-Age=31536000`;
 }
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+// Exported for the node mount harness (tests/webapp_harness), which renders
+// real views with a synthetic signed-in identity because AuthProvider only
+// reaches a usable state through effects, and server rendering runs none.
+// App code goes through <AuthProvider> and useAuth(), never this directly.
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
@@ -129,6 +138,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const multi = !!status.multi;
   const isSuperadmin = !!status.user?.superadmin;
   const workspaces = status.user?.workspaces ?? [];
+  const pipelinesLocked = !!status.authoring?.pipelines_locked;
+  const flowsLocked = !!status.authoring?.flows_locked;
 
   // Effective role. No-auth dev mode → admin. Single mode → account role.
   // Multi mode → superadmin is admin, else the membership role in the active
@@ -153,6 +164,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       role,
       can: (needed: Role) => RANK[role] >= RANK[needed],
       multi,
+      pipelinesLocked,
+      flowsLocked,
       isSuperadmin,
       workspaces,
       activeSlug,
@@ -165,7 +178,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       onUnauthorized,
     }),
-    [loading, status, role, multi, isSuperadmin, workspaces, activeSlug, setActiveWorkspace, refresh, login, setup, logout, onUnauthorized],
+    [loading, status, role, multi, isSuperadmin, pipelinesLocked, flowsLocked, workspaces, activeSlug, setActiveWorkspace, refresh, login, setup, logout, onUnauthorized],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

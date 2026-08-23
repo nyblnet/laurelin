@@ -470,6 +470,7 @@ def create_app(
     no_auth: bool = False,
     secure_cookies: bool = False,
     lock_pipelines: bool = False,
+    lock_flows: bool = False,
     database_url: Optional[str] = None,
 ) -> FastAPI:
     """Single-workspace server (``serve --workspace``). Identity lives in the
@@ -481,6 +482,7 @@ def create_app(
     since SQLite cannot be shared safely across hosts."""
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
+    lock_flows = lock_flows or os.environ.get("LAURELIN_LOCK_FLOWS") == "1"
     database_url = database_url or os.environ.get("LAURELIN_DATABASE_URL")
     store = MetadataStore(database_url or workspace.metadata_path)
     catalog = DatasetCatalog(workspace, store)
@@ -498,6 +500,7 @@ def create_app(
     app.state.no_auth = no_auth
     app.state.secure_cookies = secure_cookies
     app.state.lock_pipelines = lock_pipelines
+    app.state.lock_flows = lock_flows
     app.state.auth = AuthService(store)
     return _finalize(app)
 
@@ -509,6 +512,7 @@ def create_server_app(
     no_auth: bool = False,
     secure_cookies: bool = False,
     lock_pipelines: bool = False,
+    lock_flows: bool = False,
 ) -> FastAPI:
     """Multi-workspace server (``serve --root``). Global identity + a workspace
     registry live in the control store — ``<root>/control.db`` (SQLite) by
@@ -525,6 +529,7 @@ def create_server_app(
     mkdir_private(root)
     no_auth = no_auth or os.environ.get("LAURELIN_NO_AUTH") == "1"
     lock_pipelines = lock_pipelines or os.environ.get("LAURELIN_LOCK_PIPELINES") == "1"
+    lock_flows = lock_flows or os.environ.get("LAURELIN_LOCK_FLOWS") == "1"
     control_url = control_url or os.environ.get("LAURELIN_CONTROL_DATABASE_URL")
     control = ControlStore(control_url) if control_url else ControlStore(root / "control.db")
 
@@ -542,4 +547,5 @@ def create_server_app(
     app.state.no_auth = no_auth
     app.state.secure_cookies = secure_cookies
     app.state.lock_pipelines = lock_pipelines
+    app.state.lock_flows = lock_flows
     return _finalize(app)

@@ -500,12 +500,17 @@ function FlowBuilder({ name }: { name: string }) {
   const maskedList = Object.entries(maskedByDataset);
 
   const blockedByWorkspace = save.error instanceof ApiError && save.error.status === 409;
-  // `--lock-pipelines` covers flows, deliberately: the flag's contract is "no
-  // authoring on this server", and a flow authors a transform that runs as the
-  // system and reads datasets. A bare "403" would read as "you personally are
-  // not allowed", which is the wrong diagnosis and sends the author to an
-  // administrator who cannot help without a restart.
-  const authoringLocked = save.error instanceof ApiError && save.error.status === 403;
+  // `--lock-pipelines` no longer covers flows — that flag locks *code* (a
+  // pipeline file is exec'd as the server), while a flow compiles to bound,
+  // schema-checked SQL and cannot reach exec. Flows have their own lock,
+  // `--lock-flows`, and the boot probe (/auth/status) tells us up front
+  // whether it is set, so the banner renders before the author builds
+  // something unsaveable. The 403-on-save path stays as a backstop for a
+  // client whose cached auth status predates a server restart: a lock 403 is
+  // server-wide, not personal, and sending the author to an administrator who
+  // cannot help without a restart is the wrong diagnosis.
+  const authoringLocked =
+    auth.flowsLocked || (save.error instanceof ApiError && save.error.status === 403);
   //  0 = every value in this flow is a keyword the compiler owns, so the SQL is
   //  self-contained and a Python pipeline can hold all of it.
   // >0 = the flow binds that many author-supplied values, and eject is refused.
@@ -576,15 +581,26 @@ function FlowBuilder({ name }: { name: string }) {
           <button
             type="button"
             onClick={() => setEjectOpen(true)}
-            disabled={dirty}
+            disabled={dirty || auth.pipelinesLocked}
             /* No longer gated on `boundValues`. It used to be, because
                `TransformSpec` had no `params` field, so every flow carrying a
                single filter constant — which is to say every flow that filters
                anything — was excluded from the advertised escape hatch, and the
                only explanation lived in this tooltip. `sql_transform` now takes
                bound values, so the generated pipeline binds them exactly as the
-               flow did and nothing is written into the SQL text. */
-            title={dirty ? "Save first." : "Convert this flow into a Python pipeline. One way."}
+               flow did and nothing is written into the SQL text.
+
+               Gated on the server's Python lock, though: eject writes a `.py`,
+               which is exactly what `--lock-pipelines` exists to prevent, and
+               the server refuses it with a 403. Disabled with the reason here,
+               rather than letting the click fail. */
+            title={
+              auth.pipelinesLocked
+                ? "Python authoring is locked on this server (--lock-pipelines), and ejecting writes a Python file."
+                : dirty
+                  ? "Save first."
+                  : "Convert this flow into a Python pipeline. One way."
+            }
           >
             Open in Python…
           </button>
@@ -627,10 +643,10 @@ function FlowBuilder({ name }: { name: string }) {
           the author to Transforms, where a flow file cannot be opened). */}
       {authoringLocked ? (
         <div className="fx-note fx-note-bad">
-          <strong>This server does not accept pipeline changes.</strong> Flows, like Python
-          transforms, can only be edited where authoring is enabled — an operator started this
-          server with authoring locked. Nothing you have on screen is lost; it just cannot be
-          saved here. The flows that already exist still build and still run.
+          <strong>Flow authoring is locked on this server.</strong> An operator started it with{" "}
+          <code>--lock-flows</code>, so flows cannot be saved or deleted here by anyone — this is
+          the server's posture, not your permissions. Nothing you have on screen is lost; it just
+          cannot be saved here. The flows that already exist still build and still run.
         </div>
       ) : blockedByWorkspace ? (
         <div className="fx-note fx-note-bad">

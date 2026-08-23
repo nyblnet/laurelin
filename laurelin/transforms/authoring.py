@@ -3,8 +3,11 @@
 This backs in-browser transform authoring. Writing a pipeline file is
 **code-execution-equivalent**: the file is ``exec``'d during every build and
 metadata collection. Access to these operations is therefore gated at
-``editor`` and can be disabled entirely (``--lock-pipelines`` /
-``LAURELIN_LOCK_PIPELINES``) for hardened multi-tenant deployments. Nothing
+``editor`` and can be disabled (``--lock-pipelines`` /
+``LAURELIN_LOCK_PIPELINES``) for hardened multi-tenant deployments. That lock
+covers exactly the code-execution surface: flows — no-code artifacts compiled
+to bound SQL that cannot reach ``exec`` — stay authorable under it and have
+their own ``--lock-flows`` / ``LAURELIN_LOCK_FLOWS``. Nothing
 here sandboxes the executed code; that is a separate (roadmap) concern.
 """
 

@@ -221,6 +221,10 @@ actor.
    inherent to the feature, not a bug, and it's why in-browser transform
    authoring is editor-gated. On a multi-tenant or untrusted-editor
    deployment, serve with `--lock-pipelines` and manage pipelines through git.
+   Editors keep Flows and Explore under the lock — no-code authoring that
+   compiles to bound SQL and cannot reach `exec` — so locking Python does not
+   take authoring away from analysts. (`--lock-flows` exists if you want no
+   authoring at all.)
 2. **TLS and `--secure-cookies`.** Session cookies get the `Secure` flag; put a
    TLS-terminating ingress in front. See [DEPLOYMENT.md](../DEPLOYMENT.md).
 

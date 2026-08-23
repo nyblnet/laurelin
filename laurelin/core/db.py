@@ -449,6 +449,11 @@ CREATE TABLE IF NOT EXISTS clearances (
     PRIMARY KEY (username, marking)
 );
 CREATE INDEX IF NOT EXISTS idx_clearances_user ON clearances (username);
+CREATE TABLE IF NOT EXISTS pipeline_authors (
+    name TEXT PRIMARY KEY,
+    author TEXT NOT NULL,
+    written_at TEXT NOT NULL
+);
 {{EXTRA_DDL}}
 """
 
@@ -2620,6 +2625,45 @@ class MetadataStore:
         with self._conn() as c:
             for d, eff in effective.items():
                 self._set_effective_markings(c, d, eff)
+
+    # -- pipeline authors ---------------------------------------------------------
+    #
+    # Who last saved pipelines/<name>.py THROUGH THE API. The Builder checks
+    # that author's read access over every input immediately before running the
+    # file's transforms, exactly as a flow's recorded author is re-checked at
+    # every build. A file with no row here was authored on disk (git, import,
+    # the CLI) and builds operator-trusted, unchecked — disk possession is
+    # already the CLI's stated credential, and imported .py is already
+    # admin-acknowledged on every build entry point.
+    #
+    # In the store rather than in the file because a .py cannot carry a
+    # server-stamped field its author can't forge: the body is written
+    # verbatim, so anything in-file would be author-controlled — which is
+    # precisely what FlowFiles.write's server-side author stamp exists to
+    # prevent. Not the audit log: that is append-only prose, prunable via
+    # LAURELIN_AUDIT_MAX_EVENTS.
+
+    def set_pipeline_author(self, name: str, author: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO pipeline_authors (name, author, written_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     author = excluded.author,
+                     written_at = excluded.written_at""",
+                (name, author, utcnow_iso()),
+            )
+
+    def get_pipeline_author(self, name: str) -> Optional[str]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT author FROM pipeline_authors WHERE name = ?", (name,)
+            ).fetchone()
+        return row["author"] if row else None
+
+    def delete_pipeline_author(self, name: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM pipeline_authors WHERE name = ?", (name,))
 
     def set_dataset_policy(self, dataset: str, policy: Optional[dict]) -> None:
         with self._conn() as c:

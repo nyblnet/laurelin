@@ -178,7 +178,17 @@ export function TransformsView() {
         subtitle="Author pipeline code. Transforms are Python — use @transform / @sql_transform. Build them from the Pipeline tab."
         actions={
           canEdit ? (
-            <button type="button" className="primary" onClick={newFile}>
+            <button
+              type="button"
+              className="primary"
+              onClick={newFile}
+              disabled={auth.pipelinesLocked}
+              title={
+                auth.pipelinesLocked
+                  ? "Python authoring is locked on this server (--lock-pipelines)."
+                  : undefined
+              }
+            >
               + New file
             </button>
           ) : undefined
@@ -196,6 +206,23 @@ export function TransformsView() {
       </div>
 
       <ImportedPipelinesNotice />
+
+      {/* Said up front, from the boot probe — not discovered as a 403 after
+          the author has already written the code they cannot save. The lock
+          is `--lock-pipelines`: it closes Python (exec'd as the server), and
+          deliberately not Flows/Explore (no-code, compiled to bound SQL). */}
+      {canEdit && auth.pipelinesLocked && (
+        <div className="withheld-box">
+          <div className="withheld-head">Python authoring is locked on this server</div>
+          <p>
+            An operator started it with <code>--lock-pipelines</code>, so pipeline files can be
+            read here but only edited on disk (through git and review). This is the server&apos;s
+            posture, not your permissions. <Link to="/flows">Flows</Link> and{" "}
+            <Link to="/explore">Explore</Link> remain available — they build the same kind of
+            transform without code.
+          </p>
+        </div>
+      )}
 
       {/* R2 raised the *read* here to editor, and the page has to say so
           instead of showing a 403 in a red box. A pipeline file is exec'd on

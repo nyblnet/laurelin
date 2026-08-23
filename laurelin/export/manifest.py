@@ -1,6 +1,6 @@
 """What a workspace export carries, and what it deliberately does not.
 
-``TABLE_POLICY`` is the single source of truth. Every one of the 27 metadata
+``TABLE_POLICY`` is the single source of truth. Every one of the 28 metadata
 tables appears in it exactly once, with the columns that travel spelled out —
 an **allowlist**, never a denylist. That direction is the whole security
 argument: a column added tomorrow that nobody classified defaults to *absent*,
@@ -270,6 +270,18 @@ TABLE_POLICY: dict[str, TableSpec] = {
         scan_columns=("config_json",),
         conflict_key=("name",),
         order=32,
+    ),
+    "pipeline_authors": TableSpec(
+        _PORTABLE,
+        "Who last saved each pipelines/*.py through the API; the Builder "
+        "checks that author's read access before running the file's "
+        "transforms. Travels so an imported workspace keeps its API-authored "
+        "files entitlement-checked; an author who does not exist at the "
+        "destination refuses the build with the reassignment remedy, exactly "
+        "as an imported flow's author already does.",
+        columns=("name", "author", "written_at"),
+        conflict_key=("name",),
+        order=36,
     ),
     "schedules": TableSpec(
         _PORTABLE,

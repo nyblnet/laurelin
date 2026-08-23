@@ -34,7 +34,8 @@ secretEnv: {}
   # LAURELIN_SCIM_TOKEN: "..."
 
 secureCookies: true      # set false only when NOT behind TLS
-lockPipelines: false     # disable in-browser transform authoring (untrusted tenants)
+lockPipelines: false     # disable in-browser Python authoring (untrusted tenants); Flows/Explore stay available
+lockFlows: false         # disable no-code flow authoring too (with lockPipelines: no authoring at all)
 
 persistence:
   enabled: true

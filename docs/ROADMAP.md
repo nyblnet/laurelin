@@ -272,8 +272,10 @@ Key bets, and why:
 - ✅ **Visual pipeline builder ("Flows")** — backend and UI landed. **done**
       A flow is a declarative artifact (`pipelines/<name>.flow.json`) compiled
       to bound SQL in memory and registered into the *same* `TransformRegistry`
-      as `pipelines/*.py`, so lineage, markings, expectations, build leases,
-      the acknowledgement gate and `--lock-pipelines` all cover it unchanged.
+      as `pipelines/*.py`, so lineage, markings, expectations, build leases and
+      the acknowledgement gate all cover it unchanged. Flow authoring has its
+      own lock (`--lock-flows`); `--lock-pipelines` locks only Python, so a
+      hardened server keeps a no-code authoring path.
 
       **This bullet used to promise the builder would "emit the same Python/SQL
       files — the visual layer is a *view over code*, never a proprietary

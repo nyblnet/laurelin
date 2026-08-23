@@ -10,6 +10,101 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Security: API-authored Python transforms no longer launder ACLs, row policies or column masks
+
+An editor who could not view a dataset could save `@sql_transform(query=
+"SELECT * FROM s")` through the API, build it, and read every row of the copy
+— unfiltered, unmasked, world-readable. Closed at the build, not the route:
+the three pipeline-writing routes (`PUT /pipelines/{name}`,
+`POST /pipelines/from-query`, `POST /flows/{name}/eject`) now record the
+saving user server-side (`pipeline_authors`, never taken from the body —
+the same contract as a flow's author), and the Builder refuses any python/sql
+task whose recorded author cannot read every input **in full**: view rights,
+no row policy, and no column mask, resolved with the same author semantics as
+flows (deleted author refuses; a zero-user workspace is exempt). The check
+binds to the recorded author and never the triggering principal, so an admin
+pressing "build", the scheduler, and the CLI all enforce it identically.
+
+Per its own docstring's instruction, the pinning test
+`test_the_python_transform_path_still_launders_acls_row_policies_and_column_masks`
+has been **deleted** — the gap it documented is closed — and replaced by
+`tests/test_build_governance.py`, which asserts the laundering is refused and
+that legitimate pipelines still build.
+
+**Behaviour change, deliberate and not opt-in:** an API-authored pipeline
+refuses to build when an input carries a row policy or column mask **that
+applies to its recorded author** — one that filters the author's rows, or
+masks a column from them. A Python transform's touched columns are unknowable,
+so *any* mask that applies to the author refuses where a flow could drop the
+masked column; the remedy is in the refusal (author it as a flow, or re-save
+it as someone entitled). The check is about *applicability*, not the mere
+presence of a policy: an admin (who bypasses every policy) and an author
+explicitly exempt from a mask read the input in full and build — so an admin's
+re-save is the recovery path, and a routine re-save of a pipeline over a
+dataset whose policy does not touch its author is not turned into a refused
+build. It is resolved through `PermissionService.decide()`, the same resolver
+the read path uses, so it cannot disagree with what an actual read would show.
+
+Pipelines authored on disk (git, import, CLI) have no recorded author and
+build unchecked — operator-trusted, exactly as before, and now pinned by a
+test. Existing API-saved files from before this change are unstamped and
+therefore also unchanged until re-saved. A `--no-auth` server records no
+author (every request is the implicit admin, not a real user), so its files
+stay operator-trusted and build — a workspace that carries real users (an
+imported one, or an authed workspace restarted with `--no-auth`) is no longer
+made unbuildable by a stamped `anonymous`. The `pipeline_authors` table travels
+in workspace export/import; an imported author who does not exist at the
+destination refuses the build with the reassignment remedy, as flows already
+did.
+
+**Operational note:** because a build is checked against its recorded author,
+deleting an author account (offboarding) makes that author's API-saved
+pipelines refuse until an admin re-saves them or reassigns them. Disk-managed
+files are unaffected. This is the fail-closed direction — a build must not run
+as nobody — but it is a change from the pre-item-58 world where builds carried
+no identity.
+
+**Out of scope, unchanged:** a pipeline function body is arbitrary Python
+`exec`'d as the server process, so it can read any dataset on disk regardless
+of its declared inputs — this is the remote-code-execution surface that
+`--lock-pipelines` exists to close (see SECURITY.md), not something the
+input-entitlement check claims to. Item 58 closes laundering through the
+governed build seam; item 59's lock closes the code execution beneath it.
+
+### Changed: `--lock-pipelines` locks code, not clicks — Flows stay authorable; new `--lock-flows`
+
+There is now a safe production posture. `--lock-pipelines` /
+`LAURELIN_LOCK_PIPELINES=1` no longer refuses `PUT`/`DELETE /flows/{name}`:
+the flag's contract — stated in its own help text since it shipped — is that
+writing a pipeline file is code-execution-equivalent, and a flow is not code.
+It compiles to parameterised SQL (every value bound, every identifier checked
+against the live schema), is refused if it would launder a mask, and is
+re-checked against its recorded author at every build. Locking both behind one
+flag meant a hardened server had no authoring path at all, so the flag went
+unset and every editor kept remote code execution. The intended deployment is
+now expressible: **Python locked, Flows and Explore open, eject locked**
+(`POST /flows/{name}/eject` writes a `.py` and still refuses under
+`--lock-pipelines`; it also refuses under `--lock-flows`, since it consumes a
+flow file). Workspace import and the imported-pipelines acknowledgement gate
+stay behind `--lock-pipelines` — an archive carries `pipelines/*.py`.
+
+**Upgrade note for hardened operators:** if you run `--lock-pipelines` and
+relied on it also freezing flow authoring, that widened on this upgrade — set
+the new `--lock-flows` / `LAURELIN_LOCK_FLOWS=1` alongside it to keep exactly
+the old total lockdown. Dashboard raw-SQL panels were never covered by any
+lock (they execute as the calling viewer under row policies and masks) and
+remain out of scope of both flags.
+
+`GET /auth/status` now reports
+`"authoring": {"pipelines_locked", "flows_locked"}`, and the UI says the
+posture up front instead of letting an author discover it as a 403 on save:
+Transforms/Pipeline show a "Python authoring is locked — Flows and Explore
+remain available" notice, the Workbench's "save as transform" says whether it
+was the role or the lock, Flows disables eject with the reason, and a
+`--lock-flows` server banners the Flows screen pre-emptively. A structural
+test walks the app's dependency trees and pins the exact guarded route set for
+both flags, so silently dropping a guard fails loudly.
+
 ### Added: Explore — point-and-click data-to-chart
 
 The Contour/Quiver half of the product. An analyst who cannot write SQL picks a

@@ -66,6 +66,12 @@ class TransformSpec:
     # Assertions the output must satisfy, checked against the written Parquet
     # parts *before* the version is committed — see laurelin.transforms.expectations.
     expectations: list = field(default_factory=list)
+    # The stem of the pipelines/*.py file this spec was collected from, set by
+    # `_collect_python` and by nothing else. It is the key the Builder uses to
+    # look up the file's API-recorded author (`pipeline_authors`) for the
+    # build-time input-entitlement check. None for flow specs (a flow carries
+    # its own author) and for in-memory registries, which are operator code.
+    source_file: Optional[str] = None
 
 
 class TransformRegistry:
@@ -347,6 +353,7 @@ def _collect_python(pipelines_dir: Path, registry: TransformRegistry) -> None:
                 "__file__": str(path),
                 "__builtins__": __builtins__,
             }
+            before = len(registry.all())
             try:
                 code = compile(path.read_text(), str(path), "exec")
                 exec(code, namespace)
@@ -355,6 +362,12 @@ def _collect_python(pipelines_dir: Path, registry: TransformRegistry) -> None:
                     f"Error in pipeline file {path}: {type(exc).__name__}: {exc}",
                     pipeline=path.stem,
                 ) from exc
+            # Attribute every spec this file just registered to the file, so
+            # the Builder can resolve its API-recorded author. The delta is
+            # exactly this file's specs: `register` is the registry's only
+            # mutation point and dict insertion order is stable.
+            for spec in registry.all()[before:]:
+                spec.source_file = path.stem
 
 
 def _collect_flow_files(pipelines_dir: Path, registry: TransformRegistry) -> None:

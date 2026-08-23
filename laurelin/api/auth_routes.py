@@ -228,8 +228,16 @@ def _status_user(request: Request, user: User) -> dict:
 def auth_status(request: Request, user: CurrentUser) -> dict:
     """Never 401s — the UI probes this before deciding to show a login form."""
     multi = is_multi(request)
+    # The lock posture rides along on the boot probe so the UI can say
+    # "Python authoring is locked here" up front, instead of letting an
+    # author build something and discover the lock as a 403 on save.
+    authoring = {
+        "pipelines_locked": bool(request.app.state.lock_pipelines),
+        "flows_locked": bool(request.app.state.lock_flows),
+    }
     if request.app.state.no_auth:
         return {"auth_required": False, "setup_required": False, "multi": multi,
+                "authoring": authoring,
                 "oidc": _oidc_status(request), "saml": _saml_status(request),
                 "user": _status_user(request, user) if user else None}
     setup_required = identity_store(request).count_users() == 0
@@ -237,6 +245,7 @@ def auth_status(request: Request, user: CurrentUser) -> dict:
         "auth_required": True,
         "setup_required": setup_required,
         "multi": multi,
+        "authoring": authoring,
         "oidc": _oidc_status(request),
         "saml": _saml_status(request),
         "user": _status_user(request, user) if user else None,

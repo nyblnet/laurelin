@@ -33,6 +33,11 @@ export interface AuthStatus {
   oidc?: OidcStatus;
   saml?: OidcStatus;
   user: User | null;
+  /** Server lock posture, so screens can say "locked here" before the 403. */
+  authoring?: {
+    pipelines_locked: boolean;
+    flows_locked: boolean;
+  };
 }
 
 export interface WorkspaceSummary {

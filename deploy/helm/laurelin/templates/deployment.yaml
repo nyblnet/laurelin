@@ -39,6 +39,9 @@ spec:
             {{- if .Values.lockPipelines }}
             - --lock-pipelines
             {{- end }}
+            {{- if .Values.lockFlows }}
+            - --lock-flows
+            {{- end }}
           ports:
             - name: http
               containerPort: 8787

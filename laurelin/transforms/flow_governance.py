@@ -1,19 +1,21 @@
 """What a flow author is allowed to read, and what the flow's output inherits.
 
-This module is **stricter than the Python transform path, deliberately.**
+This module was written **stricter than the Python transform path,
+deliberately** — measured on this tree at the time: an editor who could not
+view ``secret_ds`` could write ``@sql_transform(query="SELECT * FROM s")``,
+build it, and read every row of the copy — unfiltered, unmasked, and
+world-readable. The whole point of the no-code builder is to make *every
+analyst* an editor, and inheriting that hole would have handed it to everyone
+in the business.
 
-Measured on this tree, and pinned by
-``tests/test_flow_governance.py::test_the_python_transform_path_still_launders_acls_row_policies_and_column_masks``:
-an editor who cannot view ``secret_ds`` can write ``@sql_transform(query="SELECT
-* FROM s")``, build it, and read every row of the copy — unfiltered, unmasked,
-and world-readable. "Inherit the Python path exactly" would mean inheriting
-that.
-
-The whole point of the no-code builder is to make *every analyst* an editor.
-Inheriting a laundering hole and then handing it to everyone in the business is
-not defensible, so flows do not inherit it. The asymmetry is the honest product
-claim: the no-code surface is safer than the code surface, and the Python
-path's gap is documented and tested-as-stated rather than quietly widened.
+That Python-path gap is now closed for API-authored pipeline files:
+``Builder._check_input_entitlement`` re-checks the file's recorded author
+(``pipeline_authors``) against every input at every build, resolving the
+author through this module's ``_author_user`` so the two paths cannot drift.
+Flows remain stricter in one dimension: the mask check here is
+column-granular, where a Python transform's touched columns are unknowable
+and any masked input refuses. Disk-authored ``.py`` remains operator-trusted
+— see ``MetadataStore.set_pipeline_author``.
 
 Where this runs
 ---------------
@@ -90,8 +92,8 @@ def referenced_columns(flow: FlowDef) -> set[str]:
     return names
 
 
-def _author_user(store, author) -> User:
-    """Resolve the flow's author to a live user, or refuse.
+def _author_user(store, author, what: str = "flow") -> User:
+    """Resolve the flow's (or pipeline's) author to a live user, or refuse.
 
     ``author`` is either a ``User`` — the request path already authenticated
     one, and re-looking it up would be a chance to resolve to a *different*
@@ -103,12 +105,17 @@ def _author_user(store, author) -> User:
     for row policy, but ``can_view_dataset(None, …)`` is a different question,
     and guessing here is how a governance hole gets built. Refuse, and put the
     remedy in the sentence.
+
+    ``what`` names the artifact in the refusal ("flow" or "pipeline"). The
+    Builder's input-entitlement check for API-authored Python/SQL transforms
+    resolves *its* recorded author through this same function, deliberately:
+    two resolutions of "who does this build run as" must not drift.
     """
     if isinstance(author, User):
         return author
     if not author:
         raise FlowRefused(
-            "This flow has no recorded author, so Laurelin cannot work out "
+            f"This {what} has no recorded author, so Laurelin cannot work out "
             "whose read access its build should be checked against. Re-save "
             "it, or ask an administrator to set its author.",
             field="author",
@@ -125,7 +132,7 @@ def _author_user(store, author) -> User:
         # `--no-auth` already grants every request.
         return User(id="", username=str(author) or "anonymous", role=Role.admin)
     raise FlowRefused(
-        f"This flow's author {author!r} no longer exists, so its build "
+        f"This {what}'s author {author!r} no longer exists, so its build "
         "cannot be checked against anyone's read access. Ask an "
         "administrator to reassign it to a current user.",
         field="author",

@@ -1,8 +1,10 @@
 """The /flows routes: the public shape the UI is built against.
 
 Also the tests that prove a flow is a *transform* rather than a parallel
-system: it collides with a Python pipeline over the same output, it appears in
-`GET /transforms`, and it is covered by `--lock-pipelines`.
+system: it collides with a Python pipeline over the same output and it appears
+in `GET /transforms`. Authoring locks are split: `--lock-pipelines` locks code
+(Python files, and eject — which writes one), `--lock-flows` locks no-code
+flow authoring; the lock tests at the bottom pin the split.
 """
 
 from __future__ import annotations
@@ -360,24 +362,86 @@ def test_the_column_picker_route_404s_for_a_dataset_that_does_not_exist(client):
 # ---------------------------------------------------------------------------
 
 
-def test_lock_pipelines_disables_flow_writes_and_eject_but_not_reads(workspace):
-    """`--lock-pipelines` means "no authoring on this server".
-
-    A flow authors a transform that runs as the system and reads datasets.
-    Exempting flows would silently widen what a hardened deployment permits.
+def test_lock_pipelines_locks_code_not_flows_flow_writes_succeed_python_writes_and_eject_refuse(workspace):
+    """`--lock-pipelines` locks *code execution*, which is what its name and its
+    help text always said: a pipeline file is Python exec'd as the server
+    process. A flow is not code — it compiles to parameterised SQL with every
+    value bound and every identifier schema-checked, is refused if it would
+    launder a mask, and is re-checked against its recorded author at every
+    build. Locking both behind one flag left hardened deployments with no
+    authoring path at all, so the flag went unset and every editor kept RCE —
+    the safe production posture (Python locked, Flows/Explore open, eject
+    locked) did not exist. Now it does. Eject stays locked because it is the
+    escape hatch back into code. Operators who want the old total lockdown add
+    `--lock-flows` (see the companion test below).
     """
-    open_client = TestClient(create_app(workspace, no_auth=True))
-    put(open_client)
-
     locked = TestClient(create_app(workspace, no_auth=True, lock_pipelines=True))
+
+    # No-code authoring: available.
+    assert put(locked).status_code == 200
     assert locked.get("/api/v1/flows").status_code == 200
     assert locked.get("/api/v1/flows/busy_regions").status_code == 200
     assert locked.post("/api/v1/flows/preview",
                        json={"flow": FLOW | {"name": "busy_regions"}}).status_code == 200
 
+    # The escape hatch back into code: locked.
+    assert locked.post("/api/v1/flows/busy_regions/eject").status_code == 403
+
+    # Python authoring: locked.
+    assert locked.put("/api/v1/pipelines/x", json={"content": "x = 1"}).status_code == 403
+    assert locked.post("/api/v1/pipelines/from-query",
+                       json={"sql": "SELECT 1", "output": "o"}).status_code == 403
+    assert locked.delete("/api/v1/pipelines/x").status_code == 403
+
+    # Flow delete is no-code too (and fail-closed on lineage — see the route).
+    assert locked.delete("/api/v1/flows/busy_regions").status_code == 200
+
+    # The posture is legible before the first 403: the boot probe carries it.
+    status = locked.get("/api/v1/auth/status").json()
+    assert status["authoring"] == {"pipelines_locked": True, "flows_locked": False}
+
+
+def test_lock_flows_restores_the_total_authoring_lockdown(workspace):
+    """Both flags together are exactly the old `--lock-pipelines` contract:
+    no authoring of any kind on this server. The upgrade note in the CHANGELOG
+    points hardened operators here."""
+    open_client = TestClient(create_app(workspace, no_auth=True))
+    put(open_client)
+
+    locked = TestClient(create_app(
+        workspace, no_auth=True, lock_pipelines=True, lock_flows=True,
+    ))
     assert put(locked).status_code == 403
     assert locked.delete("/api/v1/flows/busy_regions").status_code == 403
     assert locked.post("/api/v1/flows/busy_regions/eject").status_code == 403
+    assert locked.put("/api/v1/pipelines/x", json={"content": "x = 1"}).status_code == 403
+    assert locked.delete("/api/v1/pipelines/x").status_code == 403
+
+    # Reads and previews were never authoring and stay open under both flags.
+    assert locked.get("/api/v1/flows").status_code == 200
+    assert locked.get("/api/v1/flows/busy_regions").status_code == 200
+    assert locked.post("/api/v1/flows/preview",
+                       json={"flow": FLOW | {"name": "busy_regions"}}).status_code == 200
+
+    status = locked.get("/api/v1/auth/status").json()
+    assert status["authoring"] == {"pipelines_locked": True, "flows_locked": True}
+
+
+def test_lock_flows_alone_locks_flow_writes_and_eject_but_not_python(workspace):
+    """The flags are independent. `--lock-flows` without `--lock-pipelines` is
+    an unusual posture (it trusts editors with code but not with clicks), but
+    each flag must mean exactly its own sentence: eject refuses because it
+    consumes a flow file, and Python authoring is untouched."""
+    open_client = TestClient(create_app(workspace, no_auth=True))
+    put(open_client)
+
+    locked = TestClient(create_app(workspace, no_auth=True, lock_flows=True))
+    r = put(locked)
+    assert r.status_code == 403
+    assert "--lock-flows" in r.json()["detail"]
+    assert locked.delete("/api/v1/flows/busy_regions").status_code == 403
+    assert locked.post("/api/v1/flows/busy_regions/eject").status_code == 403
+    assert locked.put("/api/v1/pipelines/x", json={"content": "x = 1"}).status_code == 200
 
 
 def test_every_flow_route_requires_an_editor(workspace):

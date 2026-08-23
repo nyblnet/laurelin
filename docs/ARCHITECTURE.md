@@ -428,9 +428,13 @@ silently regresses coverage. It is also git-diffable.
 puts flows into the same `TransformRegistry` as `pipelines/*.py`, so duplicate
 name / duplicate output detection, planning, cycle detection, lineage, marking
 propagation, expectations-before-publish, build leases, scheduler targets,
-`GET /transforms`, `GET /lineage` and `--lock-pipelines` all cover flows without
+`GET /transforms` and `GET /lineage` all cover flows without
 knowing they exist. `Builder._execute_flow` compiles and then hands the result
-to the *same* DuckDB executor `kind="sql"` uses.
+to the *same* DuckDB executor `kind="sql"` uses. Flow *authoring* is locked by
+its own flag, `--lock-flows`, not by `--lock-pipelines`: the Python lock closes
+code execution, which a flow — bound, schema-checked SQL over a closed IR —
+cannot reach. Ejecting to Python writes a `.py` and refuses if either flag is
+set.
 
 Two tiers of validation, split by cost:
 
@@ -1431,8 +1435,10 @@ Reads *and* writes/deletes are **editor** — `GET /pipelines` and
 `GET /pipelines/{name}` were raised out of viewer by the audience rule, because
 they return `exec`-ed Python that a viewer could not have authored; a viewer's
 lineage need is served by `GET /transforms` and `GET /lineage`. The whole
-surface is disabled by
-`serve --lock-pipelines` / `LAURELIN_LOCK_PIPELINES=1`. Writes validate syntax
+Python surface is disabled by
+`serve --lock-pipelines` / `LAURELIN_LOCK_PIPELINES=1` (flows have their own
+`--lock-flows` / `LAURELIN_LOCK_FLOWS=1`; the boot probe `GET /auth/status`
+reports both so the UI can say so up front). Writes validate syntax
 (`compile`) before an atomic write and return the file's transforms plus any
 cross-file `collect_error` (e.g. a duplicate output). Module names must match
 `^[a-z][a-z0-9_]*$` (no paths/dots — no traversal). `from-query` wraps a
@@ -1490,7 +1496,8 @@ configured" from an empty field and retypes the credential.
 ```
 laurelin init PATH [--name] [--description]
 laurelin serve [--workspace PATH | --root DIR] [--host 127.0.0.1] [--port 8787]
-               [--no-auth] [--secure-cookies] [--lock-pipelines] [--control-db URL]
+               [--no-auth] [--secure-cookies] [--lock-pipelines] [--lock-flows]
+               [--control-db URL]
 laurelin build [TARGETS...] [--workspace PATH]
 laurelin datasets list|show NAME [--workspace PATH]
 laurelin upload NAME FILE [--workspace PATH]

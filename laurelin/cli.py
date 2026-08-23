@@ -109,9 +109,17 @@ def serve(
     lock_pipelines: bool = typer.Option(
         False,
         "--lock-pipelines",
-        help="Disable in-browser transform authoring (pipeline files can only be "
-        "edited on disk). Recommended for untrusted multi-user deployments, since "
-        "writing a pipeline file is code-execution-equivalent.",
+        help="Disable in-browser Python pipeline authoring (pipeline files can "
+        "only be edited on disk). Recommended for untrusted multi-user "
+        "deployments, since writing a pipeline file is code-execution-equivalent. "
+        "Flows and Explore — no-code authoring that compiles to bound SQL and "
+        "cannot reach exec — stay available; add --lock-flows to close those too.",
+    ),
+    lock_flows: bool = typer.Option(
+        False,
+        "--lock-flows",
+        help="Disable no-code flow authoring (Flows and Explore saves). Combine "
+        "with --lock-pipelines for a total authoring lockdown.",
     ),
 ) -> None:
     """Run the Laurelin API + UI server (single workspace, or --root for many)."""
@@ -133,6 +141,7 @@ def serve(
             no_auth=no_auth,
             secure_cookies=secure_cookies,
             lock_pipelines=lock_pipelines,
+            lock_flows=lock_flows,
         )
     else:
         from laurelin.api import create_app
@@ -140,7 +149,11 @@ def serve(
         ws = _find_workspace(workspace)
         typer.echo(f"Serving workspace '{ws.name}' ({ws.root}) on http://{host}:{port}")
         application = create_app(
-            ws, no_auth=no_auth, secure_cookies=secure_cookies, lock_pipelines=lock_pipelines
+            ws,
+            no_auth=no_auth,
+            secure_cookies=secure_cookies,
+            lock_pipelines=lock_pipelines,
+            lock_flows=lock_flows,
         )
     uvicorn.run(application, host=host, port=port)
 

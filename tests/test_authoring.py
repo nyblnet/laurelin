@@ -172,6 +172,91 @@ def test_api_lock_pipelines(ws):
     assert locked.delete("/api/v1/pipelines/x").status_code == 403
 
 
+def _api_routes(app):
+    """Every routable endpoint with a dependency tree, prefix applied.
+
+    This FastAPI version defers `include_router` behind an `_IncludedRouter`
+    wrapper whose `effective_candidates()` yields the fully-prefixed routes;
+    older versions put plain `APIRoute`s straight on `app.routes`. Handle both
+    so a FastAPI upgrade does not silently turn this test into a no-op — the
+    final assertion below fails loudly if flattening ever finds nothing.
+    """
+    for route in app.routes:
+        if hasattr(route, "dependant"):
+            yield route
+        elif hasattr(route, "effective_candidates"):
+            yield from route.effective_candidates()
+
+
+def _guarded_routes(app, guard) -> set[tuple[str, str]]:
+    """Every (method, path) whose dependency tree contains `guard` by function
+    identity — the decorator's `Depends(...)` list lands on `route.dependant`."""
+    found: set[tuple[str, str]] = set()
+
+    def walk(dependant) -> bool:
+        if dependant.call is guard:
+            return True
+        return any(walk(sub) for sub in dependant.dependencies)
+
+    for route in _api_routes(app):
+        if walk(route.dependant):
+            for method in route.methods or ():
+                found.add((method, route.path))
+    return found
+
+
+def test_every_python_writing_route_carries_the_pipeline_lock_and_the_guarded_set_is_exactly_this_one(ws):
+    """A new route that writes a `.py` MUST carry `require_pipelines_unlocked`
+    and be added to the enumeration below; dropping the guard from any of these
+    fails this test loudly. "Any future Python-authoring route is guarded" is
+    not mechanically decidable, so this pins the exact set instead — if you are
+    the author of a new `.py`-writing route, this failure is your reminder.
+
+    Deliberately absent from the set: `POST /workspace/import` and
+    `/workspace/import/from-path` check the lock *inside* the handler
+    (`_refuse_if_pipelines_locked`, so the 403 can explain the CLI alternative)
+    — the dependency tree cannot see those; they are pinned behaviourally by
+    tests/test_portability_surfaces.py instead.
+    """
+    from laurelin.api.routes import require_flows_unlocked, require_pipelines_unlocked
+
+    app = create_app(ws, no_auth=True)
+
+    assert _guarded_routes(app, require_pipelines_unlocked) == {
+        ("PUT", "/api/v1/pipelines/{name}"),
+        ("DELETE", "/api/v1/pipelines/{name}"),
+        ("POST", "/api/v1/pipelines/from-query"),
+        # Eject writes a `.py` — it is the escape hatch back into code.
+        ("POST", "/api/v1/flows/{name}/eject"),
+        # The gate that makes imported `.py` runnable.
+        ("POST", "/api/v1/workspace/import/acknowledge-pipelines"),
+    }
+
+    # The flows lock covers exactly the no-code writes, plus eject (which
+    # consumes a flow file, so it refuses when EITHER lock is set).
+    assert _guarded_routes(app, require_flows_unlocked) == {
+        ("PUT", "/api/v1/flows/{name}"),
+        ("DELETE", "/api/v1/flows/{name}"),
+        ("POST", "/api/v1/flows/{name}/eject"),
+    }
+
+    # Belt and braces for the mutating half of /pipelines specifically: every
+    # non-GET route under the prefix carries the code lock. Also proves the
+    # flattening in `_api_routes` actually saw the API surface.
+    seen = list(_api_routes(app))
+    assert any("/api/v1/pipelines" in r.path for r in seen), (
+        "route flattening found no /pipelines routes — FastAPI internals "
+        "changed shape and this whole test is asserting over nothing"
+    )
+    guarded = _guarded_routes(app, require_pipelines_unlocked)
+    for route in seen:
+        methods = (route.methods or set()) - {"GET", "HEAD"}
+        if "/api/v1/pipelines" in route.path and methods:
+            assert guarded >= {(m, route.path) for m in methods}, (
+                f"unguarded mutating pipeline route: {route.path}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # generate_sql_transform: the SQL an author wrote must be the SQL that runs
 #

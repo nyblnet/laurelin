@@ -4,9 +4,10 @@ The invariant these tests state, taken together: **a no-code author cannot use
 a flow to read data they could not read directly, and cannot use one to strip a
 row policy or a column mask off data they can.**
 
-That is deliberately *stricter* than the Python transform path, which launders
-all three. The last test in this file pins that gap as a documented fact rather
-than leaving it to be discovered.
+The Python transform path used to launder all three; that gap is now closed
+for API-authored pipeline files by the Builder's input-entitlement check —
+see tests/test_build_governance.py. Flows remain stricter in one way: they are
+column-granular where the Python check must refuse any masked input outright.
 """
 
 from __future__ import annotations
@@ -418,57 +419,13 @@ def test_the_preview_and_the_build_execute_the_same_sql_text(ws, store, catalog)
     assert '"open_ds"' in build_sql
 
 
-# ---------------------------------------------------------------------------
-# Inherited gaps: stated, not fixed
-# ---------------------------------------------------------------------------
-
-
-def test_the_python_transform_path_still_launders_acls_row_policies_and_column_masks(
-    ws, store, catalog
-):
-    """A KNOWN, DOCUMENTED GAP — asserted so it cannot regress unnoticed.
-
-    Measured on this tree: an editor who cannot view `secret_ds` writes
-    `@sql_transform(query="SELECT * FROM s")`, builds it, and the copy is
-    world-readable with the row policy and the masks gone.
-
-    Flows do not do this (see the tests above). The Python path is out of scope
-    for this change — narrowing it is a behaviour change for every existing
-    pipeline — but the inconsistency is *stated* here rather than left to be
-    discovered by someone who assumed the two paths were equivalent.
-
-    If a future change closes this, delete the test and say so in the
-    CHANGELOG; do not weaken it.
-    """
-    from laurelin.core.models import BuildStatus
-
-    grant_to(store, "secret_ds", "alice")
-    store.set_dataset_policy("secret_ds", {
-        "dataset": "secret_ds",
-        "row_policy": {"column": "region", "rules": [
-            {"subject_kind": "user", "subject": "alice", "values": ["us"]},
-        ]},
-        "column_masks": [{"column": "amount", "mode": "redact", "exempt": []}],
-    })
-    perms = PermissionService(store)
-    assert not perms.can_view_dataset(BOB, "secret_ds")
-
-    registry = TransformRegistry()
-    registry.register(TransformSpec(
-        name="leak", output=Output("leak"),
-        inputs={"s": Input("secret_ds")}, kind="sql",
-        query="SELECT * FROM s",
-    ))
-    build = Builder(ws, catalog, store, registry).build(["leak"])
-    assert build.status == BuildStatus.succeeded
-
-    # All of these are the gap, not the intent:
-    assert perms.can_view_dataset(BOB, "leak")          # ACL gone
-    assert store.grants_for_dataset("leak") == []       # no grants inherited
-    assert store.get_dataset_policy("leak") is None     # policy gone
-    rows = catalog.read("leak").to_pylist()
-    assert {r["region"] for r in rows} == {"us", "apac"}  # row policy gone
-    assert {r["amount"] for r in rows} == {1, 2}          # mask gone
+# `test_the_python_transform_path_still_launders_acls_row_policies_and_column_masks`
+# lived here until the gap it pinned was closed. Its docstring ordered: "If a
+# future change closes this, delete the test and say so in the CHANGELOG; do
+# not weaken it." Done: `Builder._check_input_entitlement` now refuses an
+# API-authored python/sql transform whose recorded author cannot read every
+# input in full. The replacement assertions — laundering REFUSED, legitimate
+# pipelines untouched — live in tests/test_build_governance.py.
 
 
 def test_deleting_a_flow_leaves_its_lineage_edges_and_therefore_its_marking_propagation(

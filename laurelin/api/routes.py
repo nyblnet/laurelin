@@ -194,6 +194,41 @@ def require_pipelines_unlocked(request: Request) -> None:
         )
 
 
+def _stamp_pipeline_author(
+    request: Request, store: MetadataStore, name: str, author: str
+) -> None:
+    """Record who authored a pipeline file, server-side, so the Builder checks
+    every build against them — *unless* the server runs ``--no-auth``.
+
+    Under ``--no-auth`` every request is the implicit admin ``anonymous``,
+    which is not a real store user. On a workspace that also has real users
+    (an imported one, or an authed workspace restarted with ``--no-auth``)
+    stamping ``anonymous`` made every subsequent build refuse: ``_author_user``
+    saw users present and a recorded author who is none of them, and failed
+    closed. A no-auth server enforces no ACLs, so there is nothing to check a
+    build against — the file belongs in the operator-trusted bucket. Clear any
+    stale stamp so a re-save there is genuinely unchecked, rather than leaving
+    a previous authed session's stamp to refuse.
+    """
+    if request.app.state.no_auth:
+        store.delete_pipeline_author(name)
+        return
+    store.set_pipeline_author(name, author)
+
+
+def require_flows_unlocked(request: Request) -> None:
+    # A separate flag with a separate sentence, because the two locks close
+    # different holes: `--lock-pipelines` closes code execution (a pipeline
+    # file is exec'd as the server), `--lock-flows` closes no-code authoring
+    # (a flow compiles to bound, schema-checked SQL and cannot reach exec).
+    # A hardened server sets the first and usually not the second.
+    if request.app.state.lock_flows:
+        raise HTTPException(
+            status_code=403,
+            detail="Flow authoring is disabled on this server (--lock-flows)",
+        )
+
+
 WorkspaceDep = Annotated[Workspace, Depends(get_workspace)]
 StoreDep = Annotated[MetadataStore, Depends(get_store)]
 CatalogDep = Annotated[DatasetCatalog, Depends(get_catalog)]
@@ -2144,9 +2179,20 @@ def read_pipeline(name: str, files: PipelineFilesDep) -> dict:
 
 @router.put("/pipelines/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
 def write_pipeline(
-    name: str, body: PipelineWriteRequest, files: PipelineFilesDep, store: StoreDep, actor: ActorDep
+    request: Request,
+    name: str,
+    body: PipelineWriteRequest,
+    files: PipelineFilesDep,
+    store: StoreDep,
+    actor: ActorDep,
 ) -> dict:
     result = files.write(name, body.content)
+    # Server-side author stamp, same contract as FlowFiles.write: the recorded
+    # author is whose read access every build of this file is checked against
+    # (Builder._check_input_entitlement), so it is never taken from the body.
+    # A re-save by a different editor re-stamps the WHOLE file to the new
+    # saver: every transform in a multi-transform .py builds as its last saver.
+    _stamp_pipeline_author(request, store, result["name"], actor)
     store.log_audit("pipeline_written", {"name": result["name"]}, actor=actor)
     return result
 
@@ -2154,12 +2200,18 @@ def write_pipeline(
 @router.delete("/pipelines/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
 def delete_pipeline(name: str, files: PipelineFilesDep, store: StoreDep, actor: ActorDep) -> dict:
     files.delete(name)
+    # A deleted file's stamp goes with it. A DISK edit to a stamped file does
+    # NOT clear the stamp — the stamp means "last API author", and staying
+    # checked is the fail-closed direction; an operator who wants the file
+    # operator-trusted deletes it here and rewrites it on disk.
+    store.delete_pipeline_author(name[:-3] if name.endswith(".py") else name)
     store.log_audit("pipeline_deleted", {"name": name}, actor=actor)
     return {"ok": True}
 
 
 @router.post("/pipelines/from-query", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
 def pipeline_from_query(
+    request: Request,
     body: QueryTransformRequest,
     files: PipelineFilesDep,
     store: StoreDep,
@@ -2180,6 +2232,10 @@ def pipeline_from_query(
     result = files.generate_sql_transform(
         body.sql, body.output, dataset_names, name=body.name
     )
+    # Same server-side author stamp as PUT above; a generated file is checked
+    # at every build against the user who saved the query, not the regex's
+    # guess about what it reads.
+    _stamp_pipeline_author(request, store, result["name"], actor)
     store.log_audit(
         "pipeline_written", {"name": result["name"], "source": "query"}, actor=actor
     )
@@ -2199,11 +2255,19 @@ def pipeline_from_query(
 # serve that structurally — a flow appears there as a transform with
 # `kind: "flow"`, with no change to either route.
 #
-# Writes are additionally gated on `--lock-pipelines`. The flag's contract is
-# "no authoring on this server", and a flow authors a transform that runs as
-# the system and reads datasets. Making flows the exception would silently
-# widen what a hardened deployment permits. If operators later want "flows but
-# not Python", that is a new flag and a new decision.
+# Writes are gated on `--lock-flows`, NOT on `--lock-pipelines`. That is the
+# "new flag and a new decision" an earlier revision of this comment reserved,
+# and this is the decision: `--lock-pipelines` locks *code* — a pipeline file
+# is Python exec'd as the server process — while a flow is a closed IR
+# compiled to parameterised SQL (every value bound, every identifier checked
+# against the live schema, refused by `check_flow_governance` if it would
+# launder a mask) and re-checked against its recorded author at every build.
+# Locking flows alongside Python left hardened deployments with no authoring
+# path at all, which meant nobody set the flag and every editor kept RCE.
+# Operators who want the old total lockdown set both flags.
+#
+# Eject is the exception: it is both a flow gesture and a `.py` write, so it
+# refuses if EITHER flag is set.
 # ---------------------------------------------------------------------------
 
 def get_flow_files(workspace: WorkspaceDep) -> FlowFiles:
@@ -2567,7 +2631,7 @@ def read_flow(
     return result
 
 
-@router.put("/flows/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+@router.put("/flows/{name}", dependencies=[EDITOR, Depends(require_flows_unlocked)])
 def write_flow(
     name: str,
     body: FlowWriteRequest,
@@ -2622,7 +2686,7 @@ def write_flow(
     }
 
 
-@router.delete("/flows/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+@router.delete("/flows/{name}", dependencies=[EDITOR, Depends(require_flows_unlocked)])
 def delete_flow(
     name: str, files: FlowFilesDep, store: StoreDep, actor: ActorDep
 ) -> dict:
@@ -2688,8 +2752,15 @@ def flow_sql(
     }
 
 
-@router.post("/flows/{name}/eject", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
+# Both guards: eject writes a `.py` (the escape hatch back into code, so
+# `--lock-pipelines` must cover it) and consumes a flow file (so a server
+# that froze flow authoring should not let flows leak out the side either).
+@router.post(
+    "/flows/{name}/eject",
+    dependencies=[EDITOR, Depends(require_pipelines_unlocked), Depends(require_flows_unlocked)],
+)
 def eject_flow(
+    request: Request,
     name: str,
     files: FlowFilesDep,
     pipelines: PipelineFilesDep,
@@ -2752,6 +2823,14 @@ def eject_flow(
     # Before the .py exists, so a crash between the two leaves the grant on
     # rather than off.
     restricted = restrict_output_to_author(store, flow, user.username)
+    # Stamp the generated .py's author BEFORE it exists, so a crash between
+    # the two leaves a dangling stamp (harmless: it re-attaches, and re-checks,
+    # any future file of this name) rather than an UNSTAMPED ejected file —
+    # which would fall into the operator-trusted bucket and let eject's
+    # one-time authoring check go stale as grants change. Stamped, the ejected
+    # file is re-checked against this user at every build, which is strictly
+    # stronger than today's eject.
+    _stamp_pipeline_author(request, store, name, user.username)
     try:
         # `inputs` from the IR, exactly — bypassing generate_sql_transform's
         # word-boundary regex, which cannot tell a table name from the same
@@ -2761,12 +2840,14 @@ def eject_flow(
             sql, name, dataset_names=[], inputs=inputs, params=params
         )
     except ValueError as exc:
+        store.delete_pipeline_author(name)
         raise HTTPException(status_code=400, detail=str(exc)) from None
     try:
         files.delete(name)
     except Exception:
         # Roll the .py back rather than leave two producers of one dataset.
         pipelines.delete(name)
+        store.delete_pipeline_author(name)
         raise
     store.log_audit(
         "flow_ejected",

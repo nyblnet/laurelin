@@ -352,9 +352,12 @@ docker compose up --build      # Laurelin + Postgres
 **Transform authoring is code execution.** Writing a pipeline file through the
 UI (the Transforms tab) or API is equivalent to running Python on the server —
 it is `exec`'d on every build. It requires the `editor` role and can be
-disabled entirely with `laurelin serve --lock-pipelines` (or
+disabled with `laurelin serve --lock-pipelines` (or
 `LAURELIN_LOCK_PIPELINES=1`) for untrusted multi-user deployments. The executed
-transform code is not yet sandboxed.
+transform code is not yet sandboxed. Locking Python does **not** lock Flows or
+Explore: those compile to bound, schema-checked SQL and cannot reach `exec`,
+so analysts keep a no-code authoring path on a hardened server. Add
+`--lock-flows` (`LAURELIN_LOCK_FLOWS=1`) to disable no-code authoring too.
 
 See [SECURITY.md](SECURITY.md) for the full security model, trust boundaries,
 and how to report a vulnerability.

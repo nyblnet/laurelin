@@ -198,9 +198,40 @@ Be clear-eyed about these. They are design consequences, not oversights:
    imports and executes. **Anyone who can write a pipeline file has remote
    code execution as the server process.** In-browser authoring is
    editor-gated for this reason. On any deployment where editors are not
-   fully trusted, serve with `--lock-pipelines` and manage pipelines through
-   git and code review. This is the single most important line in this
-   document.
+   fully trusted, serve with `--lock-pipelines` and manage pipeline files
+   through git and code review. This is the single most important line in
+   this document.
+
+   Editors are trusted with code execution only where Python authoring is
+   enabled. With `--lock-pipelines`, editors can still author **flows and
+   Explore charts** — no-code artifacts that compile to bound,
+   schema-checked SQL, are governance-checked against their recorded author
+   at every build, and cannot reach `exec` — while pipeline files are
+   managed on disk. Ejecting a flow to Python writes a `.py`, so it is
+   locked with Python. Operators who want the old total lockdown (no
+   authoring of any kind) add `--lock-flows` / `LAURELIN_LOCK_FLOWS=1`.
+   Dashboard raw-SQL panels are a separate, always-available surface: they
+   are persisted authoring but execute as the calling viewer under their own
+   row policies and masks, and were never covered by either lock.
+
+   Where Python authoring *is* enabled, an API-authored transform can no
+   longer launder data: the saving user is recorded server-side, and every
+   build refuses a python/sql transform whose recorded author cannot read
+   every input in full — view rights, and no row policy or column mask *that
+   applies to that author* — checked against the recorded author, never
+   whoever triggered the build. "Applies to" is resolved by the same engine a
+   read uses, so an admin (who bypasses policy) and an author exempt from a
+   mask build, while an author the policy would filter is refused; that is
+   what keeps a legitimate re-save from becoming a false refusal. **The
+   surviving trust assumption, plainly: pipeline files written on disk — git,
+   import, the CLI — have no recorded author and build unchecked**, as does a
+   `--no-auth` server (every request is the implicit admin, not a real user,
+   so nothing accountable is recorded). Whoever can write to `pipelines/` on
+   disk already has code execution as the server, so the entitlement check
+   binds exactly the population the API can identify and no one else. It does
+   not touch the code-execution surface itself — a pipeline function body runs
+   as the server and can read any dataset on disk regardless of its declared
+   inputs; that is what `--lock-pipelines` (item 1 above) closes.
 
 2. **Admins bypass markings and row policy.** Deliberate: a mandatory-access
    system that can lock every human out of their own workspace is an
@@ -247,7 +278,9 @@ A short checklist; details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - [ ] Terminate TLS at the ingress; run with `--secure-cookies`; ensure
       `X-Forwarded-Proto` reaches the app.
 - [ ] Set `--lock-pipelines` unless every editor is trusted with code
-      execution.
+      execution. Editors keep Flows and Explore — no-code authoring that
+      cannot reach `exec` — which is the intended production posture; add
+      `--lock-flows` only if you want no authoring surface at all.
 - [ ] Use PostgreSQL for the control plane in any multi-replica deployment,
       and back it up together with the data volume.
 - [ ] Give the server process its own OS user. Laurelin creates `metadata.db`

@@ -29,13 +29,20 @@ const MAX_ROWS = 1000;
 const PLACEHOLDER = "-- Write SQL over your datasets. Ctrl+Enter to run.\n";
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
-function saveErrorMessage(err: unknown, fileName: string): string {
+function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boolean): string {
   if (err instanceof ApiError) {
     if (err.status === 409) {
       return `A transform file named ${fileName} already exists.`;
     }
     if (err.status === 403) {
-      return "You don't have permission to create transforms (editor role required, or pipeline editing is locked).";
+      // Two different diagnoses used to share one hedged sentence ("editor
+      // role required, or pipeline editing is locked"), which sent authors
+      // in the wrong direction: a role denial is fixed by an administrator,
+      // a lock only by a server restart. /auth/status now says which.
+      return pipelinesLocked
+        ? "Python authoring is locked on this server (--lock-pipelines), so a query cannot " +
+            "be saved as a transform file here. Flows and Explore remain available."
+        : "You don't have permission to create transforms (editor role required).";
     }
     if (err.status === 400) {
       return err.detail || "Invalid request.";
@@ -304,6 +311,12 @@ export function WorkbenchView() {
                       type="button"
                       className="button small"
                       onClick={openSaveForm}
+                      disabled={auth.pipelinesLocked}
+                      title={
+                        auth.pipelinesLocked
+                          ? "Python authoring is locked on this server (--lock-pipelines); saving a query writes a pipeline file."
+                          : undefined
+                      }
                     >
                       Save as transform
                     </button>
@@ -549,7 +562,7 @@ export function WorkbenchView() {
                       color: "var(--red)",
                     }}
                   >
-                    {saveErrorMessage(saveMut.error, fileName.trim() || outName.trim())}
+                    {saveErrorMessage(saveMut.error, fileName.trim() || outName.trim(), auth.pipelinesLocked)}
                   </div>
                 )}
 
