@@ -583,6 +583,63 @@ linear grammar reopens with "cannot edit here" rather than being silently
 flattened. Two measures of very different scales share one axis and get a
 visible warning, not a second axis.
 
+#### Analyses: the multi-cell governed notebook
+
+`laurelin/ui/webapp/src/views/Analyses.tsx`, `views/analyses/model.ts`, the
+`analyses` table, `AnalysisInfo`/`AnalysisCell` in `core/models.py`, and the
+`/api/v1/analyses` routes. This is Foundry's Code Workbook minus the code: a
+saveable, shareable document of cells, where each cell is EITHER a governed
+SQL query (the workbench, inline) OR a shaping step (Explore's card stack),
+each renders a result table and an optional chart, and a later shaping cell
+may take an earlier shaping cell's output as its source.
+
+**Chaining is one statement, one policy pass.** Nothing is materialized per
+cell — per run or preview the server synthesizes ONE `FlowDef` from the
+target cell's ancestor closure (`_analysis_closure`: step ids namespaced
+`{cell_id}_{step}`, a `cell:<id>` input rewritten to the upstream cell's
+terminal), compiles it through the one Flow compiler with every value bound,
+and executes it through the one `_execute_sql` path **as the caller**. The
+whole chain — every upstream cell included — is therefore computed under the
+current caller's ACL, row policy and masks in a single pass, and no
+intermediate result ever exists outside that statement; a cell structurally
+cannot show a viewer rows only the author's policy would have allowed. No
+result is ever persisted: a cached result would be a silent RLS bypass, so
+two viewers get different rows from the same stored chain. SQL cells are
+non-chainable in both directions, because the IR is closed to raw SQL and
+both bridging mechanisms measurably fail (DuckDB refuses parameters in
+views; textual composition of raw and compiled SQL misaligns ordinals).
+
+R2 splits a cell exactly as it splits a dashboard panel: a viewer receives
+`{id, title, chart, x, y, series, stacked, width}` and rows from the run
+route; `sql`/`flow`/`inputs`/`top` are withheld, and run failures go through
+`stored_instruction_error` so the error path is not an oracle for the fields
+the read path withholds. Writes follow the `_preserve_operational` contract
+for **every** field, both halves: on a whole-record PUT (and the per-cell
+PUT), a field the request does not mention inherits the stored value —
+absence is "unchanged", never "blank it" — so a reorder sent as
+`[{"id":"c2"},{"id":"c1"}]` keeps titles and chart bindings as well as the
+instructions. Editor-facing refusals from the compiler are rewritten
+server-side into the vocabulary the product speaks (`_cell_vocabulary`:
+"Cell 2 ('Revenue by region')'s Summarise card refers to…", never
+"Step 'c2_a1'"), so scripts and MCP agents hear the same sentences the
+bundled UI shows.
+
+**What an analysis deliberately cannot do: run code.** There is no
+arbitrary-Python (or any code-execution) cell, and this is the decision that
+makes the feature safe to give every analyst: a code cell is Foundry's actual
+"Code" workbook, i.e. the RCE surface `--lock-pipelines` exists to close, and
+it would launder ACLs, row policies and column masks exactly as Python
+transforms do. Everything an analysis runs compiles to governed SQL through
+paths that were already built and attacked. If a code cell is ever proposed,
+it must gate on the same lock model as Python transforms and its output must
+pass full materialization governance — nothing in the analyses IR, routes or
+models may be loosened to accommodate it. Also out of scope, recorded as
+notes rather than half-built: materializing a cell's output as a dataset
+(would need `check_flow_governance`'s output rules or it is a mask-laundering
+hole), exporting a cell to a dashboard panel (a shaping cell's closure *is* a
+`DashboardPanel.flow`, so a later "save as panel" is a copy), scheduling,
+per-analysis ownership, and cross-analysis references.
+
 ### `laurelin/ontology`
 
 `laurelin/ontology/__init__.py` re-exports `load_ontology, OntologyService`.

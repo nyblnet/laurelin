@@ -92,6 +92,17 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   parameters, schema-checked identifiers and your own data access. What it
   won't do (yet): heatmaps, dual axes, maps, percentiles beyond median, or a
   viewer-facing mode — viewers see the saved panels.
+- **Analyses** — a saveable, shareable, multi-step analysis document
+  (Foundry's Code Workbook, minus the code). Each cell is either a governed
+  SQL query or a point-and-click shaping step, with a result table and an
+  optional chart; a later shaping cell can read an earlier cell's output, and
+  the whole chain compiles to ONE parameter-bound statement executed with the
+  *caller's* data access — no intermediate is ever materialized or cached, so
+  two viewers of the same analysis see their own rows. What an analysis
+  cannot do, on purpose: there is **no arbitrary-code cell**. A Python cell
+  is the remote-code-execution surface `--lock-pipelines` exists to close,
+  and everything an analysis runs stays inside the governed SQL compiler —
+  bound values, schema-checked identifiers, your own permissions.
 - **Dashboards** — grids of saved queries rendered as charts (zero-dependency
   SVG: table, bar, line, area, stat, pie, scatter). Panels execute with the
   *viewer's* credentials, so row-level security and ACLs apply per user — the

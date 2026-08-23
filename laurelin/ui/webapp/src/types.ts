@@ -324,6 +324,64 @@ export interface Dashboard {
 /** What POST /dashboards/{name}/panels/{id}/run returns: rows, nothing else. */
 export type PanelRunResult = QueryResult;
 
+/**
+ * One cell of an Analysis, in both of the shapes the server sends.
+ *
+ * The same R2 split as `DashboardPanel`: `id`/`title`/`chart`/`x`/`y`/
+ * `series`/`stacked`/`width` are PRESENTATION; the instruction half —
+ * `sql`, `flow` (a Flow IR fragment), `inputs` (upstream cell ids) and
+ * `top` — is OPERATIONAL and absent below editor. An absent key round-trips
+ * through a PUT as "leave it alone"; an empty one as "erase it".
+ */
+export interface AnalysisCell {
+  id: string;
+  /** Always non-empty on a stored cell: the server fills "Cell {n}". */
+  title: string;
+  /** Source A: raw SQL over datasets. OPERATIONAL — absent below editor. */
+  sql?: string;
+  /** Source B: a Flow IR fragment `{nodes, terminal}` — what the shaping
+   *  cards save. A step input of the form "cell:<id>" reads an earlier
+   *  shaping cell's output. OPERATIONAL, exactly as `sql` is. */
+  flow?: { terminal?: string; nodes?: any[] };
+  /** Upstream shaping cell ids — the instruction graph. OPERATIONAL. */
+  inputs?: string[];
+  /** Top-N bound as LIMIT ? at this cell's terminal. OPERATIONAL. */
+  top?: number | null;
+  chart: ChartKind;
+  x: string;
+  y: string[];
+  series?: string;
+  stacked?: boolean;
+  width: number;
+}
+
+/** True when this cell arrived with its operational half — i.e. we may edit
+ *  it. False for a viewer's projection. */
+export function cellIsWhole(c: AnalysisCell): boolean {
+  return c.sql !== undefined || c.flow !== undefined;
+}
+
+export interface Analysis {
+  name: string;
+  title: string;
+  description: string;
+  cells: AnalysisCell[];
+  created_at: string;
+  /** Editor+ only. */
+  created_by?: string;
+  updated_at: string;
+  /** Editor+ only: the counter behind server-assigned cell ids. */
+  next_cell?: number;
+}
+
+/** What POST /analyses/preview returns for a shaping cell. */
+export interface CellPreviewResult extends QueryResult {
+  schema: string[];
+  kinds: Record<string, FlowKind>;
+  masked_columns: Record<string, string[]>;
+  max_rows: number;
+}
+
 export type SourceType = "postgres" | "http" | "file";
 
 export interface Source {

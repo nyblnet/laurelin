@@ -50,6 +50,8 @@ from laurelin.core.failure import (
 from laurelin.core.federation import FederationError
 from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 from laurelin.core.models import (
+    AnalysisCell,
+    AnalysisInfo,
     ColumnMask,
     DashboardInfo,
     DashboardPanel,
@@ -1101,6 +1103,777 @@ def delete_dashboard(name: str, store: StoreDep, actor: ActorDep) -> dict:
     if not store.delete_dashboard(name):
         raise HTTPException(status_code=404, detail=f"Dashboard not found: {name!r}")
     store.log_audit("dashboard_deleted", {"dashboard": name}, actor=actor)
+    return {"deleted": name}
+
+
+# ---------------------------------------------------------------------------
+# Analyses: the multi-cell governed notebook (Code Workbook parity, no code)
+#
+# An analysis is a chain of cells. A cell is EITHER a governed SQL query OR a
+# point-and-click shaping step (a fragment of Flow IR), and a shaping cell may
+# take an earlier shaping cell's output as its input. There is deliberately no
+# code cell: that is the RCE surface `--lock-pipelines` exists to close, and
+# were one ever proposed it would have to gate on `app.state.lock_pipelines`
+# exactly as Python transforms do — nothing here may be loosened for it.
+#
+# The chaining invariant, which every run and preview below preserves: every
+# run of a cell executes exactly ONE SQL statement, compiled from the closed
+# Flow IR with every author value bound as a parameter, through one
+# `_execute_sql` call **as the current caller** — so the entire chain,
+# including every upstream cell, is computed under that one caller's ACL /
+# row-level security / masking in a single policy pass, and no cell's
+# intermediate result ever exists outside that statement. A cell structurally
+# cannot show a viewer data the viewer's own policy hides, even where the
+# author's policy did not. (The rejected design — materializing or registering
+# per-cell views — fails concretely: DuckDB refuses parameters in views, and
+# textual composition of raw SQL with compiled parametrized SQL misaligns
+# ordinals; both measured.)
+#
+# R2 splits a cell exactly as it splits a dashboard panel: a viewer receives
+# {id, title, chart, x, y, series, stacked, width} and the ROWS from the run
+# route, never sql / flow / inputs / top.
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+#: Cell ids are server-assigned (`c1`, `c2`, …) but a whole-record PUT (import,
+#: scripts) may bring its own; both must namespace into `_NODE_ID_RE`'s 64
+#: chars: cell id (≤32) + "_" + step id (≤31) = 64.
+_CELL_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_CELL_STEP_ID_RE = re.compile(r"^[a-z0-9_]{1,31}$")
+#: A node input of this form takes an earlier shaping cell's output.
+_CELL_REF = "cell:"
+MAX_ANALYSIS_CELLS = 50
+
+
+class AnalysisUpsertRequest(BaseModel):
+    title: str = ""
+    description: str = ""
+    # Raw dicts, not `AnalysisCell`, for the reason `DashboardUpsertRequest`
+    # documents: the model validates "exactly one of sql / flow", so a cell
+    # round-tripped from the viewer projection (whose operational half is
+    # *absent*, not blank) would be rejected before the merge could fill it
+    # back in from the stored record. Merge first, validate after.
+    cells: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AnalysisPreviewRequest(BaseModel):
+    # The DRAFT cells, not saved ones — previewing an unsaved edit is the
+    # whole interaction. The server synthesizes the closure from what is
+    # submitted, so closure synthesis exists in exactly one Python function
+    # (`_analysis_closure`) shared with the run route, not duplicated in TS.
+    cells: list[dict[str, Any]] = Field(default_factory=list)
+    cell_id: str
+    max_rows: int = 50
+
+
+class CellRunRequest(BaseModel):
+    max_rows: int = Field(default=1000, ge=1, le=100_000)
+
+
+def _cell_name(cells: list[AnalysisCell], cell_id: str) -> str:
+    """How a refusal names a cell: position + the title everyone can see."""
+    for n, cell in enumerate(cells, start=1):
+        if cell.id == cell_id:
+            return f"Cell {n} ({cell.title!r})" if cell.title else f"Cell {n}"
+    return f"cell {cell_id!r}"
+
+
+# What each step kind is called on an analyst's screen — the same net the
+# bundled UI hangs under its cards (CARD_OF in views/analyses/model.ts), so an
+# API or MCP consumer hears the vocabulary the product speaks, not the IR's.
+_CARD_NAMES = {
+    "source": "data source",
+    "filter": "Filter card",
+    "cast": "'read as dates' setting",
+    "derive": "Group by card",
+    "aggregate": "Summarise card",
+    "sort": "Order card",
+}
+
+
+def _cell_vocabulary(cells: list[AnalysisCell], message: str) -> str:
+    """Rewrite namespaced step ids in a Tier A/B refusal into cell vocabulary.
+
+    `_analysis_closure` namespaces every step as `{cell_id}_{step}` before the
+    one validator and the one compiler see it, so their sentences name ids the
+    analyst never authored and do not say which cell to fix. Measured, at the
+    API (the bundled UI translated client-side; scripts and MCP agents got
+    this raw): editing Cell 1 under a dependent returned
+
+        "Step 'c2_a1' refers to a column named 'amount', which its input does
+         not have. Available columns: 'region', 'status', 'amt'."
+
+    Rewritten here — once, server-side, for every consumer — that reads
+    "Cell 2 ('By region')'s Summarise card refers to …". Cells sorted longest
+    id first so a cell named `a_b` claims `'a_b_t'` before cell `a` can
+    misread it as its own step `b_t`. The replacement is first-party text
+    rewritten as first-party text: no value, column or SQL enters the message
+    that was not already in it.
+    """
+    flow_cells = sorted(
+        (c for c in cells if c.is_flow_cell), key=lambda c: -len(c.id)
+    )
+    for cell in flow_cells:
+        nodes = cell.flow.get("nodes")
+        if not isinstance(nodes, list):
+            continue
+        steps = [
+            n for n in nodes
+            if isinstance(n, dict) and isinstance(n.get("id"), str)
+        ]
+        for node in sorted(steps, key=lambda n: -len(n["id"])):
+            kind = node.get("kind")
+            # `kind` is unvalidated author input here (the refusal being
+            # rewritten may be the one refusing it) — an unhashable kind must
+            # not turn a clean 400 into a TypeError.
+            if isinstance(kind, str) and kind:
+                card = _CARD_NAMES.get(kind, f"{kind} step")
+            else:
+                card = "shaping step"
+            label = f"{_cell_name(cells, cell.id)}'s {card}"
+            message = re.sub(
+                rf"(?:[Ss]tep )?'{re.escape(cell.id)}_{re.escape(node['id'])}'",
+                lambda _m: label,  # noqa: B023 — bound per iteration on purpose
+                message,
+            )
+    return message
+
+
+def _refused_in_cell_vocabulary(
+    cells: list[AnalysisCell], fn, *args, **kwargs
+):
+    """`_flow_or_400`, plus the step-id → cell-vocabulary rewrite above.
+
+    These are EDITOR routes validating the caller's own cells, so the sentence
+    is still served verbatim — just in words that name the cell to fix.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except FlowRefused as exc:
+        raise HTTPException(
+            status_code=400, detail=_cell_vocabulary(cells, str(exc))
+        ) from None
+
+
+def _reraised_in_cell_vocabulary(
+    cells: list[AnalysisCell], exc: FlowRefused
+) -> FlowRefused:
+    """The same rewrite for the run route, which hands its exception to
+    `stored_instruction_error` instead of serving it directly.
+
+    Raise-and-catch rather than construct: `is_first_party` vouches for the
+    deepest traceback frame, and a never-raised exception has none — the
+    rewritten copy must carry this file's frame so the editor still receives
+    the sentence (the viewer's `Failure` brief is unchanged either way).
+    """
+    try:
+        raise FlowRefused(_cell_vocabulary(cells, str(exc)))
+    except FlowRefused as rewritten:
+        return rewritten
+
+
+def _cell_fragment(cell: AnalysisCell) -> tuple[list[dict], str]:
+    """The node list and terminal of a shaping cell's stored fragment.
+
+    Structural only — everything deeper (kinds, arity, params, DAG shape) is
+    Tier A's job on the synthesized flow, where the checks already exist and
+    stay in one place.
+    """
+    nodes = cell.flow.get("nodes")
+    terminal = cell.flow.get("terminal")
+    if (not isinstance(nodes, list) or not nodes
+            or not all(isinstance(n, dict) for n in nodes)
+            or not isinstance(terminal, str)):
+        raise FlowRefused(
+            "A shaping cell's flow must be an object with a list of 'nodes' "
+            "and a 'terminal' step id.",
+        )
+    return nodes, terminal
+
+
+def _analysis_closure(cells: list[AnalysisCell], target: AnalysisCell) -> FlowDef:
+    """Synthesize ONE FlowDef from the ancestor closure of ``target``.
+
+    This is the one place cells become a flow, shared by run, preview and the
+    save-time check, so the three cannot drift. Cross-cell chaining is literal
+    node-graph chaining: each cell's steps are namespaced `{cell_id}_{step}`,
+    and a step input written as `cell:<id>` is rewritten to the upstream
+    cell's namespaced terminal — so the compiled statement carries every
+    upstream cell as a CTE of the same single query, and `compile_flow` binds
+    every value at every depth.
+
+    Refusals about the *cell graph* (unknown cell, SQL cell referenced, a loop
+    between cells) speak cell vocabulary, because Tier A's versions of those
+    sentences name step ids the analyst never authored. Everything inside a
+    fragment is left to `FlowDef.from_json` — one validator, not two.
+    """
+    by_id = {c.id: c for c in cells}
+    order: list[str] = []
+    state: dict[str, int] = {}  # 1 = visiting, 2 = done
+
+    def visit(cell_id: str, wanted_by: str) -> None:
+        cell = by_id.get(cell_id)
+        if cell is None:
+            raise FlowRefused(
+                f"{_cell_name(cells, wanted_by)} takes its input from "
+                f"{cell_id!r}, which is not a cell of this analysis.",
+            )
+        if not cell.is_flow_cell:
+            raise FlowRefused(
+                f"{_cell_name(cells, wanted_by)} takes its input from "
+                f"{_cell_name(cells, cell_id)}, which is a SQL cell. Only "
+                "shaping cells can feed later cells — the whole chain "
+                "compiles to one governed statement, which raw SQL cannot "
+                "join. Rebuild that step with the shaping cards instead.",
+            )
+        s = state.get(cell_id, 0)
+        if s == 2:
+            return
+        if s == 1:
+            if cell_id == wanted_by:
+                raise FlowRefused(
+                    f"{_cell_name(cells, cell_id)} takes its own output as "
+                    "an input — a cell can only read cells above it.",
+                )
+            raise FlowRefused(
+                "These cells feed each other in a loop through "
+                f"{_cell_name(cells, cell_id)} — a later cell can read an "
+                "earlier one, but not the other way round.",
+            )
+        state[cell_id] = 1
+        for upstream in cell.inputs:
+            visit(upstream, cell_id)
+        state[cell_id] = 2
+        order.append(cell_id)
+
+    visit(target.id, target.id)
+
+    nodes_out: list[dict] = []
+    for cid in order:
+        cell = by_id[cid]
+        frag_nodes, _terminal = _cell_fragment(cell)
+        local_ids = {n.get("id") for n in frag_nodes}
+        referenced: set[str] = set()
+        for raw in frag_nodes:
+            step_id = raw.get("id")
+            if not isinstance(step_id, str) or not _CELL_STEP_ID_RE.match(step_id):
+                raise FlowRefused(
+                    f"{_cell_name(cells, cid)} has an invalid step id "
+                    f"{step_id!r}: use lowercase letters, digits and "
+                    "underscores (up to 31 characters).",
+                )
+            raw_inputs = raw.get("inputs", [])
+            if not isinstance(raw_inputs, list) or not all(
+                isinstance(i, str) for i in raw_inputs
+            ):
+                raise FlowRefused(
+                    f"{_cell_name(cells, cid)}: step {step_id!r} must list "
+                    "its inputs as step ids.",
+                )
+            mapped: list[str] = []
+            for inp in raw_inputs:
+                if inp.startswith(_CELL_REF):
+                    upstream_id = inp[len(_CELL_REF):]
+                    referenced.add(upstream_id)
+                    upstream = by_id.get(upstream_id)
+                    if upstream is None or not upstream.is_flow_cell or (
+                        upstream_id not in cell.inputs
+                    ):
+                        # The declared `inputs` list is what the graph walk
+                        # above vetted; a step reference outside it is refused
+                        # rather than silently widened.
+                        raise FlowRefused(
+                            f"{_cell_name(cells, cid)}: step {step_id!r} "
+                            f"reads {inp!r}, which is not one of this cell's "
+                            "declared inputs.",
+                        )
+                    _, upstream_terminal = _cell_fragment(upstream)
+                    mapped.append(f"{upstream_id}_{upstream_terminal}")
+                elif inp in local_ids:
+                    mapped.append(f"{cid}_{inp}")
+                else:
+                    raise FlowRefused(
+                        f"{_cell_name(cells, cid)}: step {step_id!r} takes "
+                        f"input from {inp!r}, which is neither a step of this "
+                        "cell nor a 'cell:<id>' reference to an earlier cell.",
+                    )
+            nodes_out.append({
+                "id": f"{cid}_{step_id}",
+                "kind": raw.get("kind"),
+                "inputs": mapped,
+                "params": raw.get("params", {}),
+            })
+        if referenced != set(cell.inputs):
+            missing = sorted(set(cell.inputs) - referenced)
+            raise FlowRefused(
+                f"{_cell_name(cells, cid)} declares inputs its steps never "
+                f"read: {', '.join(repr(m) for m in missing)}. Remove them "
+                "from the cell's inputs or point a step at them.",
+            )
+
+    _, target_terminal = _cell_fragment(target)
+    # A fixed synthetic name, the way Explore always compiles as "explore":
+    # nothing is ever materialized under it, and `from_json` requires
+    # output == name.
+    return FlowDef.from_json({
+        "name": "analysis",
+        "output": "analysis",
+        "author": "",
+        "terminal": f"{target.id}_{target_terminal}",
+        "nodes": nodes_out,
+    })
+
+
+def _stored_cell(store: MetadataStore, name: str, cell_id: str):
+    ana = store.get_analysis(name)
+    if ana is None:
+        raise HTTPException(status_code=404, detail=f"Analysis not found: {name!r}")
+    cell = next((c for c in ana.cells if c.id == cell_id), None)
+    if cell is None:
+        raise HTTPException(status_code=404, detail=f"Cell not found: {cell_id!r}")
+    return ana, cell
+
+
+@router.get("/analyses", dependencies=[VIEWER])
+def list_analyses(store: StoreDep) -> list[dict]:
+    return [_dump(a) for a in store.list_analyses()]
+
+
+@router.get("/analyses/{name}", dependencies=[VIEWER])
+def get_analysis(name: str, store: StoreDep) -> dict:
+    ana = store.get_analysis(name)
+    if ana is None:
+        raise HTTPException(status_code=404, detail=f"Analysis not found: {name!r}")
+    return _dump(ana)
+
+
+@router.post("/analyses/{name}/cells/{cell_id}/run", dependencies=[VIEWER])
+def run_analysis_cell(
+    name: str,
+    cell_id: str,
+    body: CellRunRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """Run one stored cell and return its rows. The viewer's half of R2.
+
+    A shaping cell's whole ancestor chain is synthesized into one flow and
+    compiled per run against the live schema, then executed **as the caller**
+    down `_execute_sql` — the same path, the same reason, as a dashboard
+    panel's run: the caller's ACL (an unviewable source fails as an unknown
+    table), row-level security and column masks apply to the entire chain in
+    one pass. Nothing is cached and nothing is materialized; two viewers get
+    different rows from the same cell.
+
+    Failures never echo the instruction: `stored_instruction_error` serves
+    the first-party sentence only to a principal who could have authored the
+    cell, and a `Failure` brief to everyone else.
+    """
+    ana, cell = _stored_cell(store, name, cell_id)
+    if cell.is_flow_cell:
+        try:
+            flow = _analysis_closure(ana.cells, cell)
+            # Sources view-checked against the CALLER before the compiler can
+            # name a column — `_compiled_flow`'s disclosure ordering, inlined
+            # because the closure is already synthesized.
+            check_flow_sources(store, perms, user, flow)
+            # `top` is the cell's own top-N, bound as LIMIT ? at the terminal
+            # only — never pushed upstream, where it would change every
+            # downstream aggregate's answer.
+            top = cell.top
+            limit = (top if top is not None and top <= body.max_rows
+                     else body.max_rows + 1)
+            compiled = compile_flow_now(catalog, flow, limit=limit)
+        except FlowRefused as exc:
+            # The editor's copy of a run-time refusal (the world changed under
+            # a stored chain) speaks cell vocabulary too; the viewer's brief
+            # never carried the step ids in the first place.
+            raise stored_instruction_error(
+                _reraised_in_cell_vocabulary(ana.cells, exc),
+                subject=f"cell:{cell_id}", author=Role.editor,
+            ) from None
+        except Exception as exc:
+            raise stored_instruction_error(
+                exc, subject=f"cell:{cell_id}", author=Role.editor
+            ) from None
+        return _execute_sql(
+            catalog, store, perms, user, compiled.sql, body.max_rows,
+            params=compiled.params, server_authored=True,
+        )
+    return _execute_sql(catalog, store, perms, user, cell.sql, body.max_rows)
+
+
+@router.post("/analyses/preview", dependencies=[EDITOR])
+def preview_analysis_cell(
+    body: AnalysisPreviewRequest,
+    catalog: CatalogDep,
+    store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
+) -> dict:
+    """Preview one shaping cell of a DRAFT analysis, as the caller.
+
+    `preview_explore`'s posture, inherited wholesale: capped at
+    `FLOW_PREVIEW_MAX_ROWS`, limit bound as `max_rows + 1` so `truncated` can
+    actually fire, `check_flow_governance` deliberately skipped (nothing
+    materializes — every row is computed under the caller's own policy), and
+    `schema`/`kinds`/`masked_columns` returned so chart bindings and measure
+    pickers only ever offer columns the compiled result really has.
+
+    SQL draft cells preview through the existing `POST /query`; this route is
+    the shaping side only.
+    """
+    if len(body.cells) > MAX_ANALYSIS_CELLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"An analysis is limited to {MAX_ANALYSIS_CELLS} cells",
+        )
+    cells: list[AnalysisCell] = []
+    seen: set[str] = set()
+    for raw in body.cells:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Each cell must be an object")
+        cell_id = str(raw.get("id", ""))
+        if not _CELL_ID_RE.match(cell_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid cell id {cell_id!r}: use lowercase letters, "
+                       "digits and underscores (up to 32 characters).",
+            )
+        if cell_id in seen:
+            raise HTTPException(
+                status_code=400, detail=f"Two cells share the id {cell_id!r}"
+            )
+        seen.add(cell_id)
+        try:
+            cells.append(AnalysisCell.model_validate(raw))
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cell {cell_id!r}: {exc.errors()[0]['msg']}",
+            ) from None
+    target = next((c for c in cells if c.id == body.cell_id), None)
+    if target is None:
+        raise HTTPException(
+            status_code=400, detail=f"Cell not found in the draft: {body.cell_id!r}"
+        )
+    if not target.is_flow_cell:
+        raise HTTPException(
+            status_code=400,
+            detail="SQL cells preview through POST /query; this route "
+                   "previews shaping cells.",
+        )
+    max_rows = max(1, min(int(body.max_rows), FLOW_PREVIEW_MAX_ROWS))
+    flow = _refused_in_cell_vocabulary(cells, _analysis_closure, cells, target)
+    compiled = _refused_in_cell_vocabulary(
+        cells, _compiled_flow, catalog, store, perms, user, flow,
+        limit=max_rows + 1,
+    )
+    result = _flow_execution(
+        _execute_sql, catalog, store, perms, user, compiled.sql, max_rows,
+        params=compiled.params, server_authored=True,
+    )
+    masked: dict[str, list[str]] = {}
+    for ds in flow.source_datasets():
+        columns = sorted(masked_columns_for(perms, user, ds))
+        if columns:
+            masked[ds] = columns
+    return result | {
+        "schema": compiled.schema,
+        "kinds": compiled.kinds,
+        "masked_columns": masked,
+        "max_rows": max_rows,
+    }
+
+
+def _check_analysis_cells(
+    catalog: DatasetCatalog,
+    store: MetadataStore,
+    perms: PermissionService,
+    user: User,
+    cells: list[AnalysisCell],
+    changed: Optional[set[str]] = None,
+) -> None:
+    """Save-time validation: every affected shaping cell must still compile.
+
+    `_check_flow_panel`'s pattern, per cell: synthesize the closure, Tier A,
+    the author's view rights on the sources (before compilation — the same
+    disclosure ordering as `_compiled_flow`), Tier B against the live schema,
+    then the chart bindings against the compiled result schema. A chain means
+    editing one cell can break the cells downstream of it, so `changed=None`
+    checks every shaping cell; a set checks those cells plus every transitive
+    dependent. These are EDITOR routes validating the caller's own submission,
+    so `FlowRefused` is served verbatim, its namespaced step ids rewritten
+    into cell vocabulary (`_refused_in_cell_vocabulary`). SQL cells stay
+    unvalidated — their text cannot be checked without executing it.
+    """
+    affected: Optional[set[str]] = None
+    if changed is not None:
+        affected = set(changed)
+        # Transitive dependents: keep adding cells whose inputs touch the set.
+        grew = True
+        while grew:
+            grew = False
+            for cell in cells:
+                if cell.id in affected:
+                    continue
+                if any(i in affected for i in cell.inputs):
+                    affected.add(cell.id)
+                    grew = True
+    for cell in cells:
+        if not cell.is_flow_cell:
+            continue
+        if affected is not None and cell.id not in affected:
+            continue
+        flow = _refused_in_cell_vocabulary(cells, _analysis_closure, cells, cell)
+        compiled = _refused_in_cell_vocabulary(
+            cells, _compiled_flow, catalog, store, perms, user, flow
+        )
+        produced = set(compiled.schema)
+        bindings = [("x", cell.x), ("series", cell.series)]
+        bindings += [("y", column) for column in cell.y]
+        for label, bound in bindings:
+            if bound and bound not in produced:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{_cell_name(cells, cell.id)} binds {label} to column "
+                        f"{bound!r}, but its result does not produce it. Its "
+                        "columns are: "
+                        + ", ".join(repr(c) for c in compiled.schema) + "."
+                    ),
+                )
+
+
+def _label_cells(cells: list[AnalysisCell]) -> list[AnalysisCell]:
+    """Give every cell a non-empty title at WRITE time, like `_label_panels`:
+    a viewer's label must never have to fall back to a slice of the query."""
+    out = []
+    for n, cell in enumerate(cells, start=1):
+        out.append(cell if cell.title.strip()
+                   else cell.model_copy(update={"title": f"Cell {n}"}))
+    return out
+
+
+def _merge_cells(
+    raw_cells: list[dict], existing: Optional[AnalysisInfo]
+) -> tuple[list[AnalysisCell], int]:
+    """Merge a whole-record PUT's cells over the stored record.
+
+    The `_preserve_operational` rule, verbatim: **absence is "unchanged",
+    never "blank it"** — a client round-tripping the viewer projection holds
+    cells whose `sql`/`flow`/`inputs` are *absent* (the projection omits
+    operational keys rather than blanking them), and re-PUTting them must not
+    erase the instructions it was never shown. A field the request *sends* is
+    honoured, including `""`/`[]`/`{}`.
+
+    The rule applies to EVERY field of a stored cell, not just the operational
+    half. Measured before it did: a reorder PUT of `[{"id":"c2"},{"id":"c1"}]`
+    — exactly the "round-tripped record minus what I didn't touch" shape the
+    rule above teaches — kept both cells' sql/flow/inputs but reset their
+    titles to auto-labels and their chart bindings to defaults, and later
+    refusals then named cells by the blanked title. One contract, both halves:
+    absence means "unchanged", period.
+
+    Cells without an id are new: they get the next server-assigned `c{n}`.
+    Returns the validated cells and the advanced counter.
+    """
+    stored = {c.id: c for c in (existing.cells if existing else [])}
+    next_cell = existing.next_cell if existing else 1
+    out: list[AnalysisCell] = []
+    seen: set[str] = set()
+    for raw in raw_cells:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Each cell must be an object")
+        merged = dict(raw)
+        cell_id = str(merged.get("id", "") or "")
+        if not cell_id:
+            cell_id = f"c{next_cell}"
+            next_cell += 1
+            merged["id"] = cell_id
+        elif not _CELL_ID_RE.match(cell_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid cell id {cell_id!r}: use lowercase letters, "
+                       "digits and underscores (up to 32 characters).",
+            )
+        if cell_id in seen:
+            raise HTTPException(
+                status_code=400, detail=f"Two cells share the id {cell_id!r}"
+            )
+        seen.add(cell_id)
+        prior = stored.get(cell_id)
+        if prior is not None:
+            for field in AnalysisCell.model_fields:
+                # Skipping falsy stored values is safe here: every falsy value
+                # a cell field can hold IS its default (width/top are ge=1).
+                if field not in merged and getattr(prior, field):
+                    merged[field] = getattr(prior, field)
+        try:
+            out.append(AnalysisCell.model_validate(merged))
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cell {cell_id!r}: {exc.errors()[0]['msg']}",
+            ) from None
+    # Imported ids like "c7" must advance the counter past themselves, or the
+    # next added cell would collide with one the import brought along.
+    for cell in out:
+        if cell.id.startswith("c") and cell.id[1:].isdigit():
+            next_cell = max(next_cell, int(cell.id[1:]) + 1)
+    return _label_cells(out), next_cell
+
+
+def _save_analysis(
+    store: MetadataStore, info: AnalysisInfo, actor: str, *, created: bool = False
+) -> dict:
+    store.upsert_analysis(info)
+    store.log_audit(
+        "analysis_created" if created else "analysis_updated",
+        {"analysis": info.name, "cells": len(info.cells)},
+        actor=actor, min_read_role=Role.editor,
+    )
+    return _dump(info)
+
+
+@router.put("/analyses/{name}", dependencies=[EDITOR])
+def upsert_analysis(
+    name: str, body: AnalysisUpsertRequest, catalog: CatalogDep, store: StoreDep,
+    perms: PermDep, user: UserDep, actor: ActorDep
+) -> dict:
+    if not _ANALYSIS_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid analysis name {name!r}: must match ^[a-z][a-z0-9_-]{{0,63}}$",
+        )
+    if len(body.cells) > MAX_ANALYSIS_CELLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"An analysis is limited to {MAX_ANALYSIS_CELLS} cells",
+        )
+    existing = store.get_analysis(name)
+    cells, next_cell = _merge_cells(body.cells, existing)
+    _check_analysis_cells(catalog, store, perms, user, cells)
+    info = AnalysisInfo(
+        name=name,
+        title=body.title.strip(),
+        description=body.description.strip(),
+        cells=cells,
+        next_cell=next_cell,
+        created_at=existing.created_at if existing else utcnow_iso(),
+        created_by=existing.created_by if existing else actor,
+        updated_at=utcnow_iso(),
+    )
+    return _save_analysis(store, info, actor, created=existing is None)
+
+
+def _save_cells(
+    store: MetadataStore, ana: AnalysisInfo, cells: list[AnalysisCell], actor: str,
+    *, next_cell: Optional[int] = None,
+) -> dict:
+    info = ana.model_copy(update={
+        "cells": _label_cells(cells),
+        "updated_at": utcnow_iso(),
+        **({"next_cell": next_cell} if next_cell is not None else {}),
+    })
+    return _save_analysis(store, info, actor)
+
+
+@router.post("/analyses/{name}/cells", dependencies=[EDITOR])
+def add_analysis_cell(
+    name: str, body: dict, catalog: CatalogDep, store: StoreDep,
+    perms: PermDep, user: UserDep, actor: ActorDep
+) -> dict:
+    """Append one cell, under a server-assigned id. Exists so a client never
+    has to re-PUT the whole analysis — the same reason the per-panel routes
+    exist on dashboards."""
+    ana = store.get_analysis(name)
+    if ana is None:
+        raise HTTPException(status_code=404, detail=f"Analysis not found: {name!r}")
+    if len(ana.cells) >= MAX_ANALYSIS_CELLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"An analysis is limited to {MAX_ANALYSIS_CELLS} cells",
+        )
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A cell must be an object")
+    # The counter normally never collides; an imported record that brought its
+    # own ids is the exception, and two cells sharing an id would make the run
+    # route answer for the wrong one.
+    taken = {c.id for c in ana.cells}
+    next_cell = ana.next_cell
+    while f"c{next_cell}" in taken:
+        next_cell += 1
+    cell_id = f"c{next_cell}"
+    try:
+        cell = AnalysisCell.model_validate({**body, "id": cell_id})
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail=exc.errors()[0]["msg"]
+        ) from None
+    cells = [*ana.cells, cell]
+    _check_analysis_cells(catalog, store, perms, user, cells, changed={cell_id})
+    return _save_cells(store, ana, cells, actor, next_cell=next_cell + 1)
+
+
+@router.put("/analyses/{name}/cells/{cell_id}", dependencies=[EDITOR])
+def update_analysis_cell(
+    name: str, cell_id: str, body: dict, catalog: CatalogDep, store: StoreDep,
+    perms: PermDep, user: UserDep, actor: ActorDep
+) -> dict:
+    ana, existing = _stored_cell(store, name, cell_id)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A cell must be an object")
+    merged = dict(body)
+    merged["id"] = cell_id
+    # Same merge rule as the whole-record PUT: a field the request does not
+    # mention — either half — inherits the stored value.
+    for field in AnalysisCell.model_fields:
+        if field not in merged and getattr(existing, field):
+            merged[field] = getattr(existing, field)
+    try:
+        updated = AnalysisCell.model_validate(merged)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail=exc.errors()[0]["msg"]
+        ) from None
+    cells = [updated if c.id == cell_id else c for c in ana.cells]
+    # `changed` includes this cell's transitive dependents: editing an
+    # upstream cell is exactly the edit that breaks the cells built on it,
+    # and the editor should hear that now, not when a viewer's run fails.
+    _check_analysis_cells(catalog, store, perms, user, cells, changed={cell_id})
+    return _save_cells(store, ana, cells, actor)
+
+
+@router.delete("/analyses/{name}/cells/{cell_id}", dependencies=[EDITOR])
+def delete_analysis_cell(
+    name: str, cell_id: str, store: StoreDep, actor: ActorDep
+) -> dict:
+    ana, _cell = _stored_cell(store, name, cell_id)
+    dependents = [c for c in ana.cells if cell_id in c.inputs]
+    if dependents:
+        # Refused in cell vocabulary at delete time, where the editor is
+        # watching. Tier A's "takes input from … which is not a step" remains
+        # the backstop, but it speaks step ids at run time to a viewer.
+        names = ", ".join(_cell_name(ana.cells, d.id) for d in dependents)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{names} take{'s' if len(dependents) == 1 else ''} input "
+                   "from this cell. Delete or repoint "
+                   f"{'it' if len(dependents) == 1 else 'them'} first.",
+        )
+    return _save_cells(
+        store, ana, [c for c in ana.cells if c.id != cell_id], actor
+    )
+
+
+@router.delete("/analyses/{name}", dependencies=[EDITOR])
+def delete_analysis(name: str, store: StoreDep, actor: ActorDep) -> dict:
+    if not store.delete_analysis(name):
+        raise HTTPException(status_code=404, detail=f"Analysis not found: {name!r}")
+    store.log_audit("analysis_deleted", {"analysis": name}, actor=actor)
     return {"deleted": name}
 
 

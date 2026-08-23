@@ -531,6 +531,122 @@ class DashboardInfo(Governed):
     updated_at: Annotated[str, Audience.PRESENTATION] = Field(default_factory=utcnow_iso)
 
 
+class AnalysisCell(Governed):
+    """One step of an Analysis: an instruction plus its presentation.
+
+    An analysis is a saveable, shareable chain of cells — Code Workbook
+    parity minus the code. A cell is EITHER a governed SQL query (``sql``)
+    OR a point-and-click shaping step (``flow``, a fragment of Flow IR nodes),
+    never a code cell: an arbitrary-code cell is the RCE surface
+    ``--lock-pipelines`` exists to close, and nothing in this model may be
+    loosened to accommodate one.
+
+    R2 splits a cell exactly where it splits a `DashboardPanel`: the
+    presentation half (id, title, chart bindings, width) is what a viewer's
+    screen is made of; the instruction half (``sql``/``flow``/``inputs``/
+    ``top``) is withheld, and the viewer gets the RESULTS from
+    ``POST /analyses/{name}/cells/{id}/run``, executed server-side **as the
+    caller** — so sharing an analysis grants nobody any new read access.
+
+    ``flow`` is a *fragment*, not a full FlowDef: ``{"nodes": [...],
+    "terminal": "..."}`` with node params in the exact ``flow_ir`` shapes.
+    A node input may name another node in the same fragment, or
+    ``"cell:<id>"`` to take an earlier shaping cell's output — the run route
+    synthesizes ONE FlowDef from the cell's whole ancestor closure per
+    request, so the entire chain executes as one compiled, parameter-bound
+    statement under the caller's own policy. Stored as IR and never as
+    compiled SQL, for the reason `DashboardPanel.flow` documents: the run
+    path's SQL branch carries no parameter list, so stored text would
+    silently drop its bound values.
+
+    ``inputs`` lists the upstream cell ids, redundantly with the node-level
+    ``cell:`` references (server-validated to agree), so deletion checks and
+    the UI never have to parse node graphs. OPERATIONAL: the edge names which
+    instruction feeds which — it is the instruction graph. Cell *order* is
+    already visible to a viewer via list position.
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.editor
+
+    id: Annotated[str, Audience.PRESENTATION]
+    # Always non-empty on a stored cell: the upsert fills "Cell {n}" when the
+    # author leaves it blank, so a viewer never reads an unlabeled box.
+    title: Annotated[str, Audience.PRESENTATION] = ""
+    # -- source A: SQL over datasets, exactly the workbench's power.
+    # OPERATIONAL by omission. Non-chainable both ways: the IR is closed to
+    # raw SQL by design, and both bridging mechanisms fail (DuckDB refuses
+    # parameters in views; textual composition misaligns ordinals).
+    sql: str = ""
+    # -- source B: a Flow IR fragment, what the shaping cards save.
+    flow: dict[str, Any] = Field(default_factory=dict)
+    # Upstream *shaping* cell ids. Part of the query, so OPERATIONAL.
+    inputs: list[str] = Field(default_factory=list)
+    # Top-N bound as LIMIT ? at the cell's terminal, never pushed upstream.
+    top: Optional[int] = Field(default=None, ge=1, le=10_000)
+
+    chart: Annotated[ChartKind, Audience.PRESENTATION] = ChartKind.table
+    x: Annotated[str, Audience.PRESENTATION] = ""
+    y: Annotated[list[str], Audience.PRESENTATION] = Field(default_factory=list)
+    series: Annotated[str, Audience.PRESENTATION] = ""
+    stacked: Annotated[bool, Audience.PRESENTATION] = False  # bar only
+    width: Annotated[int, Audience.PRESENTATION] = Field(default=6, ge=1, le=12)
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "AnalysisCell":
+        has_sql = bool(self.sql.strip())
+        has_flow = bool(self.flow)
+        if has_sql and has_flow:
+            raise ValueError(
+                "A cell is either a SQL query or a shaping step, not both at "
+                "once — two sources would make it ambiguous which one the "
+                "result shows."
+            )
+        if not has_sql and not has_flow:
+            raise ValueError("A cell needs either sql or flow")
+        if has_sql and self.inputs:
+            raise ValueError(
+                "A SQL cell cannot take input from other cells. Chaining is "
+                "what shaping cells do — the whole chain compiles to one "
+                "governed statement, which raw SQL cannot join."
+            )
+        if has_sql and self.top is not None:
+            raise ValueError("Top-N belongs to shaping cells; put a LIMIT in the SQL.")
+        return self
+
+    @property
+    def is_flow_cell(self) -> bool:
+        return bool(self.flow)
+
+
+class AnalysisInfo(Governed):
+    """A saved analysis: an ordered list of cells, shared like a dashboard.
+
+    ``cells`` is PRESENTATION so a viewer's screen is not an empty box; each
+    cell then narrows itself (see `AnalysisCell`), so what arrives is the
+    layout without the instructions. Display order is cosmetic — *execution*
+    order is the DAG in each cell's ``inputs``.
+
+    No result is ever persisted anywhere in this model: two viewers get
+    different rows from the same stored instruction, so a cached result would
+    be a silent row-level-security bypass. The run route recomputes, always.
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.editor
+
+    name: Annotated[str, Audience.PRESENTATION]
+    title: Annotated[str, Audience.PRESENTATION] = ""
+    description: Annotated[str, Audience.PRESENTATION] = ""
+    cells: Annotated[list[AnalysisCell], Audience.PRESENTATION] = Field(
+        default_factory=list
+    )
+    created_at: Annotated[str, Audience.PRESENTATION] = Field(default_factory=utcnow_iso)
+    created_by: str = ""
+    updated_at: Annotated[str, Audience.PRESENTATION] = Field(default_factory=utcnow_iso)
+    # The monotonic counter behind server-assigned cell ids (c1, c2, …).
+    # OPERATIONAL by omission: it is bookkeeping, not presentation.
+    next_cell: int = 1
+
+
 # ---------------------------------------------------------------------------
 # Builds & lineage
 # ---------------------------------------------------------------------------

@@ -69,6 +69,8 @@ from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.failure import Failure, FailureCode, Phase
 from laurelin.core.models import (
+    AnalysisCell,
+    AnalysisInfo,
     BuildStatus,
     BuildTaskInfo,
     DashboardInfo,
@@ -545,6 +547,36 @@ def sentinel_workspace(tmp_path):
         created_by="root",
     ))
 
+    # An analysis: the same split as a dashboard, with the two extra
+    # instruction fields cells carry — `flow` (whose filter values are author
+    # text) and `inputs` (the instruction graph). Titles are captions and stay
+    # unseeded, exactly as panel titles are.
+    store.upsert_analysis(AnalysisInfo(
+        name=SEEDED, title="Notebook",
+        cells=[
+            AnalysisCell(
+                id="c1", title="C1",
+                sql=f"SELECT * FROM postgres_scan('host=db password={SENTINEL_EDITOR}_CELLSQL')",
+            ),
+            AnalysisCell(
+                id="c2", title="C2", inputs=["c3"], top=7,
+                flow={"terminal": "s1", "nodes": [
+                    {"id": "s1", "kind": "filter", "inputs": ["cell:c3"],
+                     "params": {"predicate": {"t": "op", "op": "eq", "args": [
+                         {"t": "col", "name": f"{SENTINEL_EDITOR}_CELLCOL"},
+                         {"t": "lit", "type": "string",
+                          "value": f"{SENTINEL_EDITOR}_CELLVALUE"}]}}}]},
+            ),
+            AnalysisCell(
+                id="c3", title="C3",
+                flow={"terminal": "s1", "nodes": [
+                    {"id": "s1", "kind": "source", "inputs": [],
+                     "params": {"dataset": SEEDED}}]},
+            ),
+        ],
+        created_by="root",
+    ))
+
     # An object app whose stored filters are ADMIN-authored instructions, named
     # against a property that does not exist — the ontology-drift case, which is
     # what turned this route into an oracle.
@@ -640,6 +672,7 @@ PATH_PARAMS = {
     "api_name": "aircraft",
     "build_id": "b1",
     "panel_id": "p1",
+    "cell_id": "c1",
     "pk": "eu",
     "link_name": "operated_by",
     "username": "vic",

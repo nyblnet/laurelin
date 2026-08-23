@@ -21,6 +21,8 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 from laurelin.core.backend import Connection, make_backend
 from laurelin.core.failure import Failure, FailureCode, Phase
 from laurelin.core.models import (
+    AnalysisCell,
+    AnalysisInfo,
     AuditEvent,
     BuildInfo,
     BuildStatus,
@@ -293,6 +295,16 @@ CREATE TABLE IF NOT EXISTS dashboards (
     title TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     panels_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS analyses (
+    name TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    cells_json TEXT NOT NULL DEFAULT '[]',
+    next_cell INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     created_by TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
@@ -1511,6 +1523,65 @@ class MetadataStore:
     def delete_dashboard(self, name: str) -> bool:
         with self._conn() as c:
             cur = c.execute("DELETE FROM dashboards WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
+    # -- analyses ----------------------------------------------------------------
+    #
+    # `cells_json` is the full `model_dump` including the operational halves.
+    # Projection down to a reader's role happens ONLY in `serialize.dump` —
+    # a store that pre-projected would leave every non-REST caller (MCP, CLI,
+    # export) holding a record with holes where the instructions were.
+
+    def upsert_analysis(self, info: "AnalysisInfo") -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO analyses
+                     (name, title, description, cells_json, next_cell,
+                      created_at, created_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     title = excluded.title,
+                     description = excluded.description,
+                     cells_json = excluded.cells_json,
+                     next_cell = excluded.next_cell,
+                     updated_at = excluded.updated_at""",
+                (
+                    info.name,
+                    info.title,
+                    info.description,
+                    json.dumps([cell.model_dump() for cell in info.cells]),
+                    info.next_cell,
+                    info.created_at,
+                    info.created_by,
+                    info.updated_at,
+                ),
+            )
+
+    def _row_to_analysis(self, row) -> "AnalysisInfo":
+        return AnalysisInfo(
+            name=row["name"],
+            title=row["title"],
+            description=row["description"],
+            cells=[AnalysisCell(**c) for c in json.loads(row["cells_json"])],
+            next_cell=row["next_cell"],
+            created_at=row["created_at"],
+            created_by=row["created_by"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_analysis(self, name: str) -> Optional["AnalysisInfo"]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM analyses WHERE name = ?", (name,)).fetchone()
+        return self._row_to_analysis(row) if row else None
+
+    def list_analyses(self) -> list["AnalysisInfo"]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM analyses ORDER BY name").fetchall()
+        return [self._row_to_analysis(r) for r in rows]
+
+    def delete_analysis(self, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM analyses WHERE name = ?", (name,))
             return cur.rowcount > 0
 
     # -- build leases -------------------------------------------------------------

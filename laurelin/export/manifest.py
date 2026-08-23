@@ -260,6 +260,19 @@ TABLE_POLICY: dict[str, TableSpec] = {
         conflict_key=("name",),
         order=31,
     ),
+    "analyses": TableSpec(
+        _PORTABLE,
+        "Authored declarative config; nothing regenerates it. Cells are "
+        "instructions only — no result is ever persisted, so nothing here "
+        "can replay one caller's rows to another.",
+        columns=(
+            "name", "title", "description", "cells_json", "next_cell",
+            "created_at", "created_by", "updated_at",
+        ),
+        scan_columns=("cells_json",),
+        conflict_key=("name",),
+        order=32,
+    ),
     "object_apps": TableSpec(
         _PORTABLE,
         "Authored declarative config; nothing regenerates it.",

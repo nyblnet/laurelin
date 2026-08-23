@@ -24,6 +24,11 @@ import { Badge } from "./ui";
 const NAV: { to: string; label: string; needs?: Role }[] = [
   { to: "/datasets", label: "Datasets" },
   { to: "/dashboards", label: "Dashboards" },
+  // Beside Dashboards because it shares their sharing model: an analysis is
+  // a multi-cell notebook a viewer opens for RESULTS. Viewer-visible — the
+  // read and run routes are VIEWER, exactly like dashboards; adding and
+  // editing cells inside the page is editor-gated by the page itself.
+  { to: "/analyses", label: "Analyses" },
   // Beside Dashboards, because it is how dashboards get made: point-and-click
   // shaping into a chart. Editor-gated like Flows — its preview compiles and
   // runs queries, an authoring act.

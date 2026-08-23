@@ -10,6 +10,47 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Analyses: the multi-cell governed notebook (Code Workbook parity, no code)
+
+A new **Analyses** surface (`/analyses` in the UI, `/api/v1/analyses` REST):
+a saveable, shareable, multi-step analysis document. An analyst adds cells —
+each cell is EITHER a governed SQL query (the workbench, inline) OR a
+point-and-click shaping step (Explore's card stack) — sees the result table
+and an optional chart per cell (the same hand-rolled SVG charts), and a later
+shaping cell can take an earlier shaping cell's **output** as its source;
+that source picker is the whole chaining UX.
+
+Chaining never materializes an intermediate dataset. Per run or preview the
+server synthesizes ONE FlowDef from the target cell's ancestor closure
+(cells' step ids namespaced `{cell}_{step}`, cross-cell edges rewritten to
+the upstream cell's terminal) and compiles it through the one Flow compiler
+— so the entire chain executes as a single parameter-bound statement through
+`_execute_sql` **as the caller**, under that caller's ACL / row policy /
+masks in one policy pass. Two viewers get different rows from the same chain;
+a chained cell cannot show a viewer rows only the author's policy would have
+allowed; no result is ever persisted (a cached result would be a silent RLS
+bypass). SQL cells are non-chainable in both directions — the IR is closed
+to raw SQL by design, and both bridging mechanisms measurably fail (DuckDB
+refuses parameters in views; textual composition misaligns ordinals).
+
+Sharing is the dashboard model, R2 included: a viewer's cell arrives as
+exactly `{id, title, chart, x, y, series, stacked, width}` plus rows from
+`POST /analyses/{name}/cells/{id}/run`; `sql`, `flow`, `inputs` and `top`
+are withheld, and run errors are laundered through
+`stored_instruction_error`. The whole-record and per-cell PUTs merge every
+absent field — both halves, instruction and presentation — from the stored
+record: absence is "unchanged", never "blank it", so a round-tripping client
+cannot blank an instruction it was never shown, and a reorder PUT of bare
+`{"id": …}` cells keeps titles and chart bindings too (measured before the
+rule covered presentation: that PUT silently reset both). Editor-facing
+compiler refusals are rewritten **server-side** into the vocabulary the
+product speaks — "Cell 2 ('Revenue by region')'s Summarise card refers to a
+column named 'amount'…", never "Step 'c2_a1'" — so scripts and MCP agents
+hear the same sentences the bundled UI shows. There is deliberately **no
+code cell** — that is the RCE surface `--lock-pipelines` exists to close.
+`tests/test_analyses.py` states the invariants; the audience sweep covers
+the new routes automatically.
+
 ### MCP authoring surface: agents can now build a workspace, not just read one
 
 The MCP server grows from 18 read-mostly tools to a full authoring surface —
