@@ -33,6 +33,18 @@ from laurelin.transforms.expectations import check as check_expectations
 log = logging.getLogger("laurelin.builder")
 
 
+class TransformRefused(RuntimeError):
+    """A build task refused before execution, by Laurelin itself.
+
+    Raised by ``Builder._check_input_entitlement`` when an API-authored
+    transform's recorded author is not entitled to read an input dataset in
+    full. First-party by construction: the message is Laurelin's own sentence
+    about Laurelin identifiers, never driver text. The structured
+    ``Failure`` a reader of the build sees carries the class name and a
+    ``detail_ref`` only — no column, mask mode, or policy rule.
+    """
+
+
 def _sandbox(con) -> None:
     """Cut off the filesystem and the network for a build's DuckDB connection.
 
@@ -240,6 +252,12 @@ class Builder:
                 self.store.renew_build_lease(build.id, worker)
             validate = self._expectation_validator(spec, task)
             try:
+                # Before anything executes or writes: an API-authored
+                # transform builds only as its recorded author. Raising here
+                # lands in the same catch as an execution failure, so the
+                # task fails, the output is never created, and unrelated
+                # tasks in the build are untouched.
+                self._check_input_entitlement(spec)
                 if spec.incremental:
                     (param, only_input), = spec.inputs.items()
                     mode, delta, input_version = self._incremental_input(spec)
@@ -357,6 +375,79 @@ class Builder:
         result_build = self.store.get_build(build.id)
         assert result_build is not None
         return result_build
+
+    def _check_input_entitlement(self, spec: TransformSpec) -> None:
+        """An API-authored transform builds only if its recorded author could
+        read every input dataset **in full** — view rights, and no row policy
+        or column mask that *applies to that author* — checked here,
+        immediately before the task runs, against the recorded author and
+        never the triggering principal (a scheduled build has none, and an
+        admin pressing "build" must not lend anyone their eyes).
+
+        ``spec.source_file`` is the ``pipelines/*.py`` stem the spec was
+        collected from; ``pipeline_authors`` holds the API-stamped author for
+        that file (re-stamped to the last saver on every PUT). Disk-authored,
+        imported and in-memory pipelines have no row and build unchecked —
+        operator-trusted, deliberately; see
+        ``MetadataStore.set_pipeline_author`` and the pinning test in
+        tests/test_build_governance.py. Flow specs return early: a flow
+        carries its own author and ``_execute_flow`` runs the stricter,
+        column-granular flow checks. Both paths resolve their author through
+        ``flow_governance._author_user`` so two resolutions of "who does this
+        build run as" cannot drift.
+
+        Applicability, not presence: the policy probe is evaluated with
+        ``PermissionService.decide`` — the same resolver every read path uses
+        — so an admin author (bypasses every policy) or an author exempt from
+        a mask still builds, while an author the policy actually filters or
+        masks is refused. A Python transform's touched columns are
+        unknowable, so any *applicable* mask refuses where a flow could drop
+        the masked column.
+        """
+        if spec.flow is not None or spec.source_file is None:
+            return
+        author = self.store.get_pipeline_author(spec.source_file)
+        if author is None:
+            return  # operator-trusted: never written through the API
+        from laurelin.core.permissions import PermissionService
+        from laurelin.transforms.flow_governance import _author_user
+
+        perms = PermissionService(self.store)
+        # FlowRefused (first-party) if the author no longer exists; a
+        # zero-user workspace resolves to a synthesized admin and proceeds.
+        user = _author_user(self.store, author, what="pipeline")
+        for inp in spec.inputs.values():
+            dataset = inp.dataset
+            if not perms.can_view_dataset(user, dataset):
+                raise TransformRefused(
+                    f"Transform {spec.name!r} was authored through the API by "
+                    f"{user.username!r}, who cannot read its input "
+                    f"{dataset!r}. Building it would copy data its author may "
+                    "not see into a new dataset."
+                )
+            policy = perms.dataset_policy(dataset)
+            if policy is None:
+                continue
+            # Probe with exactly the policy's own columns: enough to answer
+            # "does this policy apply to this author" without resolving the
+            # input's schema (which, for a remotely-backed input, is a round
+            # trip to another system). `decide` needs the row-policy column
+            # present in the projection to evaluate the rules rather than
+            # fail closed on its absence.
+            probe = {m.column for m in policy.column_masks}
+            if policy.row_policy is not None:
+                probe.add(policy.row_policy.column)
+            if not probe:
+                continue
+            if perms.decide(dataset, probe, user).applies:
+                raise TransformRefused(
+                    f"Transform {spec.name!r} was authored through the API by "
+                    f"{user.username!r}, who may not read its input "
+                    f"{dataset!r} in full. Its output would be a new dataset "
+                    "carrying values its author cannot see, with none of the "
+                    "input's restrictions on it. An administrator can re-save "
+                    "the file, or lift the restriction."
+                )
 
     def _execute(self, spec: TransformSpec) -> pa.Table:
         if spec.kind == "python":

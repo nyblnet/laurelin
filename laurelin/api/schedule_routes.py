@@ -16,7 +16,9 @@ from laurelin.api.routes import (
     EDITOR,
     ActorDep,
     StoreDep,
+    WorkspaceDep,
     _dump,
+    get_registry,
 )
 from laurelin.core import authoring_hints, scheduler
 from laurelin.core.failure import safe_detail
@@ -52,7 +54,8 @@ def get_schedule(name: str, store: StoreDep) -> dict:
 
 @schedules_router.put("/schedules/{name}", dependencies=[EDITOR])
 def upsert_schedule(
-    name: str, body: ScheduleUpsertRequest, store: StoreDep, actor: ActorDep
+    name: str, body: ScheduleUpsertRequest, store: StoreDep, actor: ActorDep,
+    workspace: WorkspaceDep,
 ) -> dict:
     if not _NAME_RE.match(name):
         raise HTTPException(
@@ -82,6 +85,45 @@ def upsert_schedule(
         for label, value in checked
         if authoring_hints.credential_in_free_text(value)
     ]
+    # Referent existence, warned rather than refused, in the same save-time
+    # posture as cron validation: a bad cron 400s at PUT, but a typo'd source
+    # or a target no transform produces used to save silently and surface only
+    # when the schedule fired and the queued run failed — hours later, in a
+    # build log nobody was watching. Warnings, not 400s, because a schedule
+    # may legitimately be authored before its flow (import order) — but never
+    # silently.
+    if body.action == "sync" and body.source.strip():
+        if store.get_source(body.source.strip()) is None:
+            warnings.append({
+                "field": "source",
+                "hint": f"no source named {body.source.strip()!r} is registered; "
+                        "this schedule will fail when it fires unless one is "
+                        "created first.",
+            })
+    if body.trigger == "upstream" and body.upstream_dataset.strip():
+        if store.get_dataset(body.upstream_dataset.strip()) is None:
+            warnings.append({
+                "field": "upstream dataset",
+                "hint": f"no dataset named {body.upstream_dataset.strip()!r} "
+                        "exists; this schedule will never fire until one does.",
+            })
+    if body.action == "build" and body.targets:
+        try:
+            registry = get_registry(workspace)
+        except HTTPException:
+            # A broken pipeline file must not block schedule authoring; the
+            # registry 409 is already reported by every graph-touching route.
+            registry = None
+        if registry is not None:
+            unknown = [t for t in body.targets if registry.by_output(t) is None]
+            if unknown:
+                warnings.append({
+                    "field": "target",
+                    "hint": "no transform produces "
+                            + ", ".join(repr(t) for t in unknown)
+                            + "; builds queued by this schedule will fail until "
+                            "a flow or pipeline with that output exists.",
+                })
     existing = store.get_schedule(name)
     info = ScheduleInfo(
         name=name,

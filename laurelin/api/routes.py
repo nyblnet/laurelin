@@ -1949,8 +1949,20 @@ def list_dataset_policies(store: StoreDep) -> list[dict]:
 
 @router.put("/datasets/{name}/policy", dependencies=[ADMIN])
 def set_dataset_policy(
-    name: str, body: DatasetPolicyRequest, store: StoreDep, actor: ActorDep
+    name: str, body: DatasetPolicyRequest, store: StoreDep, actor: ActorDep,
+    workspace: WorkspaceDep,
 ) -> dict:
+    """Set (or clear) the row policy and column masks on a dataset.
+
+    The write always succeeds, but a row policy on a dataset some transform
+    READS comes back with a warning naming the transforms: flow governance
+    refuses row-policied sources unconditionally (a flow's output is a new
+    dataset without the policy, so building would launder every row), which
+    means those flows stop building — and stop being editable or previewable —
+    the moment this policy lands. Measured on this tree: the breakage
+    otherwise surfaces only on the next scheduled build, hours after the
+    admin's 200. Policying a flow's *output* is fine.
+    """
     if store.get_dataset(name) is None:
         raise KeyError(f"Dataset not found: {name!r}")
     empty = body.row_policy is None and not body.column_masks
@@ -1970,7 +1982,31 @@ def set_dataset_policy(
         },
         actor=actor,
     )
-    return {"dataset": name, "policy": policy}
+    warnings: list[str] = []
+    if body.row_policy is not None:
+        # Best-effort: a broken pipeline file must not block a governance
+        # write (get_registry 409s on one), so collection failure just means
+        # no warning. The refusal itself is enforced at build/author time by
+        # flow_governance either way.
+        try:
+            registry = get_registry(workspace)
+        except HTTPException:
+            registry = None
+        if registry is not None:
+            readers = sorted(
+                spec.name for spec in registry.all()
+                if any(inp.dataset == name for inp in spec.inputs.values())
+            )
+            if readers:
+                warnings.append(
+                    f"Dataset {name!r} is read by transform(s) "
+                    f"{', '.join(repr(r) for r in readers)}. A row policy on "
+                    "a transform's source refuses its builds, previews and "
+                    "edits (fail-closed: the output would launder the policied "
+                    "rows). Those transforms will fail until the policy is "
+                    "removed or they are repointed at an unpolicied copy."
+                )
+    return {"dataset": name, "policy": policy, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -2653,16 +2689,42 @@ def write_flow(
     touches it.
     """
     flow = _flow_or_400(FlowDef.from_json, dict(body.flow), name=name)
+    # A save may only replace the flow file it names. `by_output` alone is not
+    # enough: a *Python* transform whose name equals the flow's would pass a
+    # bare name comparison, the file would save, and the next
+    # `collect_transforms` would raise `Duplicate transform name` — 409ing
+    # every graph-touching route in the workspace until someone deletes the
+    # flow file. Measured on this tree before the `kind` check existed.
+    # Flow name == output (enforced with a 400 in `FlowDef.from_json`), and
+    # the registry this request collected is duplicate-free, so checking the
+    # output producer and falling back to the name index covers both the
+    # same-output and the same-name-different-output collision.
     existing = registry.by_output(flow.output)
-    if existing is not None and existing.name != flow.name:
-        raise HTTPException(
-            status_code=409,
-            detail=(
+    if existing is None:
+        try:
+            existing = registry.get(flow.name)
+        except KeyError:
+            existing = None
+    if existing is not None and not (
+        existing.kind == "flow" and existing.name == flow.name
+    ):
+        if existing.kind != "flow":
+            what = f"code transform {existing.name!r}"
+            if existing.source_file:
+                what += f" (pipeline file {existing.source_file!r})"
+            detail = (
+                f"{what} already uses this name or produces "
+                f"{flow.output!r}. A flow cannot replace or share a name "
+                "with a code transform; pick a different flow name or remove "
+                "the pipeline file first."
+            )
+        else:
+            detail = (
                 f"Dataset {flow.output!r} is already produced by transform "
                 f"{existing.name!r}. Each dataset may have only one producing "
                 "transform."
-            ),
-        )
+            )
+        raise HTTPException(status_code=409, detail=detail)
     _reject_workspace_cycle(registry, flow)
     compiled = _flow_or_400(
         _compiled_flow, catalog, store, perms, user, flow

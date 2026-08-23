@@ -288,3 +288,34 @@ def test_schedules_are_editor_gated(client):
     viewer.post("/api/v1/auth/login", json={"username": "vic", "password": "password123"})
     assert viewer.get("/api/v1/schedules").status_code == 403
     assert viewer.put("/api/v1/schedules/x", json={"cron": "0 2 * * *"}).status_code == 403
+
+
+def test_a_schedule_naming_a_nonexistent_referent_warns_at_save_instead_of_failing_silently_later(
+    client,
+):
+    """Cron typos 400 at save; referent typos used to save with warnings: []
+    and surface only when the schedule fired and the queued run failed. The
+    referents (sync source, build targets, upstream dataset) are checked at
+    save and reported as warnings — warnings and not 400s, because a schedule
+    may legitimately be authored before its flow, but never silently."""
+    c, _, _ = client
+
+    r = c.put("/api/v1/schedules/ghost-sync", json={
+        "trigger": "cron", "cron": "0 6 * * *",
+        "action": "sync", "source": "no_such_source"})
+    assert r.status_code == 200
+    assert any("no_such_source" in w["hint"] for w in r.json()["warnings"])
+
+    r = c.put("/api/v1/schedules/ghost-build", json={
+        "trigger": "upstream", "upstream_dataset": "no_such_ds",
+        "action": "build", "targets": ["no_such_target"]})
+    assert r.status_code == 200
+    hints = " | ".join(w["hint"] for w in r.json()["warnings"])
+    assert "no_such_ds" in hints and "no_such_target" in hints
+
+    # Real referents stay warning-free: `clean` is produced by the pipeline
+    # and `raw` exists as a dataset.
+    r = c.put("/api/v1/schedules/nightly", json={
+        "trigger": "upstream", "upstream_dataset": "raw",
+        "action": "build", "targets": ["clean"]})
+    assert r.status_code == 200 and r.json()["warnings"] == []

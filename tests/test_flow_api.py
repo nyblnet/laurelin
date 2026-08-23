@@ -164,6 +164,57 @@ def test_a_flow_and_a_python_pipeline_producing_the_same_dataset_are_refused_as_
     assert "busy_regions" in r.json()["detail"] or "clash" in r.json()["detail"]
 
 
+def _python_transform(workspace, stem: str, name: str, output: str) -> None:
+    (workspace.pipelines_dir / f"{stem}.py").write_text(
+        "from laurelin.transforms import sql_transform, Input, Output\n\n"
+        f"@sql_transform(output=Output('{output}'),\n"
+        "               inputs={'orders': Input('orders')},\n"
+        "               query='SELECT * FROM orders')\n"
+        f"def {name}():\n    ...\n"
+    )
+
+
+def test_saving_a_flow_named_after_an_existing_python_transform_is_a_409_not_a_workspace_outage(
+    client, workspace
+):
+    """The pre-save guard used to compare names only, so a flow named exactly
+    like a Python transform was mistaken for 'the flow being updated', saved,
+    and the next `collect_transforms` raised `Duplicate transform name` —
+    409ing every graph-touching route in the workspace. The guard must check
+    the producer's *kind*: only a flow may be replaced by a flow."""
+    _python_transform(workspace, "py_made", "py_made", "py_made")
+    flow = {
+        "name": "py_made", "output": "py_made", "terminal": "n0",
+        "nodes": [{"id": "n0", "kind": "source", "inputs": [],
+                   "params": {"dataset": "orders"}}],
+    }
+    r = put(client, name="py_made", flow=flow)
+    assert r.status_code == 409, r.text
+    assert "code transform" in r.json()["detail"]
+    assert not (workspace.pipelines_dir / "py_made.flow.json").exists()
+    # The workspace graph never broke: every graph-touching route still works.
+    assert client.get("/api/v1/transforms").status_code == 200
+
+
+def test_a_flow_sharing_only_a_name_with_a_python_transform_is_also_refused_before_saving(
+    client, workspace
+):
+    """Registry uniqueness covers names as well as outputs. A Python transform
+    named 'twin' producing some *other* dataset passes the output-producer
+    lookup, but saving a flow named 'twin' would still brick collection with
+    `Duplicate transform name`."""
+    _python_transform(workspace, "twin", "twin", "other_ds")
+    flow = {
+        "name": "twin", "output": "twin", "terminal": "n0",
+        "nodes": [{"id": "n0", "kind": "source", "inputs": [],
+                   "params": {"dataset": "orders"}}],
+    }
+    r = put(client, name="twin", flow=flow)
+    assert r.status_code == 409, r.text
+    assert not (workspace.pipelines_dir / "twin.flow.json").exists()
+    assert client.get("/api/v1/transforms").status_code == 200
+
+
 def test_a_flow_builds_and_writes_the_dataset_it_names(client):
     put(client)
     r = client.post("/api/v1/builds", json={"targets": ["busy_regions"], "wait": True})

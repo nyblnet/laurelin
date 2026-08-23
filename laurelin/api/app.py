@@ -39,6 +39,7 @@ from laurelin.api.auth_routes import (
 from laurelin.api.context import WORKSPACE_COOKIE, WORKSPACE_HEADER
 from laurelin.api.engine_routes import engines_router
 from laurelin.api.export_routes import export_router
+from laurelin.api.ontology_def_routes import ontology_def_router
 from laurelin.api.routes import router
 from laurelin.api.schedule_routes import schedules_router
 from laurelin.api.scim_routes import scim_router
@@ -452,6 +453,7 @@ def _finalize(app: FastAPI) -> FastAPI:
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(scim_router, prefix="/api/v1")
     app.include_router(sources_router, prefix="/api/v1")
+    app.include_router(ontology_def_router, prefix="/api/v1")
     app.include_router(schedules_router, prefix="/api/v1")
     app.include_router(engines_router, prefix="/api/v1")
     app.include_router(apps_router, prefix="/api/v1")

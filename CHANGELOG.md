@@ -10,6 +10,54 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### MCP authoring surface: agents can now build a workspace, not just read one
+
+The MCP server grows from 18 read-mostly tools to a full authoring surface —
+ontology definitions (`put_object_type` / `put_link_type` / `put_action_type`
+and their deletes, backed by a new admin-gated REST surface that writes
+managed YAML files into the ontology directory), sources, datasets, no-code
+flows (`preview_flow` / `write_flow` / `delete_flow`), dashboards, schedules,
+and governance (markings, clearances, dataset/object-type grants, row
+policies, column masks, users, groups). Every tool body is a single
+authenticated call to the same REST route the UI uses, so role gates, lock
+flags (`--lock-flows` binds MCP flow authoring; there is deliberately **no**
+Python-pipeline authoring tool), server-side author stamping, build-time
+author entitlements, audience-gated serialization and audit all run once, in
+the route — pinned by an AST test that allows `laurelin/mcp/server.py` no
+laurelin import beyond the client. Bulk row data stays off MCP by design:
+rows arrive through sources, uploads or builds.
+
+Governance is also *readable* over MCP, not write-only: `list_dataset_markings`
+(explicit + effective per dataset — how you see what a marking propagated),
+`list_dataset_grants`, `list_dataset_policies`, `list_object_type_grants` and
+`get_user_clearances` mirror the admin REST reads, so an agent can verify the
+governance it set through the same surface it set it with.
+
+New: `docs/MIGRATING-FROM-FOUNDRY.md`, a migration runbook written for an
+agent — concept map, ordered playbook with per-phase verification, the full
+Flow IR parameter reference, decision trees for the lossy translations, and a
+failure-modes table whose claims are pinned by `tests/test_migration_guide.py`.
+
+Hardening from the red-team pass on this surface:
+
+- `PUT /flows/{name}` refused to check the *kind* of a same-named producer: a
+  flow saved under the name of an existing **Python transform** passed the
+  duplicate-producer guard, saved, and broke `collect_transforms` for the
+  whole workspace (every graph-touching route 409ing) until the flow file was
+  deleted. Both the same-output and the same-name-different-output collisions
+  are now a 409 at save, naming the code transform and its pipeline file.
+- `PUT /datasets/{name}/policy` now warns, at save time, when a row policy
+  lands on a dataset any transform reads — flow governance refuses
+  row-policied sources fail-closed, so those flows stop building and editing
+  the moment the policy lands, and the breakage otherwise surfaced only on
+  the next scheduled build. The response's `warnings` names the affected
+  transforms.
+- `PUT /schedules/{name}` now warns about referents that do not exist (a
+  `sync` source that is not registered, a `build` target no transform
+  produces, an `upstream` dataset that does not exist) instead of saving
+  silently and failing when the schedule fires. Warnings, not refusals: a
+  schedule may be authored before its flow, but never silently.
+
 ### Security: API-authored Python transforms no longer launder ACLs, row policies or column masks
 
 An editor who could not view a dataset could save `@sql_transform(query=

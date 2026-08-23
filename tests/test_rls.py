@@ -221,3 +221,46 @@ def test_policy_endpoints_admin_only_and_validation(clients):
     assert admin.put("/api/v1/datasets/sales/policy", json={}).status_code == 200
     pols = {p["dataset"]: p["policy"] for p in admin.get("/api/v1/dataset-policies").json()}
     assert pols["sales"] is None
+
+
+def test_setting_a_row_policy_on_a_dataset_a_flow_reads_warns_at_save_time(clients):
+    """flow_governance refuses row-policied *sources* unconditionally, so a
+    row policy landing on a flow's input silently breaks that flow's builds,
+    previews and edits — surfacing only on the next scheduled build, hours
+    after the admin's 200. The policy write must name the affected transforms
+    in `warnings` so the breakage is visible at save time. A policy on a
+    flow's *output* is fine and must not warn."""
+    admin, _ = clients
+    flow = {
+        "name": "us_sales", "output": "us_sales", "terminal": "n1",
+        "nodes": [
+            {"id": "n0", "kind": "source", "inputs": [],
+             "params": {"dataset": "sales"}},
+            {"id": "n1", "kind": "aggregate", "inputs": ["n0"], "params": {
+                "group_by": ["region"],
+                "aggs": [{"fn": "sum", "column": "amount", "as": "total"}]}},
+        ],
+    }
+    assert admin.put("/api/v1/flows/us_sales", json={"flow": flow}).status_code == 200
+    assert admin.post(
+        "/api/v1/builds", json={"targets": ["us_sales"], "wait": True}
+    ).json()["status"] == "succeeded"
+
+    row_policy = {"column": "region", "rules": [
+        {"subject_kind": "user", "subject": "vic", "values": ["us"]}]}
+
+    # Row policy on the flow's SOURCE: saved, but warned, naming the flow.
+    r = admin.put("/api/v1/datasets/sales/policy", json={"row_policy": row_policy})
+    assert r.status_code == 200
+    warnings = r.json()["warnings"]
+    assert warnings and "us_sales" in warnings[0]
+
+    # Masks alone never trigger flow refusal, so no warning.
+    r = admin.put("/api/v1/datasets/sales/policy", json={
+        "column_masks": [{"column": "ssn", "mode": "redact", "exempt": []}]})
+    assert r.status_code == 200 and r.json()["warnings"] == []
+
+    # Row policy on the flow's OUTPUT: legitimate, silent.
+    r = admin.put("/api/v1/datasets/us_sales/policy", json={
+        "row_policy": {"column": "region", "rules": []}})
+    assert r.status_code == 200 and r.json()["warnings"] == []

@@ -62,6 +62,11 @@ class LaurelinClient:
     def list_datasets(self) -> list[dict]:
         return self._req("GET", "/datasets")
 
+    def create_dataset(self, name: str, description: str = "") -> dict:
+        return self._req(
+            "POST", "/datasets", json={"name": name, "description": description}
+        )
+
     def dataset_schema(self, name: str, version: Optional[int] = None) -> list[dict]:
         params = {"version": version} if version is not None else {}
         return self._req("GET", f"/datasets/{name}/schema", params=params)
@@ -148,6 +153,186 @@ class LaurelinClient:
     def get_build(self, build_id: str) -> dict:
         return self._req("GET", f"/builds/{build_id}")
 
+    # -- flows (no-code authoring) -----------------------------------------
+
+    def flow_dataset_schema(self, dataset: str) -> dict:
+        return self._req("GET", "/flows/schema", params={"dataset": dataset})
+
+    def preview_flow(
+        self,
+        flow: dict,
+        node_id: Optional[str] = None,
+        max_rows: int = 50,
+    ) -> dict:
+        return self._req(
+            "POST",
+            "/flows/preview",
+            json={"flow": flow, "node_id": node_id, "max_rows": max_rows},
+        )
+
+    def write_flow(self, name: str, flow: dict) -> dict:
+        return self._req("PUT", f"/flows/{name}", json={"flow": flow})
+
+    def delete_flow(self, name: str) -> dict:
+        return self._req("DELETE", f"/flows/{name}")
+
+    # -- ontology authoring (admin) ---------------------------------------
+
+    def put_object_type(
+        self,
+        api_name: str,
+        backing_dataset: str,
+        primary_key: str,
+        properties: Optional[dict] = None,
+        display_name: Optional[str] = None,
+        description: str = "",
+        title_property: Optional[str] = None,
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/ontology/object-types/{api_name}",
+            json={
+                "backing_dataset": backing_dataset,
+                "primary_key": primary_key,
+                "properties": properties or {},
+                "display_name": display_name,
+                "description": description,
+                "title_property": title_property,
+            },
+        )
+
+    def delete_object_type(self, api_name: str) -> dict:
+        return self._req("DELETE", f"/ontology/object-types/{api_name}")
+
+    def put_link_type(
+        self,
+        api_name: str,
+        from_type: str,
+        to_type: str,
+        from_property: str,
+        to_property: str,
+        cardinality: str = "one_to_many",
+        display_name: Optional[str] = None,
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/ontology/link-types/{api_name}",
+            json={
+                "from_type": from_type,
+                "to_type": to_type,
+                "from_property": from_property,
+                "to_property": to_property,
+                "cardinality": cardinality,
+                "display_name": display_name,
+            },
+        )
+
+    def delete_link_type(self, api_name: str) -> dict:
+        return self._req("DELETE", f"/ontology/link-types/{api_name}")
+
+    def put_action_type(
+        self,
+        api_name: str,
+        object_type: str,
+        kind: str,
+        parameters: Optional[dict] = None,
+        display_name: Optional[str] = None,
+        description: str = "",
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/ontology/action-types/{api_name}",
+            json={
+                "object_type": object_type,
+                "kind": kind,
+                "parameters": parameters or {},
+                "display_name": display_name,
+                "description": description,
+            },
+        )
+
+    def delete_action_type(self, api_name: str) -> dict:
+        return self._req("DELETE", f"/ontology/action-types/{api_name}")
+
+    def build_object_index(self, type_name: str) -> dict:
+        return self._req("POST", f"/ontology/object-types/{type_name}/index")
+
+    def enable_writeback(self, type_name: str, allow_transform_backed: bool = False) -> dict:
+        return self._req(
+            "POST",
+            f"/ontology/object-types/{type_name}/writeback",
+            params={"allow_transform_backed": allow_transform_backed},
+        )
+
+    def set_object_type_grants(self, type_name: str, grants: list[dict]) -> dict:
+        return self._req(
+            "PUT", f"/ontology/permissions/{type_name}", json={"grants": grants}
+        )
+
+    # -- governance (admin) ------------------------------------------------
+
+    def create_marking(self, name: str, description: str = "") -> dict:
+        return self._req(
+            "POST", "/markings", json={"name": name, "description": description}
+        )
+
+    def set_dataset_markings(self, dataset: str, markings: list[str]) -> dict:
+        return self._req(
+            "PUT", f"/datasets/{dataset}/markings", json={"markings": markings}
+        )
+
+    def set_user_clearances(self, username: str, markings: list[str]) -> dict:
+        return self._req(
+            "PUT", f"/users/{username}/clearances", json={"markings": markings}
+        )
+
+    def set_dataset_grants(self, dataset: str, grants: list[dict]) -> dict:
+        return self._req(
+            "PUT", f"/datasets/{dataset}/permissions", json={"grants": grants}
+        )
+
+    def set_dataset_policy(
+        self,
+        dataset: str,
+        row_policy: Optional[dict] = None,
+        column_masks: Optional[list[dict]] = None,
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/datasets/{dataset}/policy",
+            json={"row_policy": row_policy, "column_masks": column_masks or []},
+        )
+
+    def create_user(self, username: str, password: str, role: str = "viewer") -> dict:
+        return self._req(
+            "POST",
+            "/users",
+            json={"username": username, "password": password, "role": role},
+        )
+
+    def create_group(self, name: str) -> dict:
+        return self._req("POST", "/groups", json={"name": name})
+
+    def set_group_members(self, name: str, members: list[str]) -> dict:
+        return self._req("PUT", f"/groups/{name}/members", json={"members": members})
+
+    # -- governance read-back (admin) --------------------------------------
+
+    def list_dataset_markings(self) -> list[dict]:
+        return self._req("GET", "/dataset-markings")
+
+    def list_dataset_grants(self) -> list[dict]:
+        return self._req("GET", "/dataset-permissions")
+
+    def list_dataset_policies(self) -> list[dict]:
+        return self._req("GET", "/dataset-policies")
+
+    def list_object_type_grants(self) -> list[dict]:
+        return self._req("GET", "/ontology/permissions")
+
+    def get_user_clearances(self, username: str) -> dict:
+        return self._req("GET", f"/users/{username}/clearances")
+
     # -- sources ----------------------------------------------------------
 
     def list_sources(self) -> list[dict]:
@@ -156,7 +341,79 @@ class LaurelinClient:
     def sync_source(self, name: str) -> dict:
         return self._req("POST", f"/sources/{name}/sync")
 
+    def upsert_source(
+        self, name: str, type: str, dataset: str, config: Optional[dict] = None
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/sources/{name}",
+            json={"type": type, "dataset": dataset, "config": config or {}},
+        )
+
+    def delete_source(self, name: str) -> dict:
+        return self._req("DELETE", f"/sources/{name}")
+
     # -- dashboards --------------------------------------------------------
 
     def list_dashboards(self) -> list[dict]:
         return self._req("GET", "/dashboards")
+
+    def get_dashboard(self, name: str) -> dict:
+        return self._req("GET", f"/dashboards/{name}")
+
+    def upsert_dashboard(
+        self,
+        name: str,
+        title: str = "",
+        description: str = "",
+        panels: Optional[list[dict]] = None,
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/dashboards/{name}",
+            json={
+                "title": title,
+                "description": description,
+                "panels": panels or [],
+            },
+        )
+
+    def run_dashboard_panel(
+        self, name: str, panel_id: str, max_rows: int = 1000
+    ) -> dict:
+        return self._req(
+            "POST",
+            f"/dashboards/{name}/panels/{panel_id}/run",
+            json={"max_rows": max_rows},
+        )
+
+    # -- schedules ---------------------------------------------------------
+
+    def upsert_schedule(
+        self,
+        name: str,
+        *,
+        enabled: bool = True,
+        trigger: str = "cron",
+        cron: str = "",
+        upstream_dataset: str = "",
+        action: str = "build",
+        targets: Optional[list[str]] = None,
+        source: str = "",
+    ) -> dict:
+        return self._req(
+            "PUT",
+            f"/schedules/{name}",
+            json={
+                "enabled": enabled,
+                "trigger": trigger,
+                "cron": cron,
+                "upstream_dataset": upstream_dataset,
+                "action": action,
+                "targets": targets or [],
+                "source": source,
+            },
+        )
+
+    def run_schedule(self, name: str) -> dict:
+        return self._req("POST", f"/schedules/{name}/run")

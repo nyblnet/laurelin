@@ -99,10 +99,16 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Apps** — a curated view over one object type: the columns that matter, the
   filters that scope it, the actions an operator should reach for. Configured,
   not coded, and it grants no access the ontology doesn't already.
-- **MCP server** — `laurelin mcp` exposes datasets, SQL, the ontology, actions,
-  and builds to AI agents over the Model Context Protocol. Agents authenticate
-  with an API token and go through the same permission and audit path as any
-  user (needs the `mcp` extra — see Status below for how to install).
+- **MCP server** — `laurelin mcp` lets AI agents both operate *and build* a
+  workspace over the Model Context Protocol: read datasets, SQL and the
+  ontology, and author sources, no-code flows, ontology object/link/action
+  types, dashboards, schedules and governance (markings, clearances, grants,
+  row policies, column masks) — enough to reconstruct a Foundry-shaped
+  workspace end to end (see `docs/MIGRATING-FROM-FOUNDRY.md`). Agents
+  authenticate with an API token and go through the same permission and audit
+  path as any user: every tool is a call to the same governed REST route the
+  UI uses, so role gates, lock flags, entitlements and audit apply identically
+  (needs the `mcp` extra — see Status below for how to install).
 - **Audit** — mutations through the API are written to an audit log.
 
 ## Where compute happens

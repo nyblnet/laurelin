@@ -633,6 +633,11 @@ def sentinel_app(sentinel_workspace):
 PATH_PARAMS = {
     "name": SEEDED,
     "type_name": "aircraft",
+    # Ontology definition authoring routes. "aircraft" is defined in the
+    # fixture's hand-written YAML, so the admin sweep's PUT is a 409 (refuses
+    # to shadow a hand-written file) and DELETE likewise — probed without
+    # mutating the ontology the rest of the sweep depends on.
+    "api_name": "aircraft",
     "build_id": "b1",
     "panel_id": "p1",
     "pk": "eu",

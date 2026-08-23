@@ -827,7 +827,10 @@ def test_a_schedule_target_may_not_store_a_credential(tmp_path):
         "trigger": "cron", "cron": "0 * * * *", "action": "build",
         "targets": ["s3://bucket/t"]})
     assert ok.status_code == 200, ok.text
-    assert ok.json()["warnings"] == []
+    # No credential hint for a credential-free URI — the detector is precise.
+    # (The save may still warn that no transform produces this target; that
+    # referent warning is a different, deliberate hint.)
+    assert not any("credential" in w["hint"] for w in ok.json()["warnings"])
 
 
 def test_a_careless_audit_writer_discloses_to_nobody_below_admin(tmp_path):
