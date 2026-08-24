@@ -394,7 +394,12 @@ class PermissionService:
             return False
         if user.role == Role.admin:
             return True
-        needed = set(self.store.get_effective_markings(dataset))
+        # Explicit ∪ effective in one read: an explicit marking whose
+        # propagation (recompute) hasn't run yet must already deny — the gap
+        # between the two route statements is otherwise an enforcement hole
+        # (tests/test_concurrency_exec.py::test_a_marking_denies_the_moment_
+        # its_write_returns).
+        needed = set(self.store.get_enforced_markings(dataset))
         if not needed:
             return True
         return needed <= set(self.store.get_clearances(user.username))

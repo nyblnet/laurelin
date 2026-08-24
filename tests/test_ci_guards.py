@@ -57,6 +57,51 @@ def test_the_watermark_visibility_test_is_not_silently_skipped():
 
 
 @in_ci
+def test_the_concurrency_races_are_not_silently_skipped():
+    """The concurrency suite exists because 'follows from database semantics'
+    had already shipped false claims here. Its worst findings were
+    Postgres-only (the security-list lost update never reproduces on SQLite's
+    single-writer lock), so a CI run without Postgres would show green while
+    proving nothing about the races that actually widened access.
+
+    Three pins, same philosophy as the watermark guard above: the environment
+    must be present, the named tests must still exist, and the soak marker
+    must not have been quietly deselected in addopts (CI runs plain pytest, so
+    a `-m "not soak"` there would drop the loop-heavy tests from every run
+    without a single skip line)."""
+    assert os.environ.get("LAURELIN_TEST_POSTGRES", "").startswith("postgresql://"), (
+        "tests/test_concurrency*.py parametrize on the dialect and skip their "
+        "Postgres half without LAURELIN_TEST_POSTGRES — which is the half "
+        "where the lost-update races actually happen."
+    )
+    pins = {
+        # The Postgres-only union anomaly: two grant replaces ending wider
+        # than either writer wrote.
+        "test_concurrency.py":
+            "test_concurrent_grant_replaces_end_as_one_writers_list_not_the_union",
+        # The double fire: a stale due list must not yield a second run.
+        "test_concurrency_coord.py":
+            "test_a_schedule_fires_once_per_window_even_with_a_stale_due_list",
+        # The IdP-facing lost update, removes included.
+        "test_concurrency_exec.py":
+            "test_concurrent_scim_patches_never_lose_a_member_change",
+    }
+    for filename, test_name in pins.items():
+        source = Path(__file__).with_name(filename).read_text()
+        assert test_name in source, f"{filename} no longer contains {test_name}"
+
+    import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_bytes().decode())
+    addopts = pyproject["tool"]["pytest"]["ini_options"].get("addopts", "")
+    assert "not soak" not in addopts, (
+        "addopts deselects the soak marker, so the multi-round concurrency "
+        "tests silently vanished from every default run"
+    )
+
+
+@in_ci
 @pytest.mark.parametrize(
     "module, extra",
     [

@@ -451,6 +451,16 @@ TABLE_POLICY: dict[str, TableSpec] = {
             "updated_at",
         ),
     ),
+    "scope_locks": TableSpec(
+        _DERIVED,
+        "Anchor rows whose row locks serialize security-list replaces, plus "
+        "the marking-input generation counter that fences stale recomputes "
+        "(db.py::_lock_scope). Pure coordination state: rows are created on "
+        "first contention and mean nothing outside the database that locked "
+        "them. Carrying the generation would let an imported counter mask a "
+        "destination's own in-flight recompute.",
+        drop_columns=("kind", "scope", "generation"),
+    ),
 }
 
 

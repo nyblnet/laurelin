@@ -137,9 +137,34 @@ class Scheduler:
                 continue
             if not store.claim_schedule(schedule.name, self.worker_id):
                 continue  # another replica got there first
-            fired.append(schedule.name)
+            # The due list is a stale snapshot: between our poll and our claim
+            # another replica may have served the entire window (its record
+            # released the claim, so winning the claim alone proves nothing
+            # about the window). claim_schedule re-checks cron due-ness in
+            # SQL; upstream due-ness is a watermark comparison, so re-read the
+            # schedule under the claim and re-verify before firing — without
+            # this, two overlapping polls fire the action twice per window.
+            name = schedule.name
+            schedule = store.get_schedule(name)
+            if schedule is None or not self._still_due(store, schedule):
+                store.release_schedule_claim(name, self.worker_id)
+                continue
+            fired.append(name)
             self._run(store, schedule, run_action)
         return fired
+
+    def _still_due(self, store, schedule: ScheduleInfo) -> bool:
+        """Due-ness re-evaluated on freshly read state, AFTER winning the
+        claim. Holding the claim makes this stable: no other replica can
+        serve the window while we decide."""
+        if not schedule.enabled:
+            return False
+        if schedule.trigger == "upstream":
+            return self._upstream_advanced(store, schedule)
+        return (
+            schedule.next_run_at is not None
+            and schedule.next_run_at <= utcnow_iso()
+        )
 
     @staticmethod
     def _upstream_advanced(store, schedule: ScheduleInfo) -> bool:
@@ -172,7 +197,7 @@ class Scheduler:
             build_id = run_action(schedule)
             store.record_schedule_run(
                 schedule.name, "succeeded", next_run_at=next_at,
-                build_id=build_id, watermark=watermark,
+                build_id=build_id, watermark=watermark, worker=self.worker_id,
             )
             metrics.schedule_fires.labels(
                 trigger=schedule.trigger, status="succeeded"
@@ -190,7 +215,7 @@ class Scheduler:
             )
             store.record_schedule_run(
                 schedule.name, "failed", next_run_at=next_at,
-                failure=failure, watermark=watermark,
+                failure=failure, watermark=watermark, worker=self.worker_id,
             )
             metrics.schedule_fires.labels(
                 trigger=schedule.trigger, status="failed"

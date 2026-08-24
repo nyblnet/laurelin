@@ -301,23 +301,35 @@ async def patch_group(name: str, request: Request):
     if not store.group_exists(name):
         return _scim_error(404, f"Group {name} not found")
     body = await request.json()
-    current = set(next(g["members"] for g in store.list_groups() if g["name"] == name))
+    # Resolve SCIM member ids to usernames BEFORE the store transaction (it
+    # reads users), then hand the store a pure merge over the current member
+    # set. PATCH is a merge, not a replace: reading members here and writing
+    # them in a second store call let two overlapping PATCHes each merge onto
+    # a stale read and silently drop one IdP change while both returned 200 —
+    # store.update_group_members does read+merge+write in one locked
+    # transaction instead.
+    ops = []
     for op in body.get("Operations", []):
-        action = op.get("op", "").lower()
         values = _resolve_member_usernames(
             request,
             [m.get("value") for m in (op.get("value") or []) if isinstance(m, dict) and m.get("value")],
         )
-        if action == "add":
-            current |= set(values)
-        elif action == "remove":
-            if op.get("path", "").startswith("members") and not values:
-                current = set()  # remove all members
-            else:
-                current -= set(values)
-        elif action == "replace" and op.get("path") == "members":
-            current = set(values)
-    store.set_group_members(name, sorted(current))
+        ops.append((op.get("op", "").lower(), op.get("path", "") or "", values))
+
+    def merge(current: set) -> set:
+        for action, path, values in ops:
+            if action == "add":
+                current |= set(values)
+            elif action == "remove":
+                if path.startswith("members") and not values:
+                    current = set()  # remove all members
+                else:
+                    current -= set(values)
+            elif action == "replace" and path == "members":
+                current = set(values)
+        return current
+
+    store.update_group_members(name, merge)
     group = next(g for g in store.list_groups() if g["name"] == name)
     return _scim_json(_group_to_scim(group, request))
 

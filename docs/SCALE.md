@@ -728,6 +728,74 @@ executes each. See [DEPLOYMENT.md](DEPLOYMENT.md).
 Embedded mode (a SQLite control plane) is still **one replica** — correct for
 a laptop or a single VM, and unchanged.
 
+## What is proven under concurrency — and what still isn't
+
+Until recently, every claim on this page was **single-user, single-run**:
+"exactly once across replicas" had never seen two replicas. There is now a
+concurrency suite (`tests/test_concurrency*.py`) that forces the contended
+interleavings deterministically — N threads released from one barrier at the
+same instant, hooks that park a thread between exact store calls — and asserts
+invariants, never timings. Everything below ran on **both** SQLite (WAL,
+single-writer) and Postgres (READ COMMITTED, row locks), because they
+serialize differently and a race impossible on one is routine on the other.
+
+**Proven, in the sense of "the forcing harness tried and failed to break it"
+(100-round soaks, both backends):**
+
+- A build or schedule claim is won by exactly one of 8 simultaneous
+  claimants, every round, and the database names the same winner the return
+  values do.
+- Concurrent object edits to one object all survive with gapless sequence
+  numbers; no committed edit's effect is lost.
+- The object-index watermark is **never observed ahead of the rows it
+  certifies** and never moves backwards, under 4 writers and looping readers;
+  `catch_up` racing live commits lands exactly level with the log, skipping
+  nothing.
+- A policy swap is never seen torn (it's a single-row JSON write); a grant
+  list is never observed half-replaced by a reader.
+- Racing dataset writes all get distinct, contiguous version numbers.
+
+**Found broken and fixed** (each fix verified by reverting it and watching the
+invariant fail for the race, not for a syntax error): two concurrent
+replaces of any security list ended as the *union* of both lists on Postgres —
+wider access than either admin wrote; a marking recompute racing a marking
+change could lay down stale, emptier effective sets that silently re-opened a
+classified dataset to uncleared viewers (both backends — SQLite's single
+writer does not help across separate transactions); a committed explicit
+marking denied nobody until its propagation ran; two concurrent recomputes
+crashed one of them on Postgres (which meant: one of two concurrent builds
+failed); overlapping SCIM PATCHes lost member changes — including removes —
+while returning 200 to the IdP; and a schedule could fire twice in one window
+across two replicas, deterministically, because the claim never re-checked
+due-ness and releases weren't fenced to their owner. The CHANGELOG has the
+full accounting with measured hit rates.
+
+**Still single-run, stated plainly rather than implied:**
+
+- **A build whose transform outlives its lease.** The lease heartbeat between
+  transforms discards its return value, the reaper fails a still-running
+  build, and takeover-vs-straggler behaviour mid-transform has no harness.
+  The claim "a build executes exactly once even when a worker stalls past its
+  lease" is a *design intention*, not a proven invariant. (The narrower
+  stale-release half — a stalled worker clearing its successor's live lease —
+  is now tested and fixed.)
+- **An index rebuild racing a live commit** (`replace_object_index` takes a
+  caller-computed watermark; the interleaving is untraced).
+- **The Iceberg write path under concurrent commits** — code inspection
+  predicts a *loud* failure (a raise, metadata/data disagreement), not silent
+  corruption, but it has never been executed.
+- **The StarRocks object store against a real server** — its concurrency
+  behaviour is verified only against an in-memory double, as limitation 13
+  below already says.
+- **Multi-process parallelism** is exercised via threads over independent
+  database connections, which contend identically in the database; true
+  multi-process chaos (SIGKILL mid-transaction) is simulated only via lease
+  expiry.
+
+The loop-heavy tests carry a `soak` marker and run by default (a marker
+deselected in `addopts` would silently vanish from every green run); depth
+scales with `LAURELIN_SOAK_ROUNDS`.
+
 ## Known limitations, plainly
 
 1. **Search ranking is positional, not linguistic.** Hits are ordered by

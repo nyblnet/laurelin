@@ -10,6 +10,85 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Concurrency: the first real evidence, and the six races it found
+
+Until now every correctness claim in this project was single-user, single-run —
+"exactly once across replicas" had never actually seen two replicas. A new
+concurrency suite (`tests/test_concurrency.py`, `test_concurrency_exec.py`,
+`test_concurrency_coord.py`, sharing `tests/concurrency_harness.py`) forces the
+contended interleavings deterministically — barriers that release N threads at
+the same instant, pause hooks that park a thread between store calls — and
+asserts invariants only: counts, set-equalities, monotonicity. Never a timing.
+Every test runs on both SQLite and Postgres, because they serialize differently
+and a race impossible on one is routine on the other. Loop-heavy tests carry a
+`soak` marker (deliberately **not** deselected by default; deepen with
+`LAURELIN_SOAK_ROUNDS`).
+
+The suite found six real defects. All are fixed, and each fix was verified by
+reverting it and watching the invariant break for the race itself:
+
+- **Security — a lost update that widened access (Postgres).** All five
+  security-list setters (dataset grants, ontology grants, group members,
+  clearances, explicit markings) were an unlocked DELETE+INSERT. Two
+  concurrent replaces of the same scope ended as the **union** of both lists —
+  wider access than either administrator wrote, both told success. Measured
+  20/20 rounds before the fix. Every setter now takes a write lock on a
+  `scope_locks` anchor row first (the `_lock_index_state` idiom), so replaces
+  of one scope serialize.
+- **Security — a stale recompute emptied the effective markings (both
+  backends).** `recompute_all_markings` read its inputs across many
+  transactions and wrote blind-last. A recompute that read before a marking
+  change and wrote after that change's own recompute replaced correct
+  effective sets with stale, emptier ones — and enforcement treats an empty
+  effective set as "no clearance needed", so an uncleared viewer could read a
+  classified dataset until the next build. This is not exotic: the builder
+  recomputes on **every build**, so any build overlapping an admin's
+  `PUT /markings` is this race. Marking-input writers (explicit markings,
+  marking deletion, lineage) now bump a generation atomically with their
+  change; recompute re-checks that generation under the write lock and starts
+  over if it moved.
+- **Security — a committed marking denied nobody until its recompute ran
+  (both backends).** Enforcement read only the *effective* (inherited) rows,
+  and the marking route writes explicit markings and recomputes in two
+  transactions — so in the gap, a committed, acknowledged classification was
+  enforced against no one. Enforcement now checks explicit ∪ effective in one
+  query (`get_enforced_markings`); the union can only deny more, never less.
+- **Two replicas recomputing markings crashed one of them (Postgres, 19/20
+  rounds).** Both DELETE+INSERTed the same `(dataset, marking, inherited)`
+  rows; the loser died on a duplicate key — i.e. one of two concurrent builds
+  failed outright. Recompute writes now serialize on the marking anchor row.
+- **SCIM PATCH lost member changes while returning 200 (both backends).** The
+  route read members, merged in Python, and wrote in a second transaction; two
+  overlapping PATCHes each merged onto a stale read. A lost *add*
+  under-provisions; a lost *remove* silently **keeps a deprovisioned member**
+  in a group that may carry grants — reported to the IdP as success. The
+  merge now runs inside one locked store transaction
+  (`update_group_members`).
+- **A schedule fired twice per window (both backends, deterministic).** A
+  replica holding a stale due list could claim a schedule another replica had
+  already served — `claim_schedule` re-checked nothing about due-ness and
+  `record_schedule_run` released the claim by name alone, so a stale runner
+  could also release its *successor's* live claim (same shape in
+  `release_build`: a stalled worker's tail-end release re-opened a build
+  another replica was executing). The claim now re-checks cron due-ness in
+  SQL, the scheduler re-reads and re-verifies due-ness *under the claim*
+  before firing, and both releases are fenced to the current owner.
+
+What the same forcing machinery **failed to break**, on both backends, with
+100-round soaks: build and schedule claims are exactly-once under 8
+simultaneous claimants; concurrent object edits keep gapless seqs and lose no
+update; the object-index watermark was never observed ahead of the rows it
+certifies and never moved backwards; `catch_up` racing live commits skips
+nothing; a policy swap is never seen torn; a grant list is never observed
+half-replaced; racing catalog writes all survive with distinct contiguous
+versions; first-user creation is single-winner.
+
+Still unproven under concurrency, stated rather than implied: a build whose
+transform outlives its lease (the reap/renew/release interplay) has no
+harness yet; an index rebuild racing a live commit; the Iceberg write path's
+version-row registration; everything about the StarRocks store beyond its
+in-memory double. See docs/SCALE.md for the full honest ledger.
+
 ### Analyses: the multi-cell governed notebook (Code Workbook parity, no code)
 
 A new **Analyses** surface (`/analyses` in the UI, `/api/v1/analyses` REST):

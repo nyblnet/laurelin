@@ -105,3 +105,10 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Deliberately NOT deselected by default: CI runs plain pytest, and a marker
+# excluded in addopts would silently drop these from every green run — exactly
+# the failure tests/test_ci_guards.py exists to prevent. Opt out locally with
+# -m "not soak"; deepen with LAURELIN_SOAK_ROUNDS=500.
+markers = [
+    "soak: multi-round concurrency tests; rounds scale via LAURELIN_SOAK_ROUNDS",
+]

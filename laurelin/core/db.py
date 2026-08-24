@@ -466,6 +466,12 @@ CREATE TABLE IF NOT EXISTS pipeline_authors (
     author TEXT NOT NULL,
     written_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scope_locks (
+    kind TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, scope)
+);
 {{EXTRA_DDL}}
 """
 
@@ -1324,17 +1330,41 @@ class MetadataStore:
 
     def claim_schedule(self, name: str, worker: str, lease_seconds: int = 300) -> bool:
         """Take ownership of a due schedule. One conditional UPDATE, so with
-        several replicas polling, exactly one fires it."""
+        several replicas polling, exactly one fires it.
+
+        The claim re-checks due-ness, not just claim state: a replica claims
+        from a due list it polled earlier, and another replica may have served
+        the whole window in between (its ``record_schedule_run`` releases the
+        claim and advances ``next_run_at``). Without the due predicate here,
+        that stale claimant wins and the schedule fires twice in one window —
+        measured deterministically before the fix (tests/
+        test_concurrency_coord.py). Cron due-ness lives in ``next_run_at``
+        (same predicate as ``due_schedules``); upstream due-ness is a
+        watermark comparison the caller must re-run after claiming (see
+        ``Scheduler._tick_store``)."""
         now = utcnow_iso()
         with self._conn() as c:
             cur = c.execute(
                 """UPDATE schedules SET claimed_by = ?, lease_expires_at = ?
                    WHERE name = ? AND enabled = 1
                      AND (claimed_by IS NULL OR lease_expires_at IS NULL
-                          OR lease_expires_at < ?)""",
-                (worker, _iso_in(lease_seconds), name, now),
+                          OR lease_expires_at < ?)
+                     AND (trigger_type = 'upstream'
+                          OR (next_run_at IS NOT NULL AND next_run_at <= ?))""",
+                (worker, _iso_in(lease_seconds), name, now, now),
             )
             return cur.rowcount > 0
+
+    def release_schedule_claim(self, name: str, worker: str) -> None:
+        """Give back a claim without recording a run: the claimant re-checked
+        with fresh state and found the window already served. Owner-guarded,
+        like every release."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE schedules SET claimed_by = NULL, lease_expires_at = NULL "
+                "WHERE name = ? AND claimed_by = ?",
+                (name, worker),
+            )
 
     def record_schedule_run(
         self,
@@ -1344,23 +1374,35 @@ class MetadataStore:
         failure: Optional[Failure] = None,
         build_id: Optional[str] = None,
         watermark: Optional[int] = None,
+        worker: Optional[str] = None,
     ) -> None:
         """Record an attempt and release the claim, so the next window is
         free regardless of how this one went.
 
+        With ``worker`` the whole update is fenced to the current claim
+        holder: a runner that stalled past its lease and was succeeded by
+        another replica must not release the successor's LIVE claim (which
+        would let a third replica fire the window again) or overwrite the
+        successor's next_run_at/watermark with its stale ones. The stale
+        runner's outcome is dropped — the schedule belongs to its successor,
+        who will record its own. Callers with no claim (operator repair,
+        seeding) omit ``worker`` and update unconditionally.
+
         Takes a :class:`Failure`, not a string. That is the R1 boundary in the
         type system: there is no parameter here a driver's sentence fits into.
         """
-        with self._conn() as c:
-            c.execute(
-                """UPDATE schedules SET last_run_at = ?, last_status = ?,
+        sql = """UPDATE schedules SET last_run_at = ?, last_status = ?,
                      last_failure_json = ?, last_build_id = ?, next_run_at = ?,
                      watermark = COALESCE(?, watermark),
                      claimed_by = NULL, lease_expires_at = NULL
-                   WHERE name = ?""",
-                (utcnow_iso(), status, _failure_json(failure), build_id, next_run_at,
-                 watermark, name),
-            )
+                   WHERE name = ?"""
+        params = [utcnow_iso(), status, _failure_json(failure), build_id,
+                  next_run_at, watermark, name]
+        if worker is not None:
+            sql += " AND claimed_by = ?"
+            params.append(worker)
+        with self._conn() as c:
+            c.execute(sql, tuple(params))
 
     # -- delegated engines ---------------------------------------------------------
 
@@ -1623,11 +1665,19 @@ class MetadataStore:
             )
             return cur.rowcount > 0
 
-    def release_build(self, build_id: str) -> None:
+    def release_build(self, build_id: str, worker: Optional[str] = None) -> None:
+        """Release a finished build's lease. With ``worker`` the release is
+        fenced to the current owner: a worker that stalled past its lease and
+        was succeeded must not clear its successor's LIVE lease — an unguarded
+        release re-opens the claim and a third replica re-executes the build's
+        transforms (tests/test_concurrency_coord.py)."""
+        sql = "UPDATE builds SET lease_expires_at = NULL WHERE id = ?"
+        params: list = [build_id]
+        if worker is not None:
+            sql += " AND claimed_by = ?"
+            params.append(worker)
         with self._conn() as c:
-            c.execute(
-                "UPDATE builds SET lease_expires_at = NULL WHERE id = ?", (build_id,)
-            )
+            c.execute(sql, tuple(params))
 
     def reap_expired_builds(self) -> list[str]:
         """Fail builds whose owner stopped renewing (a replica died mid-build).
@@ -1787,6 +1837,9 @@ class MetadataStore:
                 ),
                 [(e.upstream_dataset, e.downstream_dataset, e.transform_name) for e in edges],
             )
+            # Lineage is a marking-propagation input: fence in-flight recomputes
+            # (see recompute_all_markings).
+            self._bump_scope_generation(c, *self._MARKING_GEN)
 
     def list_lineage(self) -> list[LineageEdge]:
         with self._conn() as c:
@@ -2400,6 +2453,65 @@ class MetadataStore:
         with self._conn() as c:
             c.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
 
+    # -- scope locks --------------------------------------------------------------
+    #
+    # The security lists (grants, group members, clearances, markings) are all
+    # replaced whole-for-whole: DELETE the scope, INSERT the new list. That is
+    # atomic to READERS (one transaction) but not to a CONCURRENT REPLACER of
+    # the same scope: under Postgres READ COMMITTED the loser's DELETE blocks
+    # on the winner's row locks, resumes after commit, and its snapshot never
+    # includes the winner's freshly inserted rows — so it deletes nothing and
+    # its INSERT lands *next to* the winner's. Two admins each writing a
+    # single-subject list end with the UNION: wider access than either wrote,
+    # and both were told success. Measured before the fix: 20/20 rounds
+    # anomalous on Postgres across all five setters (tests/test_concurrency.py),
+    # 0/20 on SQLite (single-writer WAL lock).
+    #
+    # The fix is the `_lock_index_state` idiom: every replacer of a scope takes
+    # a write lock on one anchor row FIRST, so replaces of the same scope are
+    # serialized rather than merely arbitrated row-by-row afterwards. The lists
+    # have no natural parent row to anchor on (grants may precede the dataset,
+    # ontology grants have no row at all), so the anchors live in a dedicated
+    # table. As with `_lock_index_state`, the lock must be a WRITE, not
+    # ``SELECT ... FOR UPDATE``: Python's sqlite3 driver only begins the
+    # transaction at the first DML statement, so a leading SELECT would run in
+    # autocommit, outside the transaction it was meant to protect.
+
+    def _lock_scope(self, c: Connection, kind: str, scope: str) -> None:
+        """Serialize writers of one security-list scope for the rest of the
+        transaction. First statement is a write (see block comment above)."""
+        c.execute(
+            self.backend.insert_or_ignore("scope_locks", "kind, scope", "?, ?"),
+            (kind, scope),
+        )
+        # No-op by value, load-bearing by effect: the row lock is the mutex.
+        c.execute(
+            "UPDATE scope_locks SET generation = generation WHERE kind = ? AND scope = ?",
+            (kind, scope),
+        )
+
+    def _bump_scope_generation(self, c: Connection, kind: str, scope: str) -> None:
+        """Advance a scope's generation. Committed atomically with the caller's
+        data change, this fences slow read-then-write recomputations: anyone who
+        read inputs at generation G can tell, at write time, that the inputs
+        have moved on."""
+        c.execute(
+            self.backend.insert_or_ignore("scope_locks", "kind, scope", "?, ?"),
+            (kind, scope),
+        )
+        c.execute(
+            "UPDATE scope_locks SET generation = generation + 1 "
+            "WHERE kind = ? AND scope = ?",
+            (kind, scope),
+        )
+
+    def _scope_generation(self, c: Connection, kind: str, scope: str) -> int:
+        row = c.execute(
+            "SELECT generation FROM scope_locks WHERE kind = ? AND scope = ?",
+            (kind, scope),
+        ).fetchone()
+        return int(row["generation"]) if row else 0
+
     # -- groups -------------------------------------------------------------------
 
     def create_group(self, name: str, created_at: str) -> None:
@@ -2447,6 +2559,7 @@ class MetadataStore:
     def set_group_members(self, name: str, usernames: list[str]) -> None:
         name = name.lower()
         with self._conn() as c:
+            self._lock_scope(c, "group_members", name)
             c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
             c.executemany(
                 self.backend.insert_or_ignore(
@@ -2454,6 +2567,40 @@ class MetadataStore:
                 ),
                 [(name, u.lower()) for u in usernames],
             )
+
+    def update_group_members(self, name: str, merge) -> list[str]:
+        """Atomic read-modify-write of a group's member list. ``merge`` is
+        given the current member set and returns the new one; read, merge and
+        replace all happen inside one locked transaction.
+
+        This exists for SCIM PATCH, which is semantically a merge ("add u2",
+        "remove u1") rather than a whole-list replace. Doing the read in the
+        route and the write in a second transaction let two overlapping
+        PATCHes each merge onto a stale read: one IdP change was silently
+        lost — including REMOVES, which kept a deprovisioned member in a
+        group that may carry grants — while both requests returned 200
+        (measured: every forced round, both backends).
+
+        ``merge`` runs inside the held transaction and lock: it must be pure
+        set algebra, never a call back into the store."""
+        name = name.lower()
+        with self._conn() as c:
+            self._lock_scope(c, "group_members", name)
+            current = {
+                r["username"]
+                for r in c.execute(
+                    "SELECT username FROM group_members WHERE group_name = ?", (name,)
+                )
+            }
+            members = sorted({u.lower() for u in merge(set(current))})
+            c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
+            c.executemany(
+                self.backend.insert_or_ignore(
+                    "group_members", "group_name, username", "?, ?"
+                ),
+                [(name, u) for u in members],
+            )
+        return members
 
     def groups_for_user(self, username: str) -> set[str]:
         with self._conn() as c:
@@ -2495,6 +2642,7 @@ class MetadataStore:
         import uuid as _uuid
 
         with self._conn() as c:
+            self._lock_scope(c, "ontology_grants", object_type)
             c.execute("DELETE FROM ontology_grants WHERE object_type = ?", (object_type,))
             c.executemany(
                 """INSERT INTO ontology_grants
@@ -2545,6 +2693,7 @@ class MetadataStore:
         import uuid as _uuid
 
         with self._conn() as c:
+            self._lock_scope(c, "dataset_grants", dataset)
             c.execute("DELETE FROM dataset_grants WHERE dataset = ?", (dataset,))
             c.executemany(
                 """INSERT INTO dataset_grants
@@ -2628,9 +2777,13 @@ class MetadataStore:
     def delete_marking(self, name: str) -> None:
         name = name.lower()
         with self._conn() as c:
+            # Serialize against recompute writes (this deletes inherited rows
+            # a concurrent recompute may be inserting) and fence stale readers.
+            self._lock_scope(c, *self._MARKING_GEN)
             c.execute("DELETE FROM markings WHERE name = ?", (name,))
             c.execute("DELETE FROM dataset_markings WHERE marking = ?", (name,))
             c.execute("DELETE FROM clearances WHERE marking = ?", (name,))
+            self._bump_scope_generation(c, *self._MARKING_GEN)
 
     def _markings_for(self, dataset: str, inherited: int) -> list[str]:
         with self._conn() as c:
@@ -2647,9 +2800,35 @@ class MetadataStore:
     def get_effective_markings(self, dataset: str) -> list[str]:
         return self._markings_for(dataset, 1)
 
+    def get_enforced_markings(self, dataset: str) -> list[str]:
+        """Explicit ∪ effective, in ONE query — the set enforcement must check.
+
+        A marking must deny from the moment its write commits. The effective
+        (inherited=1) rows only appear when ``recompute_all_markings`` runs,
+        and the routes that set markings do that in a SECOND transaction — so
+        an enforcement read between the two statements would see a committed,
+        admin-acknowledged marking that denies nobody. Reading both inherited
+        values closes that gap without waiting on propagation: the explicit
+        set is always a subset of the intended effective set, so the union
+        can only deny more, never less."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT marking FROM dataset_markings WHERE dataset = ? "
+                "ORDER BY marking",
+                (dataset,),
+            ).fetchall()
+        return [r["marking"] for r in rows]
+
     def set_explicit_markings(self, dataset: str, markings: list[str]) -> None:
         markings = sorted({m.lower() for m in markings})
         with self._conn() as c:
+            # ONE anchor for every marking write — explicit-set replaces,
+            # marking deletion, recompute's effective-set writes — so they
+            # serialize totally instead of deadlocking on two lock orders.
+            # This is also the lost-update lock for this setter (two replaces
+            # of one dataset's explicit list serialize here), and the final
+            # bump fences any in-flight recompute that read the old set.
+            self._lock_scope(c, *self._MARKING_GEN)
             c.execute(
                 "DELETE FROM dataset_markings WHERE dataset = ? AND inherited = 0", (dataset,)
             )
@@ -2657,6 +2836,7 @@ class MetadataStore:
                 "INSERT INTO dataset_markings (dataset, marking, inherited) VALUES (?, ?, 0)",
                 [(dataset, m) for m in markings],
             )
+            self._bump_scope_generation(c, *self._MARKING_GEN)
 
     def _set_effective_markings(self, c: Connection, dataset: str, markings: set[str]) -> None:
         c.execute("DELETE FROM dataset_markings WHERE dataset = ? AND inherited = 1", (dataset,))
@@ -2677,25 +2857,68 @@ class MetadataStore:
         username = username.lower()
         markings = sorted({m.lower() for m in markings})
         with self._conn() as c:
+            self._lock_scope(c, "clearances", username)
             c.execute("DELETE FROM clearances WHERE username = ?", (username,))
             c.executemany(
                 "INSERT INTO clearances (username, marking) VALUES (?, ?)",
                 [(username, m) for m in markings],
             )
 
+    # Every writer of a recompute INPUT (explicit markings, the marking
+    # catalog, lineage) bumps this generation in the same transaction as its
+    # data change; recompute_all_markings re-reads when the generation moved
+    # under it. One cell, not per-dataset: propagation is global (a marking
+    # set on one dataset changes other datasets' effective sets), so any
+    # input change invalidates the whole computation.
+    _MARKING_GEN = ("markings", "inputs")
+
     def recompute_all_markings(self) -> None:
         """Recompute every dataset's *effective* markings as its explicit markings
         plus the union of its lineage upstreams' effective markings. This is the
         propagation: a derived dataset inherits its inputs' classifications, so
-        classified data can't be laundered through a transform."""
-        datasets = [d.name for d in self.list_datasets()]
-        edges = [(e.upstream_dataset, e.downstream_dataset) for e in self.list_lineage()]
-        nodes = set(datasets) | {u for u, _ in edges} | {d for _, d in edges}
-        explicit = {d: set(self.get_explicit_markings(d)) for d in nodes}
-        effective = propagate_markings(datasets, edges, explicit)
-        with self._conn() as c:
-            for d, eff in effective.items():
-                self._set_effective_markings(c, d, eff)
+        classified data can't be laundered through a transform.
+
+        Concurrency contract (tests/test_concurrency*.py, both backends):
+
+        * Two recomputes may run at once — the builder runs one on EVERY build
+          (builder.py:349), so two replicas building concurrently do exactly
+          that. The write transactions serialize on the ``_MARKING_GEN`` anchor
+          row; before the lock, the loser's DELETE+INSERT of the same
+          ``(dataset, marking, 1)`` rows raced the winner's and one build died
+          on a duplicate-key error (measured: 19/20 rounds on Postgres).
+        * A recompute may overlap a marking change. The reads here span many
+          transactions, so a recompute that read *before* a change was set and
+          writes *after* that change's own recompute would replace correct
+          effective sets with stale, EMPTIER ones — and because enforcement
+          treats an empty effective set as "no clearance needed", that stale
+          write silently WIDENS access until the next build (measured: every
+          forced round, both backends — SQLite's single-writer lock cannot help
+          across separate transactions). The generation cell closes it: input
+          writers bump it atomically with their change; we take the write lock,
+          re-check the generation we read our inputs at, and start over if it
+          moved. Optimistic, so the common case (no churn) stays one write
+          transaction; churn has to out-race us on every attempt to starve
+          this, and each attempt's window is a few statements wide.
+        """
+        for _ in range(50):
+            with self._conn() as c:
+                gen = self._scope_generation(c, *self._MARKING_GEN)
+            datasets = [d.name for d in self.list_datasets()]
+            edges = [(e.upstream_dataset, e.downstream_dataset) for e in self.list_lineage()]
+            nodes = set(datasets) | {u for u, _ in edges} | {d for _, d in edges}
+            explicit = {d: set(self.get_explicit_markings(d)) for d in nodes}
+            effective = propagate_markings(datasets, edges, explicit)
+            with self._conn() as c:
+                self._lock_scope(c, *self._MARKING_GEN)
+                if self._scope_generation(c, *self._MARKING_GEN) != gen:
+                    continue  # an input changed after we read it: recompute
+                for d, eff in effective.items():
+                    self._set_effective_markings(c, d, eff)
+                return
+        raise RuntimeError(
+            "recompute_all_markings could not observe a quiet moment in 50 "
+            "attempts: markings/lineage are being rewritten continuously"
+        )
 
     # -- pipeline authors ---------------------------------------------------------
     #

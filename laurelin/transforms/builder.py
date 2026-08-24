@@ -366,7 +366,10 @@ class Builder:
             "build_finished", {"build_id": build.id, "status": final_status.value}
         )
         if worker is not None:
-            self.store.release_build(build.id)
+            # Owner-guarded: if this worker stalled past its lease and another
+            # replica took the build over, releasing unguarded would clear the
+            # successor's live lease and invite a third execution.
+            self.store.release_build(build.id, worker)
         # Builds are the natural periodic hook for housekeeping the audit log,
         # which nothing else bounds.
         keep = int(os.environ.get("LAURELIN_AUDIT_MAX_EVENTS", "0") or 0)
