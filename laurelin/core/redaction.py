@@ -205,10 +205,20 @@ _URL_KEY_RE = re.compile(r"(^|_)(url|uri)$", re.I)
 # Adding a name here is a disclosure decision. A key that ought to be shown and
 # is not shows up as `***** (withheld)` on an admin's screen — visible, annoying
 # and fixed in one line. That is the failure direction this list is chosen for.
+#
+# `provider` and `region` (object_store sources): pure shape — an enum naming
+# which cloud API and an AWS region label — that cannot carry a credential,
+# and without them the two fields that distinguish one bucket registration
+# from another render as `***** (withheld)` on the admin's Sources screen,
+# the exact screen-emptying failure the docstring above names. The
+# object_store secrets (`access_key_id`, `secret_access_key`) need no entry
+# anywhere: `API_SECRET_KEY_RE` masks both, and the allowlist fails closed
+# regardless. `uri`/`endpoint_url` disclose through `_URL_KEY_RE` →
+# `redact_dsn`.
 _DISCLOSABLE_KEYS = frozenset({
     "type", "table", "format", "catalog", "database", "schema", "namespace",
     "mode", "query", "cursor_column", "batch_size", "branch", "snapshot_id",
-    "path",
+    "path", "provider", "region",
 })
 
 

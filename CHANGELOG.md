@@ -10,6 +10,52 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Object-storage ingestion, and the formats real data arrives in
+
+A new `object_store` source type copies bucket objects into a governed managed
+dataset — the biggest missing ingestion path for a migration whose customer
+data sits in S3. Config is one locator (`uri: s3://bucket/prefix/*.parquet` —
+a key, prefix or glob), an optional `endpoint_url` for S3-compatible stores
+(MinIO, R2; path-style and SSL are derived), `provider: gcs` for Google Cloud
+Storage over HMAC interop, and an `access_key_id`/`secret_access_key` pair
+(absent pair = public bucket). Azure is deliberately rejected until it can be
+tested; federation already reads Azure-hosted tables in place.
+
+The pull runs on a fresh per-sync DuckDB connection hardened in the
+federation order — extensions, a temporary bucket-SCOPEd secret, **both** the
+local *and* the raw http(s) filesystems disabled, configuration locked — and
+the connection dies with the sync. Disabling `HTTPFileSystem` (not just
+`LocalFileSystem`) is defense-in-depth: `s3://` reads go through DuckDB's
+S3FileSystem and are unaffected (verified against MinIO), so the
+network-enabled sync connection cannot be steered at an arbitrary http(s) host
+(incl. cloud metadata at 169.254.169.254) even behind `validate_source`'s
+s3://-only guard. The ingest is size-capped at `LAURELIN_MAX_UPLOAD_MB` (the
+same ceiling the http puller enforces) so an editor-triggered sync of a huge
+object cannot mint an unbounded managed dataset. Build and query connections
+keep `enable_external_access=false`, which blocks `s3://` even with a valid
+secret loaded (measured), so no other path gains endpoint access. Credentials
+inherit the existing allowlist redaction:
+key pair masked in every API response, config withheld from editors entirely,
+and the export withholds `uri`/`endpoint_url` whole so a re-imported source
+refuses its first sync with a re-supply message instead of failing inside
+DuckDB.
+
+`mode: append` gets an implicit object cursor: only objects with
+`last_modified` above the stored high-water mark are pulled (a metadata-only
+listing decides), and a sync that finds nothing new mints no version. The
+strict-`>` comparison shares the postgres cursor's same-instant caveat, and an
+overwritten object re-enters an append sync — replace-in-place buckets should
+use `mode: replace`, where matching zero objects is a 400, never a silent
+empty version.
+
+All three file-shaped connectors — `object_store`, `http`, `file` — now also
+read **JSON, JSONL/NDJSON and Avro** alongside CSV and Parquet (suffix
+inference included), with zero new dependencies. The connector round-trips,
+the governance inheritance (versions, markings, ACLs on the ingested
+dataset), and the credential-redaction posture are tested against live MinIO
+(`LAURELIN_TEST_S3`, skip-with-reason when absent), and the Sources UI grows
+the fourth registration form.
+
 ### Concurrency: the first real evidence, and the six races it found
 
 Until now every correctness claim in this project was single-user, single-run —

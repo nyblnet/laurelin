@@ -16,13 +16,59 @@ Connector types:
   Config: ``{"url": ...}``, optional ``format`` ("csv"/"parquet", inferred
   from the URL path when omitted) and ``headers`` (e.g. an Authorization
   header for an API export).
-- ``file`` — read CSV/Parquet from a server-side path or glob (for data
-  landed on a mounted volume). Config: ``{"path": "/mnt/land/*.parquet"}``,
-  optional ``format``.
+- ``file`` — read CSV/Parquet/JSON/JSONL/Avro from a server-side path or glob
+  (for data landed on a mounted volume). Config:
+  ``{"path": "/mnt/land/*.parquet"}``, optional ``format``.
+- ``object_store`` — copy objects out of an S3/GCS bucket into a managed
+  dataset (ingestion, not federation: the bytes are pulled in and versioned).
+  Config: ``{"uri": "s3://bucket/prefix/*.parquet"}`` (a key, prefix or glob),
+  optional ``provider`` ("s3" default, or "gcs" via HMAC interop),
+  ``format`` (csv/parquet/json/jsonl/avro, inferred from the uri suffix when
+  omitted), ``endpoint_url`` (S3-compatible stores such as MinIO/R2; implies
+  path-style addressing, SSL from the endpoint scheme), ``region``, and the
+  credential pair ``access_key_id``/``secret_access_key`` (both or neither;
+  absent means an anonymous/public bucket).
 
-Source management is admin-only at the API layer: postgres/http configs can
-embed credentials, and file reads the server's filesystem. Secret-bearing
-config values are redacted in every API response (see ``redacted_config``).
+Source management is admin-only at the API layer: postgres/http/object_store
+configs can embed credentials, and file reads the server's filesystem.
+Secret-bearing config values are redacted in every API response (see
+``redacted_config``).
+
+**Network scope (the SSRF surface, stated).** ``endpoint_url`` and ``uri`` are
+admin-authored (``PUT /sources`` is admin-only). The *trigger* is
+lower-privileged — an editor, a viewer holding a ``can_edit`` dataset grant
+(the sync route's only gate is ``_require_dataset_edit``), and the scheduler
+unattended can all cause a fetch to the admin-configured endpoint — but none
+of them can *supply* the endpoint. The surface is therefore "an admin can
+point the server's sync path at an arbitrary URL", the same trust already
+extended for postgres/http sources. httpfs is enabled on exactly one
+connection: the fresh, per-sync DuckDB connection inside
+``_pull_object_store``, hardened in the ``federation.connect`` order
+(extensions → secret → ``disabled_filesystems`` → ``lock_configuration``) and
+closed in a ``finally``. That lockdown disables *both* ``LocalFileSystem`` and
+``HTTPFileSystem``: s3:// reads use DuckDB's S3FileSystem (unaffected), so the
+network-enabled connection cannot reach an arbitrary http(s) host (incl. cloud
+metadata at 169.254.169.254) even if a non-s3 target somehow reached the
+reader. The ingest size is capped at ``LAURELIN_MAX_UPLOAD_MB`` (default
+1024 MB, same ceiling as the http puller) so an editor-triggered sync of a huge
+object cannot mint an unbounded managed dataset. Build/query/ontology
+connections all set
+``enable_external_access=false``, which blocks ``s3://`` even with a valid
+secret on the same connection (measured), and DuckDB secrets are
+per-database-instance and temporary, so no other connection in the process
+can use the sync's credential. Residual, measured: a scoped secret is
+credential *selection*, not egress control — an out-of-scope ``s3://`` URL
+falls through to unauthenticated defaults and the request leaves for
+``s3.amazonaws.com``. Bounded because only server-generated SQL over the same
+admin's ``uri`` ever runs on that connection.
+
+**Append-mode caveats for object_store (documented, not fixed).** The cursor
+is the max object ``last_modified`` seen, compared strictly-``>`` — an object
+landing in the same instant as a sync's max is skipped, the same semantics as
+the postgres ``cursor_column > %s`` high-water mark (AWS lists
+whole-second mtimes; MinIO milliseconds). And an *overwritten* object (same
+key, newer mtime) re-enters an append sync and duplicates its rows:
+replace-in-place buckets must use ``mode="replace"``.
 """
 
 from __future__ import annotations
@@ -53,7 +99,7 @@ from laurelin.core.models import DatasetVersionInfo, Role, SourceInfo
 
 log = logging.getLogger("laurelin.connectors")
 
-CONNECTOR_TYPES = ("postgres", "http", "file")
+CONNECTOR_TYPES = ("postgres", "http", "file", "object_store")
 
 _DEFAULT_BATCH_SIZE = 50_000
 _MAX_BATCH_SIZE = 1_000_000
@@ -117,6 +163,39 @@ def validate_source(type_: str, config: dict[str, Any]) -> None:
         if not str(config.get("path", "")).strip():
             raise ValueError("file source needs a 'path' (server-side file or glob)")
         _file_format(config)
+    elif type_ == "object_store":
+        # Config values (uri, endpoint_url, keys) never appear in these
+        # messages — the 400 path is safe_detail, but the R1 rule stands:
+        # never put config values in exception text.
+        provider = config.get("provider", "s3")
+        if provider == "azure":
+            raise ValueError(
+                "provider 'azure' is not supported yet; use federation for "
+                "in-place reads"
+            )
+        if provider not in ("s3", "gcs"):
+            raise ValueError("provider must be 's3' or 'gcs'")
+        uri = str(config.get("uri", ""))
+        scheme = "gs://" if provider == "gcs" else "s3://"
+        if not uri.startswith(scheme):
+            raise ValueError(
+                f"object_store source needs a {scheme} uri for provider "
+                f"{provider!r} (a key, prefix or glob)"
+            )
+        if not urllib.parse.urlparse(uri).netloc:
+            raise ValueError("object_store uri names no bucket")
+        if bool(config.get("access_key_id")) != bool(config.get("secret_access_key")):
+            raise ValueError(
+                "access_key_id and secret_access_key must be set together "
+                "(both for a credentialed bucket, neither for a public one)"
+            )
+        endpoint = config.get("endpoint_url")
+        if endpoint is not None:
+            if provider != "s3":
+                raise ValueError("endpoint_url only applies to provider 's3'")
+            if urllib.parse.urlparse(str(endpoint)).scheme not in ("http", "https"):
+                raise ValueError("endpoint_url must be an http:// or https:// URL")
+        _object_store_format(config)
 
 
 def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -184,16 +263,30 @@ def _pull_postgres(config: dict[str, Any], since: Optional[str] = None) -> Itera
                 yield pa.table({c: pa.array([], type=pa.string()) for c in columns})
 
 
+# All the formats the DuckDB-backed readers speak. json and jsonl are two
+# names for the same reader (read_json auto-detects array vs newline-delimited,
+# measured); both survive because the *name* is the admin's declaration when
+# the suffix lies.
+_FORMATS = ("csv", "parquet", "json", "jsonl", "avro")
+_SUFFIX_FORMATS = {
+    ".csv": "csv", ".parquet": "parquet", ".pq": "parquet",
+    ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl", ".avro": "avro",
+}
+_READERS = {
+    "csv": "read_csv_auto", "parquet": "read_parquet",
+    "json": "read_json", "jsonl": "read_json", "avro": "read_avro",
+}
+
+
 def _http_format(config: dict[str, Any]) -> str:
     fmt = config.get("format")
     if not fmt:
         path = urllib.parse.urlparse(str(config.get("url", ""))).path
-        fmt = {".csv": "csv", ".parquet": "parquet", ".pq": "parquet"}.get(
-            Path(path).suffix.lower()
-        )
-    if fmt not in ("csv", "parquet"):
+        fmt = _SUFFIX_FORMATS.get(Path(path).suffix.lower())
+    if fmt not in _FORMATS:
         raise ValueError(
-            "Cannot determine file format from the URL; set format to 'csv' or 'parquet'"
+            "Cannot determine file format from the URL; set format to one of "
+            + ", ".join(_FORMATS)
         )
     return fmt
 
@@ -233,10 +326,11 @@ def _file_format(config: dict[str, Any]) -> str:
     fmt = config.get("format")
     if not fmt:
         suffix = Path(str(config.get("path", ""))).suffix.lower()
-        fmt = {".csv": "csv", ".parquet": "parquet", ".pq": "parquet"}.get(suffix)
-    if fmt not in ("csv", "parquet"):
+        fmt = _SUFFIX_FORMATS.get(suffix)
+    if fmt not in _FORMATS:
         raise ValueError(
-            "Cannot determine file format from the path; set format to 'csv' or 'parquet'"
+            "Cannot determine file format from the path; set format to one of "
+            + ", ".join(_FORMATS)
         )
     return fmt
 
@@ -244,8 +338,13 @@ def _file_format(config: dict[str, Any]) -> str:
 def _read_local(path_or_glob: str, fmt: str) -> pa.Table:
     con = duckdb.connect()
     try:
-        fn = "read_csv_auto" if fmt == "csv" else "read_parquet"
-        table = con.execute(f"SELECT * FROM {fn}(?)", [path_or_glob]).arrow()
+        # json and avro autoload on an unrestricted local connection (they are
+        # installed; read_avro's autoload needs local-FS access, which this
+        # connection has — the object_store puller is the one that must load
+        # them before locking down).
+        table = con.execute(
+            f"SELECT * FROM {_READERS[fmt]}(?)", [path_or_glob]
+        ).arrow()
     finally:
         con.close()
     if isinstance(table, pa.RecordBatchReader):
@@ -257,7 +356,173 @@ def _pull_file(config: dict[str, Any]) -> Iterator[pa.Table]:
     yield _read_local(str(config["path"]), _file_format(config))
 
 
-_PULLERS = {"postgres": _pull_postgres, "http": _pull_http, "file": _pull_file}
+def _object_store_format(config: dict[str, Any]) -> str:
+    fmt = config.get("format")
+    if not fmt:
+        path = urllib.parse.urlparse(str(config.get("uri", ""))).path
+        fmt = _SUFFIX_FORMATS.get(Path(path).suffix.lower())
+    if fmt not in _FORMATS:
+        raise ValueError(
+            "Cannot determine file format from the uri; set format to one of "
+            + ", ".join(_FORMATS)
+        )
+    return fmt
+
+
+def _sql_str(value: Any) -> str:
+    """A SQL single-quoted string literal. CREATE SECRET takes no bound
+    parameters, so credential values are embedded as literals with quotes
+    doubled. The statement never appears in any error Laurelin authors, and
+    ``redaction._SQL_SECRET_STMT_RE`` treats any CREATE SECRET text as a
+    credential if it ever surfaces anyway."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _create_sync_secret(con: "duckdb.DuckDBPyConnection", config: dict[str, Any]) -> None:
+    """One temporary, connection-scoped DuckDB secret for this sync.
+
+    Temporary (the DuckDB default — never PERSISTENT) so it dies with the
+    connection, and SCOPEd to the uri's bucket so the credential cannot be
+    presented to any other bucket on this connection. Scope is credential
+    *selection*, not egress control — see the module docstring. No ``AWS_*``
+    env vars are ever exported.
+    """
+    provider = config.get("provider", "s3")
+    bucket = urllib.parse.urlparse(str(config["uri"])).netloc
+    parts = ["TYPE gcs" if provider == "gcs" else "TYPE s3"]
+    key_id = config.get("access_key_id")
+    secret = config.get("secret_access_key")
+    if key_id and secret:
+        parts += [f"KEY_ID {_sql_str(key_id)}", f"SECRET {_sql_str(secret)}"]
+    endpoint = config.get("endpoint_url")
+    if provider == "s3" and endpoint:
+        # An S3-compatible store (MinIO, R2): path-style addressing, SSL from
+        # the endpoint scheme — the convention, measured against MinIO. No
+        # endpoint means DuckDB's defaults (vhost style, SSL) for real AWS.
+        parsed = urllib.parse.urlparse(str(endpoint))
+        parts += [
+            f"ENDPOINT {_sql_str(parsed.netloc)}",
+            "URL_STYLE 'path'",
+            f"USE_SSL {'true' if parsed.scheme == 'https' else 'false'}",
+        ]
+    if config.get("region"):
+        parts.append(f"REGION {_sql_str(config['region'])}")
+    scheme = "gs" if provider == "gcs" else "s3"
+    parts.append(f"SCOPE {_sql_str(f'{scheme}://{bucket}')}")
+    con.execute(f"CREATE SECRET laurelin_sync ({', '.join(parts)})")
+
+
+def _hardened_sync_connection(config: dict[str, Any]) -> "duckdb.DuckDBPyConnection":
+    """A fresh DuckDB connection prepared for object-store ingestion, hardened
+    in the ``federation.connect`` order.
+
+    The order is load-bearing twice: extensions load first because loading needs
+    an unlocked config *and* because ``read_avro``'s autoinstall needs the local
+    filesystem (measured: loading it after ``disabled_filesystems`` fails with
+    "LocalFileSystem has been disabled"); then the secret, then the lockdown,
+    then ``lock_configuration`` so nothing later on the connection can undo it.
+
+    The lockdown disables BOTH ``LocalFileSystem`` and ``HTTPFileSystem``.
+    s3:// reads go through DuckDB's S3FileSystem (the secret's ENDPOINT), which
+    is unaffected — verified against MinIO that read_csv/read_blob/glob over
+    s3:// still return rows with HTTPFileSystem off. Leaving HTTPFileSystem on
+    would let this network-enabled connection reach an arbitrary http(s) host
+    (incl. 169.254.169.254 cloud metadata) if a non-s3 target ever reached the
+    reader. ``validate_source`` already forces the uri to s3://gs://, so this is
+    defense-in-depth closing that gap at the connection, not the only guard.
+    """
+    con = duckdb.connect()
+    for ext in ("httpfs", "json", "avro"):
+        con.execute(f"INSTALL {ext}")
+        con.execute(f"LOAD {ext}")
+    _create_sync_secret(con, config)
+    con.execute("SET disabled_filesystems='LocalFileSystem,HTTPFileSystem'")
+    con.execute("SET lock_configuration=true")
+    return con
+
+
+def _pull_object_store(
+    config: dict[str, Any],
+    since: Optional[str] = None,
+    cursor_box: Optional[dict[str, Optional[str]]] = None,
+) -> Iterator[pa.Table]:
+    """Pull bucket objects through a fresh, hardened DuckDB connection.
+
+    ``cursor_box`` (mode="append") switches to the implicit object cursor:
+    list object metadata via ``read_blob`` (a ListObjectsV2, no content
+    fetch), keep only objects with ``last_modified > since``, and report the
+    new high-water mark through the box — filled as the generator runs, read
+    by the caller after the write consumed it.
+    """
+    fmt = _object_store_format(config)
+    uri = str(config["uri"])
+    reader = _READERS[fmt]
+    con = _hardened_sync_connection(config)
+    try:
+        target: Any = uri
+        if cursor_box is not None:
+            # CAST to VARCHAR avoids DuckDB's pytz requirement on TIMESTAMPTZ
+            # results, and the rendered offset keeps the string comparison
+            # timezone-safe when parsed back.
+            sql = (
+                "SELECT filename, CAST(last_modified AS VARCHAR) AS lm "
+                "FROM read_blob(?)"
+            )
+            params: list[Any] = [uri]
+            if since:
+                sql += " WHERE last_modified > CAST(? AS TIMESTAMPTZ)"
+                params.append(since)
+            sql += " ORDER BY last_modified"
+            listing = con.execute(sql, params).fetchall()
+            if not listing:
+                return  # nothing new: an empty stream, which append no-ops on
+            cursor_box["value"] = listing[-1][1]
+            target = [row[0] for row in listing]
+        else:
+            # mode="replace": zero matching objects must be an error, not a
+            # silent empty version — and a first-party one, not DuckDB's
+            # opaque "no files found" surfacing as a 502. Metadata-only.
+            hit = con.execute(
+                "SELECT filename FROM read_blob(?) LIMIT 1", [uri]
+            ).fetchall()
+            if not hit:
+                raise ValueError("Source matched no objects at its configured location")
+
+        # Cap total ingested size the same way _pull_http caps its download:
+        # an editor-triggered sync of a huge bucket object must not mint an
+        # unbounded managed dataset (a resource-exhaustion asymmetry — the http
+        # puller enforces this ceiling, the object puller did not). Measured on
+        # decoded Arrow bytes as the stream runs, so columnar formats still
+        # stream batch-by-batch and abort before the write balloons.
+        max_bytes = int(os.environ.get("LAURELIN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
+        seen = 0
+
+        def _guard(t: pa.Table) -> pa.Table:
+            nonlocal seen
+            seen += t.nbytes
+            if seen > max_bytes:
+                raise ValueError(
+                    f"Ingest exceeds {max_bytes // (1024 * 1024)} MB limit "
+                    "(set LAURELIN_MAX_UPLOAD_MB to raise it)"
+                )
+            return t
+
+        table = con.execute(f"SELECT * FROM {reader}(?)", [target]).arrow()
+        if isinstance(table, pa.RecordBatchReader):
+            for batch in table:
+                yield _guard(pa.Table.from_batches([batch]))
+        else:
+            yield _guard(table)
+    finally:
+        con.close()
+
+
+_PULLERS = {
+    "postgres": _pull_postgres,
+    "http": _pull_http,
+    "file": _pull_file,
+    "object_store": _pull_object_store,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -285,14 +550,26 @@ def sync_source(
     With ``mode="append"`` the pulled rows are appended (O(delta) I/O) instead
     of replacing the dataset. With a ``cursor_column`` as well, only rows above
     the stored high-water mark are pulled — so a recurring sync moves just the
-    new data, in both directions.
+    new data, in both directions. An ``object_store`` append sync has an
+    *implicit* cursor (max object ``last_modified``; no ``cursor_column``):
+    only objects newer than the stored mark are pulled, and a sync that finds
+    nothing new mints no version.
     """
     _refuse_without_credentials(source)
     mode = source.config.get("mode", "replace")
     cursor_column = source.config.get("cursor_column")
+    # The object cursor is implicit (max last_modified), not a column: the
+    # puller fills this box as the write consumes its stream, mirroring how
+    # `tracked` below fills `new_cursor` for a column cursor.
+    object_cursor_box: dict[str, Optional[str]] = {"value": None}
     try:
         if source.type == "postgres":
             chunks = _pull_postgres(source.config, since=source.cursor_value)
+        elif source.type == "object_store" and mode == "append":
+            chunks = _pull_object_store(
+                source.config, since=source.cursor_value,
+                cursor_box=object_cursor_box,
+            )
         else:
             chunks = _PULLERS[source.type](source.config)
 
@@ -312,6 +589,8 @@ def sync_source(
 
         writer = catalog.append_batches if mode == "append" else catalog.write_batches
         info = writer(source.dataset, chunks, source=f"sync:{source.type}")
+        if new_cursor is None:
+            new_cursor = object_cursor_box["value"]
     except Exception as exc:
         metrics.syncs.labels(type=source.type, status="failed").inc()
         # R1. This used to store `redact_driver_text(f"{type(exc).__name__}:
@@ -387,7 +666,10 @@ def _refuse_without_credentials(source: SourceInfo) -> None:
 # not imported on that path at all, so a stored failure sent an operator to
 # a log that does not exist. Overridden per-exception by `driver_of` when
 # the raising library is known.
-_DRIVER_BY_TYPE = {"postgres": "psycopg", "http": "urllib", "file": "duckdb"}
+_DRIVER_BY_TYPE = {
+    "postgres": "psycopg", "http": "urllib", "file": "duckdb",
+    "object_store": "duckdb",
+}
 
 
 def _sync_failure(exc: BaseException, source: SourceInfo) -> Failure:
@@ -406,7 +688,9 @@ def _sync_failure(exc: BaseException, source: SourceInfo) -> Failure:
     # The connector type says which library we *meant* to use; the raising
     # class's module says which one actually did. Prefer the fact.
     driver = driver_of(exc, _DRIVER_BY_TYPE.get(source.type, ""))
-    dsn = str(source.config.get("url") or "")
+    # `uri` is the object_store locator; the Failure's secret-awareness needs
+    # to see it (driver is duckdb there, so no psycopg connect pre-flight).
+    dsn = str(source.config.get("url") or source.config.get("uri") or "")
     if driver == "psycopg" and dsn:
         return connect_failure(
             exc, subject=subject, driver=driver, dsn=dsn, config=source.config

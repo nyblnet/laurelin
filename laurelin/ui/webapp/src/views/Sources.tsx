@@ -26,8 +26,19 @@ import {
 
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
-function typeTone(t: SourceType): "gold" | "blue" | "green" {
-  return t === "postgres" ? "blue" : t === "http" ? "green" : "gold";
+function typeTone(t: SourceType): "gold" | "blue" | "green" | "neutral" {
+  // Exhaustive on purpose: a new SourceType must pick a tone here, not
+  // inherit whatever the last else-branch happened to be.
+  switch (t) {
+    case "postgres":
+      return "blue";
+    case "http":
+      return "green";
+    case "file":
+      return "gold";
+    case "object_store":
+      return "neutral";
+  }
 }
 
 /**
@@ -47,6 +58,9 @@ function configSummary(s: Source): string | null {
     return String(c.table ?? c.query ?? "");
   }
   if (s.type === "http") return String(c.url ?? "");
+  // Explicit, not a fall-through: an unknown future type must not silently
+  // read somebody else's `path` key (see the round-3 note above).
+  if (s.type === "object_store") return String(c.uri ?? "");
   return String(c.path ?? "");
 }
 
@@ -103,6 +117,12 @@ function DeleteButton({ source }: { source: Source }) {
   );
 }
 
+// The provider choice as the form asks it. "s3" and "s3_compatible" are the
+// same wire value (`provider: "s3"`); the split exists so the endpoint field
+// appears exactly when it is needed (MinIO, R2, …) and stays out of the way
+// for real AWS.
+type BucketProvider = "s3" | "s3_compatible" | "gcs";
+
 function AddSourceForm({ onDone }: { onDone: () => void }) {
   const [type, setType] = useState<SourceType>("postgres");
   const [name, setName] = useState("");
@@ -112,6 +132,13 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
   const [query, setQuery] = useState("");
   const [path, setPath] = useState("");
   const [format, setFormat] = useState("");
+  const [provider, setProvider] = useState<BucketProvider>("s3");
+  const [uri, setUri] = useState("");
+  const [endpoint, setEndpoint] = useState("");
+  const [region, setRegion] = useState("");
+  const [mode, setMode] = useState<"replace" | "append">("replace");
+  const [accessKey, setAccessKey] = useState("");
+  const [secretKey, setSecretKey] = useState("");
 
   const create = useMutation({
     mutationFn: () => {
@@ -123,6 +150,19 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
       } else if (type === "http") {
         config.url = url.trim();
         if (format) config.format = format;
+      } else if (type === "object_store") {
+        config.provider = provider === "gcs" ? "gcs" : "s3";
+        config.uri = uri.trim();
+        if (provider === "s3_compatible") config.endpoint_url = endpoint.trim();
+        if (region.trim()) config.region = region.trim();
+        if (format) config.format = format;
+        if (mode !== "replace") config.mode = mode;
+        // Both or neither: an absent pair means an anonymous/public bucket.
+        // Never send empty strings — "" is not "unset" to the server.
+        if (accessKey.trim() !== "" || secretKey.trim() !== "") {
+          config.access_key_id = accessKey.trim();
+          config.secret_access_key = secretKey.trim();
+        }
       } else {
         config.path = path.trim();
         if (format) config.format = format;
@@ -141,6 +181,12 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
       setQuery("");
       setPath("");
       setFormat("");
+      setUri("");
+      setEndpoint("");
+      setRegion("");
+      setMode("replace");
+      setAccessKey("");
+      setSecretKey("");
       onDone();
     },
   });
@@ -152,7 +198,11 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
       ? url.trim().startsWith("postgres") && (table.trim() !== "" || query.trim() !== "")
       : type === "http"
         ? /^https?:\/\//.test(url.trim())
-        : path.trim() !== "";
+        : type === "object_store"
+          ? uri.trim().startsWith(provider === "gcs" ? "gs://" : "s3://") &&
+            (provider !== "s3_compatible" || /^https?:\/\//.test(endpoint.trim())) &&
+            (accessKey.trim() === "") === (secretKey.trim() === "")
+          : path.trim() !== "";
   const canSubmit = nameOk && datasetOk && configOk && !create.isPending;
 
   return (
@@ -165,6 +215,7 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
             <option value="postgres">PostgreSQL</option>
             <option value="http">HTTP(S) file</option>
             <option value="file">Server file / glob</option>
+            <option value="object_store">Object storage (S3 / GCS)</option>
           </select>
         </div>
         <div className="field">
@@ -223,7 +274,7 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
       {type === "http" && (
         <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
           <div className="field" style={{ flex: "1 1 380px" }}>
-            <label>URL (.csv or .parquet)</label>
+            <label>URL (.csv, .parquet, .json, .jsonl, .avro)</label>
             <input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
@@ -233,6 +284,90 @@ function AddSourceForm({ onDone }: { onDone: () => void }) {
           </div>
           <FormatSelect value={format} onChange={setFormat} />
         </div>
+      )}
+
+      {type === "object_store" && (
+        <>
+          <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
+            <div className="field">
+              <label>Provider</label>
+              <select
+                value={provider}
+                onChange={(e) => setProvider(e.target.value as BucketProvider)}
+              >
+                <option value="s3">Amazon S3</option>
+                <option value="s3_compatible">S3-compatible (MinIO, R2, …)</option>
+                <option value="gcs">Google Cloud Storage (HMAC)</option>
+              </select>
+            </div>
+            <div className="field" style={{ flex: "1 1 340px" }}>
+              <label>Bucket URI (key, prefix, or glob)</label>
+              <input
+                value={uri}
+                onChange={(e) => setUri(e.target.value)}
+                placeholder={
+                  provider === "gcs"
+                    ? "gs://bucket/prefix/*.parquet"
+                    : "s3://bucket/prefix/*.parquet"
+                }
+                autoComplete="off"
+              />
+            </div>
+            {provider === "s3_compatible" && (
+              <div className="field" style={{ flex: "1 1 240px" }}>
+                <label>Endpoint URL</label>
+                <input
+                  value={endpoint}
+                  onChange={(e) => setEndpoint(e.target.value)}
+                  placeholder="http://minio.internal:9000"
+                  autoComplete="off"
+                />
+              </div>
+            )}
+            {provider !== "gcs" && (
+              <div className="field">
+                <label>Region (optional)</label>
+                <input
+                  value={region}
+                  onChange={(e) => setRegion(e.target.value)}
+                  placeholder="us-east-1"
+                  autoComplete="off"
+                />
+              </div>
+            )}
+          </div>
+          <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
+            <FormatSelect value={format} onChange={setFormat} />
+            <div className="field">
+              <label>Mode</label>
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as "replace" | "append")}
+              >
+                <option value="replace">Replace (full refresh)</option>
+                <option value="append">Append (new objects only)</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Access key ID</label>
+              <input
+                value={accessKey}
+                onChange={(e) => setAccessKey(e.target.value)}
+                placeholder="leave blank for a public bucket"
+                autoComplete="off"
+              />
+            </div>
+            <div className="field">
+              <label>Secret access key</label>
+              <input
+                type="password"
+                value={secretKey}
+                onChange={(e) => setSecretKey(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          </div>
+        </>
       )}
 
       {type === "file" && (
@@ -277,6 +412,9 @@ function FormatSelect({
         <option value="">Infer from extension</option>
         <option value="csv">CSV</option>
         <option value="parquet">Parquet</option>
+        <option value="json">JSON</option>
+        <option value="jsonl">JSONL / NDJSON</option>
+        <option value="avro">Avro</option>
       </select>
     </div>
   );
@@ -378,7 +516,8 @@ export function SourcesSection() {
       </div>
       <p className="dim" style={{ margin: "6px 0 0" }}>
         Connectors that pull external data into datasets — PostgreSQL, HTTP
-        exports, or files landed on the server.
+        exports, files landed on the server, or object-storage buckets
+        (S3 / GCS).
       </p>
       {showAdd && isAdmin && (
         <AddSourceForm

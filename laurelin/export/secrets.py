@@ -85,9 +85,16 @@ SECRET_KEYS = (
 # which table, in which format — and not where it lives or how to log in.
 # Anything not on this list defaults to absent, which surfaces at import as a
 # needs-credentials refusal somebody fixes.
+# `provider` and `region` (object_store sources) are shape: which cloud API
+# and which region label. `uri` and `endpoint_url` are deliberately absent —
+# the export withholds the endpoint whole (this module's threat model), the
+# manifest records it, and `connectors._refuse_without_credentials` turns the
+# re-imported source's first sync into a clean re-supply refusal instead of a
+# DuckDB failure over `uri=None`.
 NON_SECRET_SHAPE_KEYS = (
     "type", "table", "format", "catalog", "database", "schema", "namespace",
     "mode", "query", "cursor_column", "batch_size", "branch", "snapshot_id",
+    "provider", "region",
 )
 
 # How to put each withheld field back. Asserted by a test against the app's

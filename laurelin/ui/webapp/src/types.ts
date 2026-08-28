@@ -382,7 +382,7 @@ export interface CellPreviewResult extends QueryResult {
   max_rows: number;
 }
 
-export type SourceType = "postgres" | "http" | "file";
+export type SourceType = "postgres" | "http" | "file" | "object_store";
 
 export interface Source {
   name: string;

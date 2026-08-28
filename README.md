@@ -62,9 +62,14 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Datasets** — versioned tables stored as Parquet. Every write creates an
   immutable new version; the full history is kept.
 - **Data sources** — connectors that pull external data into datasets:
-  PostgreSQL (streamed in batches), HTTP CSV/Parquet exports, and server-side
-  file drops. Synced versions flow through lineage, ACLs, and markings like
-  any other data.
+  PostgreSQL (streamed in batches), HTTP CSV/Parquet exports, server-side
+  file drops, and **object storage** (S3/GCS buckets, or any S3-compatible
+  endpoint like MinIO/R2 — copied into a governed managed dataset, not read in
+  place). All four read CSV, Parquet, JSON, JSONL/NDJSON and Avro. Synced
+  versions flow through lineage, ACLs, and markings like any other data.
+  (Object-store ingestion is verified against MinIO; real AWS S3, GCS HMAC
+  interop, and Azure are not yet tested — Azure is rejected pending a test,
+  and federation already reads Azure-hosted tables in place.)
 - **Transforms** — Python functions (or SQL) declared with `@transform`,
   reading input datasets and producing an output dataset. Laurelin resolves the
   DAG, executes builds, and records **lineage** automatically.

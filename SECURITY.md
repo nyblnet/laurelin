@@ -93,6 +93,41 @@ exposing such datasets to ad-hoc SQL is additionally off by default behind
 route, not a hole in the workbench: callers receive an Arrow table, never a
 connection, so only server-generated SQL reaches those engines.
 
+**The `object_store` ingestion source is secret-bearing, and its endpoint is
+admin-authored.** Registering one (`PUT /sources`, admin-only) stores an
+`access_key_id`/`secret_access_key` pair for an S3/GCS bucket, redacted in
+every API response and export by the same allowlist as postgres/http sources
+(the key pair masks to `*****`; `uri`/`endpoint_url` disclose to admins only,
+through `redact_dsn`; export withholds them whole so a re-imported source
+refuses its first sync with a re-supply message rather than failing inside
+DuckDB). The sync itself runs on a fresh, per-sync DuckDB connection that is the
+*only* network-enabled connection in the process: it loads a temporary,
+bucket-SCOPEd secret, then disables **both** `LocalFileSystem` and
+`HTTPFileSystem` and locks the configuration. `s3://` reads use DuckDB's
+S3FileSystem and are unaffected; disabling `HTTPFileSystem` stops that
+connection reaching any other http(s) host (incl. cloud metadata at
+169.254.169.254) as defense-in-depth behind `validate_source`, which already
+forces the `uri` scheme to `s3://`/`gs://`. Build and query connections keep
+`enable_external_access=false`, which blocks `s3://` even with a valid secret
+loaded, and DuckDB secrets are per-instance and temporary, so no other path in
+the process can use the sync's credential. The ingest is size-capped at
+`LAURELIN_MAX_UPLOAD_MB` (the http puller's ceiling) so a triggered sync of a
+huge object cannot mint an unbounded dataset.
+
+There is an **SSRF surface, and it is bounded by who may author the endpoint,
+not by who may trigger the sync.** The sync route's only gate is
+`_require_dataset_edit`, so a plain editor, a viewer holding a `can_edit`
+dataset grant, and the unattended scheduler can all *cause* a fetch to the
+admin-configured `endpoint_url` — but none of them can *supply* it. This is the
+same trust already extended to postgres/http sources: an admin can point the
+server's sync path at an arbitrary URL. The residual, measured: a bucket-SCOPEd
+secret is credential *selection*, not egress control, so an out-of-scope
+`s3://` URL still resolves against public AWS — bounded because the `uri` is the
+same admin's config and nothing an editor supplies ever reaches the connection.
+Object-store ingestion is verified against MinIO; real AWS S3, GCS HMAC
+interop, and Azure are not yet tested (Azure registration is rejected pending a
+test).
+
 **Secrets aren't echoed — and that no longer rests on recognising one.** Three
 rounds of attackers found credential disclosures in the module that tried to
 *detect* credentials in free text, and each round something walked around the
@@ -356,4 +391,8 @@ there is **no general request rate limiter** — the only throttle in the tree i
 on failed logins (5 consecutive failures per username → 30s lockout, 429), so a
 caller who issues many *cheap* authenticated requests is unbounded. Report a
 way to take a replica down *through* the query budget; a report that says
-"unbounded builds exist" is describing a documented default.
+"unbounded builds exist" is describing a documented default. Ingestion pulls
+(`http` and `object_store` sources) cap the pulled size at
+`LAURELIN_MAX_UPLOAD_MB` (default 1024 MB) so a single sync cannot mint an
+arbitrarily large managed dataset, but the *number* of syncs is not rate-limited
+beyond the edit gate above.
