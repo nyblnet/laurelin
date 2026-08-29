@@ -240,6 +240,78 @@ def test_output_blocks_are_never_executed():
     assert "region  revenue" not in script_for("```text\nregion  revenue\n```\n")
 
 
+def test_no_run_laurelin_commands_are_still_real_commands():
+    """A `no-run` block is shown and never executed, so it is the one place a
+    documented command can rot invisibly — and it includes the very first
+    command a reader runs (`laurelin serve ...`). Measured: adding a
+    nonexistent `--open-browser` to tutorial 01's serve line left this whole
+    file green, because nothing ever parsed it.
+
+    So parse it. Every `laurelin` invocation in a no-run block is resolved
+    against the real CLI: the subcommand chain must exist and every `--flag`
+    must be a declared option of the command it is passed to. This does not
+    execute anything — a serve line still needs what a test can't provide —
+    it only refuses to *show* readers a command the CLI would reject.
+    (`text` expected-output blocks remain unchecked; they carry no commands.)
+    """
+    import shlex
+
+    from typer.main import get_command
+
+    from laurelin.cli import app as cli_app
+
+    root = get_command(cli_app)
+    checked, problems = 0, []
+    for name, _ in ORDER:
+        for lang, opts, body in parse_blocks((TUTORIALS / name).read_text()):
+            if lang != "bash" or "no-run" not in opts:
+                continue
+            for line in body.splitlines():
+                line = line.strip()
+                if not line.startswith("laurelin"):
+                    continue  # pip install etc.: not ours to validate
+                checked += 1
+                tokens = shlex.split(line)[1:]
+                cmd = root
+                # Duck-typed group check: this typer ships its own click shim
+                # (typer._click), so TyperGroup is not an isinstance of the
+                # installed click.Group — measured, it made this walk a no-op.
+                while (
+                    tokens
+                    and not tokens[0].startswith("-")
+                    and getattr(cmd, "commands", None) is not None
+                ):
+                    sub = cmd.commands.get(tokens[0])
+                    if sub is None:
+                        problems.append(
+                            f"{name}: `laurelin ... {tokens[0]}` is not a "
+                            f"command the CLI knows ({line!r})"
+                        )
+                        break
+                    cmd, tokens = sub, tokens[1:]
+                else:
+                    allowed = {
+                        opt
+                        for param in cmd.params
+                        for opt in (*param.opts, *param.secondary_opts)
+                    } | {"--help"}
+                    for token in tokens:
+                        if token.startswith("--"):
+                            flag = token.split("=", 1)[0]
+                            if flag not in allowed:
+                                problems.append(
+                                    f"{name}: `{flag}` is not an option of "
+                                    f"that command ({line!r})"
+                                )
+    assert checked, (
+        "no `laurelin` command found in any no-run block — either the "
+        "tutorials changed shape or this parser drifted; both deserve a look"
+    )
+    assert not problems, (
+        "documented commands the CLI would reject:\n  " + "\n  ".join(problems)
+    )
+
+
 def test_every_tutorial_is_covered():
     """A new tutorial must be added to ORDER, or it silently goes untested —
     which is the failure this whole module exists to prevent."""

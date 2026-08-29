@@ -10,6 +10,58 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### CI: the workflow now exercises what the badge claims
+
+The workflow in `.github/workflows/ci.yml` had never executed, and its first
+draft was a false-confidence machine: no job set `LAURELIN_TEST_S3`, so every
+object-store test proven against live MinIO would have skipped green; the
+StarRocks job was gated on "workflow_dispatch or a label", which means never;
+and no job anywhere executed a single line of UI JavaScript. Every job's steps
+have now been executed locally, in order, as written — but **none of this has
+run on GitHub Actions yet**. Runner-side facts (the `CI=true` default, Chrome
+preinstalled on ubuntu-latest, pull bandwidth for the 1.92 GB StarRocks image)
+are from GitHub's documentation, not observation; the first push is the real
+measurement.
+
+What each job covers:
+
+- **lint** — ruff 0.9.6 + vermin 1.8.0 over `laurelin/` (1.6.0 crashed on the
+  very interpreter the job pins; found by running the step).
+- **test** (4-python matrix, 3.11–3.14) — SQLite + PostgreSQL (service
+  container) + MinIO (a `docker run` step: a `services:` MinIO starts without
+  `server /data`, dies silently, and every S3 test skips green) + embedded
+  chdb/ClickHouse + all ten optional extras + the 31 webapp-harness tests,
+  which bundle the real `.tsx` sources and execute them under node
+  (`npm ci`, 80 MB, ~2 s warm). `tests/test_ci_guards.py` turns each of those
+  suites' silent skip into a failure.
+- **package** — build the wheel, prove the UI is inside it, install into a
+  clean venv, serve, and then *execute* the served page in headless Chrome,
+  asserting the React shell mounted. The previous `grep '<title'` check was
+  measured to stay green with a bundle corrupted into a guaranteed
+  SyntaxError — a completely blank app passed every step of every job.
+- **starrocks** (one job, one Python; the image is a 1.92 GB pull, so it
+  stays out of the matrix) — runs on push to main, on PRs whose diff touches
+  StarRocks code (a `changes` job computes the diff with plain git;
+  a broken prepared cursor was measured to merge green under a main-only
+  gate), on the `starrocks` label, and on dispatch.
+- **docs** — executes the tutorials against a real server, and now also
+  validates every `laurelin` command in a `no-run` block against the real
+  CLI (a documented flag that does not exist — including on the first
+  command a reader ever runs — was measured to stay green forever).
+- **bench** — `bench/regression.py` gates the published scaling claims;
+  measured 5m25s locally, the second-longest job after the matrix.
+
+Guard changes in `tests/test_ci_guards.py`: new guards for the object-store
+suite, the webapp harness, and a pinned manifest of all 82 test files
+(deleting `tests/test_markings.py` was measured to leave guards, lint and
+collection green — nothing in the pipeline reads test names or counts); the
+StarRocks structural guard now also pins the PR path gate. And the suite got
+4 minutes faster: `test_throttle_table_is_bounded` was 252 s — 35% of the
+whole suite, paid four times per matrix run — because 8,692 authenticate()
+calls each paid the real scrypt KDF to test what is actually a dict-eviction
+invariant; the KDF is now stubbed in that one test (3.9 s), and the eviction
+failure it guards still goes red (re-measured with eviction broken).
+
 ### Object-storage ingestion, and the formats real data arrives in
 
 A new `object_store` source type copies bucket objects into a governed managed

@@ -79,17 +79,68 @@ jobs:
       - name: Install
         run: pip install -e '.[dev,postgres,saml,mcp,engines,scheduler,metrics,iceberg,clickhouse,starrocks]'
 
+      # MinIO cannot be a `services:` entry: the image's CMD is a bare
+      # `minio` (prints help and exits) and service containers cannot pass
+      # the required `server /data` arguments — a `services:` MinIO comes up
+      # dead, every object-store test skips, and the run stays green. A step
+      # can pass arguments. Cost is noise next to the rest of the job: 59 MB
+      # compressed pull, and measured 0.4 s from `docker run` on an empty
+      # volume to /minio/health/live returning 200.
+      #
+      # No bucket setup on purpose: the s3 fixture creates its own bucket
+      # (tests/test_connectors.py, S3FileSystem(allow_bucket_creation=True)
+      # + create_dir), proven against a fresh container with an empty /data.
+      # The tag pins the release verified locally.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=laurelin -e MINIO_ROOT_PASSWORD=ci-minio-secret \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 50); do
+            curl -sf localhost:9000/minio/health/live && break || sleep 0.2
+          done
+          curl -sf localhost:9000/minio/health/live
+
+      # The 31 webapp-harness tests (tests/test_charts_render.py,
+      # tests/test_explore_mount.py) bundle the real .tsx sources with the
+      # webapp's own esbuild and execute them under node — the only executions
+      # of UI TypeScript anywhere in this workflow. They skip as a unit when
+      # node_modules is absent, which was every draft of this workflow until
+      # this step existed: green, while running zero lines of UI code.
+      # tests/test_ci_guards.py::test_the_webapp_harness_is_enabled turns that
+      # skip back into a failure. Cost: 80 MB of node_modules; `npm ci`
+      # measured 1.7 s with a warm npm cache locally (expect tens of seconds
+      # cold on a runner — setup-node's cache keys on package-lock.json), and
+      # the 31 tests themselves run in 0.4 s.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: laurelin/ui/webapp/package-lock.json
+      - name: Install the webapp harness dependencies
+        run: npm ci
+        working-directory: laurelin/ui/webapp
+
       # Every optional extra is installed above, so this run exercises the
       # SAML, MCP, Flight SQL, croniter and prometheus paths rather than
       # silently skipping them.
-      - name: Test (SQLite + PostgreSQL)
+      #
+      # No `-q` here: addopts (pyproject.toml) already carries one, and the
+      # two stack to `-qq`, which suppresses the final "N passed, M skipped"
+      # tally — the one line a human reads to notice a skip count. Measured.
+      - name: Test (SQLite + PostgreSQL + MinIO)
         env:
           LAURELIN_TEST_POSTGRES: postgresql://postgres:test@127.0.0.1:5432/laurelin
-        run: pytest -q -p no:warnings -rs --durations=10
+          LAURELIN_TEST_S3: http://laurelin:ci-minio-secret@127.0.0.1:9000
+        run: pytest -p no:warnings -rs --durations=10
 
-      # tests/test_ci_guards.py fails the run if the PostgreSQL suite silently
-      # skipped — a skip is invisible in a green run, which is exactly how a
-      # whole dialect stops being tested without anyone noticing.
+      # tests/test_ci_guards.py fails the run if the PostgreSQL, object-store
+      # or webapp-harness suite silently skipped — a skip is invisible in a
+      # green run, which is exactly how a whole dialect (or the entire S3
+      # data path, or every line of UI TypeScript) stops being tested without
+      # anyone noticing. It also pins the manifest of test files: deleting a
+      # whole test file was measured to leave guards, lint and collection
+      # green, because nothing else in the pipeline reads test names.
 
   # ---------------------------------------------------------------- packaging
   #
@@ -131,25 +182,98 @@ jobs:
           curl -sf localhost:8799/health/ready
           # The UI must be served, not merely packaged.
           curl -sf localhost:8799/ | grep -qi '<title' \
-            || { echo "::error::UI did not render"; exit 1; }
+            || { echo "::error::UI was not served"; exit 1; }
           curl -sf localhost:8799/api/v1/datasets
+
+      # `grep '<title'` proves the page is served; it cannot prove the app
+      # runs. The whole UI is one inline <script type=module>, and a page
+      # whose script dies at parse — or at any top-level throw — still
+      # carries the title, so a completely blank app passed every check in
+      # this job. Measured: corrupt one identifier in the shipped bundle
+      # (`var pS` -> `var 0pS`, a guaranteed SyntaxError), and build, wheel
+      # check, install, serve and every curl above stay green while a real
+      # browser renders an empty <div id="root">. So: execute the page in
+      # the Chrome that ubuntu-latest runners preinstall, and require the
+      # React shell to have actually mounted. The dump is script-stripped
+      # before asserting because the bundle's *source* contains every UI
+      # string — grepping the raw dump matches the dead page too (measured).
+      # Chrome's presence on the runner is per the runner-images manifest;
+      # like everything else here, unproven on GitHub until the first run.
+      - name: The UI must execute, not merely be served
+        run: |
+          google-chrome --headless=new --disable-gpu --no-sandbox \
+            --virtual-time-budget=15000 --dump-dom http://localhost:8799/ \
+            > /tmp/dom.html
+          python - <<'PY'
+          import re, sys
+          dom = open("/tmp/dom.html").read()
+          stripped = re.sub(r"<script\b.*?</script>", "", dom, flags=re.S)
+          if re.search(r'<div id="root">\s*</div>', stripped):
+              sys.exit("::error::the bundle executed to an empty #root — the app never mounted")
+          if "Ontology Data Platform" not in stripped:
+              sys.exit("::error::the app shell text is missing from the rendered DOM")
+          print("UI mounted: #root has children and the shell rendered")
+          PY
+
+  # ---------------------------------------------------------------- changes
+  #
+  # PR path detection for the starrocks job below. `on.pull_request.paths`
+  # is workflow-level — it cannot gate one job — so the diff is computed
+  # here with plain git (no third-party action). Without this, a PR that
+  # breaks the StarRocks read path merges green and the breakage is first
+  # seen post-merge, when the push-to-main starrocks job goes red: measured
+  # by swapping `con.cursor(prepared=True)` for `con.cursor()` and watching
+  # the whole PR-event suite pass (44 passed, 64 skipped in the SR files)
+  # while the live-server job fails immediately.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      starrocks: ${{ steps.diff.outputs.starrocks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          else
+            changed=""
+          fi
+          echo "$changed"
+          if echo "$changed" | grep -E -q \
+            '^(laurelin/core/starrocks\.py|laurelin/core/dialects\.py|tests/test_starrocks.*\.py|tests/starrocks_env\.py)$'; then
+            echo "starrocks=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "starrocks=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # ---------------------------------------------------------------- starrocks
   #
-  # Opt-in, not part of the matrix. The allin1 image is 3.18 GB, and a pull per
-  # matrix entry would dominate the cost of the whole workflow for a backend
-  # whose dialect unit tests already run everywhere. `workflow_dispatch` (or a
-  # `starrocks` label on a PR) is what turns it on.
+  # One job at one Python, not part of the matrix. The allin1 image is a
+  # 1.92 GB compressed pull (3.18 GB on disk), and a pull per matrix entry
+  # would dominate the cost of the whole workflow for a backend whose dialect
+  # unit tests already run everywhere.
+  #
+  # It runs on every push to main — a gate of "workflow_dispatch or a label"
+  # alone meant the flagship serving tier's 300-odd integration tests ran
+  # never, which is the false-confidence machine this workflow exists to
+  # dismantle. On PRs it runs when the diff touches StarRocks code (the
+  # `changes` job above) or when the `starrocks` label asks for it, so an
+  # unrelated PR still pays nothing.
   #
   # Locally this suite runs against a container started the same way, and cold
-  # start to a live BE measured ~15 s under rootless podman — no --privileged,
+  # start to a live BE measured ~18 s under rootless podman — no --privileged,
   # no sysctl changes. **This job itself has not been executed on GitHub
   # Actions**; it is written from the local container's behaviour, so treat the
   # first run as the verification.
   starrocks:
+    needs: changes
     if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'starrocks')
+      contains(github.event.pull_request.labels.*.name, 'starrocks') ||
+      needs.changes.outputs.starrocks == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,6 +293,19 @@ jobs:
           for i in $(seq 1 120); do
             docker exec laurelin-sr mysql -h127.0.0.1 -P9030 -uroot \
               -e "CREATE DATABASE IF NOT EXISTS lau" && break || sleep 5
+          done
+          # ...and not just any query: CREATE DATABASE is FE-only metadata.
+          # Measured on a cold container, it succeeds at 11 s while a real
+          # table needs a live BE, which arrived at 18 s — so the loop above
+          # releases 7 s early and the first table-creating test can race BE
+          # registration. Probe a real table before letting pytest anywhere
+          # near the server.
+          for i in $(seq 1 60); do
+            docker exec laurelin-sr mysql -h127.0.0.1 -P9030 -uroot -e "
+              CREATE TABLE IF NOT EXISTS lau.ci_probe (id INT) DUPLICATE KEY(id)
+                DISTRIBUTED BY HASH(id) PROPERTIES('replication_num'='1');
+              INSERT INTO lau.ci_probe VALUES (1);
+              DROP TABLE lau.ci_probe" && break || sleep 2
           done
 
       # Three things learned by running this locally, each of which broke the
@@ -196,12 +333,24 @@ jobs:
             ALTER USER 'laurelin'@'%' DEFAULT ROLE ALL;
           "
 
+      # Only the single StarRocks guard from test_ci_guards.py, never the whole
+      # file: GitHub sets CI=true in every job, which arms every @in_ci guard,
+      # and this job installs only [dev,starrocks] and starts no Postgres and
+      # no MinIO. Selecting the whole file was measured (locally, in a clean
+      # venv built with this job's exact install step) to fail 12 of its 17
+      # tests — 4 Postgres guards plus 8 of the 9 optional-extras checks —
+      # before a single StarRocks test ran. The matrix job already runs the
+      # full guard file; this job needs exactly the guard that proves the
+      # container it paid 1.92 GB for is actually reachable.
+      #
+      # No `-q`: same -qq tally-suppression as the matrix job, see above.
       - name: Test
         env:
           LAURELIN_TEST_STARROCKS: starrocks://laurelin:srsecret@127.0.0.1:9030/lau
-        run: pytest -q -p no:warnings -rs tests/test_starrocks.py
+        run: pytest -p no:warnings -rs tests/test_starrocks.py
           tests/test_starrocks_governance.py tests/test_dialects.py
-          tests/test_text_agreement.py tests/test_ci_guards.py
+          tests/test_text_agreement.py
+          "tests/test_ci_guards.py::test_the_starrocks_suite_runs_wherever_it_is_configured"
 
   # ---------------------------------------------------------------- docs
   #

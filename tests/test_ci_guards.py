@@ -15,8 +15,13 @@ from pathlib import Path
 
 import pytest
 
+# Two detectors, either one arms the guards. GitHub Actions documents both
+# CI=true and GITHUB_ACTIONS=true as default environment variables for every
+# step; checking both means a job that overrides or unsets the generic CI
+# (which other tools also read) cannot accidentally disarm every guard here.
 in_ci = pytest.mark.skipif(
-    os.environ.get("CI", "").lower() not in {"1", "true"},
+    os.environ.get("CI", "").lower() not in {"1", "true"}
+    and os.environ.get("GITHUB_ACTIONS", "").lower() != "true",
     reason="guards apply to CI runs; local runs may legitimately skip suites",
 )
 
@@ -40,6 +45,95 @@ def test_the_postgres_suite_is_enabled():
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
             assert cur.fetchone()[0] == 1
+
+
+@in_ci
+def test_the_object_store_suite_is_enabled():
+    """The object-store connector tests are the only executions of the S3 data
+    path against a real endpoint, and they skip without LAURELIN_TEST_S3.
+
+    They did exactly that, invisibly, in every draft of this workflow until
+    this guard existed: the variable appeared nowhere in ci.yml, so all eleven
+    tests proven against live MinIO would have skipped while the badge stayed
+    green.
+
+    Reachability is asserted with the same S3FileSystem call the s3 fixture
+    makes, because the failure mode it catches is specific: a MinIO declared
+    as a GitHub `services:` container starts without the `server /data`
+    arguments, prints help, and exits 0 — the port is closed, the fixture
+    turns that into eleven skips, and nothing is red. Here it is a failure.
+    """
+    import urllib.parse
+
+    from pyarrow import fs as pafs
+
+    url = os.environ.get("LAURELIN_TEST_S3", "")
+    assert url.startswith("http"), (
+        "LAURELIN_TEST_S3 is unset, so every object-store connector test in "
+        "tests/test_connectors.py skipped. CI must exercise the S3 path "
+        "against a live endpoint."
+    )
+
+    # The gated tests must still exist, and still use the bucket this guard
+    # probes — same pin style as the watermark guard above.
+    source = Path(__file__).with_name("test_connectors.py").read_text()
+    assert "test_object_store_sync_ingests_each_format_from_bucket" in source
+    assert 'BUCKET = "laurelin-ingest-test"' in source
+
+    parts = urllib.parse.urlsplit(url)
+    filesystem = pafs.S3FileSystem(
+        access_key=urllib.parse.unquote(parts.username or ""),
+        secret_key=urllib.parse.unquote(parts.password or ""),
+        endpoint_override=f"{parts.scheme}://{parts.hostname}:{parts.port}",
+        scheme=parts.scheme,
+        allow_bucket_creation=True,
+    )
+    # Raises OSError if the endpoint is dead — which is the point. The fixture
+    # wraps this same call in pytest.skip; the guard must not.
+    filesystem.create_dir("laurelin-ingest-test", recursive=True)
+
+
+@in_ci
+def test_the_webapp_harness_is_enabled():
+    """The webapp-harness tests are the only executions of UI TypeScript in
+    the whole suite, and they skip as a unit when node or the webapp's
+    node_modules are absent.
+
+    That was every CI draft's permanent state until the matrix job ran
+    `npm ci`: 31 tests skipping green while no job executed a single line of
+    the UI. Proven the usual way — a bundle corrupted into a guaranteed
+    SyntaxError sailed through the package job's served-page checks, because
+    serving a page and running its script are different claims. The package
+    job now executes the shipped bundle in headless Chrome; this guard keeps
+    the source-level harness from silently returning to zero coverage.
+    """
+    import shutil
+
+    assert shutil.which("node"), (
+        "node is not on PATH, so tests/test_charts_render.py and "
+        "tests/test_explore_mount.py — the entire UI execution surface — "
+        "skipped."
+    )
+    esbuild = (
+        Path(__file__).resolve().parent.parent
+        / "laurelin" / "ui" / "webapp" / "node_modules" / ".bin" / "esbuild"
+    )
+    assert esbuild.exists(), (
+        "the webapp's node_modules are missing (`npm ci` did not run), so "
+        "the 31 webapp-harness tests skipped and no CI job executed any UI "
+        "TypeScript."
+    )
+    # The harness files must still exist and still contain the tests this
+    # guard exists to keep running — same pin style as the watermark guard.
+    pins = {
+        "test_charts_render.py":
+            "test_a_null_value_in_a_line_series_renders_as_a_gap_not_a_zero",
+        "test_explore_mount.py":
+            "test_the_explore_screen_first_mounts_without_throwing_before_any_query_resolves",
+    }
+    for filename, test_name in pins.items():
+        source = Path(__file__).with_name(filename).read_text()
+        assert test_name in source, f"{filename} no longer contains {test_name}"
 
 
 @in_ci
@@ -157,19 +251,194 @@ def test_the_starrocks_suite_runs_wherever_it_is_configured():
         con.close()
 
 
-def test_the_starrocks_job_is_opt_in_and_still_exists():
-    """It is not in the matrix — the image is 3.18 GB — so nothing else would
-    notice if it were deleted or renamed."""
+def test_the_starrocks_job_runs_on_main_and_on_prs_that_touch_it():
+    """It is not in the matrix — the image is a 1.92 GB pull — so nothing else
+    would notice if it were deleted, renamed, or quietly gated back down to
+    never.
+
+    That last one is not hypothetical: the job's original gate was
+    "workflow_dispatch or a PR label", which in practice meant the StarRocks
+    integration suite had never run anywhere but a developer's machine. The
+    gate must keep firing on push to main, AND on PRs whose diff touches
+    StarRocks code — a main-only gate was measured to merge a broken prepared
+    cursor green (the PR-event suite passed while the live-server selection
+    failed 28 tests), leaving the red for whoever pushed next. The job must
+    also keep pointing the tests at the container it pays to start.
+
+    Runs everywhere, not just in CI: it reads the workflow file, so it can
+    catch the regression before it merges.
+    """
+    import re
+
     import yaml
 
     root = Path(__file__).resolve().parent.parent
     workflow = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())
     job = workflow["jobs"].get("starrocks")
-    assert job is not None, "the opt-in StarRocks job has gone missing"
-    assert "if" in job, "it must stay opt-in rather than joining every run"
+    assert job is not None, "the StarRocks job has gone missing"
+
+    condition = job.get("if", "")
+    assert condition, (
+        "the job lost its gate: a 1.92 GB pull would now run once per matrix "
+        "trigger, which is the cost the dedicated job exists to avoid"
+    )
+    assert "github.event_name == 'push'" in condition and "refs/heads/main" in condition, (
+        "the gate no longer fires on push to main, so the StarRocks "
+        "integration suite runs only when someone remembers to ask — which is "
+        "how it ran never, for seventeen commits"
+    )
+    assert "needs.changes.outputs.starrocks == 'true'" in condition, (
+        "the gate no longer fires on PRs that touch StarRocks code, so a "
+        "regression in the read path merges green and is first seen "
+        "post-merge on main"
+    )
+    assert "changes" in (job.get("needs") or []), (
+        "the job no longer depends on the `changes` job, so its path gate "
+        "can never evaluate to true"
+    )
+
+    changes = workflow["jobs"].get("changes")
+    assert changes is not None, (
+        "the `changes` job has gone missing; the starrocks path gate reads "
+        "its output"
+    )
+    changes_runs = " ".join(str(s.get("run", "")) for s in changes["steps"])
+    assert "laurelin/core/starrocks" in changes_runs, (
+        "the changes job no longer watches laurelin/core/starrocks.py, which "
+        "is exactly the file whose regression was measured to merge green"
+    )
+
     env = [s.get("env", {}) for s in job["steps"]]
     assert any("LAURELIN_TEST_STARROCKS" in e for e in env), (
         "the job would start a container and then skip every test"
+    )
+
+    # The job must select the single StarRocks guard, never this whole file:
+    # CI=true arms every @in_ci guard, and that job has no Postgres, no MinIO
+    # and only the starrocks extra — selecting the file was measured to fail
+    # 12 guard tests before any StarRocks test ran.
+    runs = " ".join(str(s.get("run", "")) for s in job["steps"])
+    assert "test_ci_guards.py::test_the_starrocks_suite_runs_wherever_it_is_configured" in runs, (
+        "the job no longer runs the guard that proves the container is reachable"
+    )
+    assert not re.search(r"test_ci_guards\.py(?!::)", runs), (
+        "the job selects the whole guard file; with CI=true that arms the "
+        "Postgres, S3 and extras guards its environment cannot satisfy"
+    )
+
+
+def test_no_test_file_disappears_without_editing_this_manifest():
+    """Deleting an entire test file is invisible to everything else here.
+
+    Measured: `rm tests/test_markings.py` (seven markings-governance tests)
+    left the full guard file green, ruff green, and collection quietly
+    dropping from 3517 to 3510 — no job, guard or lint reads test names or
+    counts, so only the handful of files whose source other guards happen to
+    read were protected. Every other file could vanish without a red line
+    anywhere.
+
+    So the suite's file list is pinned. Removing or renaming a test file now
+    requires editing this manifest — one reviewable diff line instead of
+    silence — and a new file must be added here too, because a manifest that
+    only ever grows stale protects nothing. Runs everywhere, not just in CI:
+    losing a test file locally deserves the same red.
+    """
+    expected = {
+        "test_aggregations.py",
+        "test_analyses.py",
+        "test_api.py",
+        "test_audience.py",
+        "test_authoring.py",
+        "test_auth.py",
+        "test_bench.py",
+        "test_build_governance.py",
+        "test_build_leases.py",
+        "test_catalog.py",
+        "test_charts_render.py",
+        "test_ci_guards.py",
+        "test_clickhouse_governance.py",
+        "test_clickhouse.py",
+        "test_cli.py",
+        "test_concurrency_coord.py",
+        "test_concurrency_exec.py",
+        "test_concurrency.py",
+        "test_connectors.py",
+        "test_dashboards.py",
+        "test_dataset_acls.py",
+        "test_delegated_compute.py",
+        "test_dialects.py",
+        "test_edit_log_prune.py",
+        "test_expectations.py",
+        "test_explore_api.py",
+        "test_explore_mount.py",
+        "test_export_governance_roundtrip.py",
+        "test_export_secrets.py",
+        "test_failure.py",
+        "test_federation.py",
+        "test_file_permissions.py",
+        "test_flow_api.py",
+        "test_flow_compile.py",
+        "test_flow_governance.py",
+        "test_flow_ir.py",
+        "test_hardening.py",
+        "test_horizontal.py",
+        "test_iceberg.py",
+        "test_incremental.py",
+        "test_incremental_transforms.py",
+        "test_limits.py",
+        "test_markings.py",
+        "test_mcp_authoring.py",
+        "test_mcp_governance.py",
+        "test_mcp_presentation.py",
+        "test_mcp.py",
+        "test_migration_guide.py",
+        "test_multiworkspace.py",
+        "test_object_apps.py",
+        "test_object_index.py",
+        "test_object_ordering.py",
+        "test_object_search.py",
+        "test_object_store_governance.py",
+        "test_object_store.py",
+        "test_object_store_races.py",
+        "test_observability.py",
+        "test_oidc.py",
+        "test_ontology_authoring.py",
+        "test_ontology_pushdown.py",
+        "test_ontology.py",
+        "test_permissions.py",
+        "test_portability_surfaces.py",
+        "test_postgres.py",
+        "test_query.py",
+        "test_redaction.py",
+        "test_rls_pushdown.py",
+        "test_rls.py",
+        "test_saml.py",
+        "test_scheduler.py",
+        "test_scim.py",
+        "test_starrocks_governance.py",
+        "test_starrocks.py",
+        "test_storage.py",
+        "test_streaming_transforms.py",
+        "test_text_agreement.py",
+        "test_transforms.py",
+        "test_tutorials.py",
+        "test_uploads.py",
+        "test_workspace_export.py",
+        "test_workspace_import.py",
+        "test_writeback.py",
+    }
+    actual = {p.name for p in Path(__file__).parent.glob("test_*.py")}
+
+    missing = expected - actual
+    assert not missing, (
+        f"{sorted(missing)} are listed here but no longer exist. If the "
+        "removal is intentional, delete the entry from this manifest in the "
+        "same change — that is the reviewable line this guard exists to force."
+    )
+    unlisted = actual - expected
+    assert not unlisted, (
+        f"{sorted(unlisted)} are new test files not yet in this manifest. "
+        "Add them, so their later disappearance is loud too."
     )
 
 

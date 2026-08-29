@@ -3,6 +3,7 @@ login/logout, RBAC, user & token management, CSRF, and no-auth mode."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -808,9 +809,28 @@ def test_correct_password_bypasses_throttle_lock(service):
     assert service.authenticate("victim", "wrong") is None  # counter reset
 
 
-def test_throttle_table_is_bounded(service):
+def test_throttle_table_is_bounded(service, monkeypatch):
     """Unlimited distinct usernames can't grow the throttle table without
-    bound (finding 2)."""
+    bound (finding 2).
+
+    scrypt is stubbed out for this test only: the invariant under test is
+    dict eviction in ``_throttle_state``/``_prune_throttle``, not KDF
+    strength, and 8,692 authenticate() calls each paying the real KDF
+    (~29 ms) made this one test 252 s — 35% of the whole suite's wall clock,
+    paid four times over in the CI matrix. With the stub the same 8,692
+    calls still walk the identical authenticate() path (dummy-hash verify
+    included) in ~3 s. KDF correctness keeps its own coverage: every other
+    auth test in this file runs the real scrypt.
+    """
+    import laurelin.core.auth as auth_module
+
+    monkeypatch.setattr(
+        auth_module,
+        "_scrypt",
+        lambda password, salt, n, r, p: hashlib.sha256(
+            password.encode() + salt + f"{n}.{r}.{p}".encode()
+        ).digest(),
+    )
     for i in range(MAX_THROTTLE_ENTRIES + 500):
         service.authenticate(f"ghost{i}", "whatever")
     assert len(service._throttle) <= MAX_THROTTLE_ENTRIES
