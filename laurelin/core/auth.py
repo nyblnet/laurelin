@@ -210,7 +210,13 @@ class AuthService:
         password: str | None = None,
         disabled: bool | None = None,
         actor: str = "system",
+        ticket=None,
     ) -> User:
+        """``ticket`` is demanded (by the store) only when ``role`` changes:
+        a role is a governance write, password/disabled are identity ops the
+        approval spec exempts. Pass one from ``ApprovalService`` (routes), a
+        factory in ``laurelin.core.approvals`` (CLI, SCIM), or not at all for
+        non-role updates."""
         user = self.store.get_user(username)
         if user is None:
             raise KeyError(f"User not found: {username!r}")
@@ -229,6 +235,7 @@ class AuthService:
             role=Role(role).value if role is not None else None,
             password_hash=password_hash,
             disabled=disabled,
+            ticket=ticket,
         )
         self.store.log_audit(
             "user_updated", {"username": user.username, "changes": changed}, actor=actor

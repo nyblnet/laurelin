@@ -635,6 +635,28 @@ def sentinel_workspace(tmp_path):
     store.log_audit("dashboard_updated",
                     {"reason": f"driver said {SENTINEL_EDITOR}_AUDIT_ED"},
                     actor="vic", min_read_role=Role.editor)
+
+    # An alert webhook whose URL carries its secret in the path (the
+    # Slack-style case redaction.py documents): the URL must never come back
+    # below admin — the read route additionally withholds it even from admins.
+    store.upsert_alert_webhook(
+        SEEDED, f"https://hooks.example/{SENTINEL_ADMIN}_HOOK",
+        [], [], enabled=False, created_by="root",
+    )
+
+    # A pending governance proposal whose payload carries row-rule VALUES and
+    # admin-authored rationale — the exact contents R2 says stay admin-only.
+    from laurelin.core.approvals import file_record
+
+    PATH_PARAMS["proposal_id"] = file_record(
+        store, kind="dataset_policy", target=SEEDED,
+        payload={"policy": {"row_policy": {"column": "region", "rules": [
+            {"subject_kind": "user", "subject": "vic",
+             "values": [f"{SENTINEL_ADMIN}_PROPOSAL_VALUE"]}]},
+            "column_masks": []}},
+        proposer="root", rationale=f"{SENTINEL_ADMIN}_PROPOSAL_RATIONALE",
+        state="pending", classification="loosening",
+    )
     return ws
 
 

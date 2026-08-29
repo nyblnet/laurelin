@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
+from laurelin.core.approvals import flow_output_ticket
 from laurelin.core.models import Role, SubjectKind, User
 from laurelin.core.permissions import confusable_identifier
 from laurelin.transforms.flow_ir import FlowDef, FlowRefused
@@ -389,6 +390,12 @@ def restrict_output_to_author(store, flow: FlowDef, author: str) -> bool:
             "can_view": True,
             "can_edit": True,
         }],
+        # Provably tightening (the early-outs above: no existing grants, and
+        # the grant narrows an open output to its author alone), and the
+        # factory re-verifies the precondition rather than trusting this
+        # comment. This caller never passes through a route, which is exactly
+        # why the approval gate lives on the store method.
+        ticket=flow_output_ticket(store, flow.output, author),
     )
     return True
 

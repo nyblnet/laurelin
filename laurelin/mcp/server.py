@@ -328,6 +328,35 @@ def build_server(client: LaurelinClient):
         the group must exist (404)."""
         return _j(client.set_group_members(name, members))
 
+    # -- governance change approval (admin) --------------------------------------
+    #
+    # Thin wrappers over the /proposals routes, so the approval gate covers MCP
+    # for free — the design reason MCP is HTTP-only. The governance write tools
+    # above change behaviour only in second-approver mode: the route returns
+    # 202 + a proposal id and the tool surfaces it verbatim ("queued as
+    # proposal p_x; a second admin must approve").
+
+    @server.tool()
+    def list_proposals(state: str = "") -> str:
+        """Governance change proposals (grants, policies, markings, clearances,
+        group membership, roles) with their loosening/tightening classification
+        and decision history. Requires ADMIN. Pass state='pending' to see only
+        changes awaiting a second approver."""
+        return _j(client.list_proposals(state=state or None))
+
+    @server.tool()
+    def approve_proposal(proposal_id: str) -> str:
+        """Approve a pending governance proposal, applying its change. Requires
+        ADMIN, and a different admin than the proposer. Refuses (409) if the
+        workspace state changed since filing — the proposal is then superseded
+        and must be re-filed against current state."""
+        return _j(client.approve_proposal(proposal_id))
+
+    @server.tool()
+    def reject_proposal(proposal_id: str, reason: str = "") -> str:
+        """Reject a pending governance proposal with a reason. Requires ADMIN."""
+        return _j(client.reject_proposal(proposal_id, reason))
+
     # -- governance read-back (admin) -------------------------------------------
 
     @server.tool()
@@ -388,6 +417,14 @@ def build_server(client: LaurelinClient):
     def get_build(build_id: str) -> str:
         """Status and per-transform tasks of a build."""
         return _j(client.get_build(build_id))
+
+    @server.tool()
+    def dataset_health() -> str:
+        """Per-dataset health rollup: failing / overdue / stale / healthy /
+        unknown, with last success time, last build status and failing
+        expectations. Filtered to datasets this credential can view — the same
+        answer GET /health/datasets gives, because it is that route."""
+        return _j(client.dataset_health())
 
     # -- pipeline authoring (flows) --------------------------------------------
 

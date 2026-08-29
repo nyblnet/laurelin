@@ -268,7 +268,10 @@ def test_every_python_writing_route_carries_the_pipeline_lock_and_the_guarded_se
 
 # Shared with tests/test_flow_compile.py: a value that breaks one SQL-generating
 # surface is worth trying against the others.
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket  # noqa: E402
 from tests.test_flow_compile import HOSTILE  # noqa: E402
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 
 def test_generate_sql_transform_round_trips_a_triple_quote_instead_of_failing_to_parse(
@@ -371,7 +374,7 @@ def test_a_pipeline_generated_from_a_query_cannot_declare_an_input_its_author_ca
     store.set_grants_for_dataset("classified", [
         {"subject_kind": "user", "subject": "someone_else",
          "can_view": True, "can_edit": True},
-    ])
+    ], ticket=_TICKET)
     store.create_user(User(id="7", username="ed", role=Role.editor), _pw("pw"))
 
     app = create_app(ws)

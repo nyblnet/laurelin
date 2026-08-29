@@ -52,7 +52,8 @@ def test_provision_and_deprovision_user(app, client):
     assert app.state.auth.get_user("alice") is not None
 
     # the provisioned user can hold a live session; deprovision must kill it
-    app.state.auth.update_user("alice", role="editor")
+    from laurelin.core.approvals import local_ticket
+    app.state.auth.update_user("alice", role="editor", ticket=local_ticket("test"))
     token, _ = app.state.auth.login(app.state.auth.get_user("alice"))
     assert app.state.auth.resolve_session(token) is not None
 

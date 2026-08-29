@@ -340,4 +340,6 @@ def test_mcp_exposes_flow_authoring_but_no_python_pipeline_authoring(env):
         "run_build", "get_build", "sync_source",
     } <= names
     assert not any("pipeline" in n for n in names)
-    assert not any("eject" in n for n in names)
+    # Guards eject_sql (flow -> exec'd Python), not the "eject" hiding inside
+    # reject_proposal — an approvals tool that authors nothing.
+    assert not any("eject" in n and "reject" not in n for n in names)

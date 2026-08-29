@@ -345,8 +345,10 @@ def test_no_test_file_disappears_without_editing_this_manifest():
     """
     expected = {
         "test_aggregations.py",
+        "test_alerts.py",
         "test_analyses.py",
         "test_api.py",
+        "test_approvals.py",
         "test_audience.py",
         "test_authoring.py",
         "test_auth.py",
@@ -381,6 +383,7 @@ def test_no_test_file_disappears_without_editing_this_manifest():
         "test_flow_governance.py",
         "test_flow_ir.py",
         "test_hardening.py",
+        "test_health.py",
         "test_horizontal.py",
         "test_iceberg.py",
         "test_incremental.py",

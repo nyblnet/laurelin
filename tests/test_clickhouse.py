@@ -24,10 +24,13 @@ from fastapi.testclient import TestClient
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import clickhouse, limits
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 pytestmark = pytest.mark.skipif(
     not clickhouse.available(), reason="needs chdb: pip install 'laurelin[clickhouse]'"
@@ -141,7 +144,7 @@ def test_scan_for_reaches_the_source(env):
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "vic", "values": ["eu"]}]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     scan = catalog.scan_for("events", plan_for=perms.arrow_policy_fn(VIEWER))
     table = scan if isinstance(scan, pa.Table) else scan.to_table()
     assert set(table.column("region").to_pylist()) == {"eu"}
@@ -475,7 +478,7 @@ def test_a_genuinely_renamed_masked_column_is_still_served_in_the_clear(env):
         "dataset": "evolving",
         "row_policy": None,
         "column_masks": [{"column": "ssn", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
     viewer = User(id="9", username="vic", role=Role.viewer)
     masked = catalog.source_table(
         "evolving", sql_policy_for=perms.sql_policy_fn(viewer)

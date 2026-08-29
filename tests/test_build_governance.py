@@ -26,11 +26,14 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import BuildStatus, Role, User
 from laurelin.core.permissions import PermissionService
 from laurelin.transforms import Builder, collect_transforms
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ADMIN_CREDS = {"username": "root", "password": "trustno1!"}
 
@@ -97,7 +100,7 @@ def _grant_to(store, dataset, username):
     store.set_grants_for_dataset(dataset, [{
         "subject_kind": "user", "subject": username,
         "can_view": True, "can_edit": True,
-    }])
+    }], ticket=_TICKET)
 
 
 def _build(ws, targets=None):
@@ -181,13 +184,13 @@ def test_a_row_policied_or_masked_input_refuses_an_api_authored_transform_even_f
             {"subject_kind": "user", "subject": "alice", "values": ["us"]},
         ]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     # A mask ALONE also refuses (open_ds has no row policy and alice full view
     # rights): "in full" means no mask either, because the output carries none.
     store.set_dataset_policy("open_ds", {
         "dataset": "open_ds", "row_policy": None,
         "column_masks": [{"column": "amount", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
 
     build, store, _catalog = _build(ws)
     tasks = {t.transform_name: t for t in build.tasks}
@@ -236,7 +239,7 @@ def test_a_policy_that_does_not_apply_to_the_author_builds_but_one_that_restrict
             {"subject_kind": "user", "subject": "alice", "values": ["us"]},
         ]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
 
     # (2) An author exempt from open_ds's mask reads the column in full: builds.
     _grant_to(store, "open_ds", "carol")
@@ -246,7 +249,7 @@ def test_a_policy_that_does_not_apply_to_the_author_builds_but_one_that_restrict
             "column": "amount", "mode": "redact",
             "exempt": [{"subject_kind": "user", "subject": "carol"}],
         }],
-    })
+    }, ticket=_TICKET)
     assert carol.put(
         "/api/v1/pipelines/open_copy", json={"content": OPEN_COPY}
     ).status_code == 200

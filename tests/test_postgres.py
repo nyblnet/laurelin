@@ -10,8 +10,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from laurelin.api import create_server_app
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import EditKind, ObjectEdit
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 PG_URL = os.environ.get("LAURELIN_TEST_POSTGRES")
 
@@ -244,7 +247,7 @@ def test_group_case_insensitivity_on_postgres(store):
     assert store.group_exists("eng") is True
     assert store.group_exists("ENG") is True
     store.create_user(_user("alice"), "hash")
-    store.set_group_members("ENG", ["Alice"])
+    store.set_group_members("ENG", ["Alice"], ticket=_TICKET)
     assert store.groups_for_user("ALICE") == {"eng"}
 
 

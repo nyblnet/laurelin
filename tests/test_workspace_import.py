@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.failure import Failure, FailureCode
@@ -40,6 +41,8 @@ from laurelin.export import (
     target_is_pristine,
 )
 from laurelin.export.manifest import MANIFEST_MEMBER
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 PG_URL = os.environ.get("LAURELIN_TEST_POSTGRES")
 
@@ -94,15 +97,15 @@ def source(tmp_path, make_store):
     catalog.write("derived", pa.table({"region": ["eu"], "amount": [1]}))
     store.replace_lineage_for_transform("derive", _edges("sales", "derived"))
     store.create_marking("pii")
-    store.set_explicit_markings("sales", ["pii"])
+    store.set_explicit_markings("sales", ["pii"], ticket=_TICKET)
     store.recompute_all_markings()
     store.create_group("analysts", "2026-01-01T00:00:00Z")
-    store.set_group_members("analysts", ["vic"])
+    store.set_group_members("analysts", ["vic"], ticket=_TICKET)
     store.set_grants_for_dataset("sales", [
         Grant(subject_kind=SubjectKind.group, subject="analysts",
               can_view=True).model_dump()
-    ])
-    store.set_clearances("vic", ["pii"])
+    ], ticket=_TICKET)
+    store.set_clearances("vic", ["pii"], ticket=_TICKET)
     (workspace.pipelines_dir / "p.py").write_text(PIPELINE)
     (workspace.ontology_dir / "o.yml").write_text(
         "object_types:\n"
@@ -1010,7 +1013,7 @@ def test_a_merge_refuses_ontology_grants_for_a_type_the_target_owns(
     src_store.set_grants_for_type("report", [
         Grant(subject_kind=SubjectKind.everyone, subject="", can_view=True,
               can_edit=True).model_dump()
-    ])
+    ], ticket=_TICKET)
     archive = tmp_path / "good.tar"
     export_workspace(src_ws, src_store, archive, ExportOptions())
 
@@ -1018,7 +1021,7 @@ def test_a_merge_refuses_ontology_grants_for_a_type_the_target_owns(
     dst_store.set_grants_for_type("report", [
         Grant(subject_kind=SubjectKind.role, subject="admin",
               can_view=True).model_dump()
-    ])
+    ], ticket=_TICKET)
 
     with pytest.raises(ImportRefused, match="object_type 'report'"):
         import_workspace(archive, dst_ws, dst_store,
@@ -1147,11 +1150,11 @@ def test_a_namespaced_marking_is_renamed_in_the_clearance_checklist_too(
     the rename lived only in a field the checklist does not mention."""
     src_ws, src_store = source
     dst_ws, dst_store = target
-    src_store.delete_marking("pii")
+    src_store.delete_marking("pii", ticket=_TICKET)
     src_store.create_marking("pii", "source meaning")
-    src_store.set_explicit_markings("sales", ["pii"])
+    src_store.set_explicit_markings("sales", ["pii"], ticket=_TICKET)
     src_store.recompute_all_markings()
-    src_store.set_clearances("vic", ["pii"])
+    src_store.set_clearances("vic", ["pii"], ticket=_TICKET)
     archive = tmp_path / "good.tar"
     export_workspace(src_ws, src_store, archive, ExportOptions())
 

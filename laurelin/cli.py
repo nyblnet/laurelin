@@ -871,9 +871,15 @@ def users_role(
     workspace: Optional[Path] = WORKSPACE_OPTION,
 ) -> None:
     """Change a user's role."""
+    from laurelin.core.approvals import local_ticket
+
     auth = _auth_service(workspace)
     try:
-        user = auth.update_user(username, role=role, actor="cli")
+        # The CLI runs with the operator's filesystem privileges — disk
+        # possession is its stated credential, so the write carries a "local"
+        # ticket rather than routing through the approval queue. Approvals
+        # govern the network surface; see laurelin/core/approvals.py.
+        user = auth.update_user(username, role=role, actor="cli", ticket=local_ticket("cli"))
     except (KeyError, ValueError) as exc:
         _cli_fail(exc)
     typer.echo(f"'{user.username}' is now '{user.role.value}'")

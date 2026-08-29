@@ -6,10 +6,13 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Grant, Role, SubjectKind, User
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -69,7 +72,7 @@ def test_dataset_grant_locks_to_allowlist(perms, store):
     store.set_grants_for_dataset(
         "secret_ds",
         [Grant(subject_kind=SubjectKind.user, subject="vic", can_view=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.dataset_permission(VIEWER, "secret_ds") == (True, False)
     assert perms.dataset_permission(EDITOR, "secret_ds") == (False, False)  # locked out
     assert perms.dataset_permission(ADMIN, "secret_ds") == (True, True)  # bypass
@@ -82,7 +85,7 @@ def test_object_type_view_requires_backing_dataset_view(perms, store):
     store.set_grants_for_dataset(
         "secret_ds",
         [Grant(subject_kind=SubjectKind.role, subject="admin", can_view=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.object_type_permission(VIEWER, "secret_obj", "secret_ds") == (False, False)
     assert perms.object_type_permission(EDITOR, "secret_obj", "secret_ds") == (False, False)
     assert perms.object_type_permission(ADMIN, "secret_obj", "secret_ds") == (True, True)
@@ -95,11 +98,11 @@ def test_object_type_edit_needs_dataset_view_and_ontology_edit(perms, store):
     store.set_grants_for_type(
         "secret_obj",
         [Grant(subject_kind=SubjectKind.user, subject="vic", can_edit=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     store.set_grants_for_dataset(
         "secret_ds",
         [Grant(subject_kind=SubjectKind.role, subject="admin", can_view=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.object_type_permission(VIEWER, "secret_obj", "secret_ds") == (False, False)
     # Now also grant the viewer dataset view -> ontology edit takes effect.
     store.set_grants_for_dataset(
@@ -108,7 +111,7 @@ def test_object_type_edit_needs_dataset_view_and_ontology_edit(perms, store):
             Grant(subject_kind=SubjectKind.role, subject="admin", can_view=True).model_dump(mode="json"),
             Grant(subject_kind=SubjectKind.user, subject="vic", can_view=True).model_dump(mode="json"),
         ],
-    )
+    ticket=_TICKET)
     assert perms.object_type_permission(VIEWER, "secret_obj", "secret_ds") == (True, True)
 
 

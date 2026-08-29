@@ -16,7 +16,7 @@ import type {
   User,
 } from "../../types";
 import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
-import { InlineError, apiPut } from "./shared";
+import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const SUBJECT_KINDS: SubjectKind[] = ["everyone", "role", "group", "user"];
 const GRANTABLE_ROLES: Role[] = ["viewer", "editor", "admin"];
@@ -271,6 +271,7 @@ function TypePermissionCard({
       </div>
 
       <InlineError err={save.error} />
+      <QueuedBanner res={save.data} />
     </div>
   );
 }

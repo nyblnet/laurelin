@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -20,6 +21,8 @@ from laurelin.core.models import (
     User,
 )
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -79,7 +82,7 @@ def _set_policy(store, row_policy=None, masks=None):
             "row_policy": dp.row_policy.model_dump(mode="json") if dp.row_policy else None,
             "column_masks": [m.model_dump(mode="json") for m in dp.column_masks],
         },
-    )
+    ticket=_TICKET)
 
 
 # -- unit: policy engine -----------------------------------------------------

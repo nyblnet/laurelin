@@ -13,10 +13,13 @@ import pytest
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import clickhouse as _clickhouse
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 VIEWER = User(id="1", username="vic", role=Role.viewer)
 OTHER = User(id="2", username="oth", role=Role.viewer)
@@ -49,7 +52,7 @@ def set_policy(store, row_policy=None, masks=None):
         "dataset": "sales",
         "row_policy": row_policy,
         "column_masks": masks or [],
-    })
+    }, ticket=_TICKET)
 
 
 ROWS = lambda col, vals, subj="vic": {  # noqa: E731
@@ -112,7 +115,7 @@ def test_admin_and_no_policy_are_unfiltered(env):
     assert perms.arrow_policy_fn(ADMIN)("sales", catalog.arrow_dataset("sales").schema) is None
     assert pushed(catalog, perms, ADMIN).num_rows == 60
 
-    store.set_dataset_policy("sales", None)
+    store.set_dataset_policy("sales", None, ticket=_TICKET)
     assert perms.arrow_policy_fn(VIEWER)("sales", catalog.arrow_dataset("sales").schema) is None
     assert pushed(catalog, perms, VIEWER).num_rows == 60
 

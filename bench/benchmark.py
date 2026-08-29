@@ -32,6 +32,7 @@ import pyarrow as pa
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from laurelin.catalog import DatasetCatalog  # noqa: E402
+from laurelin.core.approvals import local_ticket  # noqa: E402
 from laurelin.core.config import Workspace  # noqa: E402
 from laurelin.core.db import MetadataStore  # noqa: E402
 from laurelin.core.models import Role, User  # noqa: E402
@@ -127,6 +128,7 @@ def bench_size(n: int, root: Path) -> dict:
             },
             "column_masks": [],
         },
+        ticket=local_ticket("bench"),
     )
     viewer = User(id="v", username="viewer", role=Role.viewer)
     rls_policy_for = PermissionService(store).arrow_policy_fn(viewer)
@@ -134,7 +136,7 @@ def bench_size(n: int, root: Path) -> dict:
         lambda: catalog.query(queries["q_aggregate"], max_rows=1000, plan_for=rls_policy_for)
     )
     result["q_aggregate_rls_ms"] = round(ms, 1)
-    store.set_dataset_policy("orders", None)
+    store.set_dataset_policy("orders", None, ticket=local_ticket("bench"))
 
     # --- row API page (what the UI grid hits) --------------------------------
     ms, _ = timed(lambda: catalog.rows("orders", limit=100, offset=0))

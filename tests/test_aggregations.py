@@ -14,10 +14,13 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import EditKind, ObjectEdit
 from laurelin.ontology import OntologyService, load_ontology
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -305,7 +308,7 @@ def test_the_aggregate_names_the_callers_masked_properties(tmp_path):
     store.set_dataset_policy("orders", {
         "row_policy": None,
         "column_masks": [{"column": "region", "mode": "redact"}],
-    })
+    }, ticket=_TICKET)
     r = ana.post("/api/v1/ontology/objects/order/aggregate", json=body)
     assert r.status_code == 200, r.text
     out = r.json()

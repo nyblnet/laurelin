@@ -26,12 +26,15 @@ from fastapi.testclient import TestClient
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import limits, starrocks
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.dialects import STARROCKS
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
 from tests import starrocks_env
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 VIEWER = User(id="1", username="vic", role=Role.viewer)
 CREDS = {"username": "root", "password": "trustno1!"}
@@ -397,7 +400,7 @@ def test_scan_for_reaches_the_source(env):
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "vic", "values": ["eu"]}]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     scan = catalog.scan_for("events", plan_for=perms.arrow_policy_fn(VIEWER))
     table = scan if isinstance(scan, pa.Table) else scan.to_table()
     assert set(table.column("region").to_pylist()) == {"eu"}
@@ -422,7 +425,7 @@ def test_the_reader_binds_and_the_statement_carries_no_value(env, monkeypatch):
             {"subject_kind": "user", "subject": "vic",
              "values": ["eu", "us') OR 1=1 --"]}]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
 
     seen = []
     real = starrocks.run

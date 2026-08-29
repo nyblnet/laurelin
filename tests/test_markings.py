@@ -6,11 +6,14 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
 from laurelin.transforms import Builder, collect_transforms
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 PIPELINE = (
     "from laurelin.transforms import transform, Input, Output\n"
@@ -54,7 +57,7 @@ ADMIN = User(id="3", username="ada", role=Role.admin)
 
 def test_markings_propagate_through_lineage_on_build(ws, store):
     store.create_marking("pii")
-    store.set_explicit_markings("raw", ["pii"])
+    store.set_explicit_markings("raw", ["pii"], ticket=_TICKET)
     store.recompute_all_markings()
     assert store.get_effective_markings("clean") == []  # not built yet
     _build(ws)
@@ -69,12 +72,12 @@ def test_markings_propagate_through_lineage_on_build(ws, store):
 def test_mandatory_access_requires_all_clearances(ws, store, perms):
     store.create_marking("pii")
     store.create_marking("secret")
-    store.set_explicit_markings("raw", ["pii", "secret"])
+    store.set_explicit_markings("raw", ["pii", "secret"], ticket=_TICKET)
     store.recompute_all_markings()
     # holding only one of two markings is not enough (deny-by-default MAC)
-    store.set_clearances("vic", ["pii"])
+    store.set_clearances("vic", ["pii"], ticket=_TICKET)
     assert perms.dataset_permission(VIEWER, "raw") == (False, False)
-    store.set_clearances("vic", ["pii", "secret"])
+    store.set_clearances("vic", ["pii", "secret"], ticket=_TICKET)
     assert perms.dataset_permission(VIEWER, "raw")[0] is True
 
 
@@ -82,20 +85,20 @@ def test_markings_override_a_permissive_grant(ws, store, perms):
     from laurelin.core.models import Grant, SubjectKind
 
     store.create_marking("pii")
-    store.set_explicit_markings("raw", ["pii"])
+    store.set_explicit_markings("raw", ["pii"], ticket=_TICKET)
     store.recompute_all_markings()
     # even an explicit edit grant can't beat an unheld marking
     store.set_grants_for_dataset(
         "raw", [Grant(subject_kind=SubjectKind.user, subject="vic", can_edit=True).model_dump(mode="json")]
-    )
+    , ticket=_TICKET)
     assert perms.dataset_permission(VIEWER, "raw") == (False, False)
-    store.set_clearances("vic", ["pii"])
+    store.set_clearances("vic", ["pii"], ticket=_TICKET)
     assert perms.dataset_permission(VIEWER, "raw") == (True, True)
 
 
 def test_admins_bypass_markings(ws, store, perms):
     store.create_marking("pii")
-    store.set_explicit_markings("raw", ["pii"])
+    store.set_explicit_markings("raw", ["pii"], ticket=_TICKET)
     store.recompute_all_markings()
     assert perms.dataset_permission(ADMIN, "raw") == (True, True)
     # editors do NOT bypass
@@ -104,10 +107,10 @@ def test_admins_bypass_markings(ws, store, perms):
 
 def test_delete_marking_recomputes(ws, store, perms):
     store.create_marking("pii")
-    store.set_explicit_markings("raw", ["pii"])
+    store.set_explicit_markings("raw", ["pii"], ticket=_TICKET)
     _build(ws)
     assert store.get_effective_markings("clean") == ["pii"]
-    store.delete_marking("pii")
+    store.delete_marking("pii", ticket=_TICKET)
     store.recompute_all_markings()
     assert store.get_effective_markings("raw") == []
     assert store.get_effective_markings("clean") == []

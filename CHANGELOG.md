@@ -10,6 +10,90 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Data health + governance change-approval (two Foundry gaps)
+
+Two governance surfaces Foundry has and Laurelin lacked, built on the records
+that already exist rather than a parallel mechanism.
+
+**Data health.** A new `GET /health/datasets` rollup and `GET /health/events`
+feed compute each dataset's status — `healthy | stale | failing | overdue |
+unknown` — deterministically from builds, build tasks, dataset versions,
+expectation results and schedules (`laurelin/core/health.py`). A dead scheduler
+is detected at read time by the same `next_run_at` predicate the live one
+advances, so a pipeline that silently stopped is visible the moment anyone
+looks. Freshness is declared per dataset (`PUT /datasets/{name}/freshness`,
+editor-gated). The rollup is **filtered per dataset** through
+`viewable_datasets`: a viewer sees only datasets they can already read, statuses
+and codes but not editor prose (`message`/`measured` ride in an editor-only
+`detail`), and there is deliberately **no unfiltered totals endpoint** — a
+global count would leak existence deltas when a hidden dataset flips state.
+
+**Outbound alerting (opt-in, off by default).** One generic JSON webhook, admin
+-configured, fired from the scheduler tick on status *transitions* (edge- not
+level-triggered). The payload is mechanically `serialize.dump(DatasetHealth)`
+at the viewer role — so it can never carry a masked value, a row count, a
+`cursor_value`, driver text or editor prose — and the link is a relative path,
+never an absolute URL. The webhook URL is a credential: write-only, read back as
+`WITHHELD`, and omitted from export archives by the existing `^url$` allowlist.
+What it does **not** do: no retries/backoff, no Slack/PagerDuty/email
+integrations, no templating, no per-user preferences, no SSRF egress allowlist
+(the destination is admin-trusted, by design).
+
+**Governance change-approval.** Every governance write — dataset/ontology
+grants, row policy, masks, markings, marking deletion, clearances, group
+membership, role changes, workspace membership — now flows through one
+chokepoint: a required `ChangeTicket` kwarg on the `MetadataStore` methods
+themselves (`laurelin/core/approvals.py`), so REST, MCP, SCIM, CLI and flow
+governance all pass the same gate; a route decorator would have missed the
+service callers. A comparator (`laurelin/core/policy_diff.py`) classifies each
+change as loosening or tightening by evaluating every non-admin user's
+capability tuple before and after — exact, because the policy language is
+closed. Tightenings apply immediately; loosenings file a proposal record.
+Default posture is **record-and-self-approve** (single-admin workspaces never
+deadlock, existing routes still return 200); **second-approver mode** is opt-in
+and requires the approver to differ from the proposer. What it does **not** do:
+no access-requests for non-admins, no approvals for non-governance changes
+(schedules, dashboards, pipeline code keep their own ceremonies), and it is
+**not** a defense against a local operator with filesystem access to
+`metadata.db` — approvals govern the network surface and the honest-operator
+record (stated in the module docstring).
+
+The pre-existing `/builds`/`/transforms`/`/lineage` viewer-wide dataset-name
+disclosure is **not** fixed here (it is flagged for its own task); the new
+health endpoint is filtered precisely so it does not widen it.
+
+### Security: three approval/health findings found by attack and fixed
+
+Found by adversarial review of the change above, each reproduced live before the
+fix and pinned by a regression test named for the invariant:
+
+- **Second-approver mode was bypassable via disable → grant → enable (HIGH).**
+  The loosening comparator skipped disabled users, so a grant, clearance or
+  group-membership naming only a *disabled* account produced zero capability
+  gains and classified as a tightening — applying immediately with no queue.
+  Re-enabling the account (an ungated identity write) then surfaced the access,
+  walking straight past the second approver. Fix: the comparator now classifies
+  against a non-admin account's *policy* capability regardless of the disabled
+  flag (the flag is reversible state, not a capability), so the loosening queues
+  when it is decided (`policy_diff.py` `_candidates`, `_diff_clearances`).
+  `tests/test_approvals.py::test_disable_grant_enable_cannot_bypass_second_approver_mode`.
+- **Workspace import applied governance loosenings without a second approver
+  (MEDIUM).** The import path writes governance rows with raw SQL below the
+  ticketed store methods (by design) and its digest-confirm ceremony is a
+  one-party act, so under second-approver mode a lone admin could import an
+  `everyone can_view can_edit` grant with zero pending proposals. Fix: while
+  second-approver mode is armed, an import carrying governance-rule tables is
+  refused rather than bypass the queue (`laurelin/export/reader.py`); data and
+  inert config still import. `tests/test_approvals.py::test_import_refuses_governance_rules_under_second_approver_mode`.
+- **The health-event feed leaked hidden transitions through a global `seq`
+  (MEDIUM).** `health_events.seq` is a global monotonic PK; filtering rows by
+  dataset *after* it was assigned left gaps a viewer could read — seq 1 and 3
+  but not 2 means one transition happened on a dataset she cannot see, timeable
+  from the bracketing `at` values, and the absolute max leaked the workspace-
+  wide event count. Fix: the route renumbers `seq` to a gap-free per-response
+  ordinal after filtering, so the global id never leaves the server
+  (`laurelin/api/health_routes.py`). `tests/test_health.py::test_health_event_seq_does_not_leak_hidden_transitions`.
+
 ### CI: the workflow now exercises what the badge claims
 
 The workflow in `.github/workflows/ci.yml` had never executed, and its first

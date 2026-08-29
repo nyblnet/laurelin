@@ -125,6 +125,30 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   path as any user: every tool is a call to the same governed REST route the
   UI uses, so role gates, lock flags, entitlements and audit apply identically
   (needs the `mcp` extra — see Status below for how to install).
+- **Data health** — a status per dataset (`healthy | stale | failing | overdue
+  | unknown`) computed deterministically from builds, expectations, dataset
+  versions and schedules — no anomaly detection, no time-series, just a read
+  over records that already exist. A silently-stopped schedule reads `overdue`
+  the moment anyone looks (a dead scheduler trips the same `next_run_at`
+  predicate the live one advances). The rollup is filtered per dataset: a viewer
+  sees health only for datasets they can already read, and there is **no
+  global totals endpoint** — a workspace-wide count would leak that a hidden
+  dataset changed state. Optional outbound **alerting** is one admin-configured
+  JSON webhook, off by default, fired on status *transitions*; its payload is
+  the viewer-level projection of the health record, so it can never carry a
+  masked value, a row count or editor prose, and the webhook URL is a
+  write-only credential. No Slack/email/PagerDuty integrations, no retries, no
+  templating — one generic webhook, and richer delivery is a consumer of it.
+- **Change approval** — the consequential governance writes (grants, row
+  policy, masks, markings, clearances, group membership, role changes) are
+  reviewable. Every such write carries a required ticket through one store-level
+  chokepoint, so REST, MCP, SCIM and the CLI all obey the same gate; a
+  comparator classifies each change as *tightening* (applies immediately) or
+  *loosening* (files a proposal record) by evaluating exactly who gains access.
+  By default a change self-approves with a record so a one-person workspace
+  never deadlocks; **second-approver mode** is opt-in and requires a different
+  admin to approve. It governs the network surface and the honest-operator
+  record — not a local operator with filesystem access to `metadata.db`.
 - **Audit** — mutations through the API are written to an audit log.
 
 ## Where compute happens

@@ -45,6 +45,7 @@ import pytest
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import clickhouse
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.dialects import CLICKHOUSE
@@ -55,6 +56,8 @@ from laurelin.core.permissions import (
     PolicyRenderError,
     SqlPolicy,
 )
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 pytestmark = pytest.mark.skipif(
     not clickhouse.available(), reason="needs chdb: pip install 'laurelin[clickhouse]'"
@@ -95,7 +98,7 @@ def set_policy(store, row_policy=None, masks=None, dataset="sales"):
         "dataset": dataset,
         "row_policy": row_policy,
         "column_masks": masks or [],
-    })
+    }, ticket=_TICKET)
 
 
 def ROWS(col, vals, subj="vic"):
@@ -631,7 +634,7 @@ def test_two_masks_on_one_column_agree_with_the_reference(env):
         "dataset": "sales",
         "row_policy": None,
         "column_masks": [MASK("ssn", "redact"), MASK("ssn", "hash")],
-    })
+    }, ticket=_TICKET)
     got = governed(catalog, perms, VIEWER)
     assert same(got, reference(catalog, perms, VIEWER))
     digest = hashlib.sha256(b"***").hexdigest()[:16]

@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 import laurelin.core.db as db_module
 from laurelin.api import create_app
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.auth import AuthService, hash_password
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
@@ -37,6 +38,8 @@ from tests.concurrency_harness import (
     pause_hook,
     rounds,
 )
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 
 @pytest.fixture(params=BACKENDS)
@@ -83,7 +86,7 @@ def test_recompute_racing_a_marking_change_never_drops_a_marking(store):
     n_rounds = rounds(3)
     for r in range(n_rounds):
         # Reset to the pre-change world: no markings anywhere, bob can view.
-        store.set_explicit_markings("src", [])
+        store.set_explicit_markings("src", [], ticket=_TICKET)
         store.recompute_all_markings()
         assert perms.can_view_dataset(bob, "src"), "baseline: unmarked dataset is viewable"
 
@@ -97,7 +100,7 @@ def test_recompute_racing_a_marking_change_never_drops_a_marking(store):
             gate.wait_reached()  # R2 has read everything, has written nothing
 
             # The committed, acknowledged classification change:
-            store.set_explicit_markings("src", ["secret"])
+            store.set_explicit_markings("src", ["secret"], ticket=_TICKET)
             store.recompute_all_markings()
             assert set(store.get_effective_markings("src")) == {"secret"}
             assert "secret" in set(store.get_effective_markings("derived"))
@@ -148,7 +151,7 @@ def test_a_marking_denies_the_moment_its_write_returns(store):
     assert perms.can_view_dataset(bob, "gap_ds"), "baseline: unmarked dataset is viewable"
 
     # Statement one of the route, committed and returned:
-    store.set_explicit_markings("gap_ds", ["secret"])
+    store.set_explicit_markings("gap_ds", ["secret"], ticket=_TICKET)
 
     denied_in_gap = not perms.can_view_dataset(bob, "gap_ds")
 
@@ -245,9 +248,11 @@ def _run_scim_pair(app, group: str, op_a: dict, op_b: dict) -> tuple[list, set]:
 
     store.list_groups = hooked_list
     if real_update is not None:
-        def hooked_update(name, merge):
+        def hooked_update(name, merge, **kwargs):
+            # kwargs carries the governance ChangeTicket (task #74) through
+            # to the real ticketed store method unchanged.
             _gate()
-            return real_update(name, merge)
+            return real_update(name, merge, **kwargs)
 
         store.update_group_members = hooked_update
     responses = [None, None]
@@ -315,7 +320,7 @@ def test_concurrent_scim_patches_never_lose_a_member_change(scim_app):
         # Case 2: remove u1 || add u2 on {u1} -> u1 gone AND u2 present.
         g2 = f"rmrace{r}"
         store.create_group(g2, utcnow_iso())
-        store.set_group_members(g2, ["u1"])
+        store.set_group_members(g2, ["u1"], ticket=_TICKET)
         _, final = _run_scim_pair(
             scim_app, g2, _patch_op("remove", "u1", path="members[...]"),
             _patch_op("add", "u2"),

@@ -126,7 +126,24 @@ class Scheduler:
                 fired.extend(self._tick_store(label, store, run_action))
             except Exception:  # noqa: BLE001 - one workspace must not stop others
                 log.exception("scheduler failed for %s", label)
+            try:
+                # Health alerting piggybacks the existing loop: no new daemon,
+                # no new lease machinery. Edge-triggered against persisted
+                # state, so overlapping replicas re-firing is bounded by the
+                # health_state upsert, and a restart does not re-alert every
+                # red dataset. Honest asymmetry, stated: a dead scheduler
+                # cannot webhook about itself — but the health PAGE computes
+                # `overdue` at read time from next_run_at, so a dead scheduler
+                # is visible in-app the moment anyone looks.
+                self._alert(store)
+            except Exception:  # noqa: BLE001 - alerting must not stop scheduling
+                log.exception("health alert pass failed for %s", label)
         return fired
+
+    def _alert(self, store) -> None:
+        from laurelin.core.health import HealthService
+
+        HealthService(store, poll_seconds=self.poll_seconds).evaluate_and_alert()
 
     def _tick_store(self, label: str, store, run_action) -> list[str]:
         fired = []

@@ -8,6 +8,31 @@ export function errDetail(err: unknown): string {
   return String((err as Error)?.message ?? err);
 }
 
+/**
+ * A governance write that came back 202: filed as a proposal, not applied.
+ * Every admin section whose PUT/PATCH/DELETE goes through the approval gate
+ * renders this under its save control — without it, a queued change looks
+ * like a silent no-op (the form re-seeds from unchanged server state) and an
+ * operator's next move is to "fix" it by saving again.
+ */
+export function QueuedBanner({ res }: { res: unknown }) {
+  const q = res as { queued?: boolean; proposal_id?: string } | null | undefined;
+  if (!q || q.queued !== true) return null;
+  return (
+    <div className="warn-box" style={{ marginTop: 8 }}>
+      Not applied yet — this change loosens access and this workspace requires a
+      second approver. Queued as proposal{" "}
+      <span className="mono">{q.proposal_id}</span>; another admin can approve it
+      in the Approvals inbox.
+    </div>
+  );
+}
+
+/** True when a mutation response is the 202 queued shape. */
+export function isQueued(res: unknown): boolean {
+  return !!res && (res as { queued?: boolean }).queued === true;
+}
+
 /** Small inline error box for a single control's failed mutation. */
 export function InlineError({ err }: { err: unknown }) {
   if (!err) return null;

@@ -127,7 +127,13 @@ class ControlStore(MetadataStore):
 
     # -- membership -----------------------------------------------------------
 
-    def set_member(self, slug: str, username: str, role: Role | str) -> None:
+    def set_member(self, slug: str, username: str, role: Role | str, *, ticket) -> None:
+        # Workspace membership IS a role grant, so the governance chokepoint
+        # covers it: ControlStore inherits MetadataStore, one gate, no
+        # parallel mechanism (task #74).
+        from laurelin.core.db import _require_ticket
+
+        _require_ticket(ticket)
         role = Role(role)
         with self._conn() as c:
             c.execute(

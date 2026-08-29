@@ -41,6 +41,7 @@ import pytest
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import starrocks
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.dialects import STARROCKS
@@ -52,6 +53,8 @@ from laurelin.core.permissions import (
     SqlPolicy,
 )
 from tests import starrocks_env
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 pytestmark = starrocks_env.needs_starrocks
 
@@ -104,7 +107,7 @@ def set_policy(store, row_policy=None, masks=None, dataset="sales"):
         "dataset": dataset,
         "row_policy": row_policy,
         "column_masks": masks or [],
-    })
+    }, ticket=_TICKET)
 
 
 def ROWS(col, vals, subj="vic"):

@@ -6,7 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { Group, User } from "../../types";
 import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
-import { InlineError, apiPut } from "./shared";
+import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const NAME_RE = /^[a-z0-9][a-z0-9_.-]{1,31}$/;
 
@@ -149,6 +149,7 @@ function ManageMembersPanel({
         )}
 
         <InlineError err={save.error} />
+        <QueuedBanner res={save.data} />
 
         <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
           <button

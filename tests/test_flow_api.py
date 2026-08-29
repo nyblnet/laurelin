@@ -17,8 +17,11 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 FLOW = {
     "output": "busy_regions",
@@ -675,7 +678,7 @@ def test_a_flow_definition_is_not_readable_by_someone_who_cannot_read_its_source
     store.set_grants_for_dataset("orders", [{
         "subject_kind": "user", "subject": "alice",
         "can_view": True, "can_edit": True,
-    }])
+    }], ticket=_TICKET)
 
     app = create_app(workspace)
     alice, bob = TestClient(app), TestClient(app)
@@ -768,7 +771,7 @@ def test_ejecting_does_not_launder_a_mask_the_flow_itself_is_refused_over(worksp
 
     store.set_dataset_policy("orders", {
         "column_masks": [{"column": "amount", "mode": "redact"}],
-    })
+    }, ticket=_TICKET)
     assert ana.put("/api/v1/flows/orders_copy",
                    json={"flow": copy}).status_code == 400
 
@@ -796,7 +799,7 @@ def test_ejecting_carries_the_author_restriction_onto_the_ejected_pipeline(works
     store.set_grants_for_dataset("orders", [{
         "subject_kind": "user", "subject": "ana",
         "can_view": True, "can_edit": True,
-    }])
+    }], ticket=_TICKET)
     app = create_app(workspace)
     ana, bob = TestClient(app), TestClient(app)
     ana.post("/api/v1/auth/login", json={"username": "ana", "password": "pw"})

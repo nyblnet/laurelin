@@ -6,10 +6,13 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Grant, Role, SubjectKind, User
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -71,7 +74,7 @@ def test_grants_lock_type_to_allowlist(perms, store):
     store.set_grants_for_type(
         "aircraft",
         [Grant(subject_kind=SubjectKind.user, subject="vic", can_view=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.permission(VIEWER, "aircraft") == (True, False)
     assert perms.permission(EDITOR, "aircraft") == (False, False)  # locked out
     assert perms.permission(ADMIN, "aircraft") == (True, True)  # admin bypass
@@ -83,7 +86,7 @@ def test_edit_grant_elevates_a_viewer(perms, store):
     store.set_grants_for_type(
         "aircraft",
         [Grant(subject_kind=SubjectKind.user, subject="vic", can_edit=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     # edit implies view; a viewer-role user can now edit this one type
     assert perms.permission(VIEWER, "aircraft") == (True, True)
 
@@ -92,7 +95,7 @@ def test_role_grant(perms, store):
     store.set_grants_for_type(
         "aircraft",
         [Grant(subject_kind=SubjectKind.role, subject="editor", can_edit=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.permission(EDITOR, "aircraft") == (True, True)
     assert perms.permission(VIEWER, "aircraft") == (False, False)
 
@@ -101,18 +104,18 @@ def test_everyone_grant(perms, store):
     store.set_grants_for_type(
         "aircraft",
         [Grant(subject_kind=SubjectKind.everyone, can_view=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.permission(VIEWER, "aircraft") == (True, False)
     assert perms.permission(EDITOR, "aircraft") == (True, False)  # editors lose edit
 
 
 def test_group_grant(perms, store):
     store.create_group("ops", "2026-01-01T00:00:00+00:00")
-    store.set_group_members("ops", ["vic"])
+    store.set_group_members("ops", ["vic"], ticket=_TICKET)
     store.set_grants_for_type(
         "aircraft",
         [Grant(subject_kind=SubjectKind.group, subject="ops", can_edit=True).model_dump(mode="json")],
-    )
+    ticket=_TICKET)
     assert perms.permission(VIEWER, "aircraft") == (True, True)  # vic is in ops
     assert perms.permission(EDITOR, "aircraft") == (False, False)  # ed is not
 

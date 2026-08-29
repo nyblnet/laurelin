@@ -153,6 +153,11 @@ class LaurelinClient:
     def get_build(self, build_id: str) -> dict:
         return self._req("GET", f"/builds/{build_id}")
 
+    def dataset_health(self) -> list[dict]:
+        # Filtered server-side to datasets this credential can view, exactly
+        # like the REST rollup — the client adds nothing and removes nothing.
+        return self._req("GET", "/health/datasets")
+
     # -- flows (no-code authoring) -----------------------------------------
 
     def flow_dataset_schema(self, dataset: str) -> dict:
@@ -315,6 +320,25 @@ class LaurelinClient:
 
     def set_group_members(self, name: str, members: list[str]) -> dict:
         return self._req("PUT", f"/groups/{name}/members", json={"members": members})
+
+    # -- governance change approval (admin) --------------------------------
+
+    def list_proposals(self, state: Optional[str] = None, limit: int = 200) -> list[dict]:
+        params: dict = {"limit": limit}
+        if state:
+            params["state"] = state
+        return self._req("GET", "/proposals", params=params)
+
+    def get_proposal(self, proposal_id: str) -> dict:
+        return self._req("GET", f"/proposals/{proposal_id}")
+
+    def approve_proposal(self, proposal_id: str) -> dict:
+        return self._req("POST", f"/proposals/{proposal_id}/approve")
+
+    def reject_proposal(self, proposal_id: str, reason: str = "") -> dict:
+        return self._req(
+            "POST", f"/proposals/{proposal_id}/reject", json={"reason": reason}
+        )
 
     # -- governance read-back (admin) --------------------------------------
 

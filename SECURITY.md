@@ -225,6 +225,34 @@ reason: its writer had no idea who would read it.
 
 **Mutations are audited** with actor, action, and details.
 
+**Governance changes can require a second admin.** The consequential governance
+writes — dataset/ontology grants, row policy, masks, markings and marking
+deletion, clearances, group membership, role changes, workspace membership —
+pass through a single store-level chokepoint that demands a `ChangeTicket`, so
+REST, MCP (which calls the same routes), SCIM and flow governance all classify
+under the same gate; a route decorator would miss the service callers. A
+comparator decides *loosening* vs *tightening* by evaluating each non-admin
+user's capability before and after the change — exact, because the policy
+language is closed and declarative — and it classifies against an account's
+**policy** capability even when the account is disabled, because the disabled
+flag is reversible by an ungated identity write (a real bypass that is now
+tested). Tightenings apply immediately; loosenings file a proposal. In
+**second-approver mode** (opt-in, and enabling it requires ≥ 2 active admins) a
+loosening queues and the approver must differ from the proposer. Enforcement is
+uniform across paths: a **workspace import** carrying governance rules is
+*refused* while second-approver mode is armed rather than write them below the
+gate through its raw-SQL importer.
+
+**Health and alert delivery leak nothing a viewer could not already read.** The
+`GET /health/datasets` rollup and `GET /health/events` feed are filtered per
+dataset (a viewer sees only datasets they can read), there is no unfiltered
+totals endpoint, and the event feed's ordinal is renumbered per response so a
+global counter cannot leak the existence, count or timing of transitions on
+datasets the caller cannot see. An outbound webhook payload is mechanically the
+*viewer-role* projection of the health record, so it cannot carry a masked
+value, a row count, a `cursor_value` or editor prose; the link is a relative
+path, never an absolute URL.
+
 ### What is *not* a boundary
 
 Be clear-eyed about these. They are design consequences, not oversights:
@@ -304,6 +332,30 @@ Be clear-eyed about these. They are design consequences, not oversights:
 6. **Multi-tenancy is soft.** Workspaces isolate data and membership, but they
    share a process. Treat the tenant boundary as an organizational one, not a
    hostile-tenant sandbox.
+
+7. **Change approval governs the network surface, not the filesystem.** The
+   approval gate binds REST, MCP, SCIM, the CLI and flow governance because
+   they all pass through the ticketed store methods — but a local process that
+   opens `metadata.db` directly (the CLI does; the file is `0600`) writes with
+   a `local` ticket and no queue. Approvals are the honest-operator record and
+   the network control, not a defense against a hostile operator with
+   filesystem access. Two composition points are exempt by explicit decision
+   and file an after-the-fact record rather than queueing: an IdP **SCIM** group
+   push (configuring `LAURELIN_SCIM_TOKEN` is the standing authorization —
+   queueing would break push semantics), and `--no-auth` mode (every request is
+   the implicit admin). Both are stated in `laurelin/core/approvals.py`.
+
+8. **An alert webhook is an outbound surface an admin controls.** The URL is
+   admin-configured and off by default; there is **no egress allowlist**, so an
+   admin can point a webhook at an internal address (a metadata endpoint, an
+   internal service) and the server will POST there. This stays within the
+   admin trust boundary — there is no non-admin path to configure a webhook or
+   induce a delivery to an attacker-chosen URL — but if your admins are not
+   trusted with outbound requests from the server's network position, do not
+   enable webhooks. The URL is stored as a write-only credential (read back as
+   `WITHHELD`, omitted from export archives), so it is not disclosed to a later
+   admin or an exported workspace; its *destination* is still the configuring
+   admin's choice.
 
 ## Deploying safely
 

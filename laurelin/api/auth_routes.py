@@ -23,9 +23,14 @@ from laurelin.api.context import (
     is_multi,
 )
 from laurelin.core import serialize
+from laurelin.core.approvals import (
+    ApprovalService,
+    identity_ticket,
+)
 from laurelin.core.auth import THROTTLED, AuthService
 from laurelin.core.failure import Failure, FailureCode, Phase, safe_detail
 from laurelin.core.models import Role, User, utcnow_iso
+from laurelin.core.permissions import PermissionService
 
 SESSION_COOKIE = "laurelin_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
@@ -173,6 +178,39 @@ def require_role(role: Role):
 require_viewer = require_role(Role.viewer)
 require_editor = require_role(Role.editor)
 require_admin = require_role(Role.admin)
+
+
+def _approvals_for(request: Request, store) -> ApprovalService:
+    """The approval gate (task #74) over whichever store a change targets:
+    the identity store for role changes, the active workspace store for group
+    membership, the control store for workspace membership. Proposals live in
+    the store they govern."""
+    return ApprovalService(
+        store,
+        PermissionService(store),
+        users=identity_store(request).list_users(),
+        local=bool(request.app.state.no_auth),
+    )
+
+
+def _queued_json(outcome, note: str = ""):
+    from fastapi.responses import JSONResponse
+
+    detail = (
+        f"Queued as proposal {outcome.proposal_id}: this change loosens access "
+        "and this workspace requires a second approver."
+    )
+    if note:
+        detail += " " + note
+    return JSONResponse(
+        status_code=202,
+        content={
+            "queued": True,
+            "proposal_id": outcome.proposal_id,
+            "classification": outcome.classification,
+            "detail": detail,
+        },
+    )
 
 
 def _user_json(user: User) -> dict:
@@ -498,10 +536,30 @@ def create_user(
     body: UserCreateRequest,
     request: Request,
     admin: Superadmin,
-) -> dict:
+):
     auth = identity_auth(request)
-    user = auth.create_user(body.username, body.password, body.role, actor=admin.username)
-    return _user_json(user)
+    if body.role == Role.viewer:
+        # A viewer account widens nobody's access; no approval to classify.
+        user = auth.create_user(body.username, body.password, body.role, actor=admin.username)
+        return _user_json(user)
+    # Creating a user with role editor/admin is a role grant and classifies
+    # like one. The account is created as a viewer first — the password never
+    # enters a proposal record — and the promotion goes through the gate; in
+    # second-approver mode it queues and the account stays a viewer until a
+    # second admin approves.
+    user = auth.create_user(body.username, body.password, Role.viewer, actor=admin.username)
+    service = _approvals_for(request, identity_store(request))
+    outcome = service.submit(
+        kind="user_role", target=user.username, payload={"role": body.role.value},
+        actor=admin.username, actor_id=admin.id,
+    )
+    if not outcome.applied:
+        return _queued_json(
+            outcome,
+            f"The account {user.username!r} was created with role 'viewer' and "
+            f"will become {body.role.value!r} when the proposal is approved.",
+        )
+    return _user_json(auth.get_user(user.username))
 
 
 @users_router.patch("/{username}")
@@ -510,7 +568,7 @@ def update_user(
     body: UserUpdateRequest,
     request: Request,
     admin: Superadmin,
-) -> dict:
+):
     auth = identity_auth(request)
     target = auth.get_user(username)
     if target is None:
@@ -520,14 +578,27 @@ def update_user(
             raise HTTPException(status_code=400, detail="You cannot disable yourself")
         if body.role is not None and body.role != Role.admin:
             raise HTTPException(status_code=400, detail="You cannot demote yourself")
-    updated = auth.update_user(
-        target.username,
-        role=body.role,
-        password=body.password,
-        disabled=body.disabled,
-        actor=admin.username,
-    )
-    return _user_json(updated)
+    # Password and the disabled flag are identity ops (exempt from approval);
+    # the ROLE is a governance write and goes through the gate, where a
+    # promotion classifies as loosening and can queue.
+    if body.password is not None or body.disabled is not None:
+        auth.update_user(
+            target.username,
+            password=body.password,
+            disabled=body.disabled,
+            actor=admin.username,
+            ticket=identity_ticket(admin.username),
+        )
+    if body.role is not None and body.role != target.role:
+        service = _approvals_for(request, identity_store(request))
+        outcome = service.submit(
+            kind="user_role", target=target.username,
+            payload={"role": body.role.value},
+            actor=admin.username, actor_id=admin.id,
+        )
+        if not outcome.applied:
+            return _queued_json(outcome)
+    return _user_json(auth.get_user(target.username))
 
 
 @users_router.delete("/{username}")
@@ -644,7 +715,7 @@ def set_group_members(
     body: GroupMembersRequest,
     request: Request,
     admin: Annotated[User, Depends(require_admin)],
-) -> dict:
+):
     store = active_store(request)
     users = identity_store(request)  # usernames are global identity, not per-workspace
     if not store.group_exists(name):
@@ -654,22 +725,34 @@ def set_group_members(
         if users.get_user(u) is None:
             raise HTTPException(status_code=400, detail=f"Unknown user: {u!r}")
         members.append(u.lower())
-    store.set_group_members(name, members)
-    store.log_audit(
-        "group_members_set", {"name": name, "count": len(members)}, actor=admin.username
+    # Adding a member to a group that carries grants, row rules or mask
+    # exemptions widens that member's access — the comparator evaluates
+    # exactly that, so an unreferenced group applies with a record while a
+    # referenced one can queue.
+    service = _approvals_for(request, store)
+    outcome = service.submit(
+        kind="group_members", target=name.lower(), payload={"members": members},
+        actor=admin.username, actor_id=admin.id,
     )
+    if not outcome.applied:
+        return _queued_json(outcome)
     return {"name": name, "members": sorted(set(members))}
 
 
 @groups_router.delete("/{name}")
 def delete_group(
     name: str, request: Request, admin: Annotated[User, Depends(require_admin)]
-) -> dict:
+):
     store = active_store(request)
     if not store.group_exists(name):
         raise HTTPException(status_code=404, detail=f"Group not found: {name!r}")
-    store.delete_group(name)
-    store.log_audit("group_deleted", {"name": name}, actor=admin.username)
+    service = _approvals_for(request, store)
+    outcome = service.submit(
+        kind="group_delete", target=name.lower(), payload={},
+        actor=admin.username, actor_id=admin.id,
+    )
+    if not outcome.applied:
+        return _queued_json(outcome)
     return {"ok": True}
 
 
@@ -784,11 +867,16 @@ def set_member(slug: str, body: MemberRequest, request: Request, admin: Superadm
         raise HTTPException(status_code=404, detail=f"Workspace not found: {slug!r}")
     if identity_store(request).get_user(body.username) is None:
         raise HTTPException(status_code=400, detail=f"Unknown user: {body.username!r}")
-    control.set_member(slug, body.username.lower(), body.role)
-    control.log_audit(
-        "workspace_member_set",
-        {"slug": slug, "username": body.username, "role": body.role.value},
-        actor=admin.username,
+    # Workspace membership is a role grant, so it goes through the approval
+    # gate. Records file in the CONTROL store, where second-approver mode is
+    # never enabled: the superadmin tier's ceremony is the record, not the
+    # queue (see laurelin/core/approvals.py).
+    service = _approvals_for(request, control)
+    service.submit(
+        kind="workspace_member", target=f"{slug}:{body.username.lower()}",
+        payload={"slug": slug, "username": body.username.lower(),
+                 "role": body.role.value},
+        actor=admin.username, actor_id=admin.id,
     )
     return {"slug": slug, "username": body.username.lower(), "role": body.role.value}
 

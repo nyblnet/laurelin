@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.export import (
@@ -26,6 +27,8 @@ from laurelin.export import (
     preview_manifest,
     stream_export,
 )
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 HARMLESS_PIPELINE = (
     "from laurelin.transforms import transform, Input, Output\n"
@@ -305,7 +308,7 @@ def test_dataset_restricts_the_data_but_never_the_governance(ws, store):
     offered for data only and the rules always travel whole."""
     catalog = DatasetCatalog(ws, store)
     catalog.write("hr", pa.table({"id": ["1"]}))
-    store.set_explicit_markings("hr", [])
+    store.set_explicit_markings("hr", [], ticket=_TICKET)
 
     sink = _Unseekable()
     manifest = stream_export(ws, store, sink, ExportOptions(datasets=("sales",)))

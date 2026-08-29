@@ -21,12 +21,15 @@ from fastapi.testclient import TestClient
 
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 
 # One hostile vocabulary for the whole repo: a value that breaks one surface
 # is automatically tried against the others.
 from tests.test_flow_compile import HOSTILE
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 #: The flow Explore's UI synthesizes for "orders, drop returned, total by
 #: region" — source → filter → aggregate → sort, always named `explore`.
@@ -326,7 +329,7 @@ def test_explore_preview_checks_source_view_rights_before_compiling_and_names_no
     store.set_grants_for_dataset("orders", [{
         "subject_kind": "user", "subject": "alice",
         "can_view": True, "can_edit": True,
-    }])
+    }], ticket=_TICKET)
     app = create_app(workspace)
     alice, bob = _login(app, "alice"), _login(app, "bob")
 
@@ -360,7 +363,7 @@ def test_explore_preview_applies_the_callers_row_policy_and_column_masks(workspa
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "eve", "values": ["eu"]}]},
         "column_masks": [{"column": "status", "mode": "redact"}],
-    })
+    }, ticket=_TICKET)
     eve = _login(create_app(workspace), "eve")
 
     flow = {"name": "explore", "output": "explore", "terminal": "n0",
@@ -392,7 +395,7 @@ def test_explore_preview_allows_a_row_policied_source_because_nothing_is_materia
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "eve", "values": ["eu"]}]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     eve = _login(create_app(workspace), "eve")
 
     flows = eve.post("/api/v1/flows/preview", json={"flow": EXPLORE})

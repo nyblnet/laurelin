@@ -29,9 +29,12 @@ from typer.testing import CliRunner
 from laurelin.api import create_app, create_server_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.cli import app as cli
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.control import ControlStore
 from laurelin.core.db import MetadataStore
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 runner = CliRunner()
 
@@ -196,7 +199,7 @@ def test_the_cli_notices_multi_workspace_mode_and_refuses_to_guess(tmp_path):
     root.mkdir()
     control = ControlStore(root / "control.db")
     control.create_workspace("alpha", "Alpha")
-    control.set_member("alpha", "vic", "admin")
+    control.set_member("alpha", "vic", "admin", ticket=_TICKET)
     ws = _seed(root / "alpha")
 
     refused = runner.invoke(cli, ["export", str(tmp_path / "a.tar"), "-w", str(ws.root)])
@@ -351,6 +354,7 @@ def test_verify_governance_reports_the_cells_where_two_workspaces_disagree(
     MetadataStore(empty_ws.metadata_path).set_dataset_policy(
         "sales",
         {"row_policy": None, "column_masks": [{"column": "ssn", "mode": "redact"}]},
+        ticket=_TICKET,
     )
     differs = runner.invoke(
         cli, ["verify-governance", "--baseline", str(out), "-w", str(empty_ws.root)]

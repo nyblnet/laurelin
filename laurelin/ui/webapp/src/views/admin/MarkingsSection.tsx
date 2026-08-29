@@ -17,7 +17,7 @@ import type {
   UserClearances,
 } from "../../types";
 import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
-import { InlineError, apiPut } from "./shared";
+import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 // Server rule: ^[a-z0-9][a-z0-9_.-]{0,47}$ (name is lowercased server-side).
 const NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,47}$/;
@@ -99,6 +99,7 @@ function MarkingsList({
   return (
     <div>
       {remove.error && <InlineError err={remove.error} />}
+      <QueuedBanner res={remove.data} />
 
       {markings.length > 0 ? (
         <div className="table-wrap">
@@ -311,6 +312,7 @@ function DatasetMarkingsCard({
       </div>
 
       <InlineError err={save.error} />
+      <QueuedBanner res={save.data} />
     </div>
   );
 }
@@ -460,6 +462,7 @@ function UserClearancesEditor({
           </div>
 
           <InlineError err={save.error} />
+      <QueuedBanner res={save.data} />
         </>
       )}
     </div>

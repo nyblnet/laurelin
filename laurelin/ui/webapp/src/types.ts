@@ -1111,3 +1111,109 @@ export interface FlowEjectResult {
   inputs: string[];
   collect_error: Failure | null;
 }
+
+// -- Data health (task #74) --------------------------------------------------
+
+export type HealthStatus = "healthy" | "stale" | "failing" | "overdue" | "unknown";
+
+export interface ExpectationSummary {
+  name: string;
+  column: string;
+  severity: string;
+  passed: boolean;
+}
+
+/** One dataset's derived health. The wide (editor+) projection additionally
+ *  carries `detail` — schedule/source names, expectation messages and measured
+ *  values. A viewer's copy simply lacks the key; never assume it. */
+export interface DatasetHealth {
+  dataset: string;
+  status: HealthStatus;
+  last_success_at: string | null;
+  last_build_status: BuildStatus | null;
+  last_build_id: string | null;
+  last_failure: Failure | null;
+  failing_expectations: ExpectationSummary[];
+  expected_fresh_within: number | null;
+  schedule_overdue: boolean;
+  last_scheduled_run_at: string | null;
+  sync_failing: boolean;
+  detail?: {
+    expectations?: { expectation?: string; message?: string; measured?: unknown }[];
+    transform?: string;
+    source?: string;
+    overdue_schedules?: string[];
+    [k: string]: unknown;
+  };
+}
+
+export interface HealthEvent {
+  seq: number;
+  dataset: string;
+  event: string;
+  status: HealthStatus;
+  at: string;
+}
+
+/** Admin-only. `url` is write-only: reads come back with the withheld marker,
+ *  never the value — render it as "configured, withheld", not as blank. */
+export interface AlertWebhook {
+  name: string;
+  url?: string;
+  datasets: string[];
+  events: string[];
+  enabled: boolean;
+  created_at: string;
+  created_by: string;
+  last_delivery_at: string | null;
+  last_delivery_status: number | null;
+  last_delivery_failure: Failure | null;
+}
+
+// -- Governance change approval (task #74) -----------------------------------
+
+export type ProposalState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn"
+  | "superseded";
+
+export interface ProposalDiff {
+  classification: "loosening" | "tightening";
+  gains: string[];
+  reason?: string;
+}
+
+export interface Proposal {
+  id: string;
+  kind: string;
+  target: string;
+  payload: Record<string, unknown>;
+  diff: ProposalDiff;
+  rationale: string;
+  proposer: string;
+  proposer_id?: string;
+  created_at: string;
+  state: ProposalState;
+  classification: string;
+  ticket_kind?: string;
+  decided_by?: string;
+  decided_at: string | null;
+  applied_at: string | null;
+  decision_reason?: string;
+}
+
+export interface ApprovalSettings {
+  require_second_approver: boolean;
+  /** How many active admins exist — the UI explains the >=2 refusal inline. */
+  active_admins?: number;
+}
+
+/** A governance write that queued instead of applying (HTTP 202). */
+export interface QueuedChange {
+  queued: true;
+  proposal_id: string;
+  classification: string;
+  detail?: string;
+}

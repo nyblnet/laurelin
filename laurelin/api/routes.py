@@ -24,6 +24,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from laurelin.api.auth_routes import (
@@ -32,10 +33,16 @@ from laurelin.api.auth_routes import (
     require_user,
     require_viewer,
 )
-from laurelin.api.context import active_catalog, active_store, active_workspace
+from laurelin.api.context import (
+    active_catalog,
+    active_store,
+    active_workspace,
+    identity_store,
+)
 from laurelin.catalog import DatasetCatalog
 from laurelin.catalog.catalog import suggest_dataset_name
 from laurelin.core import audience, authoring_hints, fileperms, serialize
+from laurelin.core.approvals import ApprovalError, ApprovalService
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.failure import (
@@ -57,6 +64,7 @@ from laurelin.core.models import (
     DashboardPanel,
     DatasetVersionInfo,
     Grant,
+    ProposalInfo,
     Role,
     RowPolicy,
     User,
@@ -182,6 +190,25 @@ def get_permissions(store: Annotated[MetadataStore, Depends(get_store)]) -> Perm
     return PermissionService(store)
 
 
+def get_approvals(
+    request: Request,
+    store: Annotated[MetadataStore, Depends(get_store)],
+    perms: Annotated[PermissionService, Depends(get_permissions)],
+) -> ApprovalService:
+    """The approval gate for workspace-scoped governance writes (task #74).
+
+    The comparator evaluates the *identity* population (the control store in
+    multi mode) against the active workspace's grants; in ``--no-auth`` mode
+    every change auto-approves with ``kind="local"`` — anything else would
+    deadlock the only local mode of operation.
+    """
+    return ApprovalService(
+        store, perms,
+        users=identity_store(request).list_users(),
+        local=bool(request.app.state.no_auth),
+    )
+
+
 def get_pipeline_files(
     workspace: Annotated[Workspace, Depends(get_workspace)],
 ) -> PipelineFiles:
@@ -238,6 +265,7 @@ RegistryDep = Annotated[TransformRegistry, Depends(get_registry)]
 OntologyDep = Annotated[OntologyService, Depends(get_ontology_service)]
 ActorDep = Annotated[str, Depends(get_actor)]
 PermDep = Annotated[PermissionService, Depends(get_permissions)]
+ApprovalsDep = Annotated[ApprovalService, Depends(get_approvals)]
 PipelineFilesDep = Annotated[PipelineFiles, Depends(get_pipeline_files)]
 # The authenticated User object (not just a role gate), for per-type checks.
 UserDep = Annotated[User, Depends(require_user)]
@@ -2620,6 +2648,23 @@ def drop_object_index(
     return {"dropped": name}
 
 
+def _queued(outcome) -> JSONResponse:
+    """202: the change is filed, not applied — a second admin must approve."""
+    return JSONResponse(
+        status_code=202,
+        content={
+            "queued": True,
+            "proposal_id": outcome.proposal_id,
+            "classification": outcome.classification,
+            "detail": (
+                f"Queued as proposal {outcome.proposal_id}: this change loosens "
+                "access and this workspace requires a second approver. Another "
+                "admin must POST /proposals/{id}/approve."
+            ),
+        },
+    )
+
+
 @router.get("/ontology/permissions", dependencies=[ADMIN])
 def list_permissions(service: OntologyDep, store: StoreDep) -> list[dict]:
     """Grants for every object type (empty list = default open per global RBAC)."""
@@ -2641,20 +2686,20 @@ def set_permissions(
     service: OntologyDep,
     store: StoreDep,
     perms: PermDep,
-    actor: ActorDep,
-) -> dict:
+    user: UserDep,
+    approvals: ApprovalsDep,
+):
     if service.ontology.object_type(type_name) is None:
         raise KeyError(f"Unknown object type: {type_name!r}")
     perms.validate_grants(body.grants)
-    store.set_grants_for_type(
+    outcome = approvals.submit(
+        kind="ontology_grants", target=type_name,
         # serialize-ok: request body -> store.
-        type_name, [g.model_dump(mode="json") for g in body.grants]
+        payload={"grants": [g.model_dump(mode="json") for g in body.grants]},
+        actor=user.username, actor_id=user.id,
     )
-    store.log_audit(
-        "ontology_permissions_set",
-        {"object_type": type_name, "grant_count": len(body.grants)},
-        actor=actor,
-    )
+    if not outcome.applied:
+        return _queued(outcome)
     # serialize-ok: echoes back the grants this admin just sent.
     return {"object_type": type_name,
             "grants": [g.model_dump(mode="json") for g in body.grants]}
@@ -2684,18 +2729,20 @@ def set_dataset_permissions(
     body: GrantsRequest,
     store: StoreDep,
     perms: PermDep,
-    actor: ActorDep,
-) -> dict:
+    user: UserDep,
+    approvals: ApprovalsDep,
+):
     if store.get_dataset(name) is None:
         raise KeyError(f"Dataset not found: {name!r}")
     perms.validate_grants(body.grants)
-    # serialize-ok: request body -> store.
-    store.set_grants_for_dataset(name, [g.model_dump(mode="json") for g in body.grants])
-    store.log_audit(
-        "dataset_permissions_set",
-        {"dataset": name, "grant_count": len(body.grants)},
-        actor=actor,
+    outcome = approvals.submit(
+        kind="dataset_grants", target=name,
+        # serialize-ok: request body -> store.
+        payload={"grants": [g.model_dump(mode="json") for g in body.grants]},
+        actor=user.username, actor_id=user.id,
     )
+    if not outcome.applied:
+        return _queued(outcome)
     # serialize-ok: echoes back the grants this admin just sent.
     return {"dataset": name,
             "grants": [g.model_dump(mode="json") for g in body.grants]}
@@ -2722,9 +2769,9 @@ def list_dataset_policies(store: StoreDep) -> list[dict]:
 
 @router.put("/datasets/{name}/policy", dependencies=[ADMIN])
 def set_dataset_policy(
-    name: str, body: DatasetPolicyRequest, store: StoreDep, actor: ActorDep,
-    workspace: WorkspaceDep,
-) -> dict:
+    name: str, body: DatasetPolicyRequest, store: StoreDep, user: UserDep,
+    approvals: ApprovalsDep, workspace: WorkspaceDep,
+):
     """Set (or clear) the row policy and column masks on a dataset.
 
     The write always succeeds, but a row policy on a dataset some transform
@@ -2745,16 +2792,12 @@ def set_dataset_policy(
         # serialize-ok: request body -> store.
         "column_masks": [m.model_dump(mode="json") for m in body.column_masks],
     }
-    store.set_dataset_policy(name, policy)
-    store.log_audit(
-        "dataset_policy_set",
-        {
-            "dataset": name,
-            "row_policy": policy is not None and policy["row_policy"] is not None,
-            "masked_columns": [m.column for m in body.column_masks],
-        },
-        actor=actor,
+    outcome = approvals.submit(
+        kind="dataset_policy", target=name, payload={"policy": policy},
+        actor=user.username, actor_id=user.id,
     )
+    if not outcome.applied:
+        return _queued(outcome)
     warnings: list[str] = []
     if body.row_policy is not None:
         # Best-effort: a broken pipeline file must not block a governance
@@ -2820,12 +2863,17 @@ def create_marking(body: MarkingCreateRequest, store: StoreDep, actor: ActorDep)
 
 
 @router.delete("/markings/{name}", dependencies=[ADMIN])
-def delete_marking(name: str, store: StoreDep, actor: ActorDep) -> dict:
+def delete_marking(name: str, store: StoreDep, user: UserDep, approvals: ApprovalsDep):
     if not store.marking_exists(name):
         raise KeyError(f"Marking not found: {name!r}")
-    store.delete_marking(name)
-    store.recompute_all_markings()  # its removal ripples through effective sets
-    store.log_audit("marking_deleted", {"name": name}, actor=actor)
+    # Deleting a marking is workspace-wide loosening (its removal ripples
+    # through every effective set), so it classifies and can queue.
+    outcome = approvals.submit(
+        kind="marking_delete", target=name, payload={},
+        actor=user.username, actor_id=user.id,
+    )
+    if not outcome.applied:
+        return _queued(outcome)
     return {"ok": True}
 
 
@@ -2844,18 +2892,21 @@ def list_dataset_markings(store: StoreDep) -> list[dict]:
 
 @router.put("/datasets/{name}/markings", dependencies=[ADMIN])
 def set_dataset_markings(
-    name: str, body: DatasetMarkingsRequest, store: StoreDep, actor: ActorDep
-) -> dict:
+    name: str, body: DatasetMarkingsRequest, store: StoreDep, user: UserDep,
+    approvals: ApprovalsDep,
+):
     if store.get_dataset(name) is None:
         raise KeyError(f"Dataset not found: {name!r}")
     for m in body.markings:
         if not store.marking_exists(m):
             raise HTTPException(status_code=400, detail=f"Unknown marking: {m!r}")
-    store.set_explicit_markings(name, body.markings)
-    store.recompute_all_markings()  # propagate downstream through lineage
-    store.log_audit(
-        "dataset_markings_set", {"dataset": name, "markings": body.markings}, actor=actor
+    outcome = approvals.submit(
+        kind="dataset_markings", target=name,
+        payload={"markings": body.markings},
+        actor=user.username, actor_id=user.id,
     )
+    if not outcome.applied:
+        return _queued(outcome)
     return {
         "dataset": name,
         "explicit": store.get_explicit_markings(name),
@@ -2870,16 +2921,134 @@ def get_clearances(username: str, store: StoreDep) -> dict:
 
 @router.put("/users/{username}/clearances", dependencies=[ADMIN])
 def set_clearances(
-    username: str, body: ClearancesRequest, store: StoreDep, actor: ActorDep
-) -> dict:
+    username: str, body: ClearancesRequest, store: StoreDep, user: UserDep,
+    approvals: ApprovalsDep,
+):
     for m in body.markings:
         if not store.marking_exists(m):
             raise HTTPException(status_code=400, detail=f"Unknown marking: {m!r}")
-    store.set_clearances(username, body.markings)
-    store.log_audit(
-        "clearances_set", {"username": username, "markings": body.markings}, actor=actor
+    outcome = approvals.submit(
+        kind="clearances", target=username.lower(),
+        payload={"markings": body.markings},
+        actor=user.username, actor_id=user.id,
     )
+    if not outcome.applied:
+        return _queued(outcome)
     return {"username": username, "markings": store.get_clearances(username)}
+
+
+# ---------------------------------------------------------------------------
+# Governance change approval (task #74) — proposals inbox + posture setting
+# ---------------------------------------------------------------------------
+
+class ProposalDecisionRequest(BaseModel):
+    reason: str = ""
+
+
+class ApprovalSettingsRequest(BaseModel):
+    require_second_approver: bool
+
+
+def _proposal_json(p) -> dict:
+    # Through the one serializer: ProposalInfo is admin-authored with every
+    # content field OPERATIONAL, so R2 withholds payload/diff/rationale below
+    # admin with no code here. The store returns the model; tolerate a raw
+    # dict for callers that build one.
+    return _dump(p if isinstance(p, ProposalInfo) else ProposalInfo(**p))
+
+
+@router.get("/proposals", dependencies=[ADMIN])
+def list_proposals(
+    store: StoreDep,
+    state: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+) -> list[dict]:
+    """The proposals inbox: pending loosenings plus the whole decision history
+    (self-approved, approved, rejected, superseded, withdrawn, imports)."""
+    return [_proposal_json(p) for p in store.list_proposals(limit=limit, state=state)]
+
+
+@router.get("/proposals/{proposal_id}", dependencies=[ADMIN])
+def get_proposal(proposal_id: str, store: StoreDep) -> dict:
+    p = store.get_proposal(proposal_id)
+    if p is None:
+        raise KeyError(f"Proposal not found: {proposal_id!r}")
+    return _proposal_json(p)
+
+
+@router.post("/proposals/{proposal_id}/approve", dependencies=[ADMIN])
+def approve_proposal(
+    proposal_id: str, user: UserDep, approvals: ApprovalsDep
+) -> dict:
+    """Reclassify against current state, then apply — see ApprovalService.approve."""
+    try:
+        return _proposal_json(
+            approvals.approve(proposal_id, approver=user.username, approver_id=user.id)
+        )
+    except ApprovalError as exc:
+        detail = exc.detail if exc.diff is None else f"{exc.detail} Current diff: {exc.diff}"
+        raise HTTPException(status_code=409, detail=detail) from exc
+
+
+@router.post("/proposals/{proposal_id}/reject", dependencies=[ADMIN])
+def reject_proposal(
+    proposal_id: str, body: ProposalDecisionRequest, user: UserDep,
+    approvals: ApprovalsDep,
+) -> dict:
+    try:
+        return _proposal_json(
+            approvals.reject(proposal_id, approver=user.username, reason=body.reason)
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+
+@router.post("/proposals/{proposal_id}/withdraw", dependencies=[ADMIN])
+def withdraw_proposal(
+    proposal_id: str, user: UserDep, approvals: ApprovalsDep
+) -> dict:
+    try:
+        return _proposal_json(
+            approvals.withdraw(proposal_id, actor=user.username, actor_id=user.id)
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+
+@router.get("/settings/approvals", dependencies=[ADMIN])
+def get_approval_settings(approvals: ApprovalsDep) -> dict:
+    return {"require_second_approver": approvals.require_second_approver()}
+
+
+@router.put("/settings/approvals", dependencies=[ADMIN])
+def put_approval_settings(
+    body: ApprovalSettingsRequest, request: Request, user: UserDep,
+    approvals: ApprovalsDep,
+):
+    """Flip second-approver mode. Enabling refuses (409) below 2 active
+    admins; disabling queues under the regime it is disabling."""
+    identity = identity_store(request)
+    active_admins = sum(
+        1 for u in identity.list_users()
+        if not u.disabled and (u.role == Role.admin or u.superadmin)
+    )
+    if request.app.state.no_auth:
+        # --no-auth has one implicit admin by construction; the mode would
+        # deadlock the only way of operating and can never be satisfied.
+        raise HTTPException(
+            status_code=409,
+            detail="Second-approver mode is unavailable under --no-auth",
+        )
+    try:
+        outcome = approvals.set_second_approver(
+            body.require_second_approver,
+            actor=user.username, actor_id=user.id, active_admins=active_admins,
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if not outcome.applied:
+        return _queued(outcome)
+    return {"require_second_approver": approvals.require_second_approver()}
 
 
 # ---------------------------------------------------------------------------

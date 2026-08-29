@@ -21,6 +21,9 @@ import {
   fmtTime,
   type Column,
 } from "../ui";
+import { ApprovalsSection } from "./admin/ApprovalsSection";
+import { ApprovalSettingsCard } from "./admin/ApprovalSettingsCard";
+import { AlertsSection } from "./admin/AlertsSection";
 import { GroupsSection } from "./admin/GroupsSection";
 import { OntologyAccessSection } from "./admin/OntologyAccessSection";
 import { DatasetAccessSection } from "./admin/DatasetAccessSection";
@@ -458,12 +461,18 @@ export function AdminView() {
         <>
           <UsersSection me={me} />
           <TokensSection />
+          {/* The inbox sits above the sections whose writes it gates, with its
+              mode toggle attached, so "why did my grant queue?" has its answer
+              one scroll up. */}
+          <ApprovalsSection />
+          <ApprovalSettingsCard />
           <GroupsSection />
           <OntologyAccessSection />
           <DatasetAccessSection />
           <DataSecuritySection />
           <MarkingsSection />
           <EnginesSection />
+          <AlertsSection />
           <FileSecuritySection />
           <PortabilitySection />
         </>

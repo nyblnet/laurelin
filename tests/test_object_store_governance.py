@@ -19,11 +19,14 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
 from laurelin.ontology import OntologyService, load_ontology
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -80,7 +83,7 @@ def env(tmp_path):
             {"subject_kind": "user", "subject": "elf", "values": ["valinor"]},
         ]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     perms = PermissionService(store)
     elf = User(id="e", username="elf", role=Role.viewer)
 
@@ -404,7 +407,7 @@ def masked(tmp_path):
             {"column": "founder", "mode": "redact", "exempt": []},
             {"column": "pop", "mode": "null", "exempt": []},
         ],
-    })
+    }, ticket=_TICKET)
     perms = PermissionService(store)
     elf = User(id="e", username="elf", role=Role.editor)
 
@@ -818,7 +821,7 @@ def test_a_policied_editor_cannot_insert_into_another_tenants_partition(tmp_path
             {"subject_kind": "user", "subject": "man", "values": ["beleriand"]},
         ]},
         "column_masks": [{"column": "founder", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
     perms = PermissionService(store)
 
     def view(username):
@@ -955,7 +958,7 @@ def _overlay_env(tmp_path, *, row_policy, column_masks):
     ontology = load_ontology(ws.ontology_dir)
     store.set_dataset_policy("cities", {
         "dataset": "cities", "row_policy": row_policy, "column_masks": column_masks,
-    })
+    }, ticket=_TICKET)
     perms = PermissionService(store)
     elf = User(id="e", username="elf", role=Role.editor)
 

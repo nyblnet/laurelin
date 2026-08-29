@@ -20,11 +20,14 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import LineageEdge, Role, User
 from laurelin.core.permissions import PermissionService
 from laurelin.ontology import OntologyService, load_ontology
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ONTOLOGY = """
 object_types:
@@ -458,7 +461,7 @@ def test_a_fold_by_a_policied_user_does_not_rewrite_the_dataset_as_they_see_it(t
             {"subject_kind": "user", "subject": "elf", "values": ["valinor"]},
         ]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     perms = PermissionService(svc.store)
     elf = User(id="e", username="elf", role=Role.viewer)
     elf_svc = OntologyService(

@@ -637,7 +637,10 @@ def test_user_management_is_audited(admin_client):
     for e in audit:
         by_action.setdefault(e["action"], []).append(e)
     assert any(e["details"].get("username") == "dave" for e in by_action["user_created"])
-    assert any(e["details"].get("username") == "dave" for e in by_action["user_updated"])
+    # A role change is a governance write since task #74: it goes through the
+    # approval gate and its audit event is `user_role_set`, carrying the
+    # proposal id and ticket kind alongside the username.
+    assert any(e["details"].get("username") == "dave" for e in by_action["user_role_set"])
     assert any(e["details"].get("username") == "dave" for e in by_action["user_deleted"])
     # Never log secrets.
     assert "davepassword" not in json.dumps(audit)

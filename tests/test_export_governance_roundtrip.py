@@ -25,6 +25,7 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import (
@@ -51,6 +52,8 @@ from laurelin.export import (
     widenings,
 )
 from laurelin.transforms import Builder, collect_transforms
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 PG_URL = os.environ.get("LAURELIN_TEST_POSTGRES")
 
@@ -187,21 +190,21 @@ def governed(tmp_path, make_store):
 
     store.create_group("analysts", "2026-01-01T00:00:00Z")
     store.create_group("auditors", "2026-01-01T00:00:00Z")
-    store.set_group_members("analysts", ["vic"])
-    store.set_group_members("auditors", ["mal"])
+    store.set_group_members("analysts", ["vic"], ticket=_TICKET)
+    store.set_group_members("auditors", ["mal"], ticket=_TICKET)
 
     store.create_marking("pii", "personally identifying")
-    store.set_explicit_markings("sales", ["pii"])
+    store.set_explicit_markings("sales", ["pii"], ticket=_TICKET)
     store.recompute_all_markings()
-    store.set_clearances("vic", ["pii"])
-    store.set_clearances("mal", [])
+    store.set_clearances("vic", ["pii"], ticket=_TICKET)
+    store.set_clearances("mal", [], ticket=_TICKET)
 
     view_by_analysts = [
         Grant(subject_kind=SubjectKind.group, subject="analysts",
               can_view=True).model_dump()
     ]
-    store.set_grants_for_dataset("sales", view_by_analysts)
-    store.set_grants_for_dataset("acl_only", view_by_analysts)
+    store.set_grants_for_dataset("sales", view_by_analysts, ticket=_TICKET)
+    store.set_grants_for_dataset("acl_only", view_by_analysts, ticket=_TICKET)
     # can_edit, not can_view: an ontology grant that only grants view is
     # indistinguishable from the no-grants default (any authenticated user may
     # view a type), so deleting it would change no decision and the fixture
@@ -210,7 +213,7 @@ def governed(tmp_path, make_store):
     store.set_grants_for_type("sale", [
         Grant(subject_kind=SubjectKind.group, subject="analysts",
               can_edit=True).model_dump()
-    ])
+    ], ticket=_TICKET)
 
     store.set_dataset_policy("sales", DatasetPolicy(
         dataset="sales",
@@ -226,7 +229,7 @@ def governed(tmp_path, make_store):
                 PolicySubject(subject_kind=SubjectKind.group, subject="auditors"),
             ]),
         ],
-    ).model_dump(mode="json"))
+    ).model_dump(mode="json"), ticket=_TICKET)
     return workspace, store
 
 
@@ -268,10 +271,10 @@ def _rebind(target, analysts=("vic",), auditors=("mal",)):
     for name, role in (("vic", Role.viewer), ("mal", Role.viewer), ("adm", Role.admin)):
         if dst_store.get_user(name) is None:
             auth.create_user(name, f"pw-{name}-longenough", role, actor="ada")
-    dst_store.set_group_members("analysts", list(analysts))
-    dst_store.set_group_members("auditors", list(auditors))
-    dst_store.set_clearances("vic", ["pii"])
-    dst_store.set_clearances("mal", [])
+    dst_store.set_group_members("analysts", list(analysts), ticket=_TICKET)
+    dst_store.set_group_members("auditors", list(auditors), ticket=_TICKET)
+    dst_store.set_clearances("vic", ["pii"], ticket=_TICKET)
+    dst_store.set_clearances("mal", [], ticket=_TICKET)
 
 
 # --------------------------------------------------------------------------- tests
@@ -385,7 +388,7 @@ def test_a_principal_who_saw_nothing_at_the_source_sees_nothing_at_every_stage(
     # Measured: putting an outsider into the destination's `analysts` flips
     # acl_only from (False, False) to (True, False). Import must never be the
     # thing that does this — an admin has to, explicitly and audibly.
-    dst_store.set_group_members("analysts", ["mal"])
+    dst_store.set_group_members("analysts", ["mal"], ticket=_TICKET)
     assert perms.dataset_permission(MAL, "acl_only") == (True, False)
 
 
@@ -549,7 +552,7 @@ def test_the_proof_catches_a_column_mask_that_stopped_being_applied(
                 PolicySubject(subject_kind=SubjectKind.group, subject="auditors"),
             ]),
         ],
-    ).model_dump(mode="json"))
+    ).model_dump(mode="json"), ticket=_TICKET)
     perturbed = _fingerprint(dst_ws, dst_store)
 
     assert diff_fingerprints(source, perturbed), "a dropped mask went unnoticed"
@@ -572,7 +575,7 @@ def test_the_proof_catches_a_group_that_gained_an_outsider(
     source = _rebound_pair(governed, target, tmp_path)
     dst_ws, dst_store = target
 
-    dst_store.set_group_members("analysts", ["vic", "mal"])
+    dst_store.set_group_members("analysts", ["vic", "mal"], ticket=_TICKET)
     perturbed = _fingerprint(dst_ws, dst_store)
 
     gained = widenings(
@@ -596,7 +599,7 @@ def test_narrowing_is_not_reported_as_widening(governed, target, tmp_path):
     source = _rebound_pair(governed, target, tmp_path)
     dst_ws, dst_store = target
 
-    dst_store.set_group_members("analysts", [])
+    dst_store.set_group_members("analysts", [], ticket=_TICKET)
     perturbed = _fingerprint(dst_ws, dst_store)
 
     assert diff_fingerprints(source, perturbed), (

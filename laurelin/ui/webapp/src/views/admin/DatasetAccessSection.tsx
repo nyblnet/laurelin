@@ -16,7 +16,7 @@ import type {
   User,
 } from "../../types";
 import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
-import { InlineError, apiPut } from "./shared";
+import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const SUBJECT_KINDS: SubjectKind[] = ["everyone", "role", "group", "user"];
 const GRANTABLE_ROLES: Role[] = ["viewer", "editor", "admin"];
@@ -271,6 +271,9 @@ function DatasetPermissionCard({
       </div>
 
       <InlineError err={save.error} />
+      {/* Widening grants can come back 202 (queued behind a second approver);
+          the grants list then legitimately re-seeds unchanged. Say so. */}
+      <QueuedBanner res={save.data} />
     </div>
   );
 }
@@ -279,8 +282,11 @@ function DatasetPermissionCard({
 
 export function DatasetAccessSection() {
   const qc = useQueryClient();
-  const invalidate = () =>
-    qc.invalidateQueries({ queryKey: ["dataset-permissions"] });
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ["dataset-permissions"] });
+    // A widening save files a proposal; keep the inbox in step.
+    void qc.invalidateQueries({ queryKey: ["proposals"] });
+  };
 
   const permsQuery = useQuery({
     queryKey: ["dataset-permissions"],

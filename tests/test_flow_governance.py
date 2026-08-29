@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
@@ -30,6 +31,8 @@ from laurelin.transforms.flow_governance import (
     restrict_output_to_author,
 )
 from laurelin.transforms.flow_ir import FlowDef, FlowRefused
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 ALICE = User(id="1", username="alice", role=Role.editor)
 BOB = User(id="2", username="bob", role=Role.editor)
@@ -82,7 +85,7 @@ def grant_to(store, dataset, username):
     store.set_grants_for_dataset(dataset, [{
         "subject_kind": "user", "subject": username,
         "can_view": True, "can_edit": True,
-    }])
+    }], ticket=_TICKET)
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +163,7 @@ def test_a_flow_over_a_row_policied_input_is_refused(store, perms):
             {"subject_kind": "user", "subject": "alice", "values": ["us"]},
         ]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(author="alice")
     with pytest.raises(FlowRefused) as exc:
         check_flow_governance(store, perms, "alice", flow, output_columns=["region"])
@@ -179,7 +182,7 @@ def test_a_flow_that_reads_a_masked_column_is_refused_and_the_message_names_it(
     store.set_dataset_policy("secret_ds", {
         "dataset": "secret_ds", "row_policy": None,
         "column_masks": [{"column": "amount", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(author="alice", columns=["amount"])
     with pytest.raises(FlowRefused) as exc:
         check_flow_governance(
@@ -198,7 +201,7 @@ def test_a_mask_on_a_column_the_flow_never_touches_does_not_block_it(store, perm
     store.set_dataset_policy("secret_ds", {
         "dataset": "secret_ds", "row_policy": None,
         "column_masks": [{"column": "note", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(author="alice", columns=["region"])
     check_flow_governance(store, perms, "alice", flow, output_columns=["region"])
 
@@ -216,7 +219,7 @@ def test_a_masked_column_that_merely_passes_through_to_the_output_is_still_refus
     store.set_dataset_policy("secret_ds", {
         "dataset": "secret_ds", "row_policy": None,
         "column_masks": [{"column": "note", "mode": "redact", "exempt": []}],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(author="alice")  # no select: everything passes through
     assert "note" not in referenced_columns(flow)
     with pytest.raises(FlowRefused) as exc:
@@ -241,7 +244,7 @@ def test_an_exempt_author_still_cannot_launder_a_masked_column(store, perms):
             "column": "amount", "mode": "redact",
             "exempt": [{"subject_kind": "user", "subject": "alice"}],
         }],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(author="alice", columns=["amount"])
     with pytest.raises(FlowRefused):
         check_flow_governance(
@@ -310,7 +313,7 @@ def test_an_administrators_widened_grant_survives_a_rebuild(store):
     store.set_grants_for_dataset("copy", [
         {"subject_kind": "role", "subject": "editor",
          "can_view": True, "can_edit": False},
-    ])
+    ], ticket=_TICKET)
     assert restrict_output_to_author(store, flow, "alice") is False
     assert {g["subject"] for g in store.grants_for_dataset("copy")} == {"editor"}
 
@@ -585,7 +588,7 @@ def test_a_mask_is_matched_the_same_way_the_policy_resolver_matches_it(
     }))
     store.set_dataset_policy("masked_ds", {
         "column_masks": [{"column": spelling, "mode": "redact"}],
-    })
+    }, ticket=_TICKET)
     flow = simple_flow(dataset="masked_ds", author="alice", name="leak")
     with pytest.raises(FlowRefused) as exc:
         check_flow_governance(store, perms, "alice", flow,
@@ -602,7 +605,7 @@ def test_a_mask_naming_a_column_the_dataset_does_not_have_still_does_not_deny_it
     catalog.write("evolved", pa.table({"person": ["a"], "amount": [1]}))
     store.set_dataset_policy("evolved", {
         "column_masks": [{"column": "long_gone", "mode": "redact"}],
-    })
+    }, ticket=_TICKET)
     check_flow_governance(
         store, perms, "alice", simple_flow(dataset="evolved", author="alice"),
         output_columns=["person", "amount"],
@@ -658,7 +661,7 @@ def test_marking_laundering_by_repointing_a_flows_source_is_refused(
     """
     store.create_marking("secret")
     catalog.write("mid", pa.table({"region": ["us"], "amount": [1]}))
-    store.set_explicit_markings("mid", ["secret"])
+    store.set_explicit_markings("mid", ["secret"], ticket=_TICKET)
     store.recompute_all_markings()
     assert not perms.can_view_dataset(BOB, "mid")
 
@@ -692,7 +695,7 @@ def test_pointing_a_flow_at_a_dataset_shared_more_widely_than_its_source_is_refu
          "can_view": True, "can_edit": True},
         {"subject_kind": "user", "subject": "bob",
          "can_view": True, "can_edit": True},
-    ])
+    ], ticket=_TICKET)
     flow = simple_flow(author="alice", name="shared_report")
     # Allowed by the build path: an admin may widen a flow's own output.
     check_flow_governance(store, perms, "alice", flow)
@@ -711,5 +714,5 @@ def test_an_administrators_widened_grant_still_survives_a_rebuild(store, perms):
     store.set_grants_for_dataset("copy", [
         {"subject_kind": "role", "subject": "editor",
          "can_view": True, "can_edit": False},
-    ])
+    ], ticket=_TICKET)
     assert restrict_output_to_author(store, flow, "alice") is False

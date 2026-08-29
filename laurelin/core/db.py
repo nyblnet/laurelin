@@ -100,6 +100,31 @@ def _iso_in(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
+def _require_ticket(ticket) -> None:
+    """The governance-write chokepoint's demand (task #74).
+
+    Every store method that can move an access-control decision — grants,
+    policies, markings, clearances, group membership, roles, workspace
+    membership — takes ``ticket`` as a required keyword with no default, so
+    every caller must declare under which authority it writes; nothing can
+    forget. Classification and queueing live above, in
+    ``laurelin.core.approvals.ApprovalService``; this function only refuses a
+    write that arrives undeclared. The audit row for the change carries the
+    ticket's ``kind`` and ``proposal_id`` (written by the service).
+
+    Imported lazily: ``approvals`` imports this module at module level, and
+    the demand is per-write, not per-import.
+    """
+    from laurelin.core.approvals import ChangeTicket
+
+    if not isinstance(ticket, ChangeTicket):
+        raise TypeError(
+            "This is a governance write: pass ticket=ChangeTicket(...) — "
+            "normally by routing the change through ApprovalService.submit "
+            "(see laurelin/core/approvals.py)."
+        )
+
+
 def propagate_markings(
     datasets: Iterable[str],
     edges: Iterable[tuple[str, str]],
@@ -150,7 +175,10 @@ CREATE TABLE IF NOT EXISTS datasets (
     description TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'managed',
-    source_json TEXT NOT NULL DEFAULT '{}'
+    source_json TEXT NOT NULL DEFAULT '{}',
+    -- Declared freshness window in seconds (NULL = undeclared). Read by
+    -- health: newest version older than this => stale.
+    expected_fresh_seconds INTEGER
 );
 CREATE TABLE IF NOT EXISTS dataset_versions (
     dataset TEXT NOT NULL,
@@ -466,6 +494,58 @@ CREATE TABLE IF NOT EXISTS pipeline_authors (
     author TEXT NOT NULL,
     written_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_build_tasks_output ON build_tasks (output_dataset);
+CREATE TABLE IF NOT EXISTS health_state (
+    -- Previous health status per dataset, so alerts are edge-triggered: a
+    -- transition fires once, a restart does not re-fire every red dataset.
+    dataset TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    since TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS health_events (
+    seq {{AUTOINC_PK}},
+    dataset TEXT NOT NULL,
+    event TEXT NOT NULL,
+    status TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alert_webhooks (
+    name TEXT PRIMARY KEY,
+    -- A credential-bearing value (a Slack-style URL carries its secret in the
+    -- path). Write-only through the API -- reads come back WITHHELD -- and
+    -- omitted from exports by the secrets allowlist (^url$ matches).
+    url TEXT NOT NULL,
+    datasets_json TEXT NOT NULL DEFAULT '[]',
+    events_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    last_delivery_at TEXT,
+    last_delivery_status INTEGER,
+    last_delivery_failure_json TEXT
+);
+CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    diff_json TEXT NOT NULL DEFAULT '{}',
+    rationale TEXT NOT NULL DEFAULT '',
+    proposer TEXT NOT NULL DEFAULT '',
+    proposer_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    classification TEXT NOT NULL DEFAULT '',
+    ticket_kind TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL DEFAULT '',
+    decided_at TEXT,
+    applied_at TEXT,
+    decision_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL DEFAULT 'null'
+);
 CREATE TABLE IF NOT EXISTS scope_locks (
     kind TEXT NOT NULL,
     scope TEXT NOT NULL,
@@ -554,6 +634,10 @@ class MetadataStore:
                 "ALTER TABLE build_tasks ADD COLUMN expectations_json "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        if not self._has_column(c, "datasets", "expected_fresh_seconds"):
+            # Health (task #74): the per-dataset freshness declaration lives on
+            # the datasets row, where per-dataset facts already live.
+            c.execute("ALTER TABLE datasets ADD COLUMN expected_fresh_seconds INTEGER")
         self._migrate_object_store(c)
         self._migrate_failures(c)
 
@@ -726,7 +810,16 @@ class MetadataStore:
             latest_version=latest,
             kind=row["kind"],
             source=json.loads(row["source_json"] or "{}"),
+            expected_fresh_seconds=row["expected_fresh_seconds"],
         )
+
+    def set_dataset_freshness(self, name: str, seconds: Optional[int]) -> None:
+        """Declare (or clear) how fresh this dataset is expected to be."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE datasets SET expected_fresh_seconds = ? WHERE name = ?",
+                (seconds, name),
+            )
 
     def set_dataset_source(self, name: str, kind: str, source: dict) -> None:
         """Mark a dataset as managed or federated, with its source config."""
@@ -2324,7 +2417,14 @@ class MetadataStore:
         role: Optional[str] = None,
         password_hash: Optional[str] = None,
         disabled: Optional[bool] = None,
+        ticket=None,
     ) -> None:
+        # The ROLE column is a governance write (a promotion widens what its
+        # holder may do everywhere) and demands a ticket; password and the
+        # disabled flag are identity operations the approval spec exempts —
+        # neither hands anyone a capability their role did not already carry.
+        if role is not None:
+            _require_ticket(ticket)
         sets, vals = [], []
         if role is not None:
             sets.append("role = ?")
@@ -2550,13 +2650,15 @@ class MetadataStore:
                 )
         return out
 
-    def delete_group(self, name: str) -> None:
+    def delete_group(self, name: str, *, ticket) -> None:
+        _require_ticket(ticket)
         name = name.lower()
         with self._conn() as c:
             c.execute("DELETE FROM group_members WHERE group_name = ?", (name,))
             c.execute("DELETE FROM groups WHERE name = ?", (name,))
 
-    def set_group_members(self, name: str, usernames: list[str]) -> None:
+    def set_group_members(self, name: str, usernames: list[str], *, ticket) -> None:
+        _require_ticket(ticket)
         name = name.lower()
         with self._conn() as c:
             self._lock_scope(c, "group_members", name)
@@ -2568,7 +2670,7 @@ class MetadataStore:
                 [(name, u.lower()) for u in usernames],
             )
 
-    def update_group_members(self, name: str, merge) -> list[str]:
+    def update_group_members(self, name: str, merge, *, ticket) -> list[str]:
         """Atomic read-modify-write of a group's member list. ``merge`` is
         given the current member set and returns the new one; read, merge and
         replace all happen inside one locked transaction.
@@ -2583,6 +2685,7 @@ class MetadataStore:
 
         ``merge`` runs inside the held transaction and lock: it must be pure
         set algebra, never a call back into the store."""
+        _require_ticket(ticket)
         name = name.lower()
         with self._conn() as c:
             self._lock_scope(c, "group_members", name)
@@ -2637,8 +2740,9 @@ class MetadataStore:
             "can_edit": bool(row["can_edit"]),
         }
 
-    def set_grants_for_type(self, object_type: str, grants: list[dict]) -> None:
+    def set_grants_for_type(self, object_type: str, grants: list[dict], *, ticket) -> None:
         """Replace all grants for an object type atomically."""
+        _require_ticket(ticket)
         import uuid as _uuid
 
         with self._conn() as c:
@@ -2688,8 +2792,9 @@ class MetadataStore:
             ).fetchall()
         return [self._dataset_grant_row(r) for r in rows]
 
-    def set_grants_for_dataset(self, dataset: str, grants: list[dict]) -> None:
+    def set_grants_for_dataset(self, dataset: str, grants: list[dict], *, ticket) -> None:
         """Replace all grants for a dataset atomically."""
+        _require_ticket(ticket)
         import uuid as _uuid
 
         with self._conn() as c:
@@ -2774,7 +2879,8 @@ class MetadataStore:
                 "SELECT 1 FROM markings WHERE name = ?", (name.lower(),)
             ).fetchone() is not None
 
-    def delete_marking(self, name: str) -> None:
+    def delete_marking(self, name: str, *, ticket) -> None:
+        _require_ticket(ticket)
         name = name.lower()
         with self._conn() as c:
             # Serialize against recompute writes (this deletes inherited rows
@@ -2819,7 +2925,8 @@ class MetadataStore:
             ).fetchall()
         return [r["marking"] for r in rows]
 
-    def set_explicit_markings(self, dataset: str, markings: list[str]) -> None:
+    def set_explicit_markings(self, dataset: str, markings: list[str], *, ticket) -> None:
+        _require_ticket(ticket)
         markings = sorted({m.lower() for m in markings})
         with self._conn() as c:
             # ONE anchor for every marking write — explicit-set replaces,
@@ -2853,7 +2960,8 @@ class MetadataStore:
             ).fetchall()
         return [r["marking"] for r in rows]
 
-    def set_clearances(self, username: str, markings: list[str]) -> None:
+    def set_clearances(self, username: str, markings: list[str], *, ticket) -> None:
+        _require_ticket(ticket)
         username = username.lower()
         markings = sorted({m.lower() for m in markings})
         with self._conn() as c:
@@ -2959,7 +3067,8 @@ class MetadataStore:
         with self._conn() as c:
             c.execute("DELETE FROM pipeline_authors WHERE name = ?", (name,))
 
-    def set_dataset_policy(self, dataset: str, policy: Optional[dict]) -> None:
+    def set_dataset_policy(self, dataset: str, policy: Optional[dict], *, ticket) -> None:
+        _require_ticket(ticket)
         with self._conn() as c:
             if policy is None:
                 c.execute("DELETE FROM dataset_policies WHERE dataset = ?", (dataset,))
@@ -2972,3 +3081,301 @@ class MetadataStore:
                          updated_at = excluded.updated_at""",
                     (dataset, json.dumps(policy), utcnow_iso()),
                 )
+
+    # -- data health (task #74) ---------------------------------------------------
+
+    def latest_build_tasks_by_dataset(self) -> dict[str, "BuildTaskInfo"]:
+        """The newest build task per output dataset, in one query.
+
+        Newest by ``started_at`` (ISO text sorts chronologically); tasks that
+        never started (NULL) are ignored — a task that has not run yet says
+        nothing about the dataset's health.
+        """
+        from laurelin.core.models import BuildTaskInfo
+
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT t.*, b.status AS build_status,
+                          b.failure_json AS build_failure_json
+                   FROM build_tasks t
+                   JOIN (SELECT output_dataset, MAX(started_at) AS m
+                         FROM build_tasks WHERE started_at IS NOT NULL
+                         GROUP BY output_dataset) x
+                     ON t.output_dataset = x.output_dataset AND t.started_at = x.m
+                   LEFT JOIN builds b ON b.id = t.build_id"""
+            ).fetchall()
+        out: dict[str, dict] = {}
+        for t in rows:
+            info = BuildTaskInfo(
+                transform_name=t["transform_name"],
+                output_dataset=t["output_dataset"],
+                status=BuildStatus(t["status"]),
+                started_at=t["started_at"],
+                finished_at=t["finished_at"],
+                failure=_failure_of(t, "failure_json"),
+                rows_written=t["rows_written"],
+                output_version=t["output_version"],
+                expectations=json.loads(t["expectations_json"] or "[]"),
+            )
+            # Two tasks sharing one MAX(started_at) is a tie the JOIN returns
+            # twice; prefer a failed one so health never under-reports.
+            prev = out.get(t["output_dataset"])
+            if prev is None or info.status == BuildStatus.failed:
+                out[t["output_dataset"]] = {
+                    "task": info,
+                    "build_id": t["build_id"],
+                    # The parent build's own outcome rides along because a
+                    # reaped build (dead replica, expired lease) is failed on
+                    # the *builds* row while its task rows still say `running`
+                    # — reap_expired_builds writes the Failure there and only
+                    # there. Health must read the build's verdict or an
+                    # abandoned build reads as eternally in-flight.
+                    "build_status": t["build_status"],
+                    "build_failure": _failure_of(t, "build_failure_json"),
+                }
+        return out
+
+    def get_health_states(self) -> dict[str, tuple[str, str]]:
+        """Previous status per dataset: {dataset: (status, since)}."""
+        with self._conn() as c:
+            rows = c.execute("SELECT dataset, status, since FROM health_state").fetchall()
+        return {r["dataset"]: (r["status"], r["since"]) for r in rows}
+
+    def set_health_state(self, dataset: str, status: str, since: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO health_state (dataset, status, since) VALUES (?, ?, ?)
+                   ON CONFLICT (dataset) DO UPDATE SET
+                     status = excluded.status, since = excluded.since""",
+                (dataset, status, since),
+            )
+
+    def add_health_event(self, dataset: str, event: str, status: str, at: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO health_events (dataset, event, status, at) VALUES (?, ?, ?, ?)",
+                (dataset, event, status, at),
+            )
+
+    def list_health_events(self, limit: int = 100) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT seq, dataset, event, status, at FROM health_events "
+                "ORDER BY seq DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- alert webhooks -----------------------------------------------------------
+
+    def _row_to_webhook(self, row) -> dict:
+        return {
+            "name": row["name"],
+            "url": row["url"],
+            "datasets": json.loads(row["datasets_json"] or "[]"),
+            "events": json.loads(row["events_json"] or "[]"),
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "created_by": row["created_by"],
+            "last_delivery_at": row["last_delivery_at"],
+            "last_delivery_status": row["last_delivery_status"],
+            "last_delivery_failure": _failure_of(row, "last_delivery_failure_json"),
+        }
+
+    def upsert_alert_webhook(
+        self,
+        name: str,
+        url: Optional[str],
+        datasets: list[str],
+        events: list[str],
+        enabled: bool,
+        created_by: str,
+    ) -> None:
+        """Create or update a webhook. ``url=None`` on update keeps the stored
+        URL — the API never echoes it back, so an edit round-trip cannot
+        carry it."""
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT url FROM alert_webhooks WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is None and not url:
+                raise ValueError("A new webhook needs a URL")
+            final_url = url if url else existing["url"]
+            c.execute(
+                """INSERT INTO alert_webhooks
+                   (name, url, datasets_json, events_json, enabled, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (name) DO UPDATE SET
+                     url = excluded.url,
+                     datasets_json = excluded.datasets_json,
+                     events_json = excluded.events_json,
+                     enabled = excluded.enabled""",
+                (name, final_url, json.dumps(datasets), json.dumps(events),
+                 int(enabled), utcnow_iso(), created_by),
+            )
+
+    def get_alert_webhook(self, name: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM alert_webhooks WHERE name = ?", (name,)
+            ).fetchone()
+        return self._row_to_webhook(row) if row else None
+
+    def list_alert_webhooks(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM alert_webhooks ORDER BY name").fetchall()
+        return [self._row_to_webhook(r) for r in rows]
+
+    def delete_alert_webhook(self, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM alert_webhooks WHERE name = ?", (name,))
+            return bool(cur.rowcount)
+
+    def record_webhook_delivery(
+        self, name: str, at: str, status: Optional[int], failure: Optional[Failure]
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE alert_webhooks SET last_delivery_at = ?,
+                   last_delivery_status = ?, last_delivery_failure_json = ?
+                   WHERE name = ?""",
+                (at, status, _failure_json(failure), name),
+            )
+
+    # -- governance change proposals (task #74) -----------------------------------
+
+    def create_proposal(self, p: dict) -> None:
+        """Insert one proposal row.
+
+        Accepts the payload/diff either as dicts (``payload``/``diff``) or
+        pre-serialized (``payload_json``/``diff_json``) — approvals.py builds
+        the latter shape.
+        """
+        payload_json = p.get("payload_json")
+        if payload_json is None:
+            payload_json = json.dumps(p.get("payload", {}))
+        diff_json = p.get("diff_json")
+        if diff_json is None:
+            diff_json = json.dumps(p.get("diff", {}))
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO proposals
+                   (id, kind, target, payload_json, diff_json, rationale, proposer,
+                    proposer_id, created_at, state, classification, ticket_kind,
+                    decided_by, decided_at, applied_at, decision_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    p["id"], p["kind"], p.get("target") or "",
+                    payload_json, diff_json,
+                    p.get("rationale") or "", p.get("proposer") or "",
+                    p.get("proposer_id") or "", p.get("created_at") or utcnow_iso(),
+                    p.get("state", "pending"), p.get("classification") or "",
+                    p.get("ticket_kind") or "", p.get("decided_by") or "",
+                    p.get("decided_at"), p.get("applied_at"),
+                    p.get("decision_reason") or "",
+                ),
+            )
+
+    def _row_to_proposal(self, row) -> dict:
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "target": row["target"],
+            "payload": json.loads(row["payload_json"] or "{}"),
+            "diff": json.loads(row["diff_json"] or "{}"),
+            "rationale": row["rationale"],
+            "proposer": row["proposer"],
+            "proposer_id": row["proposer_id"],
+            "created_at": row["created_at"],
+            "state": row["state"],
+            "classification": row["classification"],
+            "ticket_kind": row["ticket_kind"],
+            "decided_by": row["decided_by"],
+            "decided_at": row["decided_at"],
+            "applied_at": row["applied_at"],
+            "decision_reason": row["decision_reason"],
+        }
+
+    def get_proposal(self, proposal_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def list_proposals(
+        self, limit: int = 200, state: Optional[str] = None
+    ) -> list[dict]:
+        with self._conn() as c:
+            if state:
+                rows = c.execute(
+                    "SELECT * FROM proposals WHERE state = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (state, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM proposals ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._row_to_proposal(r) for r in rows]
+
+    def decide_proposal(
+        self,
+        proposal_id: str,
+        *,
+        state: str,
+        decided_by: str,
+        decision_reason: str = "",
+        applied_at: Optional[str] = None,
+        diff: Optional[dict] = None,
+        classification: Optional[str] = None,
+        ticket_kind: Optional[str] = None,
+    ) -> None:
+        """Record a decision — atomically, and only from ``pending``.
+
+        The state predicate in the UPDATE is the concurrency guard: two admins
+        deciding at once cannot both win, because only one UPDATE finds the
+        row still pending. Raises ``ValueError`` for the loser.
+        """
+        sets = ["state = ?", "decided_by = ?", "decided_at = ?", "decision_reason = ?"]
+        vals: list[Any] = [state, decided_by, utcnow_iso(), decision_reason]
+        for col, val in (
+            ("applied_at", applied_at),
+            ("diff_json", json.dumps(diff) if diff is not None else None),
+            ("classification", classification),
+            ("ticket_kind", ticket_kind),
+        ):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                vals.append(val)
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE proposals SET {', '.join(sets)} "
+                "WHERE id = ? AND state = 'pending'",
+                (*vals, proposal_id),
+            )
+            if not cur.rowcount:
+                raise ValueError(
+                    f"Proposal {proposal_id!r} is not pending (decided concurrently?)"
+                )
+
+    # -- workspace settings -------------------------------------------------------
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value_json FROM workspace_settings WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return default
+        value = json.loads(row["value_json"])
+        return default if value is None else value
+
+    def set_setting(self, key: str, value: Any) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO workspace_settings (key, value_json) VALUES (?, ?)
+                   ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json""",
+                (key, json.dumps(value)),
+            )

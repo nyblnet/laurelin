@@ -14,10 +14,13 @@ from fastapi.testclient import TestClient
 from laurelin.api import create_app
 from laurelin.catalog import DatasetCatalog
 from laurelin.core import federation
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
 from laurelin.core.models import Role, User
 from laurelin.core.permissions import PermissionService
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 VIEWER = User(id="1", username="vic", role=Role.viewer)
 ADMIN = User(id="2", username="ada", role=Role.admin)
@@ -114,7 +117,7 @@ def test_policy_is_applied_at_the_source(env):
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "vic", "values": ["eu"]}]},
         "column_masks": [{"column": "ssn", "mode": "hash", "exempt": []}],
-    })
+    }, ticket=_TICKET)
 
     table = catalog.federated_table("events", sql_policy_for=perms.sql_policy_fn(VIEWER))
     assert set(table.column("region").to_pylist()) == {"eu"}
@@ -138,7 +141,7 @@ def test_anonymous_reads_nothing(env):
         "row_policy": {"column": "region", "rules": [
             {"subject_kind": "user", "subject": "vic", "values": ["eu"]}]},
         "column_masks": [],
-    })
+    }, ticket=_TICKET)
     assert catalog.federated_table(
         "events", sql_policy_for=perms.sql_policy_fn(None)
     ).num_rows == 0

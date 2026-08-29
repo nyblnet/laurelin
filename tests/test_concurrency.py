@@ -28,6 +28,7 @@ import pyarrow as pa
 import pytest
 
 from laurelin.catalog import DatasetCatalog
+from laurelin.core.approvals import ChangeTicket as _ChangeTicket
 from laurelin.core.config import Workspace
 from laurelin.core.models import utcnow_iso
 from tests.concurrency_harness import (
@@ -36,6 +37,8 @@ from tests.concurrency_harness import (
     rounds,
     run_racers,
 )
+
+_TICKET = _ChangeTicket(kind="local", actor="test")
 
 soak = pytest.mark.soak
 
@@ -69,41 +72,41 @@ def _grant(subject: str) -> dict:
 
 
 def _seed_dataset_grants(s, scope):
-    s.set_grants_for_dataset(scope, [_grant("seed")])
+    s.set_grants_for_dataset(scope, [_grant("seed")], ticket=_TICKET)
 
 
 def _seed_type_grants(s, scope):
-    s.set_grants_for_type(scope, [_grant("seed")])
+    s.set_grants_for_type(scope, [_grant("seed")], ticket=_TICKET)
 
 
 def _seed_group(s, scope):
     s.create_group(scope, utcnow_iso())
-    s.set_group_members(scope, ["seed"])
+    s.set_group_members(scope, ["seed"], ticket=_TICKET)
 
 
 def _seed_clearances(s, scope):
-    s.set_clearances(scope, ["seed"])
+    s.set_clearances(scope, ["seed"], ticket=_TICKET)
 
 
 def _seed_markings(s, scope):
-    s.set_explicit_markings(scope, ["seed"])
+    s.set_explicit_markings(scope, ["seed"], ticket=_TICKET)
 
 
 REPLACE_CASES = {
     # name: (seed(s, scope), write(s, scope, subject), read(s, scope) -> [subjects])
     "dataset_grants": (
         _seed_dataset_grants,
-        lambda s, scope, subj: s.set_grants_for_dataset(scope, [_grant(subj)]),
+        lambda s, scope, subj: s.set_grants_for_dataset(scope, [_grant(subj)], ticket=_TICKET),
         lambda s, scope: sorted(g["subject"] for g in s.grants_for_dataset(scope)),
     ),
     "ontology_grants": (
         _seed_type_grants,
-        lambda s, scope, subj: s.set_grants_for_type(scope, [_grant(subj)]),
+        lambda s, scope, subj: s.set_grants_for_type(scope, [_grant(subj)], ticket=_TICKET),
         lambda s, scope: sorted(g["subject"] for g in s.grants_for_type(scope)),
     ),
     "group_members": (
         _seed_group,
-        lambda s, scope, subj: s.set_group_members(scope, [subj]),
+        lambda s, scope, subj: s.set_group_members(scope, [subj], ticket=_TICKET),
         lambda s, scope: sorted(
             m
             for g in s.list_groups()
@@ -113,12 +116,12 @@ REPLACE_CASES = {
     ),
     "clearances": (
         _seed_clearances,
-        lambda s, scope, subj: s.set_clearances(scope, [subj]),
+        lambda s, scope, subj: s.set_clearances(scope, [subj], ticket=_TICKET),
         lambda s, scope: sorted(s.get_clearances(scope)),
     ),
     "explicit_markings": (
         _seed_markings,
-        lambda s, scope, subj: s.set_explicit_markings(scope, [subj]),
+        lambda s, scope, subj: s.set_explicit_markings(scope, [subj], ticket=_TICKET),
         lambda s, scope: sorted(s.get_explicit_markings(scope)),
     ),
 }
@@ -158,7 +161,7 @@ def test_concurrent_recomputes_of_effective_markings_neither_crash_nor_drop(stor
     of the same (dataset, marking, inherited=1) rows races the other's."""
     store.upsert_dataset("ds_rc", "")
     store.create_marking("secret")
-    store.set_explicit_markings("ds_rc", ["secret"])
+    store.set_explicit_markings("ds_rc", ["secret"], ticket=_TICKET)
     store.recompute_all_markings()  # baseline: effective == {secret}
     anomalies = []
     n_rounds = rounds(20)
@@ -243,14 +246,14 @@ def test_a_policy_swap_is_never_seen_torn(store):
     exactly or policy B exactly — never None, never a hybrid. The policy is a
     single-row JSON upsert (db.py:2739), so a blob cannot tear; this test
     exists because that claim has to be *observed*, not deduced."""
-    store.set_dataset_policy("pol_ds", _POLICY_A)
+    store.set_dataset_policy("pol_ds", _POLICY_A, ticket=_TICKET)
     iters = max(200, rounds(200))
     violations = []
     done = threading.Event()
 
     def writer():
         for i in range(iters):
-            store.set_dataset_policy("pol_ds", _POLICY_B if i % 2 else _POLICY_A)
+            store.set_dataset_policy("pol_ds", _POLICY_B if i % 2 else _POLICY_A, ticket=_TICKET)
         done.set()
 
     t = threading.Thread(target=writer, name="policy-writer", daemon=True)
@@ -298,7 +301,7 @@ def test_a_reader_never_observes_a_half_replaced_grant_list(store):
     n_rounds = rounds(20)
     for r in range(n_rounds):
         scope = f"torn_{r}"
-        store.set_grants_for_dataset(scope, [_grant(s) for s in sorted(blocks["seed"])])
+        store.set_grants_for_dataset(scope, [_grant(s) for s in sorted(blocks["seed"])], ticket=_TICKET)
         stop = threading.Event()
 
         def reader():
@@ -322,7 +325,7 @@ def test_a_reader_never_observes_a_half_replaced_grant_list(store):
             2,
             lambda i: store.set_grants_for_dataset(
                 scope, [_grant(s) for s in sorted(blocks[writers[i]])]
-            ),
+            , ticket=_TICKET),
         )
         stop.set()
         rt.join(90)

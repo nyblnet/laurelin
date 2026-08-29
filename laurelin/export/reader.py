@@ -147,6 +147,22 @@ _PRISTINE_TABLES = (
 _IMPORT_STATE_FILE = ".laurelin-import.json"
 PIPELINES_UNACKNOWLEDGED = "pipelines_unacknowledged"
 
+# The governance-*rule* tables that actually land on import (the bindings —
+# clearances, group_members, users — are QUARANTINED above and never widen).
+# A grant of ``everyone can_view can_edit``, a removed row policy or a stripped
+# marking rides in exactly one of these, and the raw-SQL importer writes them
+# verbatim, below the ticketed store methods (by design). They map one-to-one
+# to the change kinds the approval gate enumerates, so they are the tables the
+# import path must refuse to apply while second-approver mode is armed.
+_IMPORT_GOVERNANCE_TABLES = (
+    "dataset_grants", "ontology_grants", "dataset_policies", "dataset_markings",
+)
+
+
+def _import_governance_tables(tables: dict) -> list[str]:
+    """Which governance-rule tables the archive would write, if any."""
+    return [t for t in _IMPORT_GOVERNANCE_TABLES if tables.get(t)]
+
 
 class ImportOptions(BaseModel):
     dry_run: bool = False
@@ -1003,6 +1019,32 @@ def import_workspace(
                 )
             return sealed
 
+        # Second-approver mode is armed: the digest ceremony is a ONE-party
+        # confirmation (the same admin reads the report and quotes its hash), so
+        # letting a governance-bearing import through here would walk straight
+        # past the queue that every REST/MCP/SCIM governance write obeys — the
+        # "guard on one path, absent on the next" wound. The raw-SQL importer
+        # cannot decompose the archive into per-change tickets, so it fails
+        # closed: a governance-rule-bearing import is refused until review is
+        # off (disabling it is itself a queued loosening — approvals.py), or the
+        # archive is stripped to data + inert config. Verified against finding:
+        # importing an ``everyone can_view can_edit`` grant used to auto-apply
+        # with an auto-approved record and zero pending proposals.
+        settings = store.get_setting("approvals") or {}
+        if settings.get("require_second_approver"):
+            gov = _import_governance_tables(tables)
+            if gov:
+                raise ImportRefused(
+                    "Second-approver mode is enabled, so a workspace import that "
+                    "carries governance rules cannot apply on one admin's digest "
+                    f"confirmation alone (archive writes: {', '.join(gov)}). The "
+                    "import path writes governance below the approval gate by "
+                    "design and cannot split the archive into reviewable "
+                    "proposals, so it refuses rather than bypass the queue. "
+                    "Import data and inert config, or disable second-approver "
+                    "mode first (that change itself queues for a second admin)."
+                )
+
         conn = store.backend.connect()
         report.rows_imported = _write_tables(conn, tables, resolution, data_states)
         report.rows_quarantined = {
@@ -1052,7 +1094,27 @@ def import_workspace(
             },
             actor=options.actor,
         )
-        return report.sealed()
+        # The import's superadmin gate + dry-run report + report_sha256 confirm
+        # digest IS its approval ceremony; the auto-approved record below files
+        # it in the proposals inbox alongside route-driven changes, so the
+        # "guard on one path, absent on the next" objection is answered in the
+        # record itself. The raw-SQL writes above bypass the ticketed store
+        # methods BY DESIGN (see the module docstring); this record is how
+        # that path stays visible to review.
+        from laurelin.core.approvals import file_record
+        from laurelin.core.models import utcnow_iso
+
+        sealed_final = report.sealed()
+        file_record(
+            store, kind="import", target=manifest.origin.origin_id,
+            payload={"report_sha256": sealed_final.report_sha256,
+                     "rows": sum(report.rows_imported.values())},
+            proposer=options.actor, ticket_kind="import_confirmed",
+            decided_by=options.actor, classification="loosening",
+            rationale="workspace import (digest-confirmed ceremony)",
+            applied_at=utcnow_iso(),
+        )
+        return sealed_final
     except BaseException:
         if conn is not None:
             conn.rollback()

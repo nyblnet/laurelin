@@ -148,8 +148,12 @@ TABLE_POLICY: dict[str, TableSpec] = {
     "datasets": TableSpec(
         _PORTABLE,
         "The catalog. source_json is secret-stripped per key, not omitted "
-        "wholesale — dropping it would destroy the registration itself.",
-        columns=("name", "description", "created_at", "kind", "source_json"),
+        "wholesale — dropping it would destroy the registration itself. "
+        "expected_fresh_seconds is the health-freshness declaration (task "
+        "#74): authored governance state, an integer, carried verbatim — an "
+        "archive from before the column existed imports as NULL (undeclared).",
+        columns=("name", "description", "created_at", "kind", "source_json",
+                 "expected_fresh_seconds"),
         secret_columns=("source_json",),
         scan_columns=("source_json",),
         conflict_key=("name",),
@@ -460,6 +464,67 @@ TABLE_POLICY: dict[str, TableSpec] = {
         "them. Carrying the generation would let an imported counter mask a "
         "destination's own in-flight recompute.",
         drop_columns=("kind", "scope", "generation"),
+    ),
+    # -- data health + alerting (task #74) -----------------------------------
+    "health_state": TableSpec(
+        _DERIVED,
+        "Alert dedup state: the previous HealthStatus per dataset, diffed "
+        "against a fresh derivation every scheduler tick. Recomputable by "
+        "definition — health is a pure function of builds/versions/schedules/"
+        "sources — and wrong if copied: an imported 'failing' would suppress "
+        "the destination's own first transition alert for that dataset.",
+        drop_columns=("dataset", "status", "since"),
+    ),
+    "health_events": TableSpec(
+        _EPHEMERAL,
+        "The in-app alert feed: transition history bound to the source "
+        "workspace's runtime, like builds (whose history also stays behind). "
+        "The durable trail an operator would miss is the audit log, which "
+        "already travels.",
+        drop_columns=("seq", "dataset", "event", "status", "at"),
+    ),
+    "alert_webhooks": TableSpec(
+        _EPHEMERAL,
+        "url IS the credential — a Slack-style webhook carries its secret in "
+        "the path, the case redaction.py documents the DSN-shape rule cannot "
+        "locate. The API already treats it as write-only (reads come back "
+        "WITHHELD); a file that leaves the building gets the stricter posture "
+        "and the whole row stays behind: a webhook with no URL is a husk, and "
+        "an outbound alert destination is exactly the thing a destination "
+        "operator must opt into again, deliberately.",
+        drop_columns=(
+            "name", "url", "datasets_json", "events_json", "enabled",
+            "created_at", "created_by", "last_delivery_at",
+            "last_delivery_status", "last_delivery_failure_json",
+        ),
+        secret_columns=("url",),
+    ),
+    # -- governance change approval (task #74) --------------------------------
+    "proposals": TableSpec(
+        _EPHEMERAL,
+        "Decision history bound to the source workspace's principals and to "
+        "the exact state the comparator classified against — an approve at "
+        "the destination would re-run against state the diff never saw, which "
+        "is the staleness trap the approve path exists to refuse. "
+        "payload_json also embeds governed values (row-rule literals), which "
+        "the export posture would have to withhold whole, leaving a record "
+        "that certifies nothing. The audited outcomes travel in audit_log.",
+        drop_columns=(
+            "id", "kind", "target", "payload_json", "diff_json", "rationale",
+            "proposer", "proposer_id", "created_at", "state", "classification",
+            "ticket_kind", "decided_by", "decided_at", "applied_at",
+            "decision_reason",
+        ),
+    ),
+    "workspace_settings": TableSpec(
+        _EPHEMERAL,
+        "Workspace posture (require_second_approver). Not carried: enabling "
+        "second-approver mode refuses unless the workspace has >= 2 active "
+        "admins, and an import binds no principals — so a carried 'true' "
+        "could land in a one-admin destination that the enable route would "
+        "have refused, deadlocking every loosening. The destination's admins "
+        "opt in through the route that checks.",
+        drop_columns=("key", "value_json"),
     ),
 }
 

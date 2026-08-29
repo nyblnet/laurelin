@@ -23,6 +23,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from laurelin.api.context import identity_auth, identity_store
+from laurelin.core.approvals import file_record, scim_ticket
 from laurelin.core.models import Role, User
 
 scim_router = APIRouter(prefix="/scim/v2", tags=["scim"])
@@ -287,7 +288,20 @@ async def create_group(request: Request):
         store.create_group(name, utcnow_iso())
     members = _resolve_member_usernames(request, _members_from_scim(body))
     if members:
-        store.set_group_members(name, members)
+        # Configuring LAURELIN_SCIM_TOKEN is the admin's standing authorization
+        # for IdP-driven membership: the write auto-approves (queueing would
+        # break push semantics) and the record below makes it visible in the
+        # proposals inbox after the fact. The composition risk — a push can
+        # widen access through an existing group grant with no queued approval
+        # — is accepted knowingly and documented in laurelin/core/approvals.py.
+        store.set_group_members(name, members, ticket=scim_ticket())
+        file_record(
+            store, kind="group_members", target=name,
+            payload={"members": members}, proposer="scim",
+            ticket_kind="scim_sync", decided_by="scim",
+            classification="loosening",
+            rationale="IdP group push (SCIM POST /Groups)",
+        )
     group = next(g for g in store.list_groups() if g["name"] == name)
     return _scim_json(_group_to_scim(group, request), status=201)
 
@@ -329,7 +343,14 @@ async def patch_group(name: str, request: Request):
                 current = set(values)
         return current
 
-    store.update_group_members(name, merge)
+    members = store.update_group_members(name, merge, ticket=scim_ticket())
+    file_record(
+        store, kind="group_members", target=name,
+        payload={"members": members}, proposer="scim",
+        ticket_kind="scim_sync", decided_by="scim",
+        classification="loosening",
+        rationale="IdP group push (SCIM PATCH /Groups)",
+    )
     group = next(g for g in store.list_groups() if g["name"] == name)
     return _scim_json(_group_to_scim(group, request))
 
@@ -341,5 +362,11 @@ def delete_group(name: str, request: Request):
     store = identity_store(request)
     if not store.group_exists(name.lower()):
         return _scim_error(404, f"Group {name} not found")
-    store.delete_group(name.lower())
+    store.delete_group(name.lower(), ticket=scim_ticket())
+    file_record(
+        store, kind="group_delete", target=name.lower(), payload={},
+        proposer="scim", ticket_kind="scim_sync", decided_by="scim",
+        classification="tightening",
+        rationale="IdP group delete (SCIM DELETE /Groups)",
+    )
     return Response(status_code=204)

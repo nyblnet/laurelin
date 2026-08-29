@@ -149,6 +149,10 @@ class DatasetInfo(Governed):
     #              ClickHouse it is a *remote* engine with write privileges to
     #              lose — see laurelin/core/starrocks.py.
     kind: Annotated[str, Audience.PRESENTATION] = "managed"
+    # Declared freshness expectation, in seconds; None = undeclared. Health
+    # reads it (task #74): a dataset whose newest version is older than this is
+    # `stale`. PRESENTATION — it is a promise made *to* the reader.
+    expected_fresh_seconds: Annotated[Optional[int], Audience.PRESENTATION] = None
     # ADMIN-authored, inside an editor-authored record. The three routes that
     # write it — PUT /datasets/{name}/federated, /clickhouse, /starrocks — are
     # all AdminDep, and `set_dataset_source` is reachable from nowhere else.
@@ -166,7 +170,6 @@ class DatasetInfo(Governed):
     source_descriptor: Annotated[dict[str, Any], Audience.PRESENTATION] = Field(
         default_factory=dict
     )
-
     @model_validator(mode="after")
     def _derive_source_descriptor(self) -> "DatasetInfo":
         """Keep the descriptor in step with the source, wherever it is built.
@@ -1031,3 +1034,152 @@ class ObjectTypePermission(BaseModel):
 
     can_view: bool
     can_edit: bool
+
+
+# ---------------------------------------------------------------------------
+# Data health (task #74) — a deterministic read over builds, versions,
+# expectations, schedules and sources. Nothing here is a new source of truth.
+# ---------------------------------------------------------------------------
+
+class HealthStatus(str, Enum):
+    healthy = "healthy"
+    stale = "stale"        # a declared freshness window was missed
+    failing = "failing"    # latest build/expectation/sync failed
+    overdue = "overdue"    # a schedule that should have fired has not
+    unknown = "unknown"    # nothing declared, nothing scheduled, nothing built
+
+
+class ExpectationSummary(Governed):
+    """One expectation result, at the granularity a viewer may see.
+
+    PRESENTATION-safe on purpose: a viewer who can view the dataset already
+    sees its column names through the query path. The editor-authored
+    ``message`` prose and the ``measured`` value (a number about possibly
+    masked column contents) deliberately do NOT appear here — they ride in
+    ``DatasetHealth.detail``, OPERATIONAL, editor-and-above.
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.editor
+
+    name: Annotated[str, Audience.PRESENTATION]
+    column: Annotated[str, Audience.PRESENTATION] = ""
+    severity: Annotated[str, Audience.PRESENTATION] = "error"
+    passed: Annotated[bool, Audience.PRESENTATION] = False
+
+
+class DatasetHealth(Governed):
+    """The health of one dataset, derived at read time from existing records.
+
+    Every PRESENTATION field is a timestamp, a status, a code or a name — no
+    counts, no prose. That is deliberate: this exact record, serialized at
+    ``Role.viewer``, IS the outbound alert payload, and anything outbound is
+    the export threat model. Schedule and source *names* live in ``detail``
+    (OPERATIONAL): a viewer learns ``schedule_overdue: true``, not which
+    schedule.
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.editor
+
+    dataset: Annotated[str, Audience.PRESENTATION]
+    status: Annotated[HealthStatus, Audience.PRESENTATION] = HealthStatus.unknown
+    last_success_at: Annotated[Optional[str], Audience.PRESENTATION] = None
+    last_build_status: Annotated[Optional[BuildStatus], Audience.PRESENTATION] = None
+    last_build_id: Annotated[Optional[str], Audience.PRESENTATION] = None
+    # Failure self-projects to {code, subject} below editor (serialize.dump_as
+    # narrows nested models).
+    last_failure: Annotated[Optional[Failure], Audience.PRESENTATION] = None
+    failing_expectations: Annotated[list[ExpectationSummary], Audience.PRESENTATION] = (
+        Field(default_factory=list)
+    )
+    # The declaration, in seconds. Tightening-shaped: it can only make health
+    # redder, so it is editor-settable without approval.
+    expected_fresh_within: Annotated[Optional[int], Audience.PRESENTATION] = None
+    schedule_overdue: Annotated[bool, Audience.PRESENTATION] = False
+    last_scheduled_run_at: Annotated[Optional[str], Audience.PRESENTATION] = None
+    sync_failing: Annotated[bool, Audience.PRESENTATION] = False
+    # OPERATIONAL by omission (editor+): schedule_name, source_name, expectation
+    # message/measured — editor-authored text and operator detail.
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class HealthEvent(Governed):
+    """A recorded health-status transition (the in-app alert feed)."""
+
+    laurelin_author_role: ClassVar[Role] = Role.editor
+
+    seq: Annotated[int, Audience.PRESENTATION] = 0
+    dataset: Annotated[str, Audience.PRESENTATION]
+    event: Annotated[str, Audience.PRESENTATION]  # dataset_failing | ... | dataset_healthy
+    status: Annotated[HealthStatus, Audience.PRESENTATION] = HealthStatus.unknown
+    at: Annotated[str, Audience.PRESENTATION] = Field(default_factory=utcnow_iso)
+
+
+class AlertWebhookInfo(Governed):
+    """An outbound alert destination. ADMIN-authored; the URL is a credential.
+
+    ``url`` is OPERATIONAL *and* write-only: the read routes replace it with
+    the redaction marker (a Slack-style URL carries its secret in the path,
+    which the DSN-shape rule cannot locate — redaction.py documents exactly
+    this case, and the rule there is withhold the whole value).
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.admin
+
+    name: Annotated[str, Audience.PRESENTATION]
+    url: str = ""
+    # [] = all datasets. Alerts for a dataset are only as visible as the
+    # viewer-level serialization of its DatasetHealth, so the filter is scoping,
+    # not disclosure control.
+    datasets: Annotated[list[str], Audience.PRESENTATION] = Field(default_factory=list)
+    # Which transitions to deliver; [] = all of them.
+    events: Annotated[list[str], Audience.PRESENTATION] = Field(default_factory=list)
+    enabled: Annotated[bool, Audience.PRESENTATION] = False
+    created_at: Annotated[str, Audience.PRESENTATION] = Field(default_factory=utcnow_iso)
+    created_by: Annotated[str, Audience.PRESENTATION] = ""
+    last_delivery_at: Annotated[Optional[str], Audience.PRESENTATION] = None
+    last_delivery_status: Annotated[Optional[int], Audience.PRESENTATION] = None
+    # Laurelin-authored on timeout/refusal. The delivery *response body* is
+    # never stored — it is attacker-controlled text aimed at the audit trail.
+    last_delivery_failure: Annotated[Optional[Failure], Audience.PRESENTATION] = None
+
+
+# ---------------------------------------------------------------------------
+# Governance change approval (task #74)
+# ---------------------------------------------------------------------------
+
+class ProposalState(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    withdrawn = "withdrawn"
+    superseded = "superseded"
+
+
+class ProposalInfo(Governed):
+    """A proposed governance change, pending or decided.
+
+    **Every field is OPERATIONAL, and the author role is admin — nothing here
+    serializes below admin.** ``payload`` embeds row-rule values (governed data
+    values), subject names and column names; ``rationale`` is admin-authored
+    prose. The fail-closed audience default is doing exactly its job: no
+    annotation, no disclosure.
+    """
+
+    laurelin_author_role: ClassVar[Role] = Role.admin
+
+    id: str
+    kind: str            # dataset_grants | ontology_grants | dataset_policy | ...
+    target: str
+    payload: dict[str, Any] = Field(default_factory=dict)   # proposed new state, verbatim
+    diff: dict[str, Any] = Field(default_factory=dict)      # comparator output
+    rationale: str = ""
+    proposer: str = ""
+    proposer_id: str = ""
+    created_at: str = Field(default_factory=utcnow_iso)
+    state: ProposalState = ProposalState.pending
+    classification: str = ""     # "loosening" | "tightening" as computed at file time
+    ticket_kind: str = ""        # approved | self_approved | tightening | local | scim_sync | import_confirmed
+    decided_by: str = ""
+    decided_at: Optional[str] = None
+    applied_at: Optional[str] = None
+    decision_reason: str = ""

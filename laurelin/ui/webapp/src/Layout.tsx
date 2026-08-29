@@ -35,6 +35,10 @@ const NAV: { to: string; label: string; needs?: Role }[] = [
   { to: "/explore", label: "Explore", needs: "editor" },
   { to: "/pipeline", label: "Pipeline" },
   { to: "/schedules", label: "Schedules", needs: "editor" },
+  // Viewer-visible on purpose: the rollup is filtered per caller (the
+  // GET /datasets precedent), so a viewer sees the health of exactly the
+  // datasets they can read — statuses, codes and timestamps, nothing authored.
+  { to: "/health", label: "Health" },
   // Flows sits ABOVE Transforms: the no-code builder is the front door and
   // the Python editor is the advanced surface, not the other way round.
   // Editor-gated for the same reason /transforms is — a flow authors a
