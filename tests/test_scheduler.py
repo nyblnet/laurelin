@@ -319,3 +319,18 @@ def test_a_schedule_naming_a_nonexistent_referent_warns_at_save_instead_of_faili
         "trigger": "upstream", "upstream_dataset": "raw",
         "action": "build", "targets": ["clean"]})
     assert r.status_code == 200 and r.json()["warnings"] == []
+
+
+def test_the_unknown_target_warning_speaks_the_settled_vocabulary(client):
+    """The hint renders verbatim in the UI's warning box, and it used to mix
+    three retired nouns — "transform", "flow", "pipeline" — for the same
+    concept in one sentence ("no transform produces 'x' … until a flow or
+    pipeline with that output exists"). One word per concept: pipeline."""
+    c, _, _ = client
+    r = c.put("/api/v1/schedules/typo", json={
+        "trigger": "cron", "cron": "0 2 * * *",
+        "action": "build", "targets": ["tidy_flightz"]})
+    assert r.status_code == 200
+    hint = next(w["hint"] for w in r.json()["warnings"] if w["field"] == "target")
+    assert "no pipeline produces 'tidy_flightz'" in hint
+    assert "transform" not in hint and "flow" not in hint

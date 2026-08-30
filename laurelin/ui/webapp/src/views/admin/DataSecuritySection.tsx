@@ -571,7 +571,7 @@ export function DataSecuritySection() {
       <h2 style={{ fontSize: 15, marginBottom: 12 }}>Row &amp; column security</h2>
       <div className="subtitle" style={{ marginTop: -6, marginBottom: 12 }}>
         Row-level security and column masking apply to the dataset's rows, the
-        SQL workbench, and its ontology objects. Admins are exempt.
+        SQL page, and its ontology objects. Admins are exempt.
       </div>
 
       {policiesQuery.isLoading ? (

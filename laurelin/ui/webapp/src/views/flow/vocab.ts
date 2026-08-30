@@ -46,7 +46,7 @@ export const KINDS: Record<FlowNodeKind, KindMeta> = {
   source: {
     label: "Start from a dataset",
     action: "Start from a dataset",
-    blurb: "Every flow begins with data you can already read.",
+    blurb: "Every pipeline begins with data you can already read.",
   },
   filter: {
     label: "Filter rows",

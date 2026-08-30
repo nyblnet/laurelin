@@ -1,7 +1,7 @@
-// Analyses: the multi-cell governed notebook — Code Workbook parity, no code.
+// Analyses: the multi-cell governed analysis — Code Workbook parity, no code.
 //
 // An analyst adds cells top to bottom. Each cell is EITHER a SQL query (the
-// workbench's textarea, inline) OR a point-and-click shaping step (Explore's
+// SQL page's textarea, inline) OR a point-and-click shaping step (Explore's
 // card stack), and a shaping cell's SOURCE picker offers datasets *and*
 // earlier shaping cells — that one picker is the entire chaining UX. Each
 // cell shows its result table and, optionally, a chart.
@@ -42,6 +42,7 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  Note,
   PageHeader,
   Spinner,
   Withheld,
@@ -126,8 +127,18 @@ function AnalysisList() {
     <div>
       <PageHeader
         title="Analyses"
-        subtitle="Multi-step notebooks over governed data — each cell queries or shapes, later cells build on earlier ones, and every result respects the reader's data access."
+        subtitle="Multi-step analyses over governed data — each cell queries or shapes, later cells build on earlier ones, and every result respects the reader's data access."
       />
+      {/* The other half of the sentence on Explore's header: the two screens
+          share the click-to-shape idiom, so each one says which job it is for.
+          Editor-only — the choice between authoring doors only exists for
+          someone who can author. */}
+      {auth.can("editor") && (
+        <p className="hint" style={{ marginTop: -8, marginBottom: 12 }}>
+          An analysis is a <strong>multi-step document</strong>. For one chart on
+          a dashboard, shape it in <Link to="/explore">Explore</Link> instead.
+        </p>
+      )}
       {auth.can("editor") && (
         <div className="card" style={{ marginBottom: 18 }}>
           <div className="toolbar" style={{ marginBottom: 0, gap: 12, flexWrap: "wrap" }}>
@@ -1061,22 +1072,22 @@ function EditorCell({
             <div className="hint">Waiting for Cell above to preview — its columns feed these pickers.</div>
           )}
           {issues.length > 0 && draft.shaping.source && (
-            <div className="an-note">{issues[0]}</div>
+            <Note style={{ marginTop: 8 }}>{issues[0]}</Note>
           )}
           {previewQ.isError && (
-            <div className="an-note an-note-bad">
+            <Note tone="bad" style={{ marginTop: 8 }}>
               {previewQ.error instanceof ApiError
                 ? explainCellRefusal(previewQ.error.detail, refusalCtx)
                 : String(previewQ.error)}
-            </div>
+            </Note>
           )}
         </div>
       ) : (
-        <div className="an-note">
+        <Note style={{ marginTop: 8 }}>
           This cell's shaping has a form these cards can't edit (it was likely
           written through the API). Its title, chart and layout can still be
           changed; the shaping itself is preserved as saved.
-        </div>
+        </Note>
       )}
 
       {result && (
@@ -1340,7 +1351,7 @@ function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => vo
           // A 400 here is a first-party refusal already written for the
           // analyst ("Cell 2's Summarise card refers to…") — the HTTP status
           // is not part of the sentence, so no "Error 400:" prefix.
-          <div className="an-note an-note-bad">{error.detail}</div>
+          <Note tone="bad" style={{ marginTop: 8 }}>{error.detail}</Note>
         ) : (
           <ErrorBox error={error} />
         ))}
@@ -1389,14 +1400,12 @@ function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => vo
 }
 
 const ANALYSES_STYLES = `
-.an-card { border: 1px solid var(--border, #2a2f3a55); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+.an-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
 .an-card-title { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.65; margin-bottom: 6px; }
 .an-row { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; align-items: center; }
 .an-row select, .an-row input { min-width: 0; }
-.an-add { background: none; border: 1px dashed var(--border, #2a2f3a88); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; opacity: 0.8; }
+.an-add { background: none; border: 1px dashed var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; opacity: 0.8; }
 .an-add:hover { opacity: 1; }
 .an-x { background: none; border: none; cursor: pointer; font-size: 15px; opacity: 0.6; padding: 0 4px; }
 .an-x:hover { opacity: 1; }
-.an-note { font-size: 12.5px; padding: 8px 10px; border-radius: 6px; background: rgba(140, 150, 170, 0.12); margin-top: 8px; }
-.an-note-bad { background: rgba(220, 90, 90, 0.12); }
 `;

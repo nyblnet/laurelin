@@ -10,6 +10,57 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Point-of-decision guidance: the paths a new user actually walks
+
+An adversarial novice walkthrough of the consolidated UI found that every
+journey's first success stranded the user. Fixed, in severity order, each with
+a regression test (`tests/test_ui_guidance.py` + a react-dom/server harness
+rendering the real components per role):
+
+- **The dataset detail page is no longer a dead end.** Right where an import
+  lands you, an "Open in:" row now offers the next steps, filtered by the same
+  role rules as the nav: **Explore** (`/explore?dataset=…`, editor), **SQL**
+  (`/workbench?dataset=…`, seeded with a starter query, every role), **New
+  pipeline from this dataset** (`/pipelines?from=…`, opens the naming dialog
+  and pre-picks the source, editor), **Schedule builds** (editor), and a
+  **Dataset access** link for admins only — editors deliberately get no
+  permissions door. Hidden while a dataset's reads refuse (needs-credentials).
+- **The Dashboards empty state stops pointing at a door that cannot reach a
+  dashboard.** It recommended "build one by clicking in Analyses" — and
+  Analyses has no dashboard affordance at all. It now points at Explore and
+  SQL, the two surfaces that can actually put a panel on a board.
+- **Explore and Analyses each say which job the other is for** (one chart for
+  a dashboard vs a multi-step document), at the moment of choosing instead of
+  after building the same chart twice. The Milestone B merge remains the real
+  fix; this removes the coin flip until then.
+- **The "Add panel" modal offers the no-code path** beside the raw-SQL wall
+  for new panels, linking to Explore with the dashboard prefilled. Edits keep
+  SQL-only (Explore cannot reopen a raw-SQL panel).
+- **Schedule build targets are picked, not typed from memory**: known pipeline
+  outputs render as checkboxes; the free-text box stays for a target authored
+  before its pipeline (the save-then-warn banner covers it). The warning
+  itself now speaks one word per concept — "no pipeline produces 'x'" instead
+  of mixing "transform", "flow" and "pipeline" in one sentence.
+- **Explore's save no longer fails with "The query is not finished yet."**
+  while a finished-looking (stale) chart is on screen: the Save button
+  disables with the actual shaping issue as its tooltip, and the mutation's
+  backstop error names the same issue.
+- **A dashboard states its zero-step sharing** ("Visible to everyone in this
+  workspace, computed with each viewer's own data access") — an indicator
+  line only, no sharing controls added.
+- **Focus-on-navigate now reaches headings that render after data loads**:
+  the effect parks focus on the main region and hands it to the `<h1>` when
+  it appears (MutationObserver, never stealing focus the user moved
+  themselves). Verified with a CDP probe on a dashboard detail page.
+- Retired-vocabulary stragglers: the visual builder's step copy said "Every
+  flow begins…" (`views/flow/vocab.ts`, missed by the rename sweep); the
+  datasets empty state now also names the in-repo tutorial path so the guided
+  path survives an offline install (serving docs in-product is still open).
+
+Known and deliberately unchanged: task #75 (viewer enumerates hidden dataset
+names via /builds//lineage//transforms) is still open — re-confirmed present,
+not widened, and still a sequencing constraint on any new lineage surface.
+
 ### Data health + governance change-approval (two Foundry gaps)
 
 Two governance surfaces Foundry has and Laurelin lacked, built on the records

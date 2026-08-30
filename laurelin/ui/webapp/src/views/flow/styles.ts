@@ -31,9 +31,9 @@ export const FLOW_STYLES = `
   border-radius: 8px; border: 1px solid var(--border); background: var(--bg-1);
 }
 .fx-note-ok { color: var(--text-dim); }
-.fx-note-bad { color: var(--red); background: rgba(224,102,95,0.08); border-color: #6b3330; }
-.fx-note-warn { color: var(--gold); background: rgba(217,178,90,0.07); border-color: var(--gold-dim); }
-.fx-note-gov { color: var(--text); background: rgba(91,155,213,0.08); border-color: #3a5b7d; }
+.fx-note-bad { color: var(--red); background: var(--red-tint-bg); border-color: var(--red-tint-border); }
+.fx-note-warn { color: var(--gold); background: var(--gold-tint-bg); border-color: var(--gold-dim); }
+.fx-note-gov { color: var(--text); background: var(--blue-tint-bg); border-color: var(--blue-tint-border); }
 
 /* -------------------------------------------------------------- list page */
 .fx-onboard {
@@ -176,7 +176,7 @@ export const FLOW_STYLES = `
 .fx-listitem { display: inline-flex; align-items: center; gap: 2px; }
 .fx-group {
   border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 9px; background: rgba(255,255,255,0.015);
+  padding: 8px 9px; background: var(--surface-tint);
 }
 .fx-group.depth-1, .fx-group.depth-2, .fx-group.depth-3 { margin-top: 5px; }
 .fx-group-head { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
@@ -188,7 +188,7 @@ export const FLOW_STYLES = `
 .fx-ifrow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .fx-calc {
   border: 1px solid var(--border); border-radius: 7px; padding: 4px 6px;
-  background: rgba(255,255,255,0.015);
+  background: var(--surface-tint);
 }
 
 /* -------------------------------------------------------------- checks */

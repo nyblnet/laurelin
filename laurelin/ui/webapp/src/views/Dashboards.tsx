@@ -148,9 +148,19 @@ function DashboardList() {
       ) : dashQ.data!.length === 0 ? (
         <EmptyState>
           No dashboards yet
-          {auth.can("editor")
-            ? " — create one above, or save a query from the SQL workbench."
-            : "."}
+          {auth.can("editor") ? (
+            <>
+              {/* Both doors here can actually put a panel on a dashboard.
+                  This used to point at Analyses, which cannot — a user who
+                  obeyed the hint built a chart there and then stalled with no
+                  way to finish the task. */}
+              {" "}— create one above, shape a chart by clicking in{" "}
+              <Link to="/explore">Explore</Link> and save it here, or send a query
+              from <Link to="/workbench">SQL</Link>.
+            </>
+          ) : (
+            "."
+          )}
         </EmptyState>
       ) : (
         <DataTable
@@ -409,10 +419,13 @@ function ObjectSourceFields({
 
 function PanelEditor({
   initial,
+  dashboard,
   onSave,
   onCancel,
 }: {
   initial: DashboardPanel;
+  /** The board the panel lands on, so the no-code pointer prefills it. */
+  dashboard: string;
   onSave: (p: DashboardPanel) => void;
   onCancel: () => void;
 }) {
@@ -491,6 +504,19 @@ function PanelEditor({
 
         {!p.object_type ? (
           <div className="field">
+            {/* The no-code path, offered beside the SQL wall — only for a NEW
+                panel: Explore cannot reopen a raw-SQL panel, so pointing an
+                edit there would dead-end. The link carries the dashboard name
+                so Explore's save dialog is already aimed back here. */}
+            {!(initial.sql || initial.object_type) && (
+              <p className="hint" style={{ marginTop: 0 }}>
+                Prefer clicking to writing SQL? Build this panel in{" "}
+                <Link to={`/explore?dashboard=${encodeURIComponent(dashboard)}`}>
+                  Explore
+                </Link>{" "}
+                — pick a dataset, shape it, and save it to this dashboard.
+              </p>
+            )}
             <label>SQL</label>
             <textarea
               className="mono"
@@ -663,6 +689,14 @@ function DashboardPage() {
           ) : undefined
         }
       />
+      {/* Zero-step sharing, stated instead of implied: without this line a
+          new user cannot tell whether the dashboard they just made is private
+          or workspace-visible without asking someone. An indicator only — no
+          sharing controls, no friction. */}
+      <p className="hint" style={{ marginTop: -6, marginBottom: 14 }}>
+        Visible to everyone in this workspace, computed with each viewer's own
+        data access.
+      </p>
       {savePanel.isError && <ErrorBox error={savePanel.error} />}
       {deletePanel.isError && <ErrorBox error={deletePanel.error} />}
       <WarningBox warnings={warnings} />
@@ -673,7 +707,7 @@ function DashboardPage() {
           {canEdit ? (
             <>
               {" "}— add one, shape a chart in <Link to="/explore">Explore</Link>, or send a
-              query here from the SQL workbench.
+              query here from the SQL page.
             </>
           ) : (
             "."
@@ -763,6 +797,7 @@ function DashboardPage() {
       {editing && (
         <PanelEditor
           initial={editing}
+          dashboard={dash.name}
           onSave={upsertPanel}
           onCancel={() => setEditing(null)}
         />

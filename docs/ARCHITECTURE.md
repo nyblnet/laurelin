@@ -403,7 +403,7 @@ registered into DuckDB — so validating a streaming transform's output doesn't
 materialize what streaming just avoided materializing.
 
 Results are stored per build task (`build_tasks.expectations_json`), passes
-included, and rendered on the pipeline page.
+included, and rendered on the Builds page.
 
 #### Flows: transforms without code
 
@@ -589,7 +589,7 @@ visible warning, not a second axis.
 `analyses` table, `AnalysisInfo`/`AnalysisCell` in `core/models.py`, and the
 `/api/v1/analyses` routes. This is Foundry's Code Workbook minus the code: a
 saveable, shareable document of cells, where each cell is EITHER a governed
-SQL query (the workbench, inline) OR a shaping step (Explore's card stack),
+SQL query (the SQL page, inline) OR a shaping step (Explore's card stack),
 each renders a result table and an optional chart, and a later shaping cell
 may take an earlier shaping cell's output as its source.
 
@@ -1037,7 +1037,7 @@ after every build and on any marking change) recomputes each dataset's effective
 markings as its explicit markings ∪ the union of its lineage upstreams' effective
 markings — so a derived dataset inherits its inputs' classifications and
 classified data can't be laundered through a transform. Enforced everywhere via
-`dataset_permission` (row API, SQL workbench, ontology objects). Admin API:
+`dataset_permission` (row API, SQL page, ontology objects). Admin API:
 `/markings`, `/dataset-markings`, `/datasets/{name}/markings`,
 `/users/{username}/clearances`.
 
@@ -1479,7 +1479,7 @@ trusted pipeline code); per-dataset build enforcement is future work.
 Admins are exempt. Enforcement is a single choke point,
 `PermissionService.apply_table_policy(user, dataset, table)`, applied to the
 same in-memory Arrow table by **all three** read paths — the row API (filter
-then page, so counts reflect visible rows), the SQL workbench (each registered
+then page, so counts reflect visible rows), the SQL page (each registered
 dataset is filtered/masked, so aggregates respect RLS), and ontology object
 materialization (objects are rows, so there is no read-around). Policy is
 managed by admins via `/dataset-policies` + `/datasets/{name}/policy`.
@@ -1514,19 +1514,21 @@ origin) through `src/api.ts`.
 until the React shell replaced it at feature parity — see the roadmap's Phase 1.
 `static/` now holds the built bundle and nothing else.)*
 
-Sidebar navigation (`src/Layout.tsx`, `NAV`), role-filtered:
-**Datasets / Dashboards / Explore (editor) / Pipeline / Schedules (editor) /
-Flows (editor) / Transforms (editor) / Apps / Ontology / SQL / Audit**, plus
-**Admin** for admins and **Workspaces** for superadmins. In multi-workspace
-mode a switcher sits above the nav.
+Sidebar navigation (`src/Layout.tsx`, `NAV_GROUPS`), role-filtered and grouped
+by job: **Data** (Datasets, Ontology) / **Analyze** (Dashboards, Analyses,
+Explore (editor), SQL, Apps) / **Build** (Pipelines (editor), with Visual and
+Python tabs) / **Operate** (Builds, Schedules (editor), Health) / **Govern**
+(Audit, Admin for admins, Workspaces for superadmins in multi-workspace mode).
+A group whose every item is role-hidden disappears with its header. In
+multi-workspace mode a switcher sits above the nav.
 
 - Datasets: list w/ latest version + row counts; detail = schema table, version
   history, paged row preview, and the registration panels for federated /
   Iceberg / ClickHouse / StarRocks kinds.
-- Pipeline: lineage graph (layered left-to-right SVG: dataset nodes as rounded
-  rects, transform nodes as pills; simple longest-path layering), transforms
-  list, "Run build" button (POST /builds) + build history w/ per-task status
-  and expectation results.
+- Builds (formerly "Pipeline"; /pipeline redirects): lineage graph (layered
+  left-to-right SVG: dataset nodes as rounded rects, transform nodes as pills;
+  simple longest-path layering), pipelines list, "Build now" button
+  (POST /builds) + build history w/ per-task status and expectation results.
 - Ontology: object types; per type a searchable object table; object detail
   panel with properties, linked objects, action forms (inputs per parameter,
   submit → POST apply, then refresh); object-store health and writeback.

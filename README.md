@@ -59,7 +59,7 @@ or resumable export.
 
 Laurelin maps one-to-one onto the concepts you may know from Foundry:
 
-- **Datasets** — versioned tables stored as Parquet. Every write creates an
+- **Datasets** — versioned data stored as Parquet. Every write creates an
   immutable new version; the full history is kept.
 - **Data sources** — connectors that pull external data into datasets:
   PostgreSQL (streamed in batches), HTTP CSV/Parquet exports, server-side
@@ -70,10 +70,10 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   (Object-store ingestion is verified against MinIO; real AWS S3, GCS HMAC
   interop, and Azure are not yet tested — Azure is rejected pending a test,
   and federation already reads Azure-hosted tables in place.)
-- **Transforms** — Python functions (or SQL) declared with `@transform`,
+- **Pipelines (Python)** — Python functions (or SQL) declared with `@transform`,
   reading input datasets and producing an output dataset. Laurelin resolves the
   DAG, executes builds, and records **lineage** automatically.
-- **Flows** — the same thing, built without code. Pick a dataset, then add
+- **Pipelines (Visual)** — the same thing, built without code. Pick a dataset, then add
   steps: filter rows, combine two datasets, group and summarise, sort. A flow is
   stored as `pipelines/<name>.flow.json` and compiled to SQL in memory, so it is
   a *transform* — same build, same lineage, same permissions, same schedules —
@@ -158,7 +158,7 @@ deployment mode — the same catalog, ACLs, markings, row policies and lineage
 apply across all four.
 
 - **Embedded analytical default — DuckDB, in process, per replica.** Managed
-  Parquet datasets, the SQL workbench, dashboards, transforms and ontology
+  Parquet datasets, the SQL page, dashboards, pipelines and ontology
   pushdown all run here. It is the default, it needs no infrastructure, and for
   medium data it is the only role you ever touch.
 - **Federation over foreign systems — DuckDB attach, and Flight SQL engines.**
@@ -370,7 +370,7 @@ ontology view composes with them — locking a dataset hides its objects.
 **Row-level security & column masking.** Per dataset, admins can restrict which
 *rows* a user sees (a policy column + per-subject allowed values) and *mask*
 columns (redact / null / hash) except for exempt subjects. It's enforced
-uniformly on the row API, the SQL workbench (aggregates respect it), and
+uniformly on the row API, the SQL page (aggregates respect it), and
 ontology objects — admins are exempt. Admin → Row & column security.
 
 **Multiple workspaces.** `laurelin serve --workspace X` hosts a single
@@ -396,12 +396,12 @@ docker compose up --build      # Laurelin + Postgres
 ```
 
 **Transform authoring is code execution.** Writing a pipeline file through the
-UI (the Transforms tab) or API is equivalent to running Python on the server —
+UI (the Pipelines page's Python tab) or API is equivalent to running Python on the server —
 it is `exec`'d on every build. It requires the `editor` role and can be
 disabled with `laurelin serve --lock-pipelines` (or
 `LAURELIN_LOCK_PIPELINES=1`) for untrusted multi-user deployments. The executed
-transform code is not yet sandboxed. Locking Python does **not** lock Flows or
-Explore: those compile to bound, schema-checked SQL and cannot reach `exec`,
+transform code is not yet sandboxed. Locking Python does **not** lock visual
+pipelines or Explore: those compile to bound, schema-checked SQL and cannot reach `exec`,
 so analysts keep a no-code authoring path on a hardened server. Add
 `--lock-flows` (`LAURELIN_LOCK_FLOWS=1`) to disable no-code authoring too.
 

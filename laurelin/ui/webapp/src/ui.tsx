@@ -1,7 +1,7 @@
 // Small shared UI primitives used across views. Keep this dependency-light —
 // views import from here so the look stays consistent.
 
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { ApiError } from "./api";
 import type { AuthoringWarning, Failure, FailureCode, Role } from "./types";
 
@@ -304,6 +304,29 @@ export function WarningBox({ warnings }: { warnings?: AuthoringWarning[] }) {
           <span className="mono">{w.field}</span> — {w.hint}
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * An inline status note on an authoring surface — "saved", "this will not
+ * compile", "no rows matched". One component (backed by `.note` in styles.css)
+ * where Transforms, Explore and Analyses each used to carry a private, slowly
+ * drifting copy. Neutral when no tone is given; `ok` is green, `bad` is a
+ * refusal, `warn` advises, `gov` states a governance consequence.
+ */
+export function Note({
+  tone,
+  children,
+  style,
+}: {
+  tone?: "ok" | "bad" | "warn" | "gov";
+  children: ReactNode;
+  style?: CSSProperties;
+}) {
+  return (
+    <div className={tone ? `note note-${tone}` : "note"} style={style}>
+      {children}
     </div>
   );
 }

@@ -10,7 +10,7 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
-import { Badge, ErrorBox, Spinner, fmtTime } from "../ui";
+import { Badge, EmptyState, ErrorBox, Spinner, fmtTime } from "../ui";
 
 interface Branch {
   branch: string;
@@ -295,7 +295,7 @@ function SnapshotsPanel({ name, compact }: { name: string; compact?: ReactNode }
       {q.isError && <ErrorBox error={q.error} />}
       {q.data &&
         (q.data.length === 0 ? (
-          <p className="faint" style={{ margin: 0 }}>No snapshots yet.</p>
+          <EmptyState>No snapshots yet.</EmptyState>
         ) : (
           <div className="table-wrap">
             <table>

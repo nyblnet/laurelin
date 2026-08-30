@@ -65,7 +65,7 @@ curl -X PUT localhost:8787/api/v1/datasets/customers/permissions \
 The rule that matters: **a dataset with no grants is open to the roles; the
 moment it has one grant, it is closed to everyone not named.** So `teo` — a
 viewer who could read `customers` a second ago — now can't see it at all. It
-vanishes from `GET /datasets`, its rows 403, and in the SQL workbench it
+vanishes from `GET /datasets`, its rows 403, and on the SQL page it
 becomes an unknown table rather than a permission error (no oracle telling you
 what exists).
 
@@ -97,7 +97,7 @@ exist. Two properties worth internalizing:
   rows. If the policy column is missing from the data, you get zero rows rather
   than a leak.
 - **It applies at the choke point.** Row filtering happens in one place that
-  the rows API, the SQL workbench, dashboard panels, ontology objects, and the
+  the rows API, the SQL page, dashboard panels, ontology objects, and the
   MCP tools all pass through. You cannot route around it by picking a different
   read path — that is the whole design.
 
@@ -148,7 +148,7 @@ curl -X PUT localhost:8787/api/v1/datasets/raw_orders/markings \
   -H 'Content-Type: application/json' -d '{"markings": ["pii"]}'
 ```
 
-Now run a build and look at `GET /api/v1/dataset-markings`:
+Now start a build and look at `GET /api/v1/dataset-markings`:
 
 ```
 clean_orders       explicit=[]      effective=['pii']    <- inherited
@@ -221,7 +221,7 @@ actor.
    inherent to the feature, not a bug, and it's why in-browser transform
    authoring is editor-gated. On a multi-tenant or untrusted-editor
    deployment, serve with `--lock-pipelines` and manage pipelines through git.
-   Editors keep Flows and Explore under the lock — no-code authoring that
+   Editors keep visual Pipelines and Explore under the lock — no-code authoring that
    compiles to bound SQL and cannot reach `exec` — so locking Python does not
    take authoring away from analysts. (`--lock-flows` exists if you want no
    authoring at all.)

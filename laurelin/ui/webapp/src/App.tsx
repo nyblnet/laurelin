@@ -8,10 +8,10 @@ import {
   QueryClientProvider,
   MutationCache,
 } from "@tanstack/react-query";
-import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
+import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiError } from "./api";
 import { useAuth } from "./auth";
-import { Layout } from "./Layout";
+import { Layout, RETIRED_ROUTES, flowsRedirectTarget } from "./Layout";
 import { LoginScreen, SetupScreen } from "./screens/AuthScreens";
 import { Spinner } from "./ui";
 import { DatasetsView } from "./views/Datasets";
@@ -19,11 +19,10 @@ import { DashboardsView } from "./views/Dashboards";
 import { AnalysesView } from "./views/Analyses";
 import { ExploreView } from "./views/Explore";
 import { AppsView } from "./views/Apps";
-import { PipelineView } from "./views/Pipeline";
+import { BuildsView } from "./views/Pipeline";
 import { SchedulesView } from "./views/Schedules";
 import { HealthView } from "./views/Health";
-import { TransformsView } from "./views/Transforms";
-import { FlowsView } from "./views/Flows";
+import { PipelinesView } from "./views/Pipelines";
 import { OntologyView } from "./views/Ontology";
 import { WorkbenchView } from "./views/Workbench";
 import { AuditView } from "./views/Audit";
@@ -70,6 +69,10 @@ export function App() {
   const scoped = (el: JSX.Element) =>
     needsWorkspace ? <Navigate to="/workspaces" replace /> : el;
 
+  // Role-aware landing: a viewer's entry points are things made FOR them
+  // (dashboards); everyone who can author lands on the data itself.
+  const landing = auth.can("editor") ? "/datasets" : "/dashboards";
+
   return (
     <QueryClientProvider client={queryClient}>
       <HashRouter>
@@ -79,11 +82,22 @@ export function App() {
             <Route path="/dashboards/*" element={scoped(<DashboardsView />)} />
             <Route path="/analyses/*" element={scoped(<AnalysesView />)} />
             <Route path="/explore" element={scoped(<ExploreView />)} />
-            <Route path="/pipeline" element={scoped(<PipelineView />)} />
+            <Route path="/builds" element={scoped(<BuildsView />)} />
             <Route path="/schedules" element={scoped(<SchedulesView />)} />
             <Route path="/health" element={scoped(<HealthView />)} />
-            <Route path="/flows/*" element={scoped(<FlowsView />)} />
-            <Route path="/transforms" element={scoped(<TransformsView />)} />
+            <Route path="/pipelines/*" element={scoped(<PipelinesView />)} />
+            {/* Retired routes (see RETIRED_ROUTES in Layout.tsx). Kept
+                indefinitely so bookmarks, docs and muscle memory keep
+                working after the IA consolidation. */}
+            <Route
+              path="/pipeline"
+              element={<Navigate to={RETIRED_ROUTES["/pipeline"]} replace />}
+            />
+            <Route path="/flows/*" element={<FlowsRedirect />} />
+            <Route
+              path="/transforms"
+              element={<Navigate to={RETIRED_ROUTES["/transforms"]} replace />}
+            />
             <Route path="/apps/*" element={scoped(<AppsView />)} />
             <Route path="/ontology/*" element={scoped(<OntologyView />)} />
             <Route path="/workbench" element={scoped(<WorkbenchView />)} />
@@ -91,22 +105,30 @@ export function App() {
             <Route
               path="/admin"
               element={
-                auth.can("admin") ? scoped(<AdminView />) : <Navigate to="/datasets" replace />
+                auth.can("admin") ? scoped(<AdminView />) : <Navigate to={landing} replace />
               }
             />
             <Route
               path="/workspaces"
-              element={auth.isSuperadmin ? <WorkspacesView /> : <Navigate to="/datasets" replace />}
+              element={auth.isSuperadmin ? <WorkspacesView /> : <Navigate to={landing} replace />}
             />
             <Route
               path="*"
-              element={<Navigate to={needsWorkspace ? "/workspaces" : "/datasets"} replace />}
+              element={<Navigate to={needsWorkspace ? "/workspaces" : landing} replace />}
             />
           </Routes>
         </Layout>
       </HashRouter>
     </QueryClientProvider>
   );
+}
+
+// `/flows/:name` deep links carry the pipeline's name in the path, so the
+// redirect has to preserve the subpath (and any search params) rather than
+// dumping every old link on the list page.
+function FlowsRedirect() {
+  const loc = useLocation();
+  return <Navigate to={flowsRedirectTarget(loc.pathname, loc.search)} replace />;
 }
 
 function NoWorkspaceAccess() {

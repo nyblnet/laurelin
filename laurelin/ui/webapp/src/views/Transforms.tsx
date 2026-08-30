@@ -1,9 +1,10 @@
-// Transforms — the pipeline code editor. Author `pipelines/*.py` transform code
-// (@transform / @sql_transform) from the browser. Left: file list; right: a
-// CodeMirror 6 Python editor. Editing is gated on the editor role.
+// Pipelines · Python tab — the pipeline code editor. Author `pipelines/*.py`
+// transform code (@transform / @sql_transform) from the browser. Left: file
+// list; right: a CodeMirror 6 Python editor. Editing is gated on the editor
+// role. (Formerly the Transforms screen; /transforms redirects here.)
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
@@ -13,8 +14,9 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { ApiError, api, API } from "../api";
 import type { PipelineFileContent, PipelineFileInfo, PipelineWriteResult } from "../types";
 import { useAuth } from "../auth";
-import { ErrorBox, FailureNote, PageHeader, Spinner } from "../ui";
+import { EmptyState, ErrorBox, FailureNote, Note, PageHeader, Spinner } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
+import { PipelinesTabs } from "./Pipelines";
 
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -129,6 +131,18 @@ export function TransformsView() {
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
   }
 
+  // Convert-to-Python lands here as /pipelines?tab=python&file=<name>: open
+  // the generated file once the listing confirms it exists. Only on arrival —
+  // `buffer === null` — so it never fights the author's later selections.
+  const [params] = useSearchParams();
+  useEffect(() => {
+    const f = params.get("file");
+    if (f && buffer === null && (filesQ.data ?? []).some((x) => x.name === f)) {
+      setBuffer({ name: f, isNew: false });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params, filesQ.data]);
+
   // When an existing file's content arrives, load it into the editor.
   useEffect(() => {
     if (ready && buffer && !buffer.isNew && contentQ.data) {
@@ -174,8 +188,8 @@ export function TransformsView() {
   return (
     <div>
       <PageHeader
-        title="Transforms"
-        subtitle="Author pipeline code. Transforms are Python — use @transform / @sql_transform. Build them from the Pipeline tab."
+        title="Pipelines"
+        subtitle="Turn datasets into new datasets. This tab is the advanced surface: pipeline code in Python — @transform / @sql_transform. Build from the Builds page."
         actions={
           canEdit ? (
             <button
@@ -195,14 +209,17 @@ export function TransformsView() {
         }
       />
 
-      {/* The pointer has to go both ways. Someone who cannot write Python
-          lands here first — it is the older, better-known screen — and their
-          whole experience of it is a blank editor. Flows is the screen that
-          was built for them, and nothing on this page used to say so. */}
+      <PipelinesTabs active="python" />
+
+      {/* The pointer has to go both ways. Someone who cannot write Python can
+          land here first, and their whole experience of it is a blank editor.
+          The Visual tab is the surface that was built for them, and this page
+          has to say so. */}
       <div className="tf-crosslink faint">
-        Not a Python programmer? <Link to="/flows">Flows</Link> builds the same kind of transform
-        step by step — pick a dataset, filter, combine, summarise — with a preview at every step.
-        A flow can be converted to Python here later; the reverse is not possible.
+        Not a Python programmer? The <Link to="/pipelines">Visual</Link> tab builds the same kind
+        of transform step by step — pick a dataset, filter, combine, summarise — with a preview at
+        every step. A visual pipeline can be converted to Python here later; the reverse is not
+        possible.
       </div>
 
       <ImportedPipelinesNotice />
@@ -217,7 +234,7 @@ export function TransformsView() {
           <p>
             An operator started it with <code>--lock-pipelines</code>, so pipeline files can be
             read here but only edited on disk (through git and review). This is the server&apos;s
-            posture, not your permissions. <Link to="/flows">Flows</Link> and{" "}
+            posture, not your permissions. The <Link to="/pipelines">Visual</Link> tab and{" "}
             <Link to="/explore">Explore</Link> remain available — they build the same kind of
             transform without code.
           </p>
@@ -228,7 +245,7 @@ export function TransformsView() {
           instead of showing a 403 in a red box. A pipeline file is exec'd on
           every build, so writing one is code-execution-equivalent — and reading
           one hands you the same authored text. The viewer's real need is
-          lineage, which is on the Pipeline tab and still theirs. */}
+          lineage, which is on the Builds page and still theirs. */}
       {!canEdit ? (
         <div className="withheld-box">
           <div className="withheld-head">Pipeline files are not shown to your role</div>
@@ -238,8 +255,8 @@ export function TransformsView() {
             read one is the same disclosure as being able to write one.
           </p>
           <p style={{ marginTop: 8 }}>
-            What every transform produces, what it reads, and how a build went
-            are on the <Link to="/pipeline">Pipeline</Link> tab, which is yours.
+            What every pipeline produces, what it reads, and how a build went
+            are on the <Link to="/builds">Builds</Link> page, which is yours.
           </p>
         </div>
       ) : (
@@ -251,14 +268,14 @@ export function TransformsView() {
           ) : filesQ.error ? (
             <ErrorBox error={filesQ.error} />
           ) : files.length === 0 ? (
-            <div className="tf-empty dim">
+            <EmptyState>
               <div>No pipeline files yet.</div>
               {canEdit && (
                 <button type="button" className="small" style={{ marginTop: 10 }} onClick={newFile}>
                   + New file
                 </button>
               )}
-            </div>
+            </EmptyState>
           ) : (
             <ul className="tf-list">
               {files.map((f) => (
@@ -334,15 +351,15 @@ export function TransformsView() {
           </div>
 
           {saveMut.isSuccess && !saveMut.isPending && (
-            <div className="tf-note ok">
+            <Note style={{ marginBottom: 10 }}>
               Saved{declared && declared.length > 0 ? ` — transforms: ${declared.join(", ")}` : " — no transforms declared"}
-            </div>
+            </Note>
           )}
           {saveResult?.collect_error && (
             <>
-              <div className="tf-note bad">
+              <Note tone="bad" style={{ marginBottom: 10 }}>
                 File saved, but the pipeline DAG will not collect.
-              </div>
+              </Note>
               <FailureNote failure={saveResult.collect_error} />
             </>
           )}
@@ -366,8 +383,8 @@ export function TransformsView() {
           )}
 
           <div className="tf-hint faint">
-            Transforms are Python. Use <span className="mono">@transform</span> /{" "}
-            <span className="mono">@sql_transform</span>. Build them from the Pipeline tab.
+            Pipeline code is Python. Use <span className="mono">@transform</span> /{" "}
+            <span className="mono">@sql_transform</span>. Build from the <Link to="/builds">Builds</Link> page.
           </div>
         </main>
       </div>
@@ -391,7 +408,6 @@ export function TransformsView() {
           letter-spacing: 0.12em;
           text-transform: uppercase;
         }
-        .tf-empty { font-size: 12.5px; padding: 8px 2px; }
         .tf-list {
           list-style: none;
           margin: 10px 0 0;
@@ -422,15 +438,6 @@ export function TransformsView() {
         .tf-main { min-width: 0; }
         .tf-toolbar { margin-bottom: 10px; }
         .tf-filename { font-size: 13px; }
-        .tf-note {
-          font-size: 12.5px;
-          padding: 8px 11px;
-          border-radius: 8px;
-          margin-bottom: 10px;
-          border: 1px solid var(--border);
-        }
-        .tf-note.ok { color: var(--text-dim); background: var(--bg-1); }
-        .tf-note.bad { color: var(--red); background: rgba(224,102,95,0.08); border-color: #6b3330; }
         .tf-cm .cm-editor { height: 60vh; min-height: 360px; }
         .tf-crosslink {
           font-size: 12px;

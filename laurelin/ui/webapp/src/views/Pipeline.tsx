@@ -142,7 +142,7 @@ function LineageGraphView({ graph }: { graph: LineageGraph }) {
   const { placed, byId, width, height } = useMemo(() => layout(graph), [graph]);
 
   if (graph.nodes.length === 0) {
-    return <EmptyState>No lineage yet — run a build.</EmptyState>;
+    return <EmptyState>No lineage yet — start a build.</EmptyState>;
   }
 
   return (
@@ -349,7 +349,7 @@ function BuildCard({ build }: { build: Build }) {
 
 // ------------------------------------------------------------------- view
 
-export function PipelineView() {
+export function BuildsView() {
   const auth = useAuth();
   const qc = useQueryClient();
 
@@ -396,7 +396,7 @@ export function PipelineView() {
       disabled={buildInFlight}
       onClick={() => runBuild.mutate()}
     >
-      {buildInFlight ? "Building…" : "Run build"}
+      {buildInFlight ? "Building…" : "Build now"}
     </button>
   ) : (
     <span className="dim">Viewer — builds are read-only.</span>
@@ -428,8 +428,8 @@ export function PipelineView() {
   return (
     <div>
       <PageHeader
-        title="Pipeline"
-        subtitle="Transform DAG and build history."
+        title="Builds"
+        subtitle="Build history and the pipeline DAG."
         actions={actions}
       />
 
@@ -443,8 +443,8 @@ export function PipelineView() {
           <div className="withheld-head">Python authoring is locked on this server</div>
           <p>
             Pipeline files are managed on disk (<code>--lock-pipelines</code>); existing
-            transforms still build. Flows and Explore remain available for authoring without
-            code.
+            pipelines still build. The visual Pipelines builder and Explore remain available
+            for authoring without code.
           </p>
         </div>
       )}
@@ -465,7 +465,7 @@ export function PipelineView() {
 
       {/* -------------------------------------------------- transforms */}
       <section style={{ marginTop: 24 }}>
-        <h2>Transforms</h2>
+        <h2>Pipelines</h2>
         {transformsQ.isLoading ? (
           <Spinner />
         ) : transformsQ.isError ? (

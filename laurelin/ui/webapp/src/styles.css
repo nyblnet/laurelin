@@ -19,6 +19,16 @@
   /* Sixth categorical series color. Charts must reference tokens, never hex,
      so a future light theme is one :root away. */
   --series-6: #8a7fd6;
+  /* Tint tokens for notes and status surfaces. Values are byte-identical to
+     the literals the views used to hard-code, so tokenising moved no pixels.
+     Views must use these — a hex or rgba() literal in a view fails
+     tests/test_ui_consistency.py. */
+  --red-tint-bg: rgba(224, 102, 95, 0.08);
+  --red-tint-border: #6b3330;
+  --gold-tint-bg: rgba(217, 178, 90, 0.07);
+  --blue-tint-bg: rgba(91, 155, 213, 0.08);
+  --blue-tint-border: #3a5b7d;
+  --surface-tint: rgba(255, 255, 255, 0.015);
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --sidebar-w: 232px;
@@ -263,6 +273,38 @@ h3 {
   color: var(--blue);
   border-color: #33506e;
   background: rgba(91, 155, 213, 0.08);
+}
+
+/* One inline status note for every authoring surface. Transforms, Explore and
+   Analyses each used to carry a private copy of this rule (.tf-note, .ex-note,
+   .an-note); the `Note` component in ui.tsx is the only intended user. Neutral
+   by default — a tone is a statement, not decoration. */
+.note {
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-dim);
+}
+.note-ok {
+  color: var(--green);
+}
+.note-bad {
+  color: var(--red);
+  background: var(--red-tint-bg);
+  border-color: var(--red-tint-border);
+}
+.note-warn {
+  color: var(--gold);
+  background: var(--gold-tint-bg);
+  border-color: var(--gold-dim);
+}
+.note-gov {
+  color: var(--text);
+  background: var(--blue-tint-bg);
+  border-color: var(--blue-tint-border);
 }
 
 button,
@@ -785,4 +827,144 @@ a.btn[aria-disabled="true"] {
    notice, and not red, because nothing has gone wrong. */
 .card.attention {
   border-color: var(--gold-dim);
+}
+
+/* ------------------------------------------------------------------ shell IA */
+
+/* Visually hidden until keyboard focus, then a real button in the corner.
+   The first tabbable element on the page. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 8px 12px;
+  border-radius: 0 0 8px 0;
+  background: var(--bg-3);
+  color: var(--text);
+  font-size: 12.5px;
+}
+.skip-link:focus {
+  left: 0;
+}
+.main:focus {
+  outline: none;
+}
+
+/* Grouped nav: non-interactive group labels over the same NavLinks. */
+.nav-group-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav-group-block + .nav-group-block {
+  margin-top: 10px;
+}
+.nav-group {
+  padding: 0 10px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+/* Pipelines: the Visual | Python tab strip under the page header. */
+.pl-tabs {
+  display: inline-flex;
+  gap: 2px;
+  margin-bottom: 14px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-1);
+}
+.pl-tab {
+  padding: 5px 14px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.pl-tab:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+.pl-tab.active {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+/* Command palette (Ctrl/Cmd+K): hand-rolled, nav-only. */
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+.palette {
+  width: min(440px, calc(100vw - 32px));
+  border: 1px solid var(--border-2);
+  border-radius: 12px;
+  background: var(--bg-1);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.palette-input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-1);
+  padding: 12px 14px;
+  font-size: 14px;
+  color: var(--text);
+}
+.palette-input:focus {
+  outline: none;
+}
+.palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.palette-item.selected {
+  background: var(--bg-3);
+}
+.palette-group {
+  min-width: 62px;
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.palette-none {
+  padding: 10px;
+  font-size: 12.5px;
+}
+.palette-hint {
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
 }

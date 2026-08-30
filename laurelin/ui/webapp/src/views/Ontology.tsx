@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
 import { useAuth } from "../auth";
 import type { ObjectTypeDef, ObjectTypeDetail } from "../types";
-import { Badge, ErrorBox, PageHeader, Spinner } from "../ui";
+import { Badge, EmptyState, ErrorBox, PageHeader, Spinner } from "../ui";
 import { ObjectBrowser } from "./ontology/ObjectBrowser";
 import { EditLogPanel } from "./ontology/EditLogPanel";
 import { WritebackPanel } from "./ontology/WritebackPanel";
@@ -24,7 +24,7 @@ function ObjectTypeList() {
       {q.isError && <ErrorBox error={q.error} />}
       {q.data &&
         (q.data.length === 0 ? (
-          <div className="empty">No object types defined.</div>
+          <EmptyState>No object types defined.</EmptyState>
         ) : (
           <div className="cards">
             {q.data.map((t) => (

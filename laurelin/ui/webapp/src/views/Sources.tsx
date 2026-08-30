@@ -17,6 +17,7 @@ import {
   ErrorBox,
   FailureBadge,
   FailureNote,
+  PageHeader,
   RedactedValue,
   Spinner,
   Withheld,
@@ -506,19 +507,17 @@ export function SourcesSection() {
 
   return (
     <section style={{ marginTop: 28 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <h2 style={{ margin: 0 }}>Data sources</h2>
-        {isAdmin && (
-          <button className="small" onClick={() => setShowAdd((v) => !v)}>
-            {showAdd ? "Close" : "Add source"}
-          </button>
-        )}
-      </div>
-      <p className="dim" style={{ margin: "6px 0 0" }}>
-        Connectors that pull external data into datasets — PostgreSQL, HTTP
-        exports, files landed on the server, or object-storage buckets
-        (S3 / GCS).
-      </p>
+      <PageHeader
+        title="Data sources"
+        subtitle="Connectors that pull external data into datasets — PostgreSQL, HTTP exports, files landed on the server, or object-storage buckets (S3 / GCS)."
+        actions={
+          isAdmin ? (
+            <button className="small" onClick={() => setShowAdd((v) => !v)}>
+              {showAdd ? "Close" : "Add source"}
+            </button>
+          ) : undefined
+        }
+      />
       {showAdd && isAdmin && (
         <AddSourceForm
           onDone={() => {

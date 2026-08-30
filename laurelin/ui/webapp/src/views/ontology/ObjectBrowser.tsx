@@ -8,6 +8,7 @@ import type {
   OntologyObject,
 } from "../../types";
 import {
+  EmptyState,
   Column,
   DataTable,
   ErrorBox,
@@ -79,7 +80,7 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
         {q.isError && <ErrorBox error={q.error} />}
         {q.data &&
           (q.data.objects.length === 0 ? (
-            <div className="empty">No objects match.</div>
+            <EmptyState>No objects match.</EmptyState>
           ) : (
             <>
               <DataTable
@@ -120,7 +121,7 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
         {selectedPk ? (
           <ObjectDetail detail={detail} type={type} pk={selectedPk} />
         ) : (
-          <div className="empty">Select an object.</div>
+          <EmptyState>Select an object.</EmptyState>
         )}
       </div>
     </div>

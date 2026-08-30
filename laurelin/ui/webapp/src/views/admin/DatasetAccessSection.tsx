@@ -315,7 +315,7 @@ export function DatasetAccessSection() {
         <strong>open</strong> and inherits role defaults. Adding any grant makes
         it an <strong>allowlist</strong> — only listed subjects can see or edit
         it. This also hides the dataset's ontology objects and blocks it in the
-        SQL workbench. Admins always have access.
+        SQL page. Admins always have access.
       </div>
 
       {permsQuery.isLoading ? (

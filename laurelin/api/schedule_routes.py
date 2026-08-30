@@ -117,12 +117,15 @@ def upsert_schedule(
         if registry is not None:
             unknown = [t for t in body.targets if registry.by_output(t) is None]
             if unknown:
+                # "pipeline", the settled word — this sentence renders in the
+                # UI's warning box, and it used to mix three retired nouns
+                # ("transform", "flow", "pipeline") for the same concept.
                 warnings.append({
                     "field": "target",
-                    "hint": "no transform produces "
+                    "hint": "no pipeline produces "
                             + ", ".join(repr(t) for t in unknown)
                             + "; builds queued by this schedule will fail until "
-                            "a flow or pipeline with that output exists.",
+                            "a pipeline with that output exists.",
                 })
     existing = store.get_schedule(name)
     info = ScheduleInfo(

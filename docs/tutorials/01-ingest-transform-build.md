@@ -189,11 +189,11 @@ Open <http://127.0.0.1:8787>.
 Worth a click:
 
 - **Datasets** — versions, schema, and a row preview per dataset.
-- **Pipeline** — the lineage graph (`raw_orders → clean_orders →
-  revenue_by_region`) and build history. Hit **Run build** and watch it go
+- **Builds** — the lineage graph (`raw_orders → clean_orders →
+  revenue_by_region`) and build history. Hit **Build now** and watch it go
   from `running` to `succeeded` — builds run on a worker pool, so the request
   returns immediately.
-- **SQL** — a workbench over every dataset. Try:
+- **SQL** — a query scratchpad over every dataset. Try:
 
   ```sql
   SELECT region, revenue FROM revenue_by_region ORDER BY revenue DESC

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { API, ApiError, api } from "../../api";
 import type { ObjectTypeDetail, OntologyObject } from "../../types";
-import { ErrorBox, Spinner, fmtValue } from "../../ui";
+import { EmptyState, ErrorBox, Spinner, fmtValue } from "../../ui";
 import { ActionForm } from "./ActionForm";
 import { LinkSection } from "./LinkSection";
 
@@ -26,7 +26,7 @@ export function ObjectDetail({
 
   if (q.isLoading) return <Spinner />;
   if (q.error instanceof ApiError && q.error.status === 404) {
-    return <div className="empty">This object no longer exists.</div>;
+    return <EmptyState>This object no longer exists.</EmptyState>;
   }
   if (q.isError) return <ErrorBox error={q.error} />;
   const obj = q.data;

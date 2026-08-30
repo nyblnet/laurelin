@@ -1,4 +1,5 @@
-// Flows — build a pipeline without writing code.
+// Pipelines · Visual tab — build a pipeline without writing code.
+// (Formerly the Flows screen; the /flows routes redirect here.)
 //
 // This screen is the product. Everything under `laurelin/transforms/flow_*.py`
 // is plumbing for it: the audience is an analyst who cannot write Python, and a
@@ -19,7 +20,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Link, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, ApiError, api } from "../api";
 import { useAuth } from "../auth";
@@ -51,6 +52,7 @@ import {
   fmtValue,
 } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
+import { PipelinesTabs } from "./Pipelines";
 import { StepForm, ExpectationsForm } from "./flow/StepForm";
 import type { TypeHints } from "./flow/ExprEditor";
 import {
@@ -95,27 +97,34 @@ export function FlowsView() {
 
 function FlowList() {
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  // `?from=` is the dataset detail page's "New pipeline from this dataset"
+  // door: open the naming dialog straight away, and carry the dataset through
+  // to the builder so its first step is already reading the right data.
+  const fromDataset = params.get("from") ?? "";
 
   const flowsQ = useQuery({
     queryKey: ["flows"],
     queryFn: () => api.get<FlowListEntry[]>(`${API}/flows`),
   });
 
-  const [naming, setNaming] = useState(false);
+  const [naming, setNaming] = useState(!!fromDataset);
 
   const flows = flowsQ.data ?? [];
 
   return (
     <div>
       <PageHeader
-        title="Flows"
-        subtitle="Build a pipeline step by step. No code — every flow becomes a real transform on the same build, lineage and permissions as everything else."
+        title="Pipelines"
+        subtitle="Turn datasets into new datasets. Build one step by step here — no code — or write Python on the other tab. Either way it is a real transform on the same build, lineage and permissions as everything else."
         actions={
           <button type="button" className="primary" onClick={() => setNaming(true)}>
-            + New flow
+            + New pipeline
           </button>
         }
       />
+
+      <PipelinesTabs active="visual" />
 
       <ImportedPipelinesNotice />
 
@@ -132,11 +141,11 @@ function FlowList() {
           </p>
           <p className="faint">
             What you build is a normal transform. It appears on{" "}
-            <Link to="/pipeline">Pipeline</Link> with its lineage, it can be
+            <Link to="/builds">Builds</Link> with its lineage, it can be
             scheduled, and it obeys the same permissions as everything else.
           </p>
           <button type="button" className="primary" onClick={() => setNaming(true)}>
-            Start your first flow
+            Start your first pipeline
           </button>
         </div>
       ) : (
@@ -145,7 +154,7 @@ function FlowList() {
             <div
               key={f.name}
               className="card clickable"
-              onClick={() => navigate(`/flows/${encodeURIComponent(f.name)}`)}
+              onClick={() => navigate(`/pipelines/${encodeURIComponent(f.name)}`)}
             >
               <div className="fx-card-head">
                 <strong>{f.name}</strong>
@@ -158,7 +167,7 @@ function FlowList() {
               <div className="dim">{f.description || "No description"}</div>
               <div className="faint" style={{ marginTop: 6 }}>
                 {f.failed
-                  ? "This flow will not load. Open it to see what to fix."
+                  ? "This pipeline will not load. Open it to see what to fix."
                   : `Reads ${f.sources.join(", ") || "nothing yet"}`}
               </div>
               {f.author && <div className="faint">by {f.author}</div>}
@@ -172,7 +181,7 @@ function FlowList() {
           title="Name your new pipeline"
           intro={
             <>
-              A flow builds one dataset, and the flow and the dataset share a name. Pick something
+              A pipeline builds one dataset, and the two share a name. Pick something
               you would be happy to see on a dashboard — it cannot be renamed afterwards, because
               everything downstream is keyed on it.
             </>
@@ -185,7 +194,10 @@ function FlowList() {
             // Nothing is written until the first Save. An empty flow (one
             // source, no dataset yet) is structurally valid, so the URL is
             // real and refreshable from the first moment.
-            navigate(`/flows/${encodeURIComponent(name)}?new=1`);
+            navigate(
+              `/pipelines/${encodeURIComponent(name)}?new=1` +
+                (fromDataset ? `&dataset=${encodeURIComponent(fromDataset)}` : ""),
+            );
           }}
         />
       )}
@@ -214,7 +226,11 @@ function FlowBuilder({ name }: { name: string }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const auth = useAuth();
-  const isNew = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("new") === "1";
+  const urlParams = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+  const isNew = urlParams.get("new") === "1";
+  // Carried from the dataset detail page's "New pipeline from this dataset"
+  // door (via the naming dialog): the first step reads this dataset already.
+  const presetSource = urlParams.get("dataset") ?? "";
 
   const [draft, setDraft] = useState<FlowDef | null>(null);
   const [selected, setSelected] = useState<string>("");
@@ -237,11 +253,15 @@ function FlowBuilder({ name }: { name: string }) {
 
   useEffect(() => {
     if (isNew && draft === null) {
-      setDraft(emptyFlow(name, auth.user?.username ?? ""));
+      const f = emptyFlow(name, auth.user?.username ?? "");
+      // The source picker still governs what is offered — this only pre-picks
+      // the dataset the caller was just looking at.
+      if (presetSource) f.nodes[0] = { ...f.nodes[0], params: { dataset: presetSource } };
+      setDraft(f);
       setSelected("s1");
       setDirty(true);
     }
-  }, [isNew, name, draft, auth.user?.username]);
+  }, [isNew, name, draft, auth.user?.username, presetSource]);
 
   useEffect(() => {
     if (flowQ.data?.flow && draft === null) {
@@ -363,7 +383,7 @@ function FlowBuilder({ name }: { name: string }) {
       setDraft(r.flow);
       qc.invalidateQueries({ queryKey: ["flows"] });
       qc.invalidateQueries({ queryKey: ["transforms"] });
-      if (isNew) navigate(`/flows/${encodeURIComponent(name)}`, { replace: true });
+      if (isNew) navigate(`/pipelines/${encodeURIComponent(name)}`, { replace: true });
     },
   });
 
@@ -371,7 +391,7 @@ function FlowBuilder({ name }: { name: string }) {
     mutationFn: () => api.del(`${API}/flows/${encodeURIComponent(name)}`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["flows"] });
-      navigate("/flows");
+      navigate("/pipelines");
     },
   });
 
@@ -403,7 +423,7 @@ function FlowBuilder({ name }: { name: string }) {
     onSuccess: (r) => {
       setDuplicating(false);
       qc.invalidateQueries({ queryKey: ["flows"] });
-      navigate(`/flows/${encodeURIComponent(r.name)}`);
+      navigate(`/pipelines/${encodeURIComponent(r.name)}`);
     },
   });
 
@@ -462,16 +482,16 @@ function FlowBuilder({ name }: { name: string }) {
 
   // --------------------------------------------------------------- render
 
-  if (!name) return <EmptyState>No flow named.</EmptyState>;
+  if (!name) return <EmptyState>No pipeline named.</EmptyState>;
   if (flowQ.isLoading && !draft) return <Spinner label="Opening flow…" />;
   if (flowQ.error && !draft) {
     const err = flowQ.error;
     if (err instanceof ApiError && err.status === 404) {
       return (
         <div>
-          <PageHeader title={name} subtitle="No such flow" />
+          <PageHeader title={name} subtitle="No such pipeline" />
           <EmptyState>
-            There is no flow called {name}. <Link to="/flows">Back to Flows</Link>.
+            There is no pipeline called {name}. <Link to="/pipelines">Back to Pipelines</Link>.
           </EmptyState>
         </div>
       );
@@ -538,8 +558,8 @@ function FlowBuilder({ name }: { name: string }) {
     <div className="fx-page">
       <div className="fx-head">
         <div className="fx-head-left">
-          <Link to="/flows" className="fx-back">
-            ← Flows
+          <Link to="/pipelines" className="fx-back">
+            ← Pipelines
           </Link>
           <h1>{name}</h1>
           <span className="faint">
@@ -574,7 +594,7 @@ function FlowBuilder({ name }: { name: string }) {
               duplicate.reset();
               setDuplicating(true);
             }}
-            title="Copy these steps into a new flow under a new name. Flows cannot be renamed."
+            title="Copy these steps into a new pipeline under a new name. Pipelines cannot be renamed."
           >
             Duplicate…
           </button>
@@ -599,7 +619,7 @@ function FlowBuilder({ name }: { name: string }) {
                 ? "Python authoring is locked on this server (--lock-pipelines), and ejecting writes a Python file."
                 : dirty
                   ? "Save first."
-                  : "Convert this flow into a Python pipeline. One way."
+                  : "Convert this pipeline to Python — one-way."
             }
           >
             Open in Python…
@@ -608,7 +628,7 @@ function FlowBuilder({ name }: { name: string }) {
             type="button"
             className="danger"
             onClick={() => {
-              if (window.confirm(`Delete the flow ${name}? The dataset it built is kept, and so is its lineage.`)) {
+              if (window.confirm(`Delete the pipeline ${name}? The dataset it built is kept, and so is its lineage.`)) {
                 del.mutate();
               }
             }}
@@ -622,14 +642,14 @@ function FlowBuilder({ name }: { name: string }) {
 
       {restricted && (
         <div className="fx-note fx-note-gov">
-          A dataset this flow reads is restricted, so <strong>{draft.output}</strong> will be
+          A dataset this pipeline reads is restricted, so <strong>{draft.output}</strong> will be
           readable only by <strong>{draft.author || "its author"}</strong> until an administrator
           grants access to someone else.
         </div>
       )}
       {refusal && (
         <div className="fx-note fx-note-bad">
-          <strong>This flow will not run yet.</strong> {refusal.message}
+          <strong>This pipeline will not run yet.</strong> {refusal.message}
         </div>
       )}
       {/* A 409 here is almost never about *this* flow. `PUT /flows/{name}`
@@ -643,10 +663,10 @@ function FlowBuilder({ name }: { name: string }) {
           the author to Transforms, where a flow file cannot be opened). */}
       {authoringLocked ? (
         <div className="fx-note fx-note-bad">
-          <strong>Flow authoring is locked on this server.</strong> An operator started it with{" "}
-          <code>--lock-flows</code>, so flows cannot be saved or deleted here by anyone — this is
-          the server's posture, not your permissions. Nothing you have on screen is lost; it just
-          cannot be saved here. The flows that already exist still build and still run.
+          <strong>Visual pipeline authoring is locked on this server.</strong> An operator started
+          it with <code>--lock-flows</code>, so visual pipelines cannot be saved or deleted here by
+          anyone — this is the server's posture, not your permissions. Nothing you have on screen is
+          lost; it just cannot be saved here. The pipelines that already exist still build and run.
         </div>
       ) : blockedByWorkspace ? (
         <div className="fx-note fx-note-bad">
@@ -656,8 +676,8 @@ function FlowBuilder({ name }: { name: string }) {
           blocked too.
           <div style={{ marginTop: 6 }}>
             The server said: <em>{(save.error as ApiError).detail}</em> Someone with access to the
-            workspace files has to fix or remove that file — or, if the broken one is a flow, it
-            can be deleted from <Link to="/flows">Flows</Link>.
+            workspace files has to fix or remove that file — or, if the broken one is a visual
+            pipeline, it can be deleted from <Link to="/pipelines">Pipelines</Link>.
           </div>
         </div>
       ) : (
@@ -670,7 +690,7 @@ function FlowBuilder({ name }: { name: string }) {
       {build.error != null && <ErrorBox error={build.error} />}
       {builtId && (
         <div className="fx-note fx-note-ok">
-          Build started. Watch it on <Link to="/pipeline">Pipeline</Link>.
+          Build started. Watch it on <Link to="/builds">Builds</Link>.
         </div>
       )}
       {save.isSuccess && !dirty && (
@@ -685,10 +705,10 @@ function FlowBuilder({ name }: { name: string }) {
       {showSql && (
         <div className="fx-sql">
           <div className="fx-sql-head">
-            Generated from this flow — not editable. Edit the steps, not the SQL.
+            Generated from these steps — not editable. Edit the steps, not the SQL.
           </div>
           {dirty ? (
-            <div className="faint">Save first: this shows the SQL of the saved flow.</div>
+            <div className="faint">Save first: this shows the SQL of the saved pipeline.</div>
           ) : sqlQ.isLoading ? (
             <Spinner />
           ) : sqlQ.error ? (
@@ -699,7 +719,7 @@ function FlowBuilder({ name }: { name: string }) {
               <div className="faint">
                 {boundValues} value{boundValues === 1 ? " is" : "s are"} passed separately, not
                 written into the query. Your filter values are never part of this text, and they
-                stay separate if you convert this flow to a Python pipeline.
+                stay separate if you convert this pipeline to Python.
               </div>
             </>
           )}
@@ -817,15 +837,15 @@ function FlowBuilder({ name }: { name: string }) {
                       <span className="mono">{ds}</span> {shown.length === 1 ? "is" : "are"} masked
                       for you, so the values below are the mask, not the data.{" "}
                       <strong>The build would see the real values</strong> — a total or an average
-                      over one of these is wrong here and right there. Saving a flow that keeps a
-                      masked column is refused for that reason.
+                      over one of these is wrong here and right there. Saving a pipeline that keeps
+                      a masked column is refused for that reason.
                     </div>
                   )}
                   {hidden.length > 0 && (
                     <div>
                       <span className="mono">{ds}</span> has{" "}
                       {hidden.length === 1 ? "a column" : "columns"} you are not shown in full (
-                      <span className="mono">{hidden.join(", ")}</span>). This flow does not
+                      <span className="mono">{hidden.join(", ")}</span>). This pipeline does not
                       include {hidden.length === 1 ? "it" : "them"}, so nothing here is affected.
                     </div>
                   )}
@@ -898,7 +918,7 @@ function FlowBuilder({ name }: { name: string }) {
           title={`Duplicate ${name}`}
           intro={
             <>
-              This copies every step into a new flow. Flows cannot be renamed — everything
+              This copies every step into a new pipeline. Pipelines cannot be renamed — everything
               downstream is keyed on the name — so duplicating under the name you want and
               deleting the old one is how a rename is done here.
             </>
@@ -919,7 +939,8 @@ function FlowBuilder({ name }: { name: string }) {
           onDone={() => {
             qc.invalidateQueries({ queryKey: ["flows"] });
             qc.invalidateQueries({ queryKey: ["pipelines"] });
-            navigate("/transforms");
+            // Land on the Python tab with the generated file already open.
+            navigate(`/pipelines?tab=python&file=${encodeURIComponent(name)}`);
           }}
         />
       )}
@@ -1250,7 +1271,7 @@ function NameDialog({
     : !NAME_RE.test(name)
       ? "Use lowercase letters, digits and underscores, starting with a letter — for example late_orders."
       : taken.includes(name)
-        ? `There is already a flow called ${name}.`
+        ? `There is already a pipeline called ${name}.`
         : null;
   const ok = !!name && !problem;
 
@@ -1332,12 +1353,12 @@ function EjectDialog({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal fx-modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Open this flow in Python?</h2>
+        <h2>Open this pipeline in Python?</h2>
         <p>
           <strong>This is one way.</strong> Laurelin will write{" "}
-          <span className="mono">pipelines/{name}.py</span> containing the SQL this flow
-          generates, and then delete the flow. The step-by-step builder cannot open it again —
-          from then on you edit it as Python on the <strong>Transforms</strong> screen.
+          <span className="mono">pipelines/{name}.py</span> containing the SQL these steps
+          generate, and then delete the visual version. The step-by-step builder cannot open it
+          again — from then on you edit it as Python on the <strong>Python</strong> tab.
         </p>
         <p className="faint">
           There is no un-eject. If you are not sure, press Cancel and keep building here; you can

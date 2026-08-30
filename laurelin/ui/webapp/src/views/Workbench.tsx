@@ -1,8 +1,9 @@
-// SQL Workbench — run read-only DuckDB queries over the workspace datasets.
+// The SQL page (file keeps its historical code name) — run read-only DuckDB
+// queries over the workspace datasets.
 // Each dataset is exposed as a view named after the dataset.
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
@@ -32,7 +33,7 @@ const NAME_RE = /^[a-z][a-z0-9_]*$/;
 function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boolean): string {
   if (err instanceof ApiError) {
     if (err.status === 409) {
-      return `A transform file named ${fileName} already exists.`;
+      return `A pipeline file named ${fileName} already exists.`;
     }
     if (err.status === 403) {
       // Two different diagnoses used to share one hedged sentence ("editor
@@ -41,26 +42,27 @@ function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boole
       // a lock only by a server restart. /auth/status now says which.
       return pipelinesLocked
         ? "Python authoring is locked on this server (--lock-pipelines), so a query cannot " +
-            "be saved as a transform file here. Flows and Explore remain available."
-        : "You don't have permission to create transforms (editor role required).";
+            "be saved as a pipeline file here. Visual pipelines and Explore remain available."
+        : "You don't have permission to create pipelines (editor role required).";
     }
     if (err.status === 400) {
       return err.detail || "Invalid request.";
     }
-    return err.detail || "Failed to save transform.";
+    return err.detail || "Failed to save the pipeline.";
   }
-  return "Failed to save transform.";
+  return "Failed to save the pipeline.";
 }
 
 export function WorkbenchView() {
   const auth = useAuth();
+  const [searchParams] = useSearchParams();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const runRef = useRef<() => void>(() => {});
   // Set once the editor is mounted, so sidebar-click handlers can update the doc.
   const [ready, setReady] = useState(false);
 
-  // "Save as transform" form state.
+  // "Save as pipeline" form state.
   const [saveOpen, setSaveOpen] = useState(false);
   const [outName, setOutName] = useState("");
   const [fileName, setFileName] = useState("");
@@ -172,13 +174,20 @@ export function WorkbenchView() {
     if (text.trim()) runMut.mutate(text);
   };
 
+  // `?dataset=` is the dataset detail page's "Open in SQL" door: seed the
+  // editor with the same starter query the sidebar buttons insert, so the
+  // caller lands one keystroke (Ctrl+Enter) from rows.
+  const presetDataset = searchParams.get("dataset") ?? "";
+
   // Mount the editor exactly once.
   useEffect(() => {
     if (!hostRef.current) return;
     const view = new EditorView({
       parent: hostRef.current,
       state: EditorState.create({
-        doc: PLACEHOLDER,
+        doc: presetDataset
+          ? `SELECT * FROM ${presetDataset} LIMIT 100`
+          : PLACEHOLDER,
         extensions: [
           history(),
           sql(),
@@ -204,6 +213,7 @@ export function WorkbenchView() {
       view.destroy();
       viewRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function setDoc(text: string) {
@@ -318,7 +328,7 @@ export function WorkbenchView() {
                           : undefined
                       }
                     >
-                      Save as transform
+                      Save as pipeline
                     </button>
                     <button
                       type="button"
@@ -355,8 +365,8 @@ export function WorkbenchView() {
                     color: "var(--green)",
                   }}
                 >
-                  Created transform file '{saved.name}.py' —{" "}
-                  <Link to="/pipeline">build it from the Pipeline tab.</Link>
+                  Created pipeline file '{saved.name}.py' —{" "}
+                  <Link to="/builds">build it from the Builds page.</Link>
                   {/* The file was written; the DAG just does not collect.
                       R1 turned this from the collector's own sentence into a
                       classified record, so it renders like every other
@@ -508,10 +518,10 @@ export function WorkbenchView() {
               }}
             >
               <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <div className="card-title">Save as transform</div>
+                <div className="card-title">Save as pipeline</div>
                 <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
-                  Generate a Python transform from the current query. Build it
-                  from the Pipeline tab afterward.
+                  Generate a Python pipeline file from the current query. Build
+                  it from the Builds page afterward.
                 </p>
 
                 <div className="field" style={{ marginTop: 12 }}>

@@ -81,8 +81,8 @@ Confirm all of these before mutating anything.
 |---|---|---|---|
 | Dataset | Dataset | `create_dataset` | Names: `^[a-z][a-z0-9_]*$`. |
 | Data Connection source + sync | Source (+ schedule) | `create_source`, `sync_source`, `upsert_schedule` | Types: `postgres`, `http`, `file`. |
-| Pipeline Builder pipeline | Flow (no-code IR) | `write_flow`, `preview_flow` | One flow = one output dataset, same name. |
-| Code Repository transform (Python/Java) | Flow **if expressible**, else flag for human | `write_flow` | No Python authoring over MCP. See § Hard translations. |
+| Pipeline Builder pipeline | Visual pipeline (no-code Flow IR) | `write_flow`, `preview_flow` | One flow = one output dataset, same name. |
+| Code Repository transform (Python/Java) | Visual pipeline **if expressible**, else flag for human | `write_flow` | No Python authoring over MCP. See § Hard translations. |
 | Ontology object type | Object type | `put_object_type` | Exactly one backing dataset and one primary key per type. |
 | Ontology link type | Link type | `put_link_type` | Foreign-key style: `from_property` → `to_property`. |
 | Ontology action type | Action type | `put_action_type` | Kinds: `create`, `update`, `delete`. |

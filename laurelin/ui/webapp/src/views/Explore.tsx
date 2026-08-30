@@ -39,7 +39,7 @@ import type {
   ObjectTypeDef,
   QueryResult,
 } from "../types";
-import { EmptyState, ErrorBox, PageHeader, Spinner, fmtValue } from "../ui";
+import { EmptyState, ErrorBox, Note, PageHeader, Spinner, fmtValue } from "../ui";
 import {
   DATE_BUCKETS,
   DRAFT_KEY,
@@ -149,17 +149,26 @@ function ExploreScreen() {
   const [params] = useSearchParams();
   const editDashboard = params.get("dashboard") ?? "";
   const editPanel = params.get("panel") ?? "";
+  // `?dataset=` is the dataset detail page's "Open in Explore" door: start
+  // shaping that dataset instead of resuming the draft — the caller just told
+  // us what they want to look at.
+  const presetDataset = params.get("dataset") ?? "";
 
-  // Opened plain (no edit params), the screen resumes the caller's last
-  // draft: one accidental F5 used to wipe an eight-interaction shaping
+  // Opened plain (no edit params, no preset), the screen resumes the caller's
+  // last draft: one accidental F5 used to wipe an eight-interaction shaping
   // session with nothing but an empty screen to show for it.
   const draft = useMemo(
-    () => (editDashboard && editPanel ? null : parseDraft(sessionStorage.getItem(DRAFT_KEY))),
+    () =>
+      (editDashboard && editPanel) || presetDataset
+        ? null
+        : parseDraft(sessionStorage.getItem(DRAFT_KEY)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
   const [tab, setTab] = useState<"datasets" | "objects">(draft?.tab ?? "datasets");
-  const [state, setState] = useState<ExploreState>(draft?.state ?? emptyExplore());
+  const [state, setState] = useState<ExploreState>(
+    draft?.state ?? emptyExplore(presetDataset),
+  );
   const [obj, setObj] = useState<ObjectState>(draft?.obj ?? emptyObjectState());
   const [bindings, setBindings] = useState<Bindings>(
     draft
@@ -461,7 +470,7 @@ function ExploreScreen() {
       return { ...b, x, y, series };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resultCols.join(" ")]);
+  }, [resultCols.join("\x00")]);
 
   // Columns masked for this caller, to grey out of the measure pickers.
   const maskedColumns = useMemo(() => {
@@ -513,7 +522,11 @@ function ExploreScreen() {
         width: panelWidth,
       };
       if (tab === "datasets") {
-        if (!flow) throw new Error("The query is not finished yet.");
+        // `flow` is null exactly when `issues` is non-empty, so name the
+        // actual problem. The generic sentence used to appear in the save
+        // dialog while a finished-looking (stale) chart sat behind it, with
+        // the real cause — an invalid summary name, say — never referenced.
+        if (!flow) throw new Error(issues[0] ?? "The query is not finished yet.");
         panel.flow = flow as any;
         panel.top = state.top.trim() === "" ? null : Number(state.top);
       } else {
@@ -560,7 +573,15 @@ function ExploreScreen() {
         actions={
           <button
             className="primary"
-            disabled={!result || !!previewError}
+            // `result` alone is not enough: it can be the STALE preview of a
+            // shaping that has since acquired an issue (the preview query
+            // disables rather than refetches), and saving then failed with a
+            // sentence that named neither the field nor the fix. Disable with
+            // the issue as the tooltip instead of letting the click fail.
+            disabled={
+              !result || !!previewError || (tab === "datasets" && issues.length > 0)
+            }
+            title={tab === "datasets" && issues.length > 0 ? issues[0] : undefined}
             onClick={() => {
               setSavedTo(null);
               save.reset();
@@ -572,19 +593,29 @@ function ExploreScreen() {
           </button>
         }
       />
-      {editNote && <div className="ex-note ex-note-warn">{editNote}</div>}
+      {/* The one-sentence answer to "why are there two click-to-chart
+          screens": this one makes a dashboard panel, Analyses makes a
+          multi-step document. Said here and on Analyses, at the moment of
+          choosing, because the only other way to learn it is to build the
+          same chart twice. */}
+      <p className="hint" style={{ marginTop: -8, marginBottom: 12 }}>
+        Explore makes <strong>one chart for a dashboard</strong>. For multi-step
+        work — cells that build on each other, shared as a document — use{" "}
+        <Link to="/analyses">Analyses</Link> instead.
+      </p>
+      {editNote && <Note tone="warn">{editNote}</Note>}
       {editing && !editNote && (
-        <div className="ex-note">
+        <Note>
           Editing panel “{panelTitle || editing.panel}” on{" "}
           <Link to={`/dashboards/${editing.dashboard}`}>{editing.dashboard}</Link> — saving
           updates it in place.
-        </div>
+        </Note>
       )}
       {savedTo && (
-        <div className="ex-note ex-note-ok">
+        <Note tone="ok">
           Panel saved — <Link to={`/dashboards/${savedTo}`}>open dashboard “{savedTo}”</Link>.
           Viewers get the chart; the query itself stays on the server.
-        </div>
+        </Note>
       )}
 
       <div className="ex-grid">
@@ -718,10 +749,10 @@ function ExploreScreen() {
           )}
 
           {issues.length > 0 && canPreview && (
-            <div className="ex-note">{issues[0]}</div>
+            <Note>{issues[0]}</Note>
           )}
           {previewError != null && (
-            <div className="ex-note ex-note-bad">
+            <Note tone="bad">
               {/* Refusals arrive in compiler vocabulary ("step 's3'"); rewrite
                   them into this screen's cards before an analyst reads them. */}
               {previewError instanceof ApiError
@@ -732,7 +763,7 @@ function ExploreScreen() {
                     tab === "datasets" && debouncedKey ? JSON.parse(debouncedKey) : null,
                   )
                 : String(previewError)}
-            </div>
+            </Note>
           )}
           {previewLoading && <Spinner label="Running…" />}
 
@@ -753,11 +784,11 @@ function ExploreScreen() {
                 // An empty result behind an active filter is ambiguous: bad
                 // filter value, or genuinely empty data? Say which check to
                 // make — "South" for "south" used to just render nothing.
-                <div className="ex-note">
+                <Note>
                   No rows matched your filters. Values must match the data exactly,
                   including capital letters — pick from the suggestions in the value
                   box to be sure.
-                </div>
+                </Note>
               )}
               {bindings.chart === "table" ? (
                 <div className="table-wrap" style={{ maxHeight: 420, overflowY: "auto" }}>
@@ -823,7 +854,12 @@ function ExploreScreen() {
                   <option key={d.name} value={d.name}>{d.title || d.name}</option>
                 ))}
               </datalist>
-              {!editing && <div className="hint">Type a new name to create a dashboard.</div>}
+              {!editing && (
+                <div className="hint">
+                  Lowercase letters, digits, _ and -. Type a new name to create a
+                  dashboard.
+                </div>
+              )}
             </div>
             <div className="field">
               <label>Panel title</label>
@@ -1746,15 +1782,8 @@ const EXPLORE_STYLES = `
   border-radius: 6px; padding: 3px 6px; font-size: 12px;
 }
 .ex-ychecks { display: inline-flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.ex-note {
-  font-size: 12.5px; line-height: 1.5; padding: 9px 12px; border-radius: 8px;
-  border: 1px solid var(--border); background: var(--bg-1); color: var(--text-dim);
-}
-.ex-note-bad { color: var(--red); background: rgba(224,102,95,0.08); border-color: #6b3330; }
-.ex-note-warn { color: var(--gold); background: rgba(217,178,90,0.07); border-color: var(--gold-dim); }
-.ex-note-ok { color: var(--green); }
 .ex-truncated {
-  font-size: 11.5px; color: var(--gold); background: rgba(217,178,90,0.07);
+  font-size: 11.5px; color: var(--gold); background: var(--gold-tint-bg);
   border: 1px solid var(--gold-dim); border-radius: 6px; padding: 5px 9px; margin-bottom: 8px;
 }
 `;

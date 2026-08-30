@@ -71,6 +71,7 @@ export function DatasetsView() {
 
 function DatasetList() {
   const navigate = useNavigate();
+  const auth = useAuth();
   const { data, isLoading, error } = useQuery({
     queryKey: ["datasets"],
     queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
@@ -126,7 +127,35 @@ function DatasetList() {
       {error && <ErrorBox error={error} />}
       {data &&
         (data.length === 0 ? (
-          <EmptyState>No datasets yet — import a file above to make one.</EmptyState>
+          <EmptyState>
+            No datasets yet — import a file above to make one.
+            {/* First-run next steps: three plain links, role-filtered like the
+                nav. No modal tours, no checklists. */}
+            <div style={{ marginTop: 8 }}>
+              Then: chart it in <Link to="/analyses">Analyses</Link>
+              {auth.can("editor") && (
+                <>
+                  {" "}· clean it with a <Link to="/pipelines">Pipeline</Link>
+                </>
+              )}{" "}
+              · or follow the{" "}
+              <a
+                href="https://github.com/laurelin-data/laurelin/blob/main/docs/tutorials/01-ingest-transform-build.md"
+                target="_blank"
+                rel="noreferrer"
+              >
+                10-minute tutorial
+              </a>{" "}
+              {/* The docs ship in the repo but are not served by this app yet,
+                  so on an offline or air-gapped install the link is dead —
+                  name the in-repo path so the tutorial is still findable. */}
+              <span className="faint">
+                (docs/tutorials/01-ingest-transform-build.md in the Laurelin
+                repo)
+              </span>
+              .
+            </div>
+          </EmptyState>
         ) : (
           <DataTable
             columns={columns}
@@ -548,6 +577,57 @@ function FederatedPanel() {
 
 // ------------------------------------------------------------------ detail
 
+/**
+ * The next-step doors from a dataset, so the page a new user lands on right
+ * after their first import is not a dead end. The guidance used to live only
+ * in the dataset LIST's empty state — which the import navigates away from,
+ * and which disappears forever once one dataset exists — so the first thing a
+ * new user successfully did stranded them.
+ *
+ * Same filter as the nav: a door renders only when the caller's role passes
+ * the target's `needs` (Explore, Pipelines and Schedules are editor-gated;
+ * SQL is the one authoring-adjacent surface a viewer can use). No
+ * permissions/grants display for non-admins — revealing restriction-existence
+ * to editors is a governance decision the attack passes have not reviewed —
+ * so the admin door is one link to the Admin page, nothing more.
+ */
+export function DatasetOpenIn({ name }: { name: string }) {
+  const auth = useAuth();
+  const canEdit = auth.can("editor");
+  const ds = encodeURIComponent(name);
+  return (
+    <div
+      className="toolbar"
+      style={{ gap: 14, flexWrap: "wrap", alignItems: "baseline", marginBottom: 16 }}
+    >
+      <span className="faint" style={{ fontSize: 12.5 }}>Open in:</span>
+      {canEdit && (
+        <Link to={`/explore?dataset=${ds}`} title="Shape this dataset into a chart by clicking, then save it to a dashboard">
+          Explore — chart it
+        </Link>
+      )}
+      <Link to={`/workbench?dataset=${ds}`} title="Query this dataset with SQL">
+        SQL — query it
+      </Link>
+      {canEdit && (
+        <Link to={`/pipelines?from=${ds}`} title="Start a no-code pipeline that reads this dataset">
+          New pipeline from this dataset
+        </Link>
+      )}
+      {canEdit && (
+        <Link to="/schedules" title="Build pipelines on a schedule">
+          Schedule builds
+        </Link>
+      )}
+      {auth.can("admin") && (
+        <Link to="/admin" title="Who can read this dataset — Admin → Dataset access">
+          Dataset access
+        </Link>
+      )}
+    </div>
+  );
+}
+
 function DatasetDetailPage() {
   const { name = "" } = useParams();
   const { data, isLoading, error } = useQuery({
@@ -599,6 +679,10 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
       />
 
       {needsCredentials(detail) && <NeedsCredentialsBanner detail={detail} />}
+
+      {/* Hidden while reads refuse: every door here runs a query, and offering
+          four ways to hit the same 409 would repeat the banner in red boxes. */}
+      {!needsCredentials(detail) && <DatasetOpenIn name={detail.name} />}
 
       {atSource ? (
         <FederatedSource

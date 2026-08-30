@@ -1,12 +1,12 @@
 // Schedules: the piece that makes a pipeline run without anyone pressing a
 // button. A schedule binds a trigger — a cron expression, or "a dataset gained
-// a version" — to an action — run a build, or sync a connector.
+// a version" — to an action — a build, or a connector sync.
 //
 // Editor-gated, like builds, because a schedule runs pipeline code. Firing is
 // exactly-once across replicas (leases), so this page is the same on every
 // node.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
@@ -16,6 +16,7 @@ import type {
   Schedule,
   ScheduleAction,
   ScheduleTrigger,
+  TransformSummary,
 } from "../types";
 import {
   Badge,
@@ -175,7 +176,7 @@ export function SchedulesView() {
     <div>
       <PageHeader
         title="Schedules"
-        subtitle="Run builds and syncs on a cron, or when an upstream dataset changes."
+        subtitle="Build pipelines and sync sources on a schedule, or when an upstream dataset changes."
         actions={
           canEdit ? (
             <button className="primary" onClick={() => setEditing({ ...BLANK })}>
@@ -195,7 +196,7 @@ export function SchedulesView() {
           </p>
           <p style={{ marginTop: 8 }}>
             What the schedules actually produced is on the{" "}
-            <Link to="/pipeline">Pipeline</Link> tab: every build, its status,
+            <Link to="/builds">Builds</Link> page: every build, its status,
             and when it ran.
           </p>
         </div>
@@ -209,7 +210,7 @@ export function SchedulesView() {
       {q.data &&
         (q.data.length === 0 ? (
           <EmptyState>
-            No schedules yet.{canEdit ? " Create one to run a pipeline on its own." : ""}
+            No schedules yet.{canEdit ? " Create one to build a pipeline on its own." : ""}
           </EmptyState>
         ) : (
           <>
@@ -253,6 +254,37 @@ function ScheduleEditor({
   const [s, setS] = useState<Schedule>({ ...initial });
   const isNew = initial.name === "";
   const set = (patch: Partial<Schedule>) => setS((old) => ({ ...old, ...patch }));
+
+  // The pipelines that exist are known to the server and rendered as pickers
+  // everywhere else (the builder, Explore, the SQL sidebar) — a bare text
+  // input here was a typo tax the save-then-warn banner then collected. The
+  // known outputs become checkboxes; the free-text box stays for a target
+  // that will exist later (authoring a schedule before its pipeline is a
+  // supported order — the warning covers it).
+  const transformsQ = useQuery({
+    queryKey: ["transforms"],
+    queryFn: () => api.get<TransformSummary[]>(`${API}/transforms`),
+    enabled: s.action === "build",
+    staleTime: 30_000,
+  });
+  const knownTargets = [...new Set((transformsQ.data ?? []).map((t) => t.output))].sort();
+  // Free-text targets (not produced by any known pipeline yet), kept as the
+  // author typed them; seeded once, after the pipeline list arrives, so a
+  // target the list DOES know starts as a ticked box, not as text.
+  const [extraText, setExtraText] = useState("");
+  const [extraSeeded, setExtraSeeded] = useState(false);
+  useEffect(() => {
+    if (extraSeeded || !transformsQ.data) return;
+    const ks = new Set(transformsQ.data.map((t) => t.output));
+    setExtraText(initial.targets.filter((t) => !ks.has(t)).join(", "));
+    setExtraSeeded(true);
+  }, [extraSeeded, transformsQ.data, initial.targets]);
+  const parseExtra = (text: string) =>
+    text.split(",").map((t) => t.trim()).filter(Boolean);
+  const setTargets = (checked: string[], extra: string) => {
+    const merged = [...checked, ...parseExtra(extra).filter((t) => !checked.includes(t))];
+    set({ targets: merged });
+  };
 
   const save = useMutation<Schedule, Error, void>({
     mutationFn: () =>
@@ -316,7 +348,7 @@ function ScheduleEditor({
               value={s.action}
               onChange={(e) => set({ action: e.target.value as ScheduleAction })}
             >
-              <option value="build">Run a build</option>
+              <option value="build">Build</option>
               <option value="sync">Sync a source</option>
             </select>
           </div>
@@ -357,14 +389,55 @@ function ScheduleEditor({
         {s.action === "build" ? (
           <div className="field">
             <label>Build targets (optional)</label>
-            <input
-              className="mono"
-              value={s.targets.join(", ")}
-              onChange={(e) =>
-                set({ targets: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })
-              }
-              placeholder="empty = build everything"
-            />
+            {extraSeeded && knownTargets.length > 0 ? (
+              <>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", margin: "2px 0 6px" }}>
+                  {knownTargets.map((o) => (
+                    <label key={o} className="check-inline" style={{ fontWeight: 400 }}>
+                      <input
+                        type="checkbox"
+                        checked={s.targets.includes(o)}
+                        onChange={(e) => {
+                          const checked = knownTargets.filter((k) =>
+                            k === o ? e.target.checked : s.targets.includes(k),
+                          );
+                          setTargets(checked, extraText);
+                        }}
+                      />
+                      <span className="mono">{o}</span>
+                    </label>
+                  ))}
+                </div>
+                <input
+                  className="mono"
+                  value={extraText}
+                  onChange={(e) => {
+                    setExtraText(e.target.value);
+                    setTargets(
+                      knownTargets.filter((k) => s.targets.includes(k)),
+                      e.target.value,
+                    );
+                  }}
+                  placeholder="a target that doesn't exist yet, comma-separated"
+                />
+                <p className="hint">
+                  Nothing ticked and nothing typed = build everything. A target
+                  named before its pipeline exists saves with a warning, and
+                  builds will fail until the pipeline does.
+                </p>
+              </>
+            ) : (
+              // Pipeline list still loading (or empty, or unavailable): the
+              // plain input is the whole control, exactly as before.
+              <input
+                className="mono"
+                value={s.targets.join(", ")}
+                onChange={(e) =>
+                  set({ targets: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })
+                }
+                placeholder="empty = build everything"
+              />
+            )}
           </div>
         ) : (
           <div className="field">
