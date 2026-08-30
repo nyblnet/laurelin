@@ -28,7 +28,7 @@ export function ObjectDetail({
   if (q.error instanceof ApiError && q.error.status === 404) {
     return <EmptyState>This object no longer exists.</EmptyState>;
   }
-  if (q.isError) return <ErrorBox error={q.error} />;
+  if (q.isError) return <ErrorBox error={q.error} onRetry={() => q.refetch()} />;
   const obj = q.data;
   if (!obj) return null;
 

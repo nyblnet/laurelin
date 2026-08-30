@@ -13,10 +13,11 @@
 //   a viewer sees `schedule overdue`, not which schedule.
 
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
 import { useAuth } from "../auth";
-import type { AlertWebhook, DatasetHealth, HealthEvent, HealthStatus } from "../types";
+import type { AlertWebhook, DatasetHealth, HealthEvent, HealthStatus, Role } from "../types";
 import {
   Badge,
   EmptyState,
@@ -130,9 +131,14 @@ function FreshnessEditor({ h }: { h: DatasetHealth }) {
 
 // ------------------------------------------------------------- one dataset row
 
-function HealthRow({ h, canEdit }: { h: DatasetHealth; canEdit: boolean }) {
+function HealthRow({ h, canEdit, role }: { h: DatasetHealth; canEdit: boolean; role: Role }) {
   const [open, setOpen] = useState(false);
   const detail = h.detail;
+  // Editor-and-above, like the rest of `detail`: the schedules whose last run
+  // failed. The server names them only to roles that can read schedules.
+  const failedSchedules = Array.isArray(detail?.schedule_run_failed)
+    ? (detail!.schedule_run_failed as string[])
+    : [];
   return (
     <div className="card" style={{ marginBottom: 8, padding: "10px 14px" }}>
       <div
@@ -148,6 +154,15 @@ function HealthRow({ h, canEdit }: { h: DatasetHealth; canEdit: boolean }) {
           </span>
         )}
         {h.sync_failing && <Badge tone="red">sync failing</Badge>}
+        {failedSchedules.length > 0 && (
+          <span
+            tabIndex={0}
+            title="A schedule targeting this dataset failed on its last run — the failure detail below says why."
+            aria-label="A schedule targeting this dataset failed on its last run — the failure detail below says why."
+          >
+            <Badge tone="red">schedule run failed</Badge>
+          </span>
+        )}
         {h.failing_expectations.map((e, i) => (
           <span
             key={i}
@@ -176,7 +191,7 @@ function HealthRow({ h, canEdit }: { h: DatasetHealth; canEdit: boolean }) {
 
       {open && (
         <div style={{ marginTop: 8 }}>
-          {h.last_failure && <FailureNote failure={h.last_failure} />}
+          {h.last_failure && <FailureNote failure={h.last_failure} role={role} />}
           {/* Editor-and-above detail: the server omits `detail` below editor,
               so this block simply does not render for a viewer. */}
           {detail?.expectations && detail.expectations.length > 0 && (
@@ -192,7 +207,7 @@ function HealthRow({ h, canEdit }: { h: DatasetHealth; canEdit: boolean }) {
               ))}
             </div>
           )}
-          {(detail?.transform || detail?.source || detail?.overdue_schedules) && (
+          {(detail?.transform || detail?.source || detail?.overdue_schedules || failedSchedules.length > 0) && (
             <div className="dim" style={{ fontSize: 12, marginTop: 6 }}>
               {detail?.transform && <span>transform <span className="mono">{String(detail.transform)}</span> · </span>}
               {detail?.source && <span>source <span className="mono">{String(detail.source)}</span> · </span>}
@@ -200,13 +215,24 @@ function HealthRow({ h, canEdit }: { h: DatasetHealth; canEdit: boolean }) {
                 <span>
                   overdue schedule{(detail.overdue_schedules as string[]).length > 1 ? "s" : ""}{" "}
                   <span className="mono">{(detail.overdue_schedules as string[]).join(", ")}</span>
+                  {failedSchedules.length > 0 && " · "}
+                </span>
+              )}
+              {failedSchedules.length > 0 && (
+                <span>
+                  failed schedule{failedSchedules.length > 1 ? "s" : ""}{" "}
+                  <span className="mono">{failedSchedules.join(", ")}</span>
                 </span>
               )}
             </div>
           )}
           {h.last_build_id && (
             <div className="dim" style={{ fontSize: 12, marginTop: 6 }}>
-              last build <span className="mono">{h.last_build_id}</span>
+              last build{" "}
+              {/* The id is a door, not a fact: `?build=` opens that card. */}
+              <Link className="mono" to={`/builds?build=${encodeURIComponent(h.last_build_id)}`}>
+                {h.last_build_id}
+              </Link>
               {h.last_build_status && <> ({h.last_build_status})</>}
               {h.last_scheduled_run_at && <> · last scheduled run {fmtAge(h.last_scheduled_run_at)}</>}
             </div>
@@ -226,7 +252,7 @@ function EventsFeed() {
     queryFn: () => api.get<HealthEvent[]>(`${API}/health/events`),
   });
   if (q.isLoading) return <Spinner />;
-  if (q.error) return <ErrorBox error={q.error} />;
+  if (q.error) return <ErrorBox error={q.error} onRetry={() => q.refetch()} />;
   const events = q.data ?? [];
   if (events.length === 0) {
     return <EmptyState>No health transitions recorded yet.</EmptyState>;
@@ -313,7 +339,9 @@ export function HealthView() {
       {auth.can("admin") && <WebhookNote />}
 
       {rollup.isLoading && <Spinner />}
-      {rollup.error != null && <ErrorBox error={rollup.error} />}
+      {rollup.error != null && (
+        <ErrorBox error={rollup.error} onRetry={() => rollup.refetch()} />
+      )}
 
       {rollup.data && rollup.data.length === 0 && (
         <EmptyState>No datasets visible to you.</EmptyState>
@@ -335,7 +363,7 @@ export function HealthView() {
         const body = rows
           .slice()
           .sort((a, b) => a.dataset.localeCompare(b.dataset))
-          .map((h) => <HealthRow key={h.dataset} h={h} canEdit={canEdit} />);
+          .map((h) => <HealthRow key={h.dataset} h={h} canEdit={canEdit} role={auth.role} />);
         return (
           <section key={status} style={{ marginBottom: 20 }}>
             {collapsed ? (

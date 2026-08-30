@@ -1,13 +1,14 @@
-"""The hand-rolled SVG charts and the Explore client model, rendered for real.
+"""The hand-rolled SVG charts and the shared shaping model, rendered for real.
 
 A chart is a claim about measured values, so a misleading chart is a
 correctness bug, not a cosmetic one — and none of these claims are reachable
 from Python. There is no frontend test framework in the webapp (vitest was
 deliberately not introduced; the single-file zero-CDN bundle is the product),
 so this file bundles `tests/webapp_harness/harness.tsx` with the webapp's own
-esbuild, renders the *real* `charts.tsx` and `views/explore/model.ts` through
-react-dom/server under node, and asserts on the exact markup — the same way
-the defects here were originally demonstrated.
+esbuild, renders the *real* `charts.tsx` and `views/shaping/model.ts` (the
+one model behind the quick chart and Analyses cells) through react-dom/server
+under node, and asserts on the exact markup — the same way the defects here
+were originally demonstrated.
 
 Skips as a unit when node or the webapp's node_modules are absent (a
 Python-only checkout); CI and any tree that can build the UI run it.
@@ -135,6 +136,23 @@ def test_scatter_axes_fit_the_data_rather_than_forcing_zero(rendered):
     assert max(xs) - min(xs) > 300  # spread across the plot, not a blob
 
 
+def test_an_unordered_categorical_bar_gets_a_stable_value_descending_order(rendered):
+    """A GROUP BY with no ORDER BY hands the chart the engine's arbitrary
+    order, and the same dashboard panel drew its categories shuffled
+    differently across refreshes. With no order stated by the data, bars now
+    sort first-measure-descending — the pie's largest-first rule
+    generalized."""
+    labels = x_axis_labels(rendered["bar_unordered"])
+    assert labels == ["east", "south", "west", "north"]
+
+
+def test_a_deliberate_order_in_the_data_survives_the_default_sort(rendered):
+    # A monotonic measure is an ORDER BY the user chose: kept verbatim.
+    assert x_axis_labels(rendered["bar_ordered_kept"]) == ["carrots", "apples", "bananas"]
+    # And `keepOrder` asserts deliberate order the heuristic cannot see.
+    assert x_axis_labels(rendered["bar_keeporder"]) == ["west", "east", "north", "south"]
+
+
 def test_grouped_bars_never_overflow_their_group_band(rendered):
     """8 series × 40 groups: the old 2px floor made adjacent groups' bars
     physically interleave, attaching bars to the wrong x label."""
@@ -157,6 +175,15 @@ def test_a_stat_panel_never_rounds_a_nonzero_value_to_zero(rendered):
     svg = rendered["stat_small"]
     assert "0.00400" in svg
     assert ">0<" not in svg
+
+
+def test_a_stat_of_a_multirow_result_declares_it_shows_one_of_n(rendered):
+    # A stat is a claim that the result IS one number. Given a per-region
+    # result it can only show the first row — silently, that reads as the
+    # total. The badge is mandatory, and a single-row stat never carries it.
+    html = rendered["stat_multirow"]
+    assert "first of 3 rows — filter to one row, or use a chart" in html
+    assert "first of" not in rendered["stat_small"]
 
 
 def test_axis_tick_labels_are_distinct_for_sub_hundredth_domains(rendered):
@@ -225,7 +252,7 @@ def test_mismatched_measure_scales_get_a_visible_note(rendered):
 
 
 # ---------------------------------------------------------------------------
-# The Explore client model
+# The shared shaping model (quick chart + Analyses cells)
 # ---------------------------------------------------------------------------
 
 
@@ -276,6 +303,23 @@ def test_a_server_refusal_is_rewritten_into_card_vocabulary(rendered):
 def test_an_explore_draft_survives_a_serialize_parse_round_trip(rendered):
     assert json.loads(rendered["draft_roundtrip"]) == json.loads(rendered["draft_original"])
     assert json.loads(rendered["draft_garbage"]) == [None, None, None]
+
+
+def test_picking_a_date_bucket_defaults_the_sort_to_chronological(rendered):
+    """A time series nobody ordered charts in whatever order the engine
+    grouped it — shuffled months that look like a valid chart. The shared
+    transition (views/shaping/model.ts, so Analyses cells inherit it too)
+    defaults the sort to the new bucket, ascending, the moment a date bucket
+    is picked — unless the author's own sort still names a real column."""
+    assert json.loads(rendered["bucket_autosort"]) == {"column": "when month", "dir": "asc"}
+    assert json.loads(rendered["bucket_autosort_kept"]) == {"column": "row count", "dir": "desc"}
+
+
+def test_sort_direction_defaults_by_what_the_column_is(rendered):
+    # A measure descends (biggest first is what "sort by the count" means);
+    # a grouping ascends (a time column sorted largest-first runs backwards).
+    assert json.loads(rendered["sort_measure_default"]) == {"column": "row count", "dir": "desc"}
+    assert json.loads(rendered["sort_group_default"]) == {"column": "when", "dir": "asc"}
 
 
 def test_value_suggestions_are_an_ordinary_flow_over_the_one_preview_route(rendered):

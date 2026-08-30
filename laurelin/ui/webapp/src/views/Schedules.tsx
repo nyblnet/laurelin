@@ -7,7 +7,7 @@
 // node.
 
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
 import { useAuth } from "../auth";
@@ -26,6 +26,9 @@ import {
   ErrorBox,
   FailureBadge,
   FailureNote,
+  LiveStatus,
+  Modal,
+  NAME_RULE,
   PageHeader,
   Spinner,
   WarningBox,
@@ -75,10 +78,29 @@ export function SchedulesView() {
   const canEdit = auth.can("editor");
   const qc = useQueryClient();
   const [editing, setEditing] = useState<Schedule | null>(null);
+  // `?target=<dataset>`: the "Schedule builds" door on a dataset page carries
+  // which dataset the user was looking at, so landing here opens the editor
+  // with that target already ticked instead of making them re-pick it from
+  // scratch. Read once at mount; the param is a handoff, not state.
+  const [params, setParams] = useSearchParams();
+  useEffect(() => {
+    const target = params.get("target");
+    if (target && canEdit) {
+      setEditing({ ...BLANK, targets: [target] });
+      setParams({}, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit]);
   // Authoring hints from the last save. The write already succeeded — this used
   // to be a 400 that refused it — so they belong beside the list, not inside a
   // modal that is closing.
   const [warnings, setWarnings] = useState<AuthoringWarning[]>([]);
+  // Run-now in flight: the schedule we fired and the last_run_at it had when
+  // we fired it. While set, the list polls; when the row's last_run_at moves,
+  // the run has landed and `outcome` says how it went. Without this, the
+  // click was fire-and-forget: the row said "never" until a manual refresh.
+  const [watching, setWatching] = useState<{ name: string; prevRunAt: string | null } | null>(null);
+  const [outcome, setOutcome] = useState<Schedule | null>(null);
 
   const q = useQuery({
     queryKey: ["schedules"],
@@ -86,12 +108,34 @@ export function SchedulesView() {
     // Editor-gated on the server. Asking anyway buys a 403 in a red box, which
     // reads as a fault rather than as the deliberate boundary it is.
     enabled: canEdit,
+    // Poll only while a run we triggered is pending, so the row converges.
+    refetchInterval: watching ? 2000 : false,
   });
+
+  const watchedRow = watching ? q.data?.find((r) => r.name === watching.name) : undefined;
+  useEffect(() => {
+    if (
+      watching &&
+      watchedRow &&
+      watchedRow.last_run_at !== watching.prevRunAt &&
+      // The server projects `last_status` through the queued build, so a row
+      // can read "running" after the firing lands. Keep polling until the
+      // build settles — "finished: running." is not an outcome.
+      watchedRow.last_status !== "running"
+    ) {
+      setOutcome(watchedRow);
+      setWatching(null);
+    }
+  }, [watching, watchedRow]);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["schedules"] });
 
   const runNow = useMutation({
-    mutationFn: (name: string) => api.post(`${API}/schedules/${name}/run`, {}),
+    mutationFn: (s: Schedule) => api.post(`${API}/schedules/${s.name}/run`, {}),
+    onSuccess: (_data, s) => {
+      setOutcome(null);
+      setWatching({ name: s.name, prevRunAt: s.last_run_at });
+    },
     onSettled: invalidate,
   });
   const remove = useMutation({
@@ -136,6 +180,16 @@ export function SchedulesView() {
               <Badge tone={statusTone(s.last_status)}>{s.last_status}</Badge>
             )}
             <span className="dim">{fmtTime(s.last_run_at)}</span>
+            {/* What the run actually produced, one click away. */}
+            {s.last_build_id && (
+              <Link
+                className="mono"
+                style={{ fontSize: 12 }}
+                to={`/builds?build=${encodeURIComponent(s.last_build_id)}`}
+              >
+                build →
+              </Link>
+            )}
           </span>
         ) : (
           <span className="faint">never</span>
@@ -150,11 +204,11 @@ export function SchedulesView() {
         <span className="toolbar" style={{ gap: 6 }}>
           <button
             className="small"
-            disabled={runNow.isPending}
-            onClick={() => runNow.mutate(s.name)}
+            disabled={runNow.isPending || watching?.name === s.name}
+            onClick={() => runNow.mutate(s)}
             title="Fire now, without waiting for the window"
           >
-            Run now
+            {watching?.name === s.name ? "Running…" : "Run now"}
           </button>
           <button className="small" onClick={() => setEditing(s)}>
             Edit
@@ -202,9 +256,33 @@ export function SchedulesView() {
         </div>
       )}
       {q.isLoading && canEdit && <Spinner />}
-      {q.isError && <ErrorBox error={q.error} />}
+      {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
       {(runNow.error || remove.error) && (
         <ErrorBox error={runNow.error || remove.error} />
+      )}
+      {/* Run-now acknowledges, then converges: announced live, so the click
+          has an audible/visible receipt, and the sentence changes to the
+          outcome when the polled row reflects it. */}
+      {watching && (
+        <LiveStatus className="dim" style={{ fontSize: 13, margin: "8px 0" }}>
+          Run of <span className="mono">{watching.name}</span> requested — the row
+          below updates when it finishes.
+        </LiveStatus>
+      )}
+      {outcome && !watching && (
+        <LiveStatus className="dim" style={{ fontSize: 13, margin: "8px 0" }}>
+          Run of <span className="mono">{outcome.name}</span> finished:{" "}
+          {outcome.last_status ?? "unknown"}.
+          {outcome.last_build_id && (
+            <>
+              {" "}
+              <Link to={`/builds?build=${encodeURIComponent(outcome.last_build_id)}`}>
+                See the build
+              </Link>
+              .
+            </>
+          )}
+        </LiveStatus>
       )}
       <WarningBox warnings={warnings} />
       {q.data &&
@@ -218,7 +296,7 @@ export function SchedulesView() {
             {q.data.filter((s) => s.last_failure).map((s) => (
               <div key={s.name} style={{ marginTop: 10 }}>
                 <div className="mono dim" style={{ fontSize: 12 }}>{s.name}</div>
-                <FailureNote failure={s.last_failure!} />
+                <FailureNote failure={s.last_failure!} role={auth.role} />
               </div>
             ))}
           </>
@@ -312,9 +390,12 @@ function ScheduleEditor({
     (s.action === "sync" ? s.source.trim() !== "" : true);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" style={{ width: 560, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
-        <div className="card-title">{isNew ? "New schedule" : `Edit ${initial.name}`}</div>
+    <Modal
+      label={isNew ? "New schedule" : `Edit schedule ${initial.name}`}
+      onClose={onClose}
+      width={560}
+    >
+      <div className="card-title">{isNew ? "New schedule" : `Edit ${initial.name}`}</div>
 
         <div className="field">
           <label>Name</label>
@@ -326,7 +407,7 @@ function ScheduleEditor({
             placeholder="nightly_rollup"
           />
           {isNew && !nameValid && s.name !== "" && (
-            <p className="hint">Lowercase letters, digits, `-` and `_`; start with a letter.</p>
+            <p className="hint">{NAME_RULE}</p>
           )}
           {nameTaken && <p className="hint">A schedule with that name already exists.</p>}
         </div>
@@ -453,17 +534,16 @@ function ScheduleEditor({
 
         {save.error && <ErrorBox error={save.error} />}
 
-        <div className="toolbar" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-          <button onClick={onClose}>Cancel</button>
-          <button
-            className="primary"
-            disabled={!complete || save.isPending}
-            onClick={() => save.mutate()}
-          >
-            {save.isPending ? "Saving…" : "Save schedule"}
-          </button>
-        </div>
+      <div className="toolbar" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+        <button onClick={onClose}>Cancel</button>
+        <button
+          className="primary"
+          disabled={!complete || save.isPending}
+          onClick={() => save.mutate()}
+        >
+          {save.isPending ? "Saving…" : "Save schedule"}
+        </button>
       </div>
-    </div>
+    </Modal>
   );
 }

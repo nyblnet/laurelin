@@ -16,6 +16,18 @@ import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { FlowsView } from "./Flows";
 import { TransformsView } from "./Transforms";
 
+/**
+ * One sentence for both tabs, deliberately shared: the two halves used to
+ * introduce themselves differently ("no code — or write Python on the other
+ * tab" vs "this tab is the advanced surface"), which read as two products
+ * that happened to share a header. The header is the product; the tabs are
+ * idioms.
+ */
+export const PIPELINES_SUBTITLE =
+  "Turn datasets into new datasets. One kind of thing, two ways to write it: " +
+  "step by step with no code on the Visual tab, or as Python on the Python tab. " +
+  "Either way it is a real transform on the same builds, lineage and permissions.";
+
 export function PipelinesView() {
   const location = useLocation();
   const [params] = useSearchParams();

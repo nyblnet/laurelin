@@ -1,7 +1,7 @@
 // Small shared UI primitives used across views. Keep this dependency-light —
 // views import from here so the look stays consistent.
 
-import type { CSSProperties, ReactNode } from "react";
+import { useEffect, useRef, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { ApiError } from "./api";
 import type { AuthoringWarning, Failure, FailureCode, Role } from "./types";
 
@@ -13,7 +13,14 @@ export function EmptyState({ children }: { children: ReactNode }) {
   return <div className="empty">{children}</div>;
 }
 
-export function ErrorBox({ error }: { error: unknown }) {
+/**
+ * A failed surface's red box. `onRetry` matters for auto-run surfaces: the
+ * app-wide query defaults are `retry: false, refetchOnWindowFocus: false`
+ * (App.tsx), so without a Retry control a transient 503 on a dashboard panel
+ * or an object list is terminal until a full reload. Screens whose queries
+ * run without a user gesture pass their query's `refetch` here.
+ */
+export function ErrorBox({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   let msg: string;
   if (error instanceof ApiError) {
     msg =
@@ -23,7 +30,142 @@ export function ErrorBox({ error }: { error: unknown }) {
   } else {
     msg = `Error: ${String((error as Error)?.message ?? error)}`;
   }
-  return <div className="error-box">{msg}</div>;
+  return (
+    <div className="error-box">
+      {msg}
+      {onRetry && (
+        <button type="button" className="small error-retry" onClick={onRetry}>
+          Retry
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A polite live region for async outcomes — "1,204 rows", "Saved", a build's
+ * terminal status. Screen-reader users otherwise learn that a result arrived
+ * only by re-reading the page. `role="status"` announces content changes
+ * without stealing focus; wrap the *changing* text, not whole sections.
+ */
+export function LiveStatus({
+  children,
+  className,
+  style,
+}: {
+  children: ReactNode;
+  className?: string;
+  style?: CSSProperties;
+}) {
+  return (
+    <div role="status" className={className} style={style}>
+      {children}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------- modal
+//
+// One dialog implementation for the whole app. The command palette proved the
+// pattern (role=dialog, focus in on open, Escape closes, focus restored);
+// every ad-hoc `.modal-backdrop` div in a view had none of it — an invisible
+// wall to a keyboard user, whose Tab kept walking the page underneath.
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Keep Tab inside `container`: wraps from the last focusable to the first and
+ * back. Exported for the command palette, which shares the dialog contract
+ * but owns its own chrome.
+ */
+export function containFocusTab(
+  e: { key: string; shiftKey: boolean; preventDefault: () => void },
+  container: HTMLElement | null,
+): void {
+  if (e.key !== "Tab" || !container) return;
+  const nodes = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE));
+  if (nodes.length === 0) {
+    e.preventDefault();
+    return;
+  }
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || active === container)) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && active === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+/**
+ * The app's one modal dialog.
+ *
+ * Renders the same `.modal-backdrop`/`.modal` chrome the hand-rolled call
+ * sites used, so migrating a view is: replace the two outer divs with
+ * `<Modal label onClose>` and delete the stopPropagation plumbing. What the
+ * primitive adds and a view must not re-implement: role=dialog + aria-modal,
+ * focus moves in on open (first focusable control, else the dialog), Escape
+ * closes, Tab is contained, and focus returns to the opener on close.
+ * Backdrop close is mousedown-on-backdrop, not click, so a drag that starts
+ * in an input and ends outside cannot destroy the form.
+ */
+export function Modal({
+  label,
+  onClose,
+  width,
+  children,
+}: {
+  /** Accessible name for the dialog — what a screen reader announces. */
+  label: string;
+  /** Called on Escape, backdrop mousedown, and whatever close controls the
+   *  content renders. The opener owns the open/closed state. */
+  onClose: () => void;
+  /** Content width (px or CSS length). Default is the sheet's 460px max. */
+  width?: number | string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const dialog = ref.current;
+    const first = dialog?.querySelector<HTMLElement>(FOCUSABLE);
+    (first ?? dialog)?.focus();
+    return () => {
+      opener?.focus?.();
+    };
+  }, []);
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={ref}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        tabIndex={-1}
+        style={width !== undefined ? { width, maxWidth: "92vw" } : undefined}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            onClose();
+          } else {
+            containFocusTab(e, ref.current);
+          }
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 // The marker the API sends instead of a value it could not redact safely — an
@@ -41,11 +183,13 @@ export const WITHHELD = "***** (withheld)";
  */
 export function RedactedValue({ value }: { value: string }) {
   if (value !== WITHHELD) return <>{value}</>;
+  const why =
+    "Withheld by the server: this value could not be redacted safely, so none of it was sent. Laurelin masks a credential only where it can locate it exactly — in a scheme://user:password@host URL. An ODBC keyword string, or a URL with a query, could hide a secret anywhere in it.";
+  // tabIndex + aria-label: the explanation must be reachable without a mouse.
+  // A title tooltip alone is invisible to keyboard and screen-reader users —
+  // the *content* disclosed is unchanged, only the path to it.
   return (
-    <span
-      className="faint"
-      title="Withheld by the server: this value could not be redacted safely, so none of it was sent. Laurelin masks a credential only where it can locate it exactly — in a scheme://user:password@host URL. An ODBC keyword string, or a URL with a query, could hide a secret anywhere in it."
-    >
+    <span className="faint" tabIndex={0} title={why} aria-label={`withheld. ${why}`}>
       withheld
     </span>
   );
@@ -95,8 +239,16 @@ export function Withheld({
   /** Overrides the visible text; defaults to "<role> only". */
   label?: string;
 }) {
+  const title = withheldTitle(what, role, why);
+  // Focusable, and the explanation rides aria-label: title-only prose is
+  // unreachable by keyboard. Same statement, one more path to it.
   return (
-    <span className="withheld" title={withheldTitle(what, role, why)}>
+    <span
+      className="withheld"
+      tabIndex={0}
+      title={title}
+      aria-label={`${label ?? `${role} only`}. ${title}`}
+    >
       {label ?? `${role} only`}
     </span>
   );
@@ -206,11 +358,21 @@ const FAILURE_TEXT: Record<FailureCode, FailureText> = {
     advice: "A panel or an app still names a property that has been renamed or removed. Whoever can edit it sees which one; a reader deliberately does not.",
   },
   transform_failed: {
-    label: "Laurelin's own code raised",
-    // Deliberately not "while running": the same code covers a pipeline file
-    // that will not import (phase `compile`), and the phase line below says
-    // which. Claiming the wrong step sends an operator to the wrong place.
-    advice: "A transform or a pipeline file raised. The traceback is in the server log.",
+    // Not "Laurelin's own code": the code that raised is the workspace's own
+    // transform or pipeline file, and blaming the platform sent authors to
+    // file bugs about their own typo. Deliberately not "while running"
+    // either: the same code covers a pipeline file that will not import
+    // (phase `compile`), and the phase line below says which.
+    label: "The pipeline's code raised",
+    advice:
+      "A transform or a pipeline file in this workspace raised. Fix the code it names — the exception class is on the technical line below when your role receives it; the full traceback is in the server log.",
+  },
+  blocked_by_upstream: {
+    label: "Skipped: an input it reads from failed",
+    // No log pointer on purpose: nothing here ran, nothing here raised, and
+    // there is nothing in any log about this task. The one action is
+    // upstream.
+    advice: "Fix the failed upstream transform first; this one never started.",
   },
   expectation_failed: {
     label: "A data expectation failed",
@@ -223,6 +385,11 @@ const FAILURE_TEXT: Record<FailureCode, FailureText> = {
 };
 
 function failureLabel(f: Failure): string {
+  // `subject` is in the viewer projection, so even the narrowest reader can
+  // be told WHICH upstream to look at instead of a generic "an input".
+  if (f.code === "blocked_by_upstream" && f.subject) {
+    return `Skipped: its input '${f.subject}' failed`;
+  }
   return FAILURE_TEXT[f.code]?.label ?? f.code.replace(/_/g, " ");
 }
 
@@ -230,10 +397,13 @@ export function failureAdvice(f: Failure): string {
   return FAILURE_TEXT[f.code]?.advice ?? "";
 }
 
-/** A one-word status for a table cell, with the whole explanation on hover. */
+/** A one-word status for a table cell, with the whole explanation on hover —
+ *  and on focus: the span is tabbable and the prose rides aria-label, so the
+ *  explanation is not mouse-only. */
 export function FailureBadge({ failure }: { failure: Failure }) {
+  const prose = `${failureLabel(failure)}. ${failureAdvice(failure)}`;
   return (
-    <span title={`${failureLabel(failure)}. ${failureAdvice(failure)}`}>
+    <span tabIndex={0} title={prose} aria-label={prose}>
       <Badge tone="red">{failure.code.replace(/_/g, " ")}</Badge>
     </span>
   );
@@ -246,8 +416,15 @@ export function FailureBadge({ failure }: { failure: Failure }) {
  * projection, by design — so the technical line and the log reference simply do
  * not render, and a line says why rather than leaving the reader wondering
  * whether the build really failed for no reason.
+ *
+ * `role` is the CALLER's role, from useAuth(). It exists because the
+ * missing-detail fallback used to key on the absent `detail_ref` alone and
+ * told a superadmin "an editor sees more" — a lie. Only a role below editor
+ * gets the your-role-sees-less education; anyone else with no ref is told the
+ * truth: no further detail was recorded. Omitting `role` is safe — the
+ * neutral sentence renders — but screens that know the caller should pass it.
  */
-export function FailureNote({ failure }: { failure: Failure }) {
+export function FailureNote({ failure, role }: { failure: Failure; role?: Role }) {
   const detail = [
     failure.driver,
     failure.exc_class,
@@ -277,10 +454,14 @@ export function FailureNote({ failure }: { failure: Failure }) {
           <span className="mono">grep {failure.detail_ref}</span>. Laurelin never
           stores a driver's own message, because it cannot know what is in it.
         </div>
-      ) : (
+      ) : role === "viewer" ? (
         <div className="failure-meta faint">
           This is everything your role is shown. An editor sees which system
           failed, at which step, and a reference into the server log.
+        </div>
+      ) : (
+        <div className="failure-meta faint">
+          No further detail was recorded for this failure.
         </div>
       )}
     </div>
@@ -367,6 +548,12 @@ export interface Column<T> {
   className?: string;
 }
 
+/**
+ * The keyboard contract: `onRowClick` implies the row is a control, so the
+ * row is tabbable and Enter/Space activate it — a view never adds its own
+ * key handling on top. A clickable row that only a mouse could reach made
+ * ObjectBrowser's whole selection flow keyboard-invisible.
+ */
 export function DataTable<T>({
   columns,
   rows,
@@ -403,6 +590,21 @@ export function DataTable<T>({
                 .join(" ")
                 .trim()}
               onClick={onRowClick ? () => onRowClick(row) : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+              onKeyDown={
+                onRowClick
+                  ? (e: KeyboardEvent<HTMLTableRowElement>) => {
+                      // Only when the row itself has focus: Enter inside a
+                      // control rendered in a cell must keep meaning that
+                      // control, and Space in an input must stay a space.
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onRowClick(row);
+                      }
+                    }
+                  : undefined
+              }
             >
               {columns.map((c, j) => (
                 <td key={j} className={c.className}>
@@ -419,6 +621,30 @@ export function DataTable<T>({
 
 export function fmtNum(n: number | null | undefined): string {
   return n == null ? "—" : n.toLocaleString("en-US");
+}
+
+/**
+ * The one sentence for every name gate, so six surfaces stop phrasing the
+ * same regex five ways (silent disable, raw `^[a-z][a-z0-9_]*$`, literal
+ * markdown backticks, and two prose variants — all live at once). Two rules
+ * exist in the product and only two: names that allow hyphens (dashboards,
+ * schedules, analyses, workspaces: `^[a-z][a-z0-9_-]{0,63}$`) and names that
+ * do not (datasets, pipelines: `^[a-z][a-z0-9_]*$`). One sentence each,
+ * stated in words a person can act on, never as a regex.
+ */
+export const NAME_RULE =
+  "Lowercase letters, digits, underscores and hyphens, starting with a letter — for example nightly_rollup.";
+export const NAME_RULE_NO_HYPHEN =
+  "Lowercase letters, digits and underscores, starting with a letter — for example late_orders.";
+
+/**
+ * The one phrase for a truncated result, so "truncated at 1000",
+ * "(first of more)", "Showing the first 200 rows…" and "first 1,000 of a
+ * larger result" stop being four renderings of one fact. Callers may append
+ * an action ("— add a filter…") but the fact itself has one voice.
+ */
+export function truncationNote(n: number): string {
+  return `first ${fmtNum(n)} of a larger result`;
 }
 
 /**

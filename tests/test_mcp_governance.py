@@ -220,7 +220,9 @@ def test_governance_set_over_mcp_binds_other_mcp_callers_immediately(env):
     ])
     with pytest.raises(LaurelinError) as err:
         viewer.dataset_rows("towns")
-    assert err.value.status == 403
+    # 404, not 403: a view refusal must not confirm the dataset exists.
+    # (An *edit* refusal stays 403 — that caller can already see it.)
+    assert err.value.status == 404
 
     # Markings: fail closed until the clearance arrives, open after.
     admin.create_marking("secret", description="crown jewels")
@@ -228,7 +230,9 @@ def test_governance_set_over_mcp_binds_other_mcp_callers_immediately(env):
     assert marked["effective"] == ["secret"]
     with pytest.raises(LaurelinError) as err:
         viewer.dataset_rows("cities")
-    assert err.value.status == 403
+    # 404 for the same reason as the grant case above: a marking the caller
+    # has no clearance for hides the dataset rather than confirming it.
+    assert err.value.status == 404
     admin.set_user_clearances("vi", ["secret"])
     assert len(viewer.dataset_rows("cities")["rows"]) == 2
 

@@ -334,3 +334,59 @@ def test_the_unknown_target_warning_speaks_the_settled_vocabulary(client):
     hint = next(w["hint"] for w in r.json()["warnings"] if w["field"] == "target")
     assert "no pipeline produces 'tidy_flightz'" in hint
     assert "transform" not in hint and "flow" not in hint
+
+
+def test_the_schedule_row_reports_the_queued_builds_own_outcome(client):
+    """`record_schedule_run` writes "succeeded" when a build-action firing
+    QUEUES its build — true of the firing and a lie on the page: the row read
+    green all night while the build it launched failed on an expectation
+    moments later, and only a different screen (Health) disagreed. The read
+    routes project `last_status` through the build's own terminal state, and
+    report an unfinished build as "running" rather than either lie."""
+    from laurelin.core.models import BuildStatus
+
+    c, _, store = client
+    c.put("/api/v1/schedules/nightly", json={
+        "cron": "0 2 * * *", "action": "build", "targets": ["clean"]})
+    build = store.create_build(["clean"])
+    store.record_schedule_run("nightly", "succeeded", build_id=build.id)
+
+    # Queued-but-unfinished is "running", not the recorder's "succeeded".
+    assert c.get("/api/v1/schedules/nightly").json()["last_status"] == "running"
+
+    store.update_build(build.id, status=BuildStatus.failed)
+    assert c.get("/api/v1/schedules/nightly").json()["last_status"] == "failed"
+    listed = {s["name"]: s for s in c.get("/api/v1/schedules").json()}
+    assert listed["nightly"]["last_status"] == "failed"
+
+    store.update_build(build.id, status=BuildStatus.succeeded)
+    assert c.get("/api/v1/schedules/nightly").json()["last_status"] == "succeeded"
+
+
+def test_a_plan_refusal_is_recorded_as_definition_stale_not_transform_failed(client):
+    """A schedule whose target no pipeline produces fails at plan time: no
+    build is created, so nothing else can carry the story. Recording it as
+    TRANSFORM_FAILED made the UI blame "the pipeline's code" for a schedule
+    with no pipeline and no code. The refusal is raised by Laurelin's own
+    planner (first-party), and what it means is that the stored definition
+    does not match the workspace — DEFINITION_STALE, at phase `plan`."""
+    from laurelin.api.app import _scheduler_targets
+
+    c, app, store = client
+    c.put("/api/v1/schedules/broken", json={
+        "cron": "0 2 * * *", "action": "build", "targets": ["ghost_dataset"]})
+    assert c.post("/api/v1/schedules/broken/run").status_code == 200
+
+    sched = scheduler.Scheduler(lambda: _scheduler_targets(app), worker_id="a")
+    assert "broken" in sched.tick()
+
+    info = store.get_schedule("broken")
+    assert info.last_status == "failed"
+    assert info.last_build_id is None
+    assert info.last_failure is not None
+    assert info.last_failure.code.value == "definition_stale"
+    assert info.last_failure.phase.value == "plan"
+    # And the API row agrees (no build to project through).
+    row = c.get("/api/v1/schedules/broken").json()
+    assert row["last_status"] == "failed"
+    assert row["last_failure"]["code"] == "definition_stale"

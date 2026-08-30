@@ -542,7 +542,7 @@ function DatasetPolicyCard({
 
 // --------------------------------------------------------------- section
 
-export function DataSecuritySection() {
+export function DataSecuritySection({ filter = "" }: { filter?: string }) {
   const qc = useQueryClient();
   const invalidate = () =>
     qc.invalidateQueries({ queryKey: ["dataset-policies"] });
@@ -564,7 +564,11 @@ export function DataSecuritySection() {
 
   const groups = useMemo(() => groupsQuery.data ?? [], [groupsQuery.data]);
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data]);
-  const entries = policiesQuery.data ?? [];
+  const all = policiesQuery.data ?? [];
+  const needle = filter.trim().toLowerCase();
+  const entries = needle
+    ? all.filter((e) => e.dataset.toLowerCase().includes(needle))
+    : all;
 
   return (
     <section style={{ marginBottom: 32 }}>
@@ -588,6 +592,11 @@ export function DataSecuritySection() {
             onSaved={invalidate}
           />
         ))
+      ) : needle ? (
+        <EmptyState>
+          No dataset named like "{filter.trim()}" — clear the filter above to
+          see all {all.length}.
+        </EmptyState>
       ) : (
         <EmptyState>No datasets defined.</EmptyState>
       )}

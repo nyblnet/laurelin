@@ -423,3 +423,39 @@ def test_freshness_declaration_rejects_unknown_dataset_and_bad_values(editor):
     assert editor.put(
         "/api/v1/datasets/public_ds/freshness", json={"expected_fresh_seconds": 5}
     ).status_code == 400  # sub-minute promise is a typo, not a policy
+
+
+def test_a_schedule_whose_firing_failed_marks_its_target_failing(
+    admin, viewer, editor, store, service
+):
+    """S3: a plan-time schedule failure creates NO build, so no build task can
+    ever carry it into this rollup — Health read all-clear while the Schedules
+    page showed the row red, and the 'refresh daily and tell me when it
+    breaks' journey had two Operate screens contradicting each other. The
+    recorded firing outcome now feeds the derivation directly. Schedule names
+    stay editor-and-above (they ride `detail`, like overdue_schedules); the
+    viewer learns `failing`, never which schedule."""
+    store.upsert_schedule(ScheduleInfo(
+        name="sekrit-sched", trigger="cron", cron="0 2 * * *", action="build",
+        targets=["public_ds"], next_run_at="2999-01-01T00:00:00+00:00",
+    ))
+    store.record_schedule_run("sekrit-sched", "failed", failure=Failure(
+        code=FailureCode.DEFINITION_STALE, subject="schedule:sekrit-sched",
+    ))
+
+    health = service.dataset_health(["public_ds"])["public_ds"]
+    assert health.status == HealthStatus.failing
+    assert health.detail.get("schedule_run_failed") == ["sekrit-sched"]
+    # The carried failure is re-subjected to the dataset the reader is
+    # looking at — the schedule name must not ride the PRESENTATION field.
+    assert health.last_failure is not None
+    assert health.last_failure.subject == "dataset:public_ds"
+
+    v = viewer.get("/api/v1/health/datasets")
+    assert "sekrit-sched" not in v.text
+    row = next(h for h in v.json() if h["dataset"] == "public_ds")
+    assert row["status"] == "failing"
+
+    e = editor.get("/api/v1/health/datasets")
+    erow = next(h for h in e.json() if h["dataset"] == "public_ds")
+    assert erow["detail"]["schedule_run_failed"] == ["sekrit-sched"]

@@ -75,6 +75,20 @@ def _refuse(message: str, *, node: str = "", field: str = "") -> "FlowRefused":
     return FlowRefused(message, node=node, field=field)
 
 
+class FlowSourceDenied(FlowRefused):
+    """A flow's source exists but the principal it runs as may not read it.
+
+    A subclass, not a flag, so the type itself is the discriminator at catch
+    sites that must answer *access* differently from *staleness*: a viewer
+    running a stored panel over a dataset withheld from their role was told the
+    panel "refers to something that no longer exists" — false three ways (the
+    dataset exists, nothing is broken, and an entitled viewer sees a working
+    chart). The message still names the dataset, so it is still served only to
+    a principal who could have authored the flow; below that level the catch
+    site renders an access sentence with no dataset name in it.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Closed vocabularies
 #

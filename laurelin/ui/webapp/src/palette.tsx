@@ -11,6 +11,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "./auth";
 import { visibleNavGroups } from "./Layout";
+import { containFocusTab } from "./ui";
 import type { Role } from "./types";
 
 export interface PaletteItem {
@@ -38,6 +39,7 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   // Focus returns to wherever the user was when the palette closes.
   const restoreRef = useRef<HTMLElement | null>(null);
 
@@ -84,10 +86,15 @@ export function CommandPalette() {
   return (
     <div className="palette-backdrop" onClick={() => setOpen(false)}>
       <div
+        ref={dialogRef}
         className="palette"
         role="dialog"
+        aria-modal="true"
         aria-label="Go to page"
         onClick={(e) => e.stopPropagation()}
+        // The same containment the Modal primitive has: Tab must not walk
+        // out of an open dialog into the page underneath it.
+        onKeyDown={(e) => containFocusTab(e, dialogRef.current)}
       >
         <input
           ref={inputRef}

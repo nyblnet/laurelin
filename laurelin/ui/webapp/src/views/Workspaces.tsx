@@ -30,6 +30,7 @@ const SLUG_RE = /^[a-z0-9][a-z0-9_-]{1,47}$/;
 
 function CreateWorkspacePanel() {
   const qc = useQueryClient();
+  const auth = useAuth();
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -41,11 +42,16 @@ function CreateWorkspacePanel() {
         name: name.trim() || undefined,
         description: description.trim() || undefined,
       }),
-    onSuccess: () => {
+    onSuccess: async () => {
       qc.invalidateQueries({ queryKey: ["workspaces"] });
       setSlug("");
       setName("");
       setDescription("");
+      // Re-probe /auth/status so the shell learns about the new workspace
+      // without a reload — and, when this was the FIRST workspace, activates
+      // it. A superadmin who just created their first workspace used to stay
+      // stranded on a stale "no workspace" state until a hard refresh.
+      await auth.refreshAuth();
     },
   });
 
@@ -157,7 +163,7 @@ export function WorkspacesView() {
       {wsQuery.isLoading ? (
         <Spinner />
       ) : wsQuery.error ? (
-        <ErrorBox error={wsQuery.error} />
+        <ErrorBox error={wsQuery.error} onRetry={() => wsQuery.refetch()} />
       ) : workspaces.length === 0 ? (
         <EmptyState>No workspaces yet. Create one below.</EmptyState>
       ) : (

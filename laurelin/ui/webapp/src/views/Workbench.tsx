@@ -2,8 +2,8 @@
 // queries over the workspace datasets.
 // Each dataset is exposed as a view named after the dataset.
 
-import { useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
@@ -17,10 +17,15 @@ import { Chart } from "../charts";
 import {
   ErrorBox,
   FailureNote,
+  LiveStatus,
+  Modal,
+  NAME_RULE,
+  NAME_RULE_NO_HYPHEN,
   PageHeader,
   Spinner,
   WarningBox,
   fmtValue,
+  truncationNote,
 } from "../ui";
 import { useAuth } from "../auth";
 
@@ -29,6 +34,89 @@ const RESULT_VIEWS: ChartKind[] = ["table", "bar", "line", "area", "stat", "pie"
 const MAX_ROWS = 1000;
 const PLACEHOLDER = "-- Write SQL over your datasets. Ctrl+Enter to run.\n";
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+// ------------------------------------------------------------------ draft
+//
+// Authored text survives navigation (rule L4): the editor doc, the chosen
+// result view and the last result persist in sessionStorage — sessionStorage
+// deliberately, not localStorage, for the same shared-machine-leakage reason
+// as the quick-chart draft (a query's text can embed filter values).
+
+export const WORKBENCH_DRAFT_KEY = "laurelin.workbench.draft.v1";
+
+// A stored result larger than this is dropped rather than persisted: a
+// 1000-row result can approach the sessionStorage quota, and losing the
+// cached ROWS on navigation is a shrug — losing the authored SQL is not.
+const MAX_PERSISTED_RESULT_BYTES = 900_000;
+
+export interface WorkbenchDraft {
+  sql: string;
+  view?: ChartKind;
+  result?: QueryResult;
+}
+
+/** Tolerant parser: any unexpected shape degrades to null, never a crash. */
+export function parseWorkbenchDraft(raw: string | null): WorkbenchDraft | null {
+  if (!raw) return null;
+  try {
+    const d = JSON.parse(raw) as Record<string, unknown>;
+    if (!d || typeof d !== "object" || typeof d.sql !== "string") return null;
+    const out: WorkbenchDraft = { sql: d.sql };
+    if (typeof d.view === "string" && RESULT_VIEWS.includes(d.view as ChartKind)) {
+      out.view = d.view as ChartKind;
+    }
+    const r = d.result as QueryResult | undefined;
+    if (
+      r &&
+      typeof r === "object" &&
+      Array.isArray(r.columns) &&
+      Array.isArray(r.rows) &&
+      typeof r.row_count === "number"
+    ) {
+      out.result = r;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function readDraft(): WorkbenchDraft | null {
+  try {
+    return parseWorkbenchDraft(sessionStorage.getItem(WORKBENCH_DRAFT_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function writeDraft(draft: WorkbenchDraft): void {
+  try {
+    let payload = JSON.stringify(draft);
+    if (draft.result && payload.length > MAX_PERSISTED_RESULT_BYTES) {
+      payload = JSON.stringify({ sql: draft.sql, view: draft.view });
+    }
+    sessionStorage.setItem(WORKBENCH_DRAFT_KEY, payload);
+  } catch {
+    // Quota or privacy mode: the draft is a courtesy, never a requirement.
+  }
+}
+
+/**
+ * True when the text contains something DuckDB could execute. The pristine
+ * editor holds only the placeholder comment, and running it used to travel
+ * all the way to the engine and come back as a classified failure blaming a
+ * "remote system" (spec F9). A comment is refused here, before the POST,
+ * with a sentence about the actual situation.
+ */
+export function sqlHasExecutableStatement(text: string): boolean {
+  const stripped = text
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ");
+  return /[^\s;]/.test(stripped);
+}
+
+export const COMMENT_ONLY_REFUSAL =
+  "Nothing to run — the editor only contains a comment.";
 
 function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boolean): string {
   if (err instanceof ApiError) {
@@ -42,7 +130,7 @@ function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boole
       // a lock only by a server restart. /auth/status now says which.
       return pipelinesLocked
         ? "Python authoring is locked on this server (--lock-pipelines), so a query cannot " +
-            "be saved as a pipeline file here. Visual pipelines and Explore remain available."
+            "be saved as a pipeline file here. Visual pipelines and the quick chart remain available."
         : "You don't have permission to create pipelines (editor role required).";
     }
     if (err.status === 400) {
@@ -55,12 +143,16 @@ function saveErrorMessage(err: unknown, fileName: string, pipelinesLocked: boole
 
 export function WorkbenchView() {
   const auth = useAuth();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const runRef = useRef<() => void>(() => {});
   // Set once the editor is mounted, so sidebar-click handlers can update the doc.
   const [ready, setReady] = useState(false);
+
+  // The draft is read once per mount; every later change writes through.
+  const draft = useMemo(() => readDraft(), []);
 
   // "Save as pipeline" form state.
   const [saveOpen, setSaveOpen] = useState(false);
@@ -70,7 +162,8 @@ export function WorkbenchView() {
   const [saved, setSaved] = useState<PipelineWriteResult | null>(null);
 
   // Result presentation + "Add to dashboard" state.
-  const [view, setView] = useState<ChartKind>("table");
+  const [view, setView] = useState<ChartKind>(draft?.view ?? "table");
+  const [result, setResult] = useState<QueryResult | null>(draft?.result ?? null);
   const [dashOpen, setDashOpen] = useState(false);
   const [dashName, setDashName] = useState("");
   const [panelTitle, setPanelTitle] = useState("");
@@ -80,6 +173,12 @@ export function WorkbenchView() {
   const [panelX, setPanelX] = useState("");
   const [panelY, setPanelY] = useState<string[]>([]);
   const [dashDone, setDashDone] = useState<string | null>(null);
+
+  // Client-side refusal (comment-only run) and cancellation state.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [cancelled, setCancelled] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const persistTimer = useRef<number | null>(null);
 
   const dashboardsQ = useQuery({
     queryKey: ["dashboards"],
@@ -149,7 +248,7 @@ export function WorkbenchView() {
   function submitSave() {
     const output = outName.trim();
     if (!NAME_RE.test(output)) {
-      setNameErr("Must match ^[a-z][a-z0-9_]*$ (lowercase, digits, underscore).");
+      setNameErr(NAME_RULE_NO_HYPHEN);
       return;
     }
     setNameErr(null);
@@ -163,20 +262,65 @@ export function WorkbenchView() {
     queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
   });
 
+  const persistNow = (patch?: Partial<WorkbenchDraft>) => {
+    writeDraft({
+      sql: viewRef.current?.state.doc.toString() ?? "",
+      view,
+      result: result ?? undefined,
+      ...patch,
+    });
+  };
+  // Keep the persist closure fresh for the debounced editor listener.
+  const persistRef = useRef(persistNow);
+  persistRef.current = persistNow;
+
   const runMut = useMutation<QueryResult, unknown, string>({
-    mutationFn: (sqlText: string) =>
-      api.post<QueryResult>(`${API}/query`, { sql: sqlText, max_rows: MAX_ROWS }),
+    mutationFn: (sqlText: string) => {
+      const ctl = new AbortController();
+      abortRef.current = ctl;
+      return api.post<QueryResult>(
+        `${API}/query`,
+        { sql: sqlText, max_rows: MAX_ROWS },
+        ctl.signal,
+      );
+    },
+    onSuccess: (data) => {
+      setResult(data);
+      persistRef.current({ result: data });
+    },
+    onSettled: () => {
+      abortRef.current = null;
+    },
   });
 
   // Keep the run callback fresh so the Ctrl-Enter keymap never calls a stale closure.
   runRef.current = () => {
     const text = viewRef.current?.state.doc.toString() ?? "";
-    if (text.trim()) runMut.mutate(text);
+    setCancelled(false);
+    if (!text.trim()) return;
+    if (!sqlHasExecutableStatement(text)) {
+      // Refused before the POST: the gray placeholder is a hint, not a query.
+      setRefusal(COMMENT_ONLY_REFUSAL);
+      return;
+    }
+    setRefusal(null);
+    runMut.mutate(text);
   };
+
+  // Cancel frees the admission slot the running query holds (the server caps
+  // concurrent queries process-wide) instead of leaving it pinned until the
+  // statement finishes for a reader who has already given up on it.
+  function cancelRun() {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setCancelled(true);
+    runMut.reset();
+  }
 
   // `?dataset=` is the dataset detail page's "Open in SQL" door: seed the
   // editor with the same starter query the sidebar buttons insert, so the
-  // caller lands one keystroke (Ctrl+Enter) from rows.
+  // caller lands one keystroke (Ctrl+Enter) from rows. It outranks the
+  // resumed draft — the caller named what they want to look at.
   const presetDataset = searchParams.get("dataset") ?? "";
 
   // Mount the editor exactly once.
@@ -187,7 +331,7 @@ export function WorkbenchView() {
       state: EditorState.create({
         doc: presetDataset
           ? `SELECT * FROM ${presetDataset} LIMIT 100`
-          : PLACEHOLDER,
+          : draft?.sql || PLACEHOLDER,
         extensions: [
           history(),
           sql(),
@@ -204,17 +348,37 @@ export function WorkbenchView() {
             ...defaultKeymap,
             ...historyKeymap,
           ]),
+          EditorView.updateListener.of((u) => {
+            if (!u.docChanged) return;
+            if (persistTimer.current !== null) {
+              window.clearTimeout(persistTimer.current);
+            }
+            persistTimer.current = window.setTimeout(() => {
+              persistTimer.current = null;
+              persistRef.current();
+            }, 400);
+          }),
         ],
       }),
     });
     viewRef.current = view;
     setReady(true);
     return () => {
+      if (persistTimer.current !== null) {
+        window.clearTimeout(persistTimer.current);
+        persistTimer.current = null;
+      }
       view.destroy();
       viewRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The chosen result view is part of the draft too.
+  useEffect(() => {
+    if (ready) persistRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
 
   function setDoc(text: string) {
     const view = viewRef.current;
@@ -225,8 +389,13 @@ export function WorkbenchView() {
     view.focus();
   }
 
+  function saveAsAnalysisCell() {
+    const sqlText = viewRef.current?.state.doc.toString() ?? "";
+    persistRef.current();
+    navigate(`/analyses?mode=doc&sql=${encodeURIComponent(sqlText)}`);
+  }
+
   const datasets = datasetsQ.data ?? [];
-  const result = runMut.data;
 
   return (
     <div>
@@ -241,10 +410,10 @@ export function WorkbenchView() {
           {datasetsQ.isLoading ? (
             <Spinner />
           ) : datasetsQ.error ? (
-            <ErrorBox error={datasetsQ.error} />
+            <ErrorBox error={datasetsQ.error} onRetry={() => datasetsQ.refetch()} />
           ) : datasets.length === 0 ? (
             <div className="dim" style={{ fontSize: 12.5, padding: "8px 0" }}>
-              No datasets yet.
+              No datasets yet — <Link to="/datasets">add one on the Datasets page</Link>.
             </div>
           ) : (
             <ul className="wb-ds-list">
@@ -277,14 +446,31 @@ export function WorkbenchView() {
             >
               {runMut.isPending ? "Running…" : "Run"}
             </button>
+            {runMut.isPending && (
+              <button type="button" onClick={cancelRun}>
+                Cancel
+              </button>
+            )}
             <span className="faint" style={{ fontSize: 12 }}>
               ⌘/Ctrl+Enter
             </span>
           </div>
 
+          {refusal && !runMut.isPending && (
+            <div className="warn-box" style={{ marginTop: 10 }}>
+              {refusal}
+            </div>
+          )}
+
           {runMut.isPending && <Spinner label="Running query…" />}
 
-          {runMut.error != null && !runMut.isPending && (
+          {cancelled && !runMut.isPending && (
+            <div className="dim" style={{ fontSize: 12.5, marginTop: 10 }}>
+              Query cancelled.
+            </div>
+          )}
+
+          {runMut.error != null && !runMut.isPending && !cancelled && (
             <ErrorBox error={runMut.error} />
           )}
 
@@ -299,10 +485,12 @@ export function WorkbenchView() {
                   flexWrap: "wrap",
                 }}
               >
-                <span>
+                {/* The row count is the async outcome a screen reader must
+                    hear without re-reading the page (rule A6). */}
+                <LiveStatus style={{ display: "inline" }}>
                   {result.row_count.toLocaleString("en-US")} rows
-                  {result.truncated ? ` · truncated at ${MAX_ROWS}` : ""}
-                </span>
+                  {result.truncated ? ` · ${truncationNote(MAX_ROWS)}` : ""}
+                </LiveStatus>
                 <span className="wb-viewtabs">
                   {RESULT_VIEWS.map((k) => (
                     <button
@@ -343,6 +531,16 @@ export function WorkbenchView() {
                     >
                       Add to dashboard
                     </button>
+                    {/* A quick query's lightweight home: an analysis cell is
+                        already SQL, so the handoff is a navigation, not a new
+                        server surface. */}
+                    <button
+                      type="button"
+                      className="button small"
+                      onClick={saveAsAnalysisCell}
+                    >
+                      Save as analysis cell
+                    </button>
                   </>
                 )}
               </div>
@@ -372,7 +570,7 @@ export function WorkbenchView() {
                       classified record, so it renders like every other
                       failure rather than as a bare string. */}
                   {saved.collect_error ? (
-                    <FailureNote failure={saved.collect_error} />
+                    <FailureNote failure={saved.collect_error} role={auth.role} />
                   ) : null}
                 </div>
               )}
@@ -385,7 +583,9 @@ export function WorkbenchView() {
                   <Chart data={result} kind={view} />
                 </div>
               ) : (
-                <div className="table-wrap">
+                // Capped height: a 1000-row result must scroll inside its own
+                // pane, not turn the page into a 60,000px wall.
+                <div className="table-wrap" style={{ maxHeight: 440, overflowY: "auto" }}>
                   <table>
                     <thead>
                       <tr>
@@ -414,191 +614,196 @@ export function WorkbenchView() {
           )}
 
           {dashOpen && (
-            <div
-              className="modal-backdrop"
-              onClick={() => {
+            <Modal
+              label="Add to dashboard"
+              onClose={() => {
                 if (!addToDash.isPending) setDashOpen(false);
               }}
             >
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <div className="card-title">Add to dashboard</div>
-                <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
-                  Saves the current query as a{" "}
-                  <span className="mono">{view === "table" ? "table" : view}</span> panel.
-                  Type a new name to create a dashboard.
-                </p>
-                <div className="field" style={{ marginTop: 12 }}>
-                  <label>Dashboard</label>
-                  <input
-                    className="mono"
-                    autoFocus
-                    list="wb-dash-list"
-                    placeholder="revenue"
-                    value={dashName}
-                    onChange={(e) => setDashName(e.target.value)}
-                  />
-                  <datalist id="wb-dash-list">
-                    {(dashboardsQ.data ?? []).map((d) => (
-                      <option key={d.name} value={d.name}>
-                        {d.title || d.name}
-                      </option>
-                    ))}
-                  </datalist>
-                  <div className="hint">Lowercase letters, digits, _ and -.</div>
-                </div>
-                <div className="field">
-                  <label>Panel title</label>
-                  <input
-                    value={panelTitle}
-                    onChange={(e) => setPanelTitle(e.target.value)}
-                    placeholder="Revenue by region"
-                  />
-                </div>
-                {view !== "table" && result && result.columns.length > 0 && (
-                  <>
-                    <div className="field">
-                      <label>X column</label>
-                      <select value={panelX} onChange={(e) => setPanelX(e.target.value)}>
-                        <option value="">(infer)</option>
-                        {result.columns.map((c) => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field">
-                      <label>Y columns (none = all numeric)</label>
-                      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        {result.columns.map((c) => (
-                          <label key={c} className="check-inline">
-                            <input
-                              type="checkbox"
-                              checked={panelY.includes(c)}
-                              onChange={(e) =>
-                                setPanelY((y) =>
-                                  e.target.checked
-                                    ? [...y.filter((x) => x !== c), c]
-                                    : y.filter((x) => x !== c),
-                                )
-                              }
-                            />
-                            <span className="mono" style={{ fontSize: 11.5 }}>{c}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  </>
-                )}
-                {addToDash.error != null && <ErrorBox error={addToDash.error} />}
-                <div className="toolbar" style={{ marginTop: 16, justifyContent: "flex-end" }}>
-                  <button
-                    type="button"
-                    disabled={addToDash.isPending}
-                    onClick={() => setDashOpen(false)}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={addToDash.isPending || !/^[a-z][a-z0-9_-]{0,63}$/.test(dashName.trim())}
-                    onClick={() => addToDash.mutate()}
-                  >
-                    {addToDash.isPending ? "Adding…" : "Add panel"}
-                  </button>
-                </div>
+              <div className="card-title">Add to dashboard</div>
+              <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
+                Saves the current query as a{" "}
+                <span className="mono">{view === "table" ? "table" : view}</span> panel.
+                Type a new name to create a dashboard.
+              </p>
+              <div className="field" style={{ marginTop: 12 }}>
+                <label htmlFor="wb-dash-name">Dashboard</label>
+                <input
+                  id="wb-dash-name"
+                  className="mono"
+                  autoFocus
+                  list="wb-dash-list"
+                  placeholder="revenue"
+                  value={dashName}
+                  onChange={(e) => setDashName(e.target.value)}
+                />
+                <datalist id="wb-dash-list">
+                  {(dashboardsQ.data ?? []).map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.title || d.name}
+                    </option>
+                  ))}
+                </datalist>
+                <div className="hint">{NAME_RULE}</div>
               </div>
-            </div>
+              <div className="field">
+                <label htmlFor="wb-panel-title">Panel title</label>
+                <input
+                  id="wb-panel-title"
+                  value={panelTitle}
+                  onChange={(e) => setPanelTitle(e.target.value)}
+                  placeholder="Revenue by region"
+                />
+              </div>
+              {view !== "table" && result && result.columns.length > 0 && (
+                <>
+                  <div className="field">
+                    <label htmlFor="wb-panel-x">X column</label>
+                    <select
+                      id="wb-panel-x"
+                      value={panelX}
+                      onChange={(e) => setPanelX(e.target.value)}
+                    >
+                      <option value="">(infer)</option>
+                      {result.columns.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>Y columns (none = all numeric)</label>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      {result.columns.map((c) => (
+                        <label key={c} className="check-inline">
+                          <input
+                            type="checkbox"
+                            checked={panelY.includes(c)}
+                            onChange={(e) =>
+                              setPanelY((y) =>
+                                e.target.checked
+                                  ? [...y.filter((x) => x !== c), c]
+                                  : y.filter((x) => x !== c),
+                              )
+                            }
+                          />
+                          <span className="mono" style={{ fontSize: 11.5 }}>{c}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+              {addToDash.error != null && <ErrorBox error={addToDash.error} />}
+              {/* No silent disable: the moment the typed name breaks the
+                  rule, say the rule. */}
+              {dashName.trim() !== "" && !/^[a-z][a-z0-9_-]{0,63}$/.test(dashName.trim()) && (
+                <p className="hint">{NAME_RULE}</p>
+              )}
+              <div className="toolbar" style={{ marginTop: 16, justifyContent: "flex-end" }}>
+                <button
+                  type="button"
+                  disabled={addToDash.isPending}
+                  onClick={() => setDashOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={addToDash.isPending || !/^[a-z][a-z0-9_-]{0,63}$/.test(dashName.trim())}
+                  onClick={() => addToDash.mutate()}
+                >
+                  {addToDash.isPending ? "Adding…" : "Add panel"}
+                </button>
+              </div>
+            </Modal>
           )}
 
           {saveOpen && (
-            <div
-              className="modal-backdrop"
-              onClick={() => {
+            <Modal
+              label="Save as pipeline"
+              onClose={() => {
                 if (!saveMut.isPending) setSaveOpen(false);
               }}
             >
-              <div className="modal" onClick={(e) => e.stopPropagation()}>
-                <div className="card-title">Save as pipeline</div>
-                <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
-                  Generate a Python pipeline file from the current query. Build
-                  it from the Builds page afterward.
-                </p>
+              <div className="card-title">Save as pipeline</div>
+              <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
+                Generate a Python pipeline file from the current query. Build
+                it from the Builds page afterward.
+              </p>
 
-                <div className="field" style={{ marginTop: 12 }}>
-                  <label htmlFor="wb-out-name">Output dataset name</label>
-                  <input
-                    id="wb-out-name"
-                    className="mono"
-                    autoFocus
-                    placeholder="e.g. daily_sales"
-                    value={outName}
-                    onChange={(e) => {
-                      setOutName(e.target.value);
-                      if (nameErr) setNameErr(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") submitSave();
-                    }}
-                  />
-                  {nameErr ? (
-                    <div className="hint bad">{nameErr}</div>
-                  ) : (
-                    <div className="hint">
-                      Lowercase letters, digits, and underscores.
-                    </div>
-                  )}
-                </div>
-
-                <div className="field" style={{ marginTop: 4 }}>
-                  <label htmlFor="wb-file-name">File name (optional)</label>
-                  <input
-                    id="wb-file-name"
-                    className="mono"
-                    placeholder={outName.trim() || "defaults to output name"}
-                    value={fileName}
-                    onChange={(e) => setFileName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") submitSave();
-                    }}
-                  />
-                  <div className="hint">Defaults to the output name.</div>
-                </div>
-
-                {saveMut.error != null && (
-                  <div
-                    style={{
-                      marginTop: 8,
-                      fontSize: 12,
-                      color: "var(--red)",
-                    }}
-                  >
-                    {saveErrorMessage(saveMut.error, fileName.trim() || outName.trim(), auth.pipelinesLocked)}
-                  </div>
+              <div className="field" style={{ marginTop: 12 }}>
+                <label htmlFor="wb-out-name">Output dataset name</label>
+                <input
+                  id="wb-out-name"
+                  className="mono"
+                  autoFocus
+                  placeholder="e.g. daily_sales"
+                  value={outName}
+                  onChange={(e) => {
+                    setOutName(e.target.value);
+                    if (nameErr) setNameErr(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") submitSave();
+                  }}
+                />
+                {nameErr ? (
+                  <div className="hint bad">{nameErr}</div>
+                ) : (
+                  <div className="hint">{NAME_RULE_NO_HYPHEN}</div>
                 )}
-
-                <div
-                  className="toolbar"
-                  style={{ marginTop: 16, justifyContent: "flex-end" }}
-                >
-                  <button
-                    type="button"
-                    className="button"
-                    disabled={saveMut.isPending}
-                    onClick={() => setSaveOpen(false)}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={saveMut.isPending}
-                    onClick={submitSave}
-                  >
-                    {saveMut.isPending ? "Saving…" : "Save"}
-                  </button>
-                </div>
               </div>
-            </div>
+
+              <div className="field" style={{ marginTop: 4 }}>
+                <label htmlFor="wb-file-name">File name (optional)</label>
+                <input
+                  id="wb-file-name"
+                  className="mono"
+                  placeholder={outName.trim() || "defaults to output name"}
+                  value={fileName}
+                  onChange={(e) => setFileName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") submitSave();
+                  }}
+                />
+                <div className="hint">Defaults to the output name.</div>
+              </div>
+
+              {saveMut.error != null && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    fontSize: 12,
+                    color: "var(--red)",
+                  }}
+                >
+                  {saveErrorMessage(saveMut.error, fileName.trim() || outName.trim(), auth.pipelinesLocked)}
+                </div>
+              )}
+
+              <div
+                className="toolbar"
+                style={{ marginTop: 16, justifyContent: "flex-end" }}
+              >
+                <button
+                  type="button"
+                  className="button"
+                  disabled={saveMut.isPending}
+                  onClick={() => setSaveOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={saveMut.isPending}
+                  onClick={submitSave}
+                >
+                  {saveMut.isPending ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </Modal>
           )}
         </main>
       </div>

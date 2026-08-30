@@ -87,9 +87,12 @@ function SyncButton({ source }: { source: Source }) {
       >
         {sync.isPending ? "Syncing…" : "Sync now"}
       </button>
+      {/* Visible text, not a tooltip: the reason a sync failed is the whole
+          point of reading it, and prose that exists only in a title= is
+          unreachable by keyboard and invisible until hovered. */}
       {sync.isError && (
-        <span className="hint bad" title={(sync.error as Error).message}>
-          failed
+        <span className="hint bad" style={{ margin: 0 }}>
+          failed — {(sync.error as Error).message}
         </span>
       )}
     </span>
@@ -506,7 +509,7 @@ export function SourcesSection() {
   ];
 
   return (
-    <section style={{ marginTop: 28 }}>
+    <section id="data-sources" style={{ marginTop: 28 }}>
       <PageHeader
         title="Data sources"
         subtitle="Connectors that pull external data into datasets — PostgreSQL, HTTP exports, files landed on the server, or object-storage buckets (S3 / GCS)."
@@ -518,6 +521,35 @@ export function SourcesSection() {
           ) : undefined
         }
       />
+      {/* The other ingest door, named up front. Each sync COPIES rows into a
+          new version of the target dataset; registering an external table
+          scans it in place and copies nothing. The two doors look identical
+          until the data is stale, so each names the other. */}
+      <p className="hint" style={{ marginTop: 0 }}>
+        Each sync copies the rows into a new version of the target dataset. To
+        query a table where it already lives — copying nothing —{" "}
+        {isAdmin ? (
+          <>
+            use{" "}
+            <button
+              className="link-button"
+              onClick={() =>
+                document
+                  .getElementById("external-table")
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+            >
+              Register an external table
+            </button>{" "}
+            above.
+          </>
+        ) : (
+          <>
+            an admin can register an external table from the button above the
+            dataset list.
+          </>
+        )}
+      </p>
       {showAdd && isAdmin && (
         <AddSourceForm
           onDone={() => {
@@ -529,10 +561,17 @@ export function SourcesSection() {
       {sourcesQ.isLoading ? (
         <Spinner />
       ) : sourcesQ.isError ? (
-        <ErrorBox error={sourcesQ.error} />
+        <ErrorBox error={sourcesQ.error} onRetry={() => sourcesQ.refetch()} />
       ) : sourcesQ.data!.length === 0 ? (
         <EmptyState>
-          No sources configured{isAdmin ? " — add one to pull external data." : "."}
+          {/* The editor branch names the gate instead of ending in a full
+              stop: capability-existence ("this needs an admin") is product
+              documentation, not a secret — what stays undisclosed is any
+              restriction on a specific object. */}
+          No sources configured
+          {isAdmin
+            ? " — add one to pull external data."
+            : " — adding sources requires an admin."}
         </EmptyState>
       ) : (
         <>
@@ -544,7 +583,10 @@ export function SourcesSection() {
           {sourcesQ.data!.filter((s) => s.last_sync_failure).map((s) => (
             <div key={s.name} style={{ marginTop: 10 }}>
               <div className="mono dim" style={{ fontSize: 12 }}>{s.name}</div>
-              <FailureNote failure={s.last_sync_failure!} />
+              {/* role: the fallback sentence differs for a viewer vs an
+                  editor+ (SH3) — and this section is editor-gated, so the
+                  reader here is never told a stronger role sees more. */}
+              <FailureNote failure={s.last_sync_failure!} role={auth.role} />
             </div>
           ))}
         </>

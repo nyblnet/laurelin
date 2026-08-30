@@ -9,13 +9,22 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type {
   DatasetGrants,
+  FingerprintResponse,
+  GovernanceCell,
   Group,
   Grant,
   Role,
   SubjectKind,
   User,
 } from "../../types";
-import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
+import {
+  Badge,
+  DataTable,
+  EmptyState,
+  ErrorBox,
+  Spinner,
+  type Column,
+} from "../../ui";
 import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const SUBJECT_KINDS: SubjectKind[] = ["everyone", "role", "group", "user"];
@@ -139,6 +148,122 @@ function GrantRow({
         </button>
       </td>
     </tr>
+  );
+}
+
+// ---------------------------------------------------- effective access
+//
+// "Who can see this dataset?" answered on the card that controls it, instead
+// of an admin cross-referencing grants, group membership, markings and row
+// policy across three screens. The answer is COMPUTED, not summarized: it
+// calls the same governance-fingerprint route Portability's verification
+// panel uses, which walks every enforcement path for each (principal,
+// dataset) pair — so what renders here is what a query would actually do.
+
+function effectiveAccessColumns(
+  cells: Record<string, GovernanceCell>,
+  dataset: string,
+): Column<string>[] {
+  const cellOf = (who: string) => cells[`${who}|${dataset}`];
+  return [
+    {
+      label: "Principal",
+      className: "mono",
+      render: (who) => who,
+    },
+    {
+      label: "Access",
+      render: (who) => {
+        const cell = cellOf(who);
+        return !cell || (!cell.can_view && !cell.can_edit) ? (
+          <Badge tone="red">no access</Badge>
+        ) : cell.can_edit ? (
+          <Badge tone="gold">view + edit</Badge>
+        ) : (
+          <Badge tone="green">view</Badge>
+        );
+      },
+    },
+    {
+      label: "Markings in force",
+      className: "mono dim",
+      render: (who) => {
+        const cell = cellOf(who);
+        return cell && cell.effective_markings.length > 0
+          ? cell.effective_markings.join(", ")
+          : "—";
+      },
+    },
+    {
+      // The rendered decision as visible text, not a tooltip: governance
+      // prose must be readable without a mouse hover (rule F6).
+      label: "Rows they see",
+      className: "mono dim",
+      render: (who) => {
+        const cell = cellOf(who);
+        return cell ? cell.decision || (cell.can_view ? "all rows" : "—") : "—";
+      },
+    },
+  ];
+}
+
+function EffectiveAccessPanel({ dataset }: { dataset: string }) {
+  const [open, setOpen] = useState(false);
+
+  const compute = useMutation({
+    mutationFn: () =>
+      api.post<FingerprintResponse>(`${API}/workspace/governance/fingerprint`, {
+        principals: [],
+        datasets: [dataset],
+      }),
+  });
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !compute.data && !compute.isPending) compute.mutate();
+  };
+
+  const fp = compute.data?.fingerprint;
+  const principals = fp?.principals ?? [];
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <button
+        type="button"
+        className="button small"
+        aria-expanded={open}
+        onClick={toggle}
+      >
+        {open ? "Hide effective access" : "Effective access"}
+      </button>
+      {open && (
+        <div style={{ marginTop: 8 }}>
+          {compute.isPending ? (
+            <Spinner label="Computing who can see this dataset…" />
+          ) : compute.isError ? (
+            <InlineError err={compute.error} />
+          ) : fp ? (
+            <>
+              <p className="dim" style={{ fontSize: 12, marginTop: 0, marginBottom: 6 }}>
+                Computed live through every enforcement path — grants, groups,
+                markings and clearances, row policy and column masks. Admins
+                always have access and are shown as such.
+              </p>
+              {principals.length === 0 ? (
+                <EmptyState>No principals to evaluate.</EmptyState>
+              ) : (
+                <DataTable
+                  columns={effectiveAccessColumns(fp.cells, dataset)}
+                  rows={principals}
+                  rowKey={(who) => who}
+                />
+              )}
+            </>
+          ) : null}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -274,13 +399,15 @@ function DatasetPermissionCard({
       {/* Widening grants can come back 202 (queued behind a second approver);
           the grants list then legitimately re-seeds unchanged. Say so. */}
       <QueuedBanner res={save.data} />
+
+      <EffectiveAccessPanel dataset={entry.dataset} />
     </div>
   );
 }
 
 // --------------------------------------------------------------- section
 
-export function DatasetAccessSection() {
+export function DatasetAccessSection({ filter = "" }: { filter?: string }) {
   const qc = useQueryClient();
   const invalidate = () => {
     void qc.invalidateQueries({ queryKey: ["dataset-permissions"] });
@@ -305,7 +432,11 @@ export function DatasetAccessSection() {
 
   const groups = useMemo(() => groupsQuery.data ?? [], [groupsQuery.data]);
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data]);
-  const entries = permsQuery.data ?? [];
+  const all = permsQuery.data ?? [];
+  const needle = filter.trim().toLowerCase();
+  const entries = needle
+    ? all.filter((e) => e.dataset.toLowerCase().includes(needle))
+    : all;
 
   return (
     <section style={{ marginBottom: 32 }}>
@@ -332,6 +463,11 @@ export function DatasetAccessSection() {
             onSaved={invalidate}
           />
         ))
+      ) : needle ? (
+        <EmptyState>
+          No dataset named like "{filter.trim()}" — clear the filter above to
+          see all {all.length}.
+        </EmptyState>
       ) : (
         <EmptyState>No datasets defined.</EmptyState>
       )}

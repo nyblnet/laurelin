@@ -85,6 +85,10 @@ export type FailureCode =
   | "resource_exhausted"
   | "definition_stale"
   | "transform_failed"
+  /** A downstream task never ran because a task it reads from failed.
+   *  `subject` names the failed upstream — nothing here raised, so there is
+   *  no log reference to point at. */
+  | "blocked_by_upstream"
   | "expectation_failed"
   | "remote_failed";
 
@@ -604,7 +608,10 @@ export interface Schedule {
   source: string;
   next_run_at: string | null;
   last_run_at: string | null;
-  last_status: "succeeded" | "failed" | null;
+  // "running" is a read-time projection: for a build action the server
+  // resolves last_status through the queued build's own state, so a row
+  // whose build is still in flight says so instead of "succeeded".
+  last_status: "succeeded" | "failed" | "running" | null;
   /** R1: replaced `last_error`, which held the driver's own sentence. */
   last_failure: Failure | null;
   last_build_id: string | null;

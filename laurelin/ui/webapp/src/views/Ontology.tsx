@@ -19,19 +19,54 @@ function ObjectTypeList() {
 
   return (
     <div>
-      <PageHeader title="Ontology" subtitle="Object types, links, and actions" />
+      <PageHeader
+        title="Ontology"
+        subtitle="Each object type turns a dataset's rows into things you can search, link and act on"
+      />
       {q.isLoading && <Spinner />}
-      {q.isError && <ErrorBox error={q.error} />}
+      {q.isError && (
+        <>
+          {/* The list breaking is almost always a definition file breaking —
+              the server reloads ontology/*.yml on every request, so one bad
+              edit takes this whole page down. The error alone ("Error 500")
+              names neither the mechanism nor the fix; this sentence does. */}
+          <p className="hint">
+            The object-type definitions could not be loaded. They live in{" "}
+            <code>ontology/*.yml</code> in the workspace — a file that does not
+            parse breaks this page until it is fixed, and the parse error is in
+            the server log.
+          </p>
+          <ErrorBox error={q.error} onRetry={() => q.refetch()} />
+        </>
+      )}
       {q.data &&
         (q.data.length === 0 ? (
-          <EmptyState>No object types defined.</EmptyState>
+          <EmptyState>
+            No object types yet. An object type turns rows of a dataset into
+            things you can browse, link and act on — aircraft, customers,
+            orders. Define one in <code>ontology/*.yml</code> in the workspace;
+            the tutorial at <code>docs/tutorials/02-ontology-and-actions.md</code>{" "}
+            walks through it end to end.
+          </EmptyState>
         ) : (
           <div className="cards">
             {q.data.map((t) => (
+              // A real keyboard control, not a mouse-only div: the card grid
+              // is the only way into a type, so it must be tabbable and
+              // Enter/Space must open it.
               <div
                 key={t.api_name}
+                role="button"
+                tabIndex={0}
                 className="card clickable"
                 onClick={() => navigate(`/ontology/${t.api_name}`)}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    navigate(`/ontology/${t.api_name}`);
+                  }
+                }}
               >
                 <div className="card-title">{t.display_name || t.api_name}</div>
                 {t.description && (
@@ -40,7 +75,11 @@ function ObjectTypeList() {
                   </div>
                 )}
                 <div className="faint" style={{ fontSize: 12 }}>
-                  {Object.keys(t.properties).length} props · {t.backing_dataset}
+                  {Object.keys(t.properties).length}{" "}
+                  {Object.keys(t.properties).length === 1
+                    ? "property"
+                    : "properties"}{" "}
+                  · from {t.backing_dataset}
                 </div>
               </div>
             ))}
@@ -71,7 +110,7 @@ function ObjectTypePage() {
         actions={<Link to="/ontology">← All types</Link>}
       />
       {q.isLoading && <Spinner />}
-      {q.isError && <ErrorBox error={q.error} />}
+      {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
       {q.data && (
         <>
           {/* The order is the story of the page: what the store knows, then how

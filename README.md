@@ -89,7 +89,8 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
 - **Schedules** — cron or on-upstream-changed triggers drive builds and
   connector syncs, so pipelines keep themselves current. Exactly-once across
   replicas, with no leader election.
-- **Explore** — point-and-click analysis (Foundry's Contour/Quiver): pick a
+- **Quick charts** — point-and-click analysis (Foundry's Contour/Quiver),
+  the zero-commitment entry on the Analyses page: pick a
   dataset or object type, shape it by clicking — filter, group (with date
   buckets and numeric bins), summarise, order, top-N — watch the chart update
   live, save it to a dashboard. There is no query language anywhere in it:
@@ -130,7 +131,9 @@ Laurelin maps one-to-one onto the concepts you may know from Foundry:
   versions and schedules — no anomaly detection, no time-series, just a read
   over records that already exist. A silently-stopped schedule reads `overdue`
   the moment anyone looks (a dead scheduler trips the same `next_run_at`
-  predicate the live one advances). The rollup is filtered per dataset: a viewer
+  predicate the live one advances), and a schedule whose last firing failed
+  before it could even queue a build marks its targets `failing` — the
+  schedule is named to editors and above only. The rollup is filtered per dataset: a viewer
   sees health only for datasets they can already read, and there is **no
   global totals endpoint** — a workspace-wide count would leak that a hidden
   dataset changed state. Optional outbound **alerting** is one admin-configured
@@ -401,7 +404,7 @@ it is `exec`'d on every build. It requires the `editor` role and can be
 disabled with `laurelin serve --lock-pipelines` (or
 `LAURELIN_LOCK_PIPELINES=1`) for untrusted multi-user deployments. The executed
 transform code is not yet sandboxed. Locking Python does **not** lock visual
-pipelines or Explore: those compile to bound, schema-checked SQL and cannot reach `exec`,
+pipelines or Analyses charts: those compile to bound, schema-checked SQL and cannot reach `exec`,
 so analysts keep a no-code authoring path on a hardened server. Add
 `--lock-flows` (`LAURELIN_LOCK_FLOWS=1`) to disable no-code authoring too.
 

@@ -11,13 +11,17 @@ import {
 import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiError } from "./api";
 import { useAuth } from "./auth";
-import { Layout, RETIRED_ROUTES, flowsRedirectTarget } from "./Layout";
+import {
+  Layout,
+  RETIRED_ROUTES,
+  exploreRedirectTarget,
+  flowsRedirectTarget,
+} from "./Layout";
 import { LoginScreen, SetupScreen } from "./screens/AuthScreens";
 import { Spinner } from "./ui";
 import { DatasetsView } from "./views/Datasets";
 import { DashboardsView } from "./views/Dashboards";
 import { AnalysesView } from "./views/Analyses";
-import { ExploreView } from "./views/Explore";
 import { AppsView } from "./views/Apps";
 import { BuildsView } from "./views/Pipeline";
 import { SchedulesView } from "./views/Schedules";
@@ -81,7 +85,7 @@ export function App() {
             <Route path="/datasets/*" element={scoped(<DatasetsView />)} />
             <Route path="/dashboards/*" element={scoped(<DashboardsView />)} />
             <Route path="/analyses/*" element={scoped(<AnalysesView />)} />
-            <Route path="/explore" element={scoped(<ExploreView />)} />
+            <Route path="/explore" element={<ExploreRedirect />} />
             <Route path="/builds" element={scoped(<BuildsView />)} />
             <Route path="/schedules" element={scoped(<SchedulesView />)} />
             <Route path="/health" element={scoped(<HealthView />)} />
@@ -129,6 +133,15 @@ export function App() {
 function FlowsRedirect() {
   const loc = useLocation();
   return <Navigate to={flowsRedirectTarget(loc.pathname, loc.search)} replace />;
+}
+
+// `/explore` merged into Analyses as its quick-chart entry. The redirect keeps
+// every search param (`?dataset=`, `?dashboard=&panel=`) so the dataset-detail
+// door and the dashboard panel-edit round trip both land where the capability
+// now lives, not on a bare list page.
+function ExploreRedirect() {
+  const loc = useLocation();
+  return <Navigate to={exploreRedirectTarget(loc.search)} replace />;
 }
 
 function NoWorkspaceAccess() {

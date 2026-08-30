@@ -150,7 +150,8 @@ def test_http_marking_flow_and_enforcement(ws, clients):
     # uncleared viewer cannot see the marked datasets anywhere
     names = {d["name"] for d in viewer.get("/api/v1/datasets").json()}
     assert "raw" not in names and "clean" not in names
-    assert viewer.get("/api/v1/datasets/clean/rows").status_code == 403
+    # 404 not 403: hidden reads as nonexistent (deliberate; see test_dataset_acls)
+    assert viewer.get("/api/v1/datasets/clean/rows").status_code == 404
     assert viewer.post("/api/v1/query", json={"sql": "SELECT * FROM clean"}).status_code == 400  # unknown table
 
     # grant clearance -> now visible

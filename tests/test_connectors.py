@@ -797,7 +797,9 @@ def test_ingested_dataset_is_governed_like_any_managed_dataset(clients, s3):
         "name": "pii", "description": "personal"}).status_code == 200
     assert admin.put("/api/v1/datasets/gov_rows/markings", json={
         "markings": ["pii"]}).status_code == 200
-    assert viewer.get("/api/v1/datasets/gov_rows/rows").status_code == 403
+    # 404, not 403: a marking the caller lacks clearance for must hide the
+    # dataset, not confirm it exists. Edit refusals stay 403.
+    assert viewer.get("/api/v1/datasets/gov_rows/rows").status_code == 404
 
     # And a restrictive ACL refuses them independently of the marking.
     assert admin.put("/api/v1/datasets/gov_rows/markings", json={
@@ -805,7 +807,9 @@ def test_ingested_dataset_is_governed_like_any_managed_dataset(clients, s3):
     assert admin.put("/api/v1/datasets/gov_rows/permissions", json={"grants": [
         {"subject_kind": "user", "subject": "ed", "can_view": True,
          "can_edit": True}]}).status_code == 200
-    assert viewer.get("/api/v1/datasets/gov_rows/rows").status_code == 403
+    # 404, not 403: a marking the caller lacks clearance for must hide the
+    # dataset, not confirm it exists. Edit refusals stay 403.
+    assert viewer.get("/api/v1/datasets/gov_rows/rows").status_code == 404
 
 
 @s3_gate

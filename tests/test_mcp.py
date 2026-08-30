@@ -109,7 +109,12 @@ def test_client_is_subject_to_acls_and_auth(env):
     assert "secret_ds" not in {d["name"] for d in c.list_datasets()}
     with pytest.raises(LaurelinError) as err:
         c.dataset_rows("secret_ds")
-    assert err.value.status == 403
+    # 404, not 403: a 403 confirms the dataset exists, which is an existence
+    # oracle one URL over from a list that deliberately omits it. The SQL path
+    # below has always answered "unknown table"; _require_dataset_view now
+    # matches it, because the withholding boundary is only real if every
+    # surface honours it.
+    assert err.value.status == 404
     with pytest.raises(LaurelinError):
         c.query("SELECT * FROM secret_ds")  # unknown table -> 400
     c.close()

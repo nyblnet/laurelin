@@ -875,3 +875,56 @@ def test_a_route_level_catch_does_not_return_a_librarys_words_either(
         detail = safe_detail(exc, subject="dataset:x")
         assert "S3KRET_ROUTE_LEVEL" not in detail
         assert "err-" in detail
+
+
+def test_audit_filters_are_applied_server_side_before_the_limit(three_roles):
+    """S4: the UI's filter bar sends since/until/actor/action and used to
+    re-filter a 200-row window client-side — so a filter aimed at anything
+    older than the newest 200 events rendered a false "No events match".
+    The params now narrow the query itself, as ANDs applied AFTER the
+    min_read_role visibility clause: a filter can only narrow what the role
+    may read, never widen it."""
+    admin, editor, _viewer = three_roles
+    assert admin.put(
+        "/api/v1/dashboards/f", json={"title": "f", "panels": []}
+    ).status_code == 200
+
+    # actor: exact match, applied in SQL — not the same bytes as unfiltered.
+    everyone = admin.get("/api/v1/audit").json()
+    just_root = admin.get("/api/v1/audit", params={"actor": "root"}).json()
+    assert just_root and all(e["actor"] == "root" for e in just_root)
+    nobody = admin.get("/api/v1/audit", params={"actor": "no_such_user"}).json()
+    assert nobody == []
+    assert len(everyone) >= len(just_root)
+
+    # action: exact match.
+    only = admin.get("/api/v1/audit", params={"action": "dashboard_created"}).json()
+    assert only and all(e["action"] == "dashboard_created" for e in only)
+
+    # since/until: inclusive dates. Everything logged today survives a
+    # [today, today] window and nothing survives a window in the past.
+    today = everyone[0]["timestamp"][:10]
+    windowed = admin.get(
+        "/api/v1/audit", params={"since": today, "until": today}
+    ).json()
+    assert len(windowed) == len(everyone)
+    assert admin.get(
+        "/api/v1/audit", params={"until": "1999-12-31"}
+    ).json() == []
+    # Filtering happens BEFORE the limit: with limit=1 and an actor filter,
+    # the one row returned matches the filter rather than being the newest
+    # row overall re-filtered to nothing.
+    one = admin.get(
+        "/api/v1/audit", params={"limit": 1, "actor": "root"}
+    ).json()
+    assert len(one) == 1 and one[0]["actor"] == "root"
+
+    # No filter widens visibility: an editor filtering for an admin-level
+    # action still reads only rows their role may read.
+    for e in editor.get("/api/v1/audit", params={"actor": "root"}).json():
+        assert e["min_read_role"] in ("viewer", "editor")
+
+    # Malformed dates are refused, not silently ignored.
+    assert admin.get(
+        "/api/v1/audit", params={"since": "not-a-date"}
+    ).status_code in (400, 422)

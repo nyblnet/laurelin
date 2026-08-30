@@ -695,7 +695,8 @@ def test_a_flow_definition_is_not_readable_by_someone_who_cannot_read_its_source
                 {"t": "lit", "type": "string", "value": secret_value}]}}}]}
     assert alice.put("/api/v1/flows/deals", json={"flow": flow}).status_code == 200
 
-    assert bob.get("/api/v1/datasets/orders/rows").status_code == 403
+    # 404 not 403: hidden reads as nonexistent (deliberate; see test_dataset_acls)
+    assert bob.get("/api/v1/datasets/orders/rows").status_code == 404
     read = bob.get("/api/v1/flows/deals")
     assert read.status_code == 403
     assert secret_value not in read.text
@@ -818,7 +819,8 @@ def test_ejecting_carries_the_author_restriction_onto_the_ejected_pipeline(works
     build = ana.post("/api/v1/builds",
                      json={"targets": ["orders_copy"], "wait": True})
     assert build.json()["status"] == "succeeded", build.text
-    assert bob.get("/api/v1/datasets/orders_copy/rows").status_code == 403
+    # 404 not 403: hidden reads as nonexistent (deliberate; see test_dataset_acls)
+    assert bob.get("/api/v1/datasets/orders_copy/rows").status_code == 404
     assert ana.get("/api/v1/datasets/orders_copy/rows").status_code == 200
 
 

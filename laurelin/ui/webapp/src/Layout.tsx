@@ -59,11 +59,10 @@ export const NAV_GROUPS: NavGroup[] = [
       // is a multi-cell document a viewer opens for RESULTS. Viewer-visible —
       // the read and run routes are VIEWER, exactly like dashboards; adding
       // and editing cells inside the page is editor-gated by the page itself.
+      // Explore merged into this door (its quick-chart entry) — /explore is a
+      // retired route now, and its editor-only shaping surface lives behind
+      // the page's own role gate rather than a nav gate.
       { to: "/analyses", label: "Analyses" },
-      // Editor-gated like Pipelines — its preview compiles and runs queries
-      // through an EDITOR-gated endpoint, an authoring act. Merges into
-      // Analyses in a follow-on milestone; until then it keeps its door.
-      { to: "/explore", label: "Explore", needs: "editor" },
       // The throwaway-query scratchpad, deliberately separate from Analyses:
       // folding it in would force naming a persistent artifact for a
       // disposable query, and it is the one authoring-adjacent surface a
@@ -108,12 +107,21 @@ export const RETIRED_ROUTES: Record<string, string> = {
   "/pipeline": "/builds",
   "/flows": "/pipelines",
   "/transforms": "/pipelines?tab=python",
+  "/explore": "/analyses",
 };
 
 /** `/flows/x?q → /pipelines/x?q` — the visual builder's deep links survive. */
 export function flowsRedirectTarget(pathname: string, search: string): string {
   const rest = pathname.replace(/^\/flows(?=\/|$)/, "");
   return `/pipelines${rest}${search}`;
+}
+
+/** `/explore?dataset=X → /analyses?mode=chart&dataset=X` — Explore's deep
+ *  links (dataset preset, dashboard panel-edit round trip) land on the merged
+ *  quick-chart surface with every param intact. */
+export function exploreRedirectTarget(search: string): string {
+  const rest = search.replace(/^\?/, "");
+  return `/analyses?mode=chart${rest ? "&" + rest : ""}`;
 }
 
 interface NavGate {
@@ -217,8 +225,9 @@ export function Layout({ children }: { children: ReactNode }) {
 
         {auth.multi && auth.workspaces.length > 0 && (
           <div className="ws-switch">
-            <label>Workspace</label>
+            <label htmlFor="ws-switch-select">Workspace</label>
             <select
+              id="ws-switch-select"
               value={auth.activeSlug ?? ""}
               onChange={(e) => auth.setActiveWorkspace(e.target.value)}
             >

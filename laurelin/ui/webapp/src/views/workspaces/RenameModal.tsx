@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { WorkspaceSummary } from "../../types";
+import { Modal } from "../../ui";
 import { InlineError } from "../admin/shared";
 
 export function RenameModal({
@@ -31,12 +32,7 @@ export function RenameModal({
   });
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className="modal"
-        onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: 480 }}
-      >
+    <Modal label={`Edit ${workspace.slug}`} onClose={onClose} width={480}>
         <h2 style={{ fontSize: 16, marginBottom: 12 }}>
           Edit <span className="mono">{workspace.slug}</span>
         </h2>
@@ -77,7 +73,6 @@ export function RenameModal({
             Cancel
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

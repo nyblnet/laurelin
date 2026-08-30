@@ -39,7 +39,7 @@ from typing import Iterable, Optional
 from laurelin.core.approvals import flow_output_ticket
 from laurelin.core.models import Role, SubjectKind, User
 from laurelin.core.permissions import confusable_identifier
-from laurelin.transforms.flow_ir import FlowDef, FlowRefused
+from laurelin.transforms.flow_ir import FlowDef, FlowRefused, FlowSourceDenied
 
 
 def referenced_columns(flow: FlowDef) -> set[str]:
@@ -160,7 +160,11 @@ def check_flow_sources(store, perms, author, flow: FlowDef) -> None:
                 field="dataset",
             )
         if not perms.can_view_dataset(user, dataset):
-            raise FlowRefused(
+            # `FlowSourceDenied`, not plain `FlowRefused`: run paths that
+            # execute a *stored* flow as the caller need to tell "you may not
+            # read this" apart from "the definition went stale" without
+            # parsing this sentence.
+            raise FlowSourceDenied(
                 f"{who!r} cannot read {dataset!r}, so this flow cannot use "
                 "it as a source. Ask an administrator for access to that "
                 "dataset, or use a different source.",

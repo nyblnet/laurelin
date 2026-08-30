@@ -383,7 +383,7 @@ export function StepForm(props: StepFormProps) {
               className="fx-add"
               onClick={() => set({ aggs: [...(p.aggs ?? []), { fn: "sum", column: "", as: "" }] })}
             >
-              + another summary
+              + add a summary
             </button>
           </div>
           <div className="hint">

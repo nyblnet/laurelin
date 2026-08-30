@@ -62,8 +62,10 @@ EXPECTED_GROUPS = [
         "label": "Analyze",
         "items": [
             {"to": "/dashboards", "label": "Dashboards"},
+            # Explore merged into Analyses as its quick-chart entry — the
+            # follow-on milestone the previous pass promised. One charting
+            # door; /explore is a retired route below.
             {"to": "/analyses", "label": "Analyses"},
-            {"to": "/explore", "label": "Explore", "needs": "editor"},
             {"to": "/workbench", "label": "SQL"},
             {"to": "/apps", "label": "Apps"},
         ],
@@ -168,16 +170,18 @@ def test_every_role_sees_exactly_the_agreed_doors_and_a_viewers_nav_never_gains_
     rendered = mounted[f"rendered_{role}"]
     assert rendered["stray_anchors"] == 0
     assert rendered["groups"] == expected, f"{role} sees the wrong doors"
-    # The counts the IA settled on: viewer 9, editor 12 (11 once Explore
-    # merges into Analyses in the follow-on milestone), admin 13,
-    # superadmin 13 single / 14 multi.
+    # The counts the IA settled on after Explore merged into Analyses (the
+    # follow-on milestone the previous pass promised): the viewer count is
+    # unchanged — a viewer never had the Explore door — and every
+    # editor-and-above count shrank by exactly one. Counts shrink, never
+    # grow, without a deliberate edit here.
     n = sum(len(g["items"]) for g in rendered["groups"])
     assert n == {
         "viewer": 9,
-        "editor": 12,
-        "admin": 13,
-        "superadmin_single": 13,
-        "superadmin_multi": 14,
+        "editor": 11,
+        "admin": 12,
+        "superadmin_single": 12,
+        "superadmin_multi": 13,
     }[role]
 
 
@@ -198,12 +202,21 @@ def test_every_retired_route_redirects_to_its_replacement(mounted):
         "/pipeline": "/builds",
         "/flows": "/pipelines",
         "/transforms": "/pipelines?tab=python",
+        "/explore": "/analyses",
     }
     # Deep links into the visual builder keep their subpath and search params.
     assert mounted["flows_redirects"] == {
         "bare": "/pipelines",
         "named": "/pipelines/late_orders",
         "named_search": "/pipelines/late_orders?new=1",
+    }
+    # Explore's deep links land on the merged quick-chart surface with every
+    # param intact — the dataset-detail door and the dashboard panel-edit
+    # round trip both depend on it.
+    assert mounted["explore_redirects"] == {
+        "bare": "/analyses?mode=chart",
+        "dataset": "/analyses?mode=chart&dataset=tidy_flights",
+        "panel_edit": "/analyses?mode=chart&dashboard=ops&panel=p1",
     }
     # The wiring: react-dom/server cannot observe <Navigate> (it fires in an
     # effect), so the route table is pinned at source. Each retired path must
@@ -219,6 +232,10 @@ def test_every_retired_route_redirects_to_its_replacement(mounted):
     )
     assert re.search(r'<Route path="/flows/\*" element=\{<FlowsRedirect />\} />', src)
     assert "flowsRedirectTarget(loc.pathname, loc.search)" in src
+    # /explore is routed to the param-preserving redirect, not the old view.
+    assert re.search(r'<Route path="/explore" element=\{<ExploreRedirect />\} />', src)
+    assert "exploreRedirectTarget(loc.search)" in src
+    assert "ExploreView" not in src
     # And the replacements are really routed to the real views.
     assert re.search(r'<Route path="/builds" element=\{scoped\(<BuildsView />\)\} />', src)
     assert re.search(r'<Route path="/pipelines/\*" element=\{scoped\(<PipelinesView />\)\} />', src)

@@ -18,6 +18,7 @@ import {
   Layout,
   NAV_GROUPS,
   RETIRED_ROUTES,
+  exploreRedirectTarget,
   flowsRedirectTarget,
   visibleNavGroups,
 } from "../../laurelin/ui/webapp/src/Layout";
@@ -93,6 +94,14 @@ out.flows_redirects = {
   bare: flowsRedirectTarget("/flows", ""),
   named: flowsRedirectTarget("/flows/late_orders", ""),
   named_search: flowsRedirectTarget("/flows/late_orders", "?new=1"),
+};
+// Explore's deep links must land on the merged quick-chart surface with
+// every param intact: the dataset-detail door and the dashboard panel-edit
+// round trip both ride these.
+out.explore_redirects = {
+  bare: exploreRedirectTarget(""),
+  dataset: exploreRedirectTarget("?dataset=tidy_flights"),
+  panel_edit: exploreRedirectTarget("?dashboard=ops&panel=p1"),
 };
 
 const ROLES: Record<string, unknown> = {

@@ -1,4 +1,4 @@
-// Renders the REAL charts.tsx and exercises the REAL explore model — both
+// Renders the REAL charts.tsx and exercises the REAL shaping model — both
 // imported from the source tree, never copied — and prints one JSON object of
 // results for tests/test_charts_render.py to assert against. Zero mocking of
 // the renderer: every chart claim below is made about the exact SVG markup
@@ -17,7 +17,9 @@ import {
   serializeDraft,
   stateFromFlow,
   distinctValuesFlow,
-} from "../../laurelin/ui/webapp/src/views/explore/model";
+  withGroupBucket,
+  withSortColumn,
+} from "../../laurelin/ui/webapp/src/views/shaping/model";
 
 const out: Record<string, unknown> = {};
 
@@ -317,6 +319,79 @@ out.scale_note = render(
   />,
 );
 
+// A stat of a multi-row result shows ONE number; it must say which.
+out.stat_multirow = render(
+  <Chart
+    kind="stat"
+    y={["total"]}
+    data={{
+      columns: ["region", "total"],
+      rows: [
+        { region: "eu", total: 41250 },
+        { region: "us", total: 39800 },
+        { region: "apac", total: 12100 },
+      ],
+    }}
+  />,
+);
+
+// An unordered categorical result (the engine's arbitrary group-by order —
+// no sorted labels, no monotonic measure) gets the stable default: first
+// measure descending.
+out.bar_unordered = render(
+  <Chart
+    kind="bar"
+    x="region"
+    y={["n"]}
+    data={{
+      columns: ["region", "n"],
+      rows: [
+        { region: "west", n: 20 },
+        { region: "east", n: 45 },
+        { region: "north", n: 5 },
+        { region: "south", n: 30 },
+      ],
+    }}
+  />,
+);
+
+// A monotonic measure IS an order the caller chose (ORDER BY n ASC): kept.
+out.bar_ordered_kept = render(
+  <Chart
+    kind="bar"
+    x="k"
+    y={["v"]}
+    data={{
+      columns: ["k", "v"],
+      rows: [
+        { k: "carrots", v: 5 },
+        { k: "apples", v: 10 },
+        { k: "bananas", v: 20 },
+      ],
+    }}
+  />,
+);
+
+// `keepOrder` lets a caller assert a deliberate order the heuristic cannot
+// see; the same unordered data then renders untouched.
+out.bar_keeporder = render(
+  <Chart
+    kind="bar"
+    x="region"
+    y={["n"]}
+    keepOrder
+    data={{
+      columns: ["region", "n"],
+      rows: [
+        { region: "west", n: 20 },
+        { region: "east", n: 45 },
+        { region: "north", n: 5 },
+        { region: "south", n: 30 },
+      ],
+    }}
+  />,
+);
+
 // ----------------------------------------------------------------- model
 
 // A raw-SQL panel's `{}` flow must parse to null, never crash.
@@ -391,5 +466,24 @@ try {
 
 // The value-suggestion flow is an ordinary FlowDef over the one route.
 out.distinct_flow = JSON.stringify(distinctValuesFlow("orders", "region", "ana"));
+
+// Phase-A courtesies live in the SHARED model, once: picking a date bucket
+// defaults the sort to chronological (unless the author's own sort still
+// names a real result column), and sorting by a measure defaults to
+// largest-first. These transitions used to be inline in Explore's JSX, so
+// Analyses' copy of the cards silently lacked them.
+{
+  const state = emptyExplore("events");
+  state.groups = [{ column: "when", bucket: "", binWidth: "", parse: false }];
+  state.sort = null;
+  const bucketed = withGroupBucket(state, 0, "month", "text", []);
+  out.bucket_autosort = JSON.stringify(bucketed.sort);
+  // An author-chosen sort on a surviving column is not overridden.
+  const kept = { ...state, sort: { column: "row count", dir: "desc" as const } };
+  out.bucket_autosort_kept = JSON.stringify(withGroupBucket(kept, 0, "month", "text", []).sort);
+  // Direction defaults: measure descends, plain grouping ascends.
+  out.sort_measure_default = JSON.stringify(withSortColumn(state, "row count").sort);
+  out.sort_group_default = JSON.stringify(withSortColumn(state, "when").sort);
+}
 
 process.stdout.write(JSON.stringify(out));

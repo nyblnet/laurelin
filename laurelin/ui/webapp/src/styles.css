@@ -2,6 +2,9 @@
    Self-hosted only: a system font stack, zero external fonts or CSS. */
 
 :root {
+  /* Native widgets (scrollbars, selects, date pickers) must render dark too,
+     or every <select> pops open a white sheet inside a dark app. */
+  color-scheme: dark;
   --bg: #0d0f12;
   --bg-1: #14171c;
   --bg-2: #1b1f26;
@@ -10,7 +13,10 @@
   --border-2: #3a4150;
   --text: #e6e9ef;
   --text-dim: #9aa3b2;
-  --text-faint: #6b7385;
+  /* ≥4.5:1 against every surface token (--bg through --bg-3): faint means
+     de-emphasized, not unreadable — truncation notes and axis labels are
+     load-bearing copy. Still darker than --text-dim, so the hierarchy holds. */
+  --text-faint: #8791a8;
   --gold: #d9b25a;
   --gold-dim: #a8863f;
   --green: #5fb87a;
@@ -111,6 +117,9 @@ h3 {
   display: flex;
   flex-direction: column;
   padding: 18px 14px;
+  /* Short viewports: the nav scrolls rather than clipping its lower groups
+     (and the user footer) out of existence with no way to reach them. */
+  overflow-y: auto;
 }
 
 .brand {
@@ -425,6 +434,14 @@ tr.clickable {
 tr.clickable:hover {
   background: var(--bg-1);
 }
+/* The DataTable keyboard contract: a clickable row is tabbable, so it needs
+   a visible focus state — hover styling alone leaves a keyboard user with no
+   idea where they are in the table. */
+tr.clickable:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: -2px;
+  background: var(--bg-1);
+}
 tr.selected {
   background: var(--bg-2);
 }
@@ -492,6 +509,12 @@ tr.selected {
   padding: 10px 14px;
   margin: 8px 0;
   font-size: 13px;
+}
+/* ErrorBox's optional Retry: beside the message, never a second row — the
+   red box stays one compact statement with one action. */
+.error-retry {
+  margin-left: 10px;
+  vertical-align: baseline;
 }
 
 /* A write that succeeded but wants a word. Distinct from .error-box on purpose:

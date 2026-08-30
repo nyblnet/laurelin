@@ -189,7 +189,7 @@ it is the metadata database.
 |---|---|
 | `LAURELIN_CONTROL_DATABASE_URL` | Postgres URL for the multi-workspace control plane |
 | `LAURELIN_NO_AUTH=1` | Disable auth (local dev only) |
-| `LAURELIN_LOCK_PIPELINES=1` | Disable in-browser *Python* pipeline authoring (untrusted tenants). Flows/Explore — no-code, cannot reach `exec` — stay available |
+| `LAURELIN_LOCK_PIPELINES=1` | Disable in-browser *Python* pipeline authoring (untrusted tenants). Flows and Analyses charts — no-code, cannot reach `exec` — stay available |
 | `LAURELIN_LOCK_FLOWS=1` | Disable no-code flow authoring too. Both flags together = no authoring of any kind |
 | *(no env var)* — use the `--secure-cookies` flag | `Secure` flag on session cookies. There is deliberately no `LAURELIN_SECURE_COOKIES`; the flag is the only switch, and the Helm chart passes it. The flag is also implied per-request when `X-Forwarded-Proto: https` reaches the app |
 | `LAURELIN_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ROLE_MAP` | OIDC SSO |

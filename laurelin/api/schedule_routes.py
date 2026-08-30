@@ -39,9 +39,32 @@ class ScheduleUpsertRequest(BaseModel):
     source: str = ""
 
 
+def _with_build_outcome(store: StoreDep, dumped: dict) -> dict:
+    """`last_status` as the reader needs it, not as the recorder wrote it.
+
+    The scheduler records "succeeded" when a build-action firing *queues* its
+    build — correct for the firing, and a lie on the page: the row said
+    succeeded, green, all night, while the build it launched failed on an
+    expectation a hundred milliseconds later. The truthful outcome already
+    exists on the builds table, so project through it at read time: a
+    pending/running build reads as "running", and the terminal states read as
+    themselves. Nothing stored changes; sync actions (which run inline) and
+    plan failures (which record "failed" with no build) pass through untouched.
+    """
+    build_id = dumped.get("last_build_id")
+    if dumped.get("action") == "build" and dumped.get("last_status") and build_id:
+        build = store.get_build(build_id)
+        if build is not None:
+            status = str(build.status.value)
+            dumped["last_status"] = (
+                "running" if status in ("pending", "running") else status
+            )
+    return dumped
+
+
 @schedules_router.get("/schedules", dependencies=[EDITOR])
 def list_schedules(store: StoreDep) -> list[dict]:
-    return [_dump(s) for s in store.list_schedules()]
+    return [_with_build_outcome(store, _dump(s)) for s in store.list_schedules()]
 
 
 @schedules_router.get("/schedules/{name}", dependencies=[EDITOR])
@@ -49,7 +72,7 @@ def get_schedule(name: str, store: StoreDep) -> dict:
     info = store.get_schedule(name)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Schedule not found: {name!r}")
-    return _dump(info)
+    return _with_build_outcome(store, _dump(info))
 
 
 @schedules_router.put("/schedules/{name}", dependencies=[EDITOR])

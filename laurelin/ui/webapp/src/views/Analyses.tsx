@@ -1,10 +1,17 @@
-// Analyses: the multi-cell governed analysis — Code Workbook parity, no code.
+// Analyses: ONE door from a question to a shared answer.
 //
-// An analyst adds cells top to bottom. Each cell is EITHER a SQL query (the
-// SQL page's textarea, inline) OR a point-and-click shaping step (Explore's
-// card stack), and a shaping cell's SOURCE picker offers datasets *and*
-// earlier shaping cells — that one picker is the entire chaining UX. Each
-// cell shows its result table and, optionally, a chart.
+// The landing page offers the two ways in, in order of commitment:
+//
+//   * QUICK CHART (views/analyses/QuickChart.tsx) — point-and-click
+//     data-to-chart, no name, no server record, a sessionStorage draft.
+//     Formerly the standalone Explore screen; /explore redirects here. Save
+//     to a dashboard, or "keep going" into cell 1 of a new analysis.
+//   * NEW ANALYSIS — the multi-cell governed document (Code Workbook parity,
+//     no code). An analyst adds cells top to bottom: each is EITHER a SQL
+//     query OR a point-and-click shaping step (the same shared card stack the
+//     quick chart uses), and a shaping cell's SOURCE picker offers datasets
+//     *and* earlier shaping cells — that one picker is the entire chaining
+//     UX. Each cell shows its result table and, optionally, a chart.
 //
 // There is deliberately no code cell. That is Foundry's actual "Code"
 // workbook and the RCE surface --lock-pipelines exists to close; everything
@@ -21,16 +28,16 @@
 // inputs. Reordering cells never edits inputs.
 
 import { useEffect, useMemo, useState } from "react";
-import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Link, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api, ApiError } from "../api";
 import { useAuth } from "../auth";
-import { Chart } from "../charts";
 import type {
   Analysis,
   AnalysisCell,
   CellPreviewResult,
-  ChartKind,
+  Dashboard,
+  DashboardPanel,
   Dataset,
   FlowKind,
   FlowSchemaResult,
@@ -42,26 +49,31 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  Modal,
   Note,
   PageHeader,
   Spinner,
   Withheld,
   fmtTime,
-  fmtValue,
 } from "../ui";
 import {
-  DATE_BUCKETS,
-  FILTER_OPS,
-  MEASURE_FNS,
-  NUMERIC_FNS,
-  defaultAlias,
-  type ExploreBucket,
-  type ExploreFilter,
-  type ExploreFilterOp,
-} from "./explore/model";
+  docDraftKey,
+  parseDocDraft,
+  serializeDocDraft,
+  shapedResultColumns,
+  type StoredDraftCell,
+} from "./shaping/model";
+import {
+  BindingsRow,
+  CHART_KINDS,
+  CellResult,
+  ChartKindBar,
+  SHAPING_STYLES,
+  ShapingCards,
+  type Bindings,
+} from "./shaping/ShapingCards";
 import {
   cellFragment,
-  cellResultColumns,
   emptyShaping,
   explainCellRefusal,
   shapingFromCell,
@@ -71,26 +83,31 @@ import {
   type CellShaping,
   type RefusalContext,
 } from "./analyses/model";
+import { NAME_RULE, QuickChart } from "./analyses/QuickChart";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const CHART_KINDS: ChartKind[] = ["table", "bar", "line", "area", "stat", "pie", "scatter"];
 const PREVIEW_ROWS = 200;
 
 export function AnalysesView() {
   return (
     <Routes>
-      <Route path="/" element={<AnalysisList />} />
+      <Route path="/" element={<AnalysesLanding />} />
       <Route path=":name" element={<AnalysisPage />} />
     </Routes>
   );
 }
 
-// ------------------------------------------------------------------- list
+// ---------------------------------------------------------------- landing
 
-function AnalysisList() {
+function AnalysesLanding() {
   const auth = useAuth();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const [params] = useSearchParams();
+  // The SQL page's "save as analysis cell" hand-off: ?mode=doc&sql=<encoded>
+  // prefills the new-analysis form with a ready SQL cell, so a quick query
+  // that turned out to matter gets a lightweight home without retyping.
+  const prefillSql = params.get("mode") === "doc" ? params.get("sql") ?? "" : "";
   const [newName, setNewName] = useState("");
   const [newTitle, setNewTitle] = useState("");
 
@@ -100,11 +117,26 @@ function AnalysisList() {
   });
 
   const create = useMutation({
-    mutationFn: () =>
-      api.put<Analysis>(`${API}/analyses/${newName.trim()}`, {
-        title: newTitle.trim() || newName.trim(),
+    mutationFn: async () => {
+      const name = newName.trim();
+      const created = await api.put<Analysis>(`${API}/analyses/${name}`, {
+        title: newTitle.trim() || name,
         cells: [],
-      }),
+      });
+      if (prefillSql.trim()) {
+        await api.post<Analysis>(`${API}/analyses/${encodeURIComponent(name)}/cells`, {
+          title: "Query",
+          sql: prefillSql,
+          chart: "table",
+          x: "",
+          y: [],
+          series: "",
+          stacked: false,
+          width: 12,
+        });
+      }
+      return created;
+    },
     onSuccess: (a) => {
       qc.invalidateQueries({ queryKey: ["analyses"] });
       navigate(`/analyses/${a.name}`);
@@ -127,34 +159,49 @@ function AnalysisList() {
     <div>
       <PageHeader
         title="Analyses"
-        subtitle="Multi-step analyses over governed data — each cell queries or shapes, later cells build on earlier ones, and every result respects the reader's data access."
+        subtitle="From a question to a shared answer: chart something quickly, or build a multi-step analysis — every result respects the reader's data access."
       />
-      {/* The other half of the sentence on Explore's header: the two screens
-          share the click-to-shape idiom, so each one says which job it is for.
-          Editor-only — the choice between authoring doors only exists for
-          someone who can author. */}
+      {/* The quick chart is the default, zero-commitment entry; the document
+          is the committed one. Both live behind this one door so "clean this
+          dataset and chart the result" is never a coin flip between two
+          near-identical screens. Editor-only — the choice between authoring
+          entries only exists for someone who can author. */}
       {auth.can("editor") && (
-        <p className="hint" style={{ marginTop: -8, marginBottom: 12 }}>
-          An analysis is a <strong>multi-step document</strong>. For one chart on
-          a dashboard, shape it in <Link to="/explore">Explore</Link> instead.
-        </p>
+        <div style={{ marginBottom: 22 }}>
+          <QuickChart />
+        </div>
       )}
       {auth.can("editor") && (
         <div className="card" style={{ marginBottom: 18 }}>
+          <div className="card-title">New analysis</div>
+          <p className="hint" style={{ marginTop: 2, marginBottom: 8 }}>
+            A multi-step document: cells that build on each other — shaped by
+            clicking or written in SQL — shared as one URL.
+          </p>
+          {prefillSql.trim() && (
+            <Note>
+              Your SQL query from the SQL page will be added as the first cell.
+            </Note>
+          )}
           <div className="toolbar" style={{ marginBottom: 0, gap: 12, flexWrap: "wrap" }}>
             <div className="field">
-              <label>Name</label>
+              <label htmlFor="an-new-name">Name</label>
               <input
+                id="an-new-name"
                 className="mono"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 placeholder="churn-investigation"
                 autoComplete="off"
               />
+              {/* The create button used to disable silently on a name the
+                  gate refused, with nothing saying why. */}
+              <div className="hint">{NAME_RULE}</div>
             </div>
             <div className="field" style={{ flex: "1 1 220px" }}>
-              <label>Title</label>
+              <label htmlFor="an-new-title">Title</label>
               <input
+                id="an-new-title"
                 value={newTitle}
                 onChange={(e) => setNewTitle(e.target.value)}
                 placeholder="Churn investigation"
@@ -164,6 +211,7 @@ function AnalysisList() {
             <button
               className="primary"
               disabled={!nameOk || create.isPending}
+              title={!nameOk && newName.trim() !== "" ? NAME_RULE : undefined}
               onClick={() => create.mutate()}
             >
               {create.isPending ? "Creating…" : "New analysis"}
@@ -188,72 +236,6 @@ function AnalysisList() {
           onRowClick={(a) => navigate(`/analyses/${a.name}`)}
         />
       )}
-    </div>
-  );
-}
-
-// ------------------------------------------------------------ result table
-
-function ResultTable({ result, maxHeight = 300 }: { result: QueryResult; maxHeight?: number }) {
-  return (
-    <div>
-      <div className="table-wrap" style={{ maxHeight, overflowY: "auto" }}>
-        <table>
-          <thead>
-            <tr>
-              {result.columns.map((c) => (
-                <th key={c} className="mono">{c}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {result.rows.map((row, i) => (
-              <tr key={i}>
-                {result.columns.map((c) => (
-                  <td key={c} className="mono">{fmtValue(row[c])}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div className="faint" style={{ fontSize: 11, marginTop: 6, display: "flex", gap: 8 }}>
-        {result.row_count.toLocaleString("en-US")} row{result.row_count === 1 ? "" : "s"}
-        {result.truncated && (
-          <span className="badge badge-gold">first {result.row_count.toLocaleString("en-US")} of a larger result</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function CellResult({
-  result,
-  chart,
-  x,
-  y,
-  series,
-  stacked,
-}: {
-  result: QueryResult;
-  chart: ChartKind;
-  x: string;
-  y: string[];
-  series: string;
-  stacked: boolean;
-}) {
-  if (chart === "table" || result.columns.length === 0) {
-    return <ResultTable result={result} />;
-  }
-  return (
-    <div>
-      <Chart data={result} kind={chart} x={x} y={y} series={series} stacked={stacked} />
-      <details style={{ marginTop: 8 }}>
-        <summary className="faint" style={{ fontSize: 11.5, cursor: "pointer" }}>
-          {result.row_count.toLocaleString("en-US")} row{result.row_count === 1 ? "" : "s"} — show table
-        </summary>
-        <ResultTable result={result} />
-      </details>
     </div>
   );
 }
@@ -286,7 +268,7 @@ function ViewerCell({ analysis, cell }: { analysis: string; cell: AnalysisCell }
       {q.isLoading ? (
         <Spinner label="Running…" />
       ) : q.isError ? (
-        <ErrorBox error={q.error} />
+        <ErrorBox error={q.error} onRetry={() => q.refetch()} />
       ) : (
         <CellResult
           result={q.data!}
@@ -301,98 +283,9 @@ function ViewerCell({ analysis, cell }: { analysis: string; cell: AnalysisCell }
   );
 }
 
-// ---------------------------------------------------------------- bindings
-
-interface Bindings {
-  chart: ChartKind;
-  x: string;
-  y: string[];
-  series: string;
-  stacked: boolean;
-}
+// -------------------------------------------------------------- draft model
 
 const AUTO_BINDINGS: Bindings = { chart: "table", x: "", y: [], series: "", stacked: false };
-
-function BindingsRow({
-  bindings,
-  set,
-  columns,
-  kinds,
-}: {
-  bindings: Bindings;
-  set: (b: Bindings) => void;
-  columns: string[];
-  kinds: Record<string, FlowKind>;
-}) {
-  const numeric = columns.filter((c) => kinds[c] === "number");
-  return (
-    <div>
-      <div className="toolbar" style={{ gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-        {CHART_KINDS.map((k) => (
-          <button
-            key={k}
-            className={`small${bindings.chart === k ? " primary" : ""}`}
-            onClick={() => set({ ...bindings, chart: k })}
-          >
-            {k}
-          </button>
-        ))}
-      </div>
-      {bindings.chart !== "table" && bindings.chart !== "stat" && (
-        <div className="toolbar" style={{ gap: 10, flexWrap: "wrap" }}>
-          <div className="field">
-            <label>X axis</label>
-            <select value={bindings.x} onChange={(e) => set({ ...bindings, x: e.target.value })}>
-              <option value="">(infer)</option>
-              {columns.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </div>
-          <div className="field">
-            <label>Y (values)</label>
-            <select
-              multiple
-              size={Math.min(3, Math.max(2, numeric.length))}
-              value={bindings.y}
-              onChange={(e) =>
-                set({ ...bindings, y: Array.from(e.target.selectedOptions, (o) => o.value) })
-              }
-            >
-              {(numeric.length > 0 ? numeric : columns).map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </div>
-          <div className="field">
-            <label>Split by</label>
-            <select
-              value={bindings.series}
-              onChange={(e) => set({ ...bindings, series: e.target.value })}
-            >
-              <option value="">—</option>
-              {columns.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </div>
-          {bindings.chart === "bar" && (
-            <label className="check-inline" style={{ alignSelf: "flex-end", paddingBottom: 8 }}>
-              <input
-                type="checkbox"
-                checked={bindings.stacked}
-                onChange={(e) => set({ ...bindings, stacked: e.target.checked })}
-              />
-              <span>stacked</span>
-            </label>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// -------------------------------------------------------------- draft model
 
 interface DraftCell {
   /** Stable local key (never reused; survives id assignment on save). */
@@ -439,13 +332,35 @@ function draftFromCell(c: AnalysisCell): DraftCell {
   };
 }
 
+/** The chart bindings this cell should DRAW and SAVE: explicit choices win,
+ *  and the gaps fill from the SHAPING, not from value-type inference — x is
+ *  the first group column, y the measures. Inference alone puts a numeric
+ *  group column (a histogram's bin) on the y axis as a series, because all
+ *  it can see is "this column holds numbers". */
+function effectiveCellBindings(d: DraftCell): { x: string; y: string[] } {
+  const b = d.bindings;
+  if (
+    d.kind !== "shaping" || !d.shaping || d.shaping.measures.length === 0 ||
+    b.chart === "table" || b.chart === "stat"
+  ) {
+    return { x: b.x, y: b.y };
+  }
+  const cols = shapedResultColumns(d.shaping, []);
+  const groups = cols.filter((c) => !d.shaping!.measures.some((m) => m.alias === c));
+  return {
+    x: b.x || (groups[0] ?? ""),
+    y: b.y.length > 0 ? b.y : d.shaping.measures.map((m) => m.alias).filter(Boolean),
+  };
+}
+
 /** The wire dict for one draft cell — presentation + whichever source it is. */
 function cellPayload(d: DraftCell, kinds: Record<string, FlowKind>): Record<string, unknown> | null {
+  const eff = effectiveCellBindings(d);
   const base = {
     title: d.title,
     chart: d.bindings.chart,
-    x: d.bindings.x,
-    y: d.bindings.y,
+    x: eff.x,
+    y: eff.y,
     series: d.bindings.series,
     stacked: d.bindings.stacked,
     width: d.width,
@@ -466,380 +381,72 @@ function cellPayload(d: DraftCell, kinds: Record<string, FlowKind>): Record<stri
   return null;
 }
 
-// ------------------------------------------------------------ shaping cards
+// ---------------------------------------------------- doc draft persistence
 
-function ShapingCards({
-  state,
-  set,
-  columns,
-  kinds,
-  sources,
-}: {
-  state: CellShaping;
-  set: (fn: (s: CellShaping) => CellShaping) => void;
-  /** Columns + kinds of the picked source (dataset schema or upstream cell's
-   *  preview schema). */
-  columns: string[];
-  kinds: Record<string, FlowKind>;
-  /** What the source picker offers. */
-  sources: { value: string; label: string; hint?: string }[];
-}) {
-  const aggregating = state.measures.length > 0;
-  const resultCols = cellResultColumns(state, columns);
+function toStored(d: DraftCell): StoredDraftCell {
+  return {
+    id: d.id,
+    title: d.title,
+    kind: d.kind,
+    sql: d.sql,
+    shaping: d.shaping,
+    bindings: d.bindings,
+    width: d.width,
+    dirty: d.dirty,
+  };
+}
 
-  return (
-    <div>
-      <div className="toolbar" style={{ gap: 10, flexWrap: "wrap" }}>
-        <div className="field">
-          <label>Reads from</label>
-          <select
-            value={state.source}
-            onChange={(e) => {
-              const source = e.target.value;
-              // Columns belong to a source; shaping does not survive a swap.
-              set(() => emptyShaping(source));
-            }}
-          >
-            <option value="">Pick a source…</option>
-            {sources.map((s) => (
-              <option key={s.value} value={s.value} title={s.hint}>{s.label}</option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {state.source && (
-        <>
-          {/* -------------------------------------------------------- filter */}
-          <div className="an-card">
-            <div className="an-card-title">Filter</div>
-            {state.filters.map((f, i) => {
-              const kind = kinds[f.column] ?? "";
-              const needsValue = f.op !== "is_null" && f.op !== "is_not_null";
-              const isList = f.op === "in" || f.op === "not_in";
-              return (
-                <div key={i} className="an-row">
-                  <select
-                    value={f.column}
-                    onChange={(e) =>
-                      set((s) => ({
-                        ...s,
-                        filters: s.filters.map((x, j) => (j === i ? { ...x, column: e.target.value } : x)),
-                      }))
-                    }
-                  >
-                    <option value="">Pick a column…</option>
-                    {columns.map((c) => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
-                  </select>
-                  <select
-                    value={f.op}
-                    onChange={(e) =>
-                      set((s) => ({
-                        ...s,
-                        filters: s.filters.map((x, j) =>
-                          j === i ? { ...x, op: e.target.value as ExploreFilterOp } : x,
-                        ),
-                      }))
-                    }
-                  >
-                    {(Object.keys(FILTER_OPS) as ExploreFilterOp[]).map((op) => (
-                      <option key={op} value={op}>{FILTER_OPS[op]}</option>
-                    ))}
-                  </select>
-                  {needsValue && !isList && (
-                    <input
-                      value={f.value}
-                      placeholder={
-                        kind === "time" ? "YYYY-MM-DD" : kind === "number" ? "e.g. 100" : kind === "boolean" ? "true / false" : "value"
-                      }
-                      onChange={(e) =>
-                        set((s) => ({
-                          ...s,
-                          filters: s.filters.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)),
-                        }))
-                      }
-                    />
-                  )}
-                  {isList && (
-                    <input
-                      value={f.values.join(", ")}
-                      placeholder="value, value, value"
-                      onChange={(e) =>
-                        set((s) => ({
-                          ...s,
-                          filters: s.filters.map((x, j) =>
-                            j === i
-                              ? { ...x, values: e.target.value.split(",").map((v) => v.trim()).filter(Boolean) }
-                              : x,
-                          ),
-                        }))
-                      }
-                    />
-                  )}
-                  <button
-                    className="an-x"
-                    title="Remove this filter"
-                    onClick={() => set((s) => ({ ...s, filters: s.filters.filter((_, j) => j !== i) }))}
-                  >
-                    ×
-                  </button>
-                </div>
-              );
-            })}
-            <button
-              className="an-add"
-              onClick={() =>
-                set((s) => ({
-                  ...s,
-                  filters: [...s.filters, { column: "", op: "eq", value: "", values: [] } as ExploreFilter],
-                }))
-              }
-            >
-              + keep only rows where…
-            </button>
-          </div>
-
-          {/* ----------------------------------------------------- summarise */}
-          <div className="an-card">
-            <div className="an-card-title">Summarise</div>
-            {!aggregating && (
-              <div className="hint" style={{ marginBottom: 6 }}>
-                No summaries — this cell returns the rows themselves. Add one to aggregate.
-              </div>
-            )}
-            {state.measures.map((m, i) => (
-              <div key={i} className="an-row">
-                <select
-                  value={m.fn}
-                  onChange={(e) => {
-                    const fn = e.target.value as typeof m.fn;
-                    set((s) => ({
-                      ...s,
-                      measures: s.measures.map((x, j) =>
-                        j === i
-                          ? {
-                              ...x, fn,
-                              column: fn === "count_star" ? "" : x.column,
-                              alias:
-                                x.alias === defaultAlias(x.fn, x.column) || !x.alias
-                                  ? defaultAlias(fn, fn === "count_star" ? "" : x.column)
-                                  : x.alias,
-                            }
-                          : x,
-                      ),
-                    }));
-                  }}
-                >
-                  {Object.entries(MEASURE_FNS).map(([fn, label]) => (
-                    <option key={fn} value={fn}>{label}</option>
-                  ))}
-                </select>
-                {m.fn !== "count_star" && (
-                  <select
-                    value={m.column}
-                    onChange={(e) => {
-                      const column = e.target.value;
-                      set((s) => ({
-                        ...s,
-                        measures: s.measures.map((x, j) =>
-                          j === i
-                            ? {
-                                ...x, column,
-                                alias:
-                                  x.alias === defaultAlias(x.fn, x.column) || !x.alias
-                                    ? defaultAlias(x.fn, column)
-                                    : x.alias,
-                              }
-                            : x,
-                        ),
-                      }));
-                    }}
-                  >
-                    <option value="">Pick a column…</option>
-                    {(NUMERIC_FNS.has(m.fn)
-                      ? columns.filter((c) => !kinds[c] || kinds[c] === "number")
-                      : columns
-                    ).map((c) => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
-                  </select>
-                )}
-                <input
-                  value={m.alias}
-                  placeholder="name in the result"
-                  onChange={(e) =>
-                    set((s) => ({
-                      ...s,
-                      measures: s.measures.map((x, j) => (j === i ? { ...x, alias: e.target.value } : x)),
-                    }))
-                  }
-                />
-                <button
-                  className="an-x"
-                  title="Remove this summary"
-                  onClick={() => set((s) => ({ ...s, measures: s.measures.filter((_, j) => j !== i) }))}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            <button
-              className="an-add"
-              onClick={() =>
-                set((s) => ({
-                  ...s,
-                  measures: [...s.measures, { fn: "count_star", column: "", alias: defaultAlias("count_star", "") }],
-                }))
-              }
-            >
-              + add a summary
-            </button>
-          </div>
-
-          {/* ------------------------------------------------------ group by */}
-          {aggregating && (
-            <div className="an-card">
-              <div className="an-card-title">Group by</div>
-              {state.groups.map((g, i) => {
-                const kind = kinds[g.column] ?? "";
-                return (
-                  <div key={i} className="an-row">
-                    <select
-                      value={g.column}
-                      onChange={(e) => {
-                        const column = e.target.value;
-                        set((s) => ({
-                          ...s,
-                          groups: s.groups.map((x, j) =>
-                            j === i ? { column, bucket: "" as ExploreBucket, binWidth: "", parse: false } : x,
-                          ),
-                          sort: column && !s.sort ? { column, dir: "asc" } : s.sort,
-                        }));
-                      }}
-                    >
-                      <option value="">Pick a column…</option>
-                      {columns.map((c) => (
-                        <option key={c} value={c}>{c}</option>
-                      ))}
-                    </select>
-                    {(kind === "time" || kind === "text") && (
-                      <select
-                        value={g.bucket === "bin" ? "" : g.bucket}
-                        onChange={(e) => {
-                          const bucket = e.target.value as ExploreBucket;
-                          const parse = kind === "text" && !!bucket;
-                          set((s) => ({
-                            ...s,
-                            groups: s.groups.map((x, j) => (j === i ? { ...x, bucket, parse } : x)),
-                          }));
-                        }}
-                      >
-                        <option value="">exact values</option>
-                        {Object.entries(DATE_BUCKETS).map(([k, v]) => (
-                          <option key={k} value={k}>
-                            {kind === "text" ? `read as dates, by ${v}` : `by ${v}`}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                    {kind === "number" && (
-                      <>
-                        <select
-                          value={g.bucket === "bin" ? "bin" : ""}
-                          onChange={(e) => {
-                            const bin = e.target.value === "bin";
-                            set((s) => ({
-                              ...s,
-                              groups: s.groups.map((x, j) =>
-                                j === i
-                                  ? { ...x, bucket: (bin ? "bin" : "") as ExploreBucket, binWidth: bin ? x.binWidth || "10" : "", parse: false }
-                                  : x,
-                              ),
-                            }));
-                          }}
-                        >
-                          <option value="">exact values</option>
-                          <option value="bin">in ranges of…</option>
-                        </select>
-                        {g.bucket === "bin" && (
-                          <input
-                            style={{ width: 80 }}
-                            value={g.binWidth}
-                            onChange={(e) =>
-                              set((s) => ({
-                                ...s,
-                                groups: s.groups.map((x, j) => (j === i ? { ...x, binWidth: e.target.value } : x)),
-                              }))
-                            }
-                          />
-                        )}
-                      </>
-                    )}
-                    <button
-                      className="an-x"
-                      title="Remove this grouping"
-                      onClick={() => set((s) => ({ ...s, groups: s.groups.filter((_, j) => j !== i) }))}
-                    >
-                      ×
-                    </button>
-                  </div>
-                );
-              })}
-              <button
-                className="an-add"
-                onClick={() =>
-                  set((s) => ({
-                    ...s,
-                    groups: [...s.groups, { column: "", bucket: "" as ExploreBucket, binWidth: "", parse: false }],
-                  }))
-                }
-              >
-                + group by…
-              </button>
-            </div>
-          )}
-
-          {/* --------------------------------------------------- order + top */}
-          <div className="an-card">
-            <div className="an-card-title">Order &amp; Top N</div>
-            <div className="an-row">
-              <select
-                value={state.sort?.column ?? ""}
-                onChange={(e) => {
-                  const column = e.target.value;
-                  set((s) => ({ ...s, sort: column ? { column, dir: s.sort?.dir ?? "asc" } : null }));
-                }}
-              >
-                <option value="">unordered</option>
-                {resultCols.map((c) => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-              {state.sort && (
-                <select
-                  value={state.sort.dir}
-                  onChange={(e) =>
-                    set((s) => ({ ...s, sort: s.sort ? { ...s.sort, dir: e.target.value as "asc" | "desc" } : null }))
-                  }
-                >
-                  <option value="asc">smallest first</option>
-                  <option value="desc">largest first</option>
-                </select>
-              )}
-              <input
-                style={{ width: 110 }}
-                value={state.top}
-                placeholder="top N (all)"
-                onChange={(e) => set((s) => ({ ...s, top: e.target.value }))}
-              />
-            </div>
-          </div>
-        </>
-      )}
-    </div>
-  );
+/** The editor's cells, seeded from the server record and overlaid with the
+ *  session's stored draft: edited saved cells resume dirty, unsaved cells
+ *  come back whole. useState-only drafts meant one refresh destroyed every
+ *  unsaved cell — the worst data-loss cliff on the documents side. */
+function restoreDrafts(ana: Analysis): DraftCell[] {
+  const base = ana.cells.map(draftFromCell);
+  let stored: StoredDraftCell[] | null = null;
+  try {
+    stored = parseDocDraft(sessionStorage.getItem(docDraftKey(ana.name)));
+  } catch {
+    stored = null;
+  }
+  if (!stored) return base;
+  const sanitizeBindings = (b: StoredDraftCell["bindings"]): Bindings => ({
+    chart: CHART_KINDS.includes(b.chart as Bindings["chart"])
+      ? (b.chart as Bindings["chart"])
+      : "table",
+    x: b.x,
+    y: b.y,
+    series: b.series,
+    stacked: b.stacked,
+  });
+  const out = base.map((d) => {
+    const s = stored!.find((c) => c.id !== null && c.id === d.id && c.dirty);
+    if (!s || s.kind !== d.kind) return d;
+    return {
+      ...d,
+      title: s.title,
+      sql: s.sql,
+      shaping: d.kind === "shaping" ? (s.shaping ?? d.shaping) : d.shaping,
+      bindings: sanitizeBindings(s.bindings),
+      width: s.width,
+      dirty: true,
+    };
+  });
+  for (const s of stored) {
+    if (s.id !== null) continue;
+    out.push({
+      key: nextKey(),
+      id: null,
+      title: s.title,
+      kind: s.kind,
+      sql: s.sql,
+      shaping: s.kind === "shaping" ? (s.shaping ?? emptyShaping()) : null,
+      raw: null,
+      bindings: sanitizeBindings(s.bindings),
+      width: s.width,
+      dirty: true,
+    });
+  }
+  return out;
 }
 
 // -------------------------------------------------------------- editor cell
@@ -952,6 +559,15 @@ function EditorCell({
     }
   }, [draft.id, previewQ.data, reportMeta]);
 
+  // Columns masked for this caller, greyed in the measure pickers — the data
+  // already arrives on every preview; the cells just never used it.
+  const maskedColumns = useMemo(() => {
+    const out = new Set<string>();
+    for (const cols of Object.values(previewQ.data?.masked_columns ?? {}))
+      for (const c of cols) out.add(c);
+    return out;
+  }, [previewQ.data?.masked_columns]);
+
   // ---------------------------------------------------------- SQL run (200)
   const sqlRun = useMutation({
     mutationFn: () => api.post<QueryResult>(`${API}/query`, { sql: draft.sql, max_rows: PREVIEW_ROWS }),
@@ -992,18 +608,31 @@ function EditorCell({
         ? issues.length === 0
         : draft.raw !== null; // unparseable but whole: presentation-only saves
 
-  // What the source picker offers: datasets + earlier SAVED shaping cells.
+  // What the source picker offers: datasets + earlier shaping cells. An
+  // earlier UNSAVED shaping cell is listed too — disabled, saying what to do
+  // — because "only saved cells chain" was otherwise discoverable only by
+  // noticing an absence, and chaining is the product's whole reason to have
+  // cells at all.
   const datasetsQ = useQuery({
     queryKey: ["datasets"],
     queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
     enabled: draft.kind === "shaping",
   });
   const sources = useMemo(() => {
-    const out: { value: string; label: string; hint?: string }[] = [];
+    const out: { value: string; label: string; hint?: string; disabled?: boolean }[] = [];
     for (let i = 0; i < drafts.length; i++) {
       const d = drafts[i];
       if (d === draft) break; // only EARLIER cells: execution reads upward
-      if (d.kind !== "shaping" || !d.id) continue;
+      if (d.kind !== "shaping") continue;
+      if (!d.id) {
+        out.push({
+          value: `unsaved:${d.key}`,
+          label: `Cell ${i + 1} — save it to read from it here`,
+          hint: "Save that cell first; chaining reads saved cells.",
+          disabled: true,
+        });
+        continue;
+      }
       out.push({ value: `cell:${d.id}`, label: `Cell ${i + 1} — ${d.title || d.id}` });
     }
     for (const d of datasetsQ.data ?? []) {
@@ -1012,11 +641,49 @@ function EditorCell({
     return out;
   }, [drafts, draft, datasetsQ.data]);
 
+  // ------------------------------------------------------ save to dashboard
+
+  // A self-contained aggregated shaping cell can become a dashboard panel —
+  // the same panel the quick chart saves, so the quick chart can reopen it.
+  const eff = effectiveCellBindings(draft);
+  const dashboardable =
+    draft.kind === "shaping" && !!draft.shaping && !!ds &&
+    draft.shaping.measures.length > 0 && issues.length === 0;
+  const dashboardDisabledWhy =
+    draft.kind !== "shaping" || !draft.shaping
+      ? null // no button at all
+      : upCell
+        ? "This cell reads from another cell; dashboards hold self-contained panels."
+        : draft.shaping.measures.length === 0
+          ? "Add a summary first — a dashboard panel charts an aggregated result."
+          : issues.length > 0
+            ? issues[0]
+            : null;
+  const [dashOpen, setDashOpen] = useState(false);
+  const auth = useAuth();
+  const panelFlow = () => {
+    const frag = cellFragment(draft.shaping!, sourceKinds);
+    if (!frag) return null;
+    return {
+      flow: {
+        name: "explore",
+        output: "explore",
+        author: auth.user?.username ?? "explore",
+        description: "",
+        terminal: frag.flow.terminal,
+        nodes: frag.flow.nodes,
+        expectations: [],
+      },
+      top: frag.top,
+    };
+  };
+
   return (
     <div className="card" style={{ marginBottom: 14 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
         <span className="badge">{position}</span>
         <input
+          aria-label={`Cell ${position} title`}
           value={draft.title}
           placeholder={`Cell ${position}`}
           onChange={(e) => update((d) => ({ ...d, title: e.target.value, dirty: true }))}
@@ -1029,12 +696,22 @@ function EditorCell({
           {draft.kind === "sql" ? "SQL — can't be referenced by later cells" : "shaping"}
         </span>
         <span style={{ flexShrink: 0, display: "inline-flex", gap: 6 }}>
-          <button className="small" title="Move up (display order only — execution follows the cell links)" onClick={() => onMove(-1)} disabled={position === 1}>↑</button>
-          <button className="small" title="Move down (display order only)" onClick={() => onMove(1)}>↓</button>
+          {draft.kind === "shaping" && draft.shaping && (
+            <button
+              className="small"
+              disabled={!dashboardable}
+              title={dashboardDisabledWhy ?? "Save this cell's chart as a dashboard panel"}
+              onClick={() => setDashOpen(true)}
+            >
+              Save to dashboard
+            </button>
+          )}
+          <button className="small" aria-label="Move up" title="Move up (display order only — execution follows the cell links)" onClick={() => onMove(-1)} disabled={position === 1}>↑</button>
+          <button className="small" aria-label="Move down" title="Move down (display order only)" onClick={() => onMove(1)}>↓</button>
           <button className="small primary" disabled={!canSave || saving} onClick={onSave}>
             {saving ? "Saving…" : draft.id ? (draft.dirty ? "Save" : "Saved") : "Save cell"}
           </button>
-          <button className="small danger" onClick={onDelete}>✕</button>
+          <button className="small danger" aria-label="Delete this cell" onClick={onDelete}>✕</button>
         </span>
       </div>
 
@@ -1061,13 +738,41 @@ function EditorCell({
         </div>
       ) : draft.shaping ? (
         <div>
-          <ShapingCards
-            state={draft.shaping}
-            set={(fn) => update((d) => ({ ...d, shaping: fn(d.shaping!), dirty: true }))}
-            columns={sourceColumns}
-            kinds={sourceKinds}
-            sources={sources}
-          />
+          <div className="toolbar" style={{ gap: 10, flexWrap: "wrap" }}>
+            <div className="field">
+              <label htmlFor={`an-src-${draft.key}`}>Reads from</label>
+              <select
+                id={`an-src-${draft.key}`}
+                value={draft.shaping.source}
+                onChange={(e) => {
+                  const source = e.target.value;
+                  // Columns belong to a source; shaping does not survive a swap.
+                  update((d) => ({ ...d, shaping: emptyShaping(source), dirty: true }));
+                }}
+              >
+                <option value="">Pick a source…</option>
+                {sources.map((s) => (
+                  <option key={s.value} value={s.value} title={s.hint} disabled={s.disabled}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          {draft.shaping.source && (
+            <ShapingCards
+              state={draft.shaping}
+              set={(fn) =>
+                update((d) => ({ ...d, shaping: { ...d.shaping!, ...fn(d.shaping!) }, dirty: true }))
+              }
+              columns={sourceColumns}
+              kinds={sourceKinds}
+              masked={maskedColumns}
+              measuresRequired={false}
+              suggestDataset={ds}
+              idPrefix={`an-${draft.key}`}
+            />
+          )}
           {upCell && !upMeta && (
             <div className="hint">Waiting for Cell above to preview — its columns feed these pickers.</div>
           )}
@@ -1092,18 +797,38 @@ function EditorCell({
 
       {result && (
         <div style={{ marginTop: 10 }}>
-          <BindingsRow
-            bindings={draft.bindings}
-            set={(b) => update((d) => ({ ...d, bindings: b, dirty: true }))}
-            columns={result.columns}
-            kinds={resultKinds}
+          <ChartKindBar
+            value={draft.bindings.chart}
+            onChange={(k) => update((d) => ({ ...d, bindings: { ...d.bindings, chart: k }, dirty: true }))}
           />
+          {draft.bindings.chart !== "table" && draft.bindings.chart !== "stat" && (
+            <BindingsRow
+              bindings={draft.bindings}
+              setBindings={(fn) => update((d) => ({ ...d, bindings: fn(d.bindings), dirty: true }))}
+              columns={result.columns}
+              numericCols={result.columns.filter((c) => resultKinds[c] === "number")}
+              categoricalCols={result.columns.filter(
+                (c) => resultKinds[c] === "text" || resultKinds[c] === "boolean",
+              )}
+              idPrefix={`an-${draft.key}`}
+            />
+          )}
+          {result.rows.length === 0 && draft.kind === "shaping" &&
+            (draft.shaping?.filters.length ?? 0) > 0 && (
+              // An empty result behind an active filter is ambiguous: bad
+              // filter value, or genuinely empty data? Say which check to make.
+              <Note>
+                No rows matched your filters. Values must match the data exactly,
+                including capital letters — pick from the suggestions in the value
+                box to be sure.
+              </Note>
+            )}
           <div style={{ marginTop: 8 }}>
             <CellResult
               result={result}
               chart={draft.bindings.chart}
-              x={draft.bindings.x}
-              y={draft.bindings.y}
+              x={eff.x}
+              y={eff.y}
               series={draft.bindings.series}
               stacked={draft.bindings.stacked}
             />
@@ -1115,7 +840,141 @@ function EditorCell({
         </div>
       )}
       {draft.kind === "shaping" && previewQ.isFetching && <Spinner label="Running…" />}
+
+      {dashOpen && (
+        <SaveCellPanelModal
+          cellTitle={draft.title || `Cell ${position}`}
+          bindings={draft.bindings}
+          effX={eff.x}
+          effY={eff.y}
+          panelFlow={panelFlow}
+          onClose={() => setDashOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// ------------------------------------------------- cell → dashboard panel
+
+/** The quick chart's save dialog, for a cell: same panel routes, same
+ *  inline dashboard creation, same success link. Only self-contained
+ *  aggregated cells get here (the button gates), so the saved panel is
+ *  exactly one the quick chart can reopen for editing. */
+function SaveCellPanelModal({
+  cellTitle,
+  bindings,
+  effX,
+  effY,
+  panelFlow,
+  onClose,
+}: {
+  cellTitle: string;
+  bindings: Bindings;
+  effX: string;
+  effY: string[];
+  panelFlow: () => { flow: unknown; top: number | null } | null;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [dashName, setDashName] = useState("");
+  const [panelTitle, setPanelTitle] = useState(cellTitle);
+  const [savedTo, setSavedTo] = useState<string | null>(null);
+  const dashboardsQ = useQuery({
+    queryKey: ["dashboards"],
+    queryFn: () => api.get<Dashboard[]>(`${API}/dashboards`),
+  });
+  const save = useMutation({
+    mutationFn: async () => {
+      const pf = panelFlow();
+      if (!pf) throw new Error("This cell isn't finished yet.");
+      const name = dashName.trim();
+      const panel: Partial<DashboardPanel> = {
+        id: Math.random().toString(36).slice(2, 10),
+        title: panelTitle.trim(),
+        chart: bindings.chart,
+        x: effX,
+        y: effY,
+        series: bindings.series,
+        stacked: bindings.stacked,
+        width: 6,
+        flow: pf.flow as any,
+        top: pf.top,
+      };
+      const base = `${API}/dashboards/${encodeURIComponent(name)}`;
+      const exists = (dashboardsQ.data ?? []).some((d) => d.name === name);
+      if (!exists) {
+        await api.put<Dashboard>(base, { title: name, description: "", panels: [] });
+      }
+      return api.post<Dashboard>(`${base}/panels`, panel);
+    },
+    onSuccess: (d) => {
+      setSavedTo(d.name);
+      qc.invalidateQueries({ queryKey: ["dashboard", d.name] });
+      qc.invalidateQueries({ queryKey: ["dashboards"] });
+      qc.invalidateQueries({ queryKey: ["panel-run", d.name] });
+    },
+  });
+
+  return (
+    <Modal label="Save cell to dashboard" onClose={() => !save.isPending && onClose()}>
+      <div className="card-title">Save to dashboard</div>
+      <p className="dim" style={{ fontSize: 12.5, marginTop: 4 }}>
+        The panel is a copy of this cell's shaping: viewers of the dashboard
+        get the chart, computed with <em>their</em> data access. Later edits to
+        the cell do not change the panel.
+      </p>
+      {savedTo ? (
+        <>
+          <Note tone="ok">
+            Panel saved — <Link to={`/dashboards/${savedTo}`}>open dashboard “{savedTo}”</Link>.
+          </Note>
+          <div className="toolbar" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+            <button onClick={onClose}>Close</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="field" style={{ marginTop: 12 }}>
+            <label htmlFor="an-cell-dash">Dashboard</label>
+            <input
+              id="an-cell-dash"
+              className="mono"
+              autoFocus
+              list="an-cell-dash-list"
+              placeholder="revenue"
+              value={dashName}
+              onChange={(e) => setDashName(e.target.value)}
+            />
+            <datalist id="an-cell-dash-list">
+              {(dashboardsQ.data ?? []).map((d) => (
+                <option key={d.name} value={d.name}>{d.title || d.name}</option>
+              ))}
+            </datalist>
+            <div className="hint">{NAME_RULE} Type a new name to create a dashboard.</div>
+          </div>
+          <div className="field">
+            <label htmlFor="an-cell-panel-title">Panel title</label>
+            <input
+              id="an-cell-panel-title"
+              value={panelTitle}
+              onChange={(e) => setPanelTitle(e.target.value)}
+            />
+          </div>
+          {save.error != null && <ErrorBox error={save.error} />}
+          <div className="toolbar" style={{ marginTop: 16, justifyContent: "flex-end" }}>
+            <button disabled={save.isPending} onClick={onClose}>Cancel</button>
+            <button
+              className="primary"
+              disabled={save.isPending || !NAME_RE.test(dashName.trim())}
+              onClick={() => save.mutate()}
+            >
+              {save.isPending ? "Saving…" : "Save panel"}
+            </button>
+          </div>
+        </>
+      )}
+    </Modal>
   );
 }
 
@@ -1170,10 +1029,26 @@ function AnalysisPage() {
 
 function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => void }) {
   const qc = useQueryClient();
-  const [drafts, setDrafts] = useState<DraftCell[]>(() => ana.cells.map(draftFromCell));
+  const [drafts, setDrafts] = useState<DraftCell[]>(() => restoreDrafts(ana));
   const [cellMeta, setCellMeta] = useState<Record<string, { schema: string[]; kinds: Record<string, FlowKind> }>>({});
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
+
+  // Unsaved work survives a refresh: dirty and unsaved cells persist per
+  // analysis, in sessionStorage; a clean editor clears its key so a stale
+  // draft can never shadow the server's record later.
+  useEffect(() => {
+    try {
+      const unsaved = drafts.filter((d) => d.dirty || !d.id);
+      if (unsaved.length === 0) {
+        sessionStorage.removeItem(docDraftKey(ana.name));
+      } else {
+        sessionStorage.setItem(docDraftKey(ana.name), serializeDocDraft(unsaved.map(toStored)));
+      }
+    } catch {
+      // Storage full or denied: losing the draft beats losing the screen.
+    }
+  }, [drafts, ana.name]);
 
   const reportMeta = useMemo(
     () => (cellId: string, meta: { schema: string[]; kinds: Record<string, FlowKind> }) =>
@@ -1281,7 +1156,14 @@ function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => vo
 
   const del = useMutation({
     mutationFn: () => api.del(`${API}/analyses/${ana.name}`),
-    onSuccess: onDeleted,
+    onSuccess: () => {
+      try {
+        sessionStorage.removeItem(docDraftKey(ana.name));
+      } catch {
+        // A stale draft for a deleted analysis is harmless; it just lingers.
+      }
+      onDeleted();
+    },
   });
 
   // The server now rewrites compiler refusals into cell + card vocabulary
@@ -1394,18 +1276,7 @@ function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => vo
         />
       )}
 
-      <style>{ANALYSES_STYLES}</style>
+      <style>{SHAPING_STYLES}</style>
     </div>
   );
 }
-
-const ANALYSES_STYLES = `
-.an-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
-.an-card-title { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.65; margin-bottom: 6px; }
-.an-row { display: flex; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; align-items: center; }
-.an-row select, .an-row input { min-width: 0; }
-.an-add { background: none; border: 1px dashed var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; opacity: 0.8; }
-.an-add:hover { opacity: 1; }
-.an-x { background: none; border: none; cursor: pointer; font-size: 15px; opacity: 0.6; padding: 0 4px; }
-.an-x:hover { opacity: 1; }
-`;

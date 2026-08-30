@@ -523,18 +523,21 @@ build's aggregate, and a preview that quietly answers a different question is
 worse than a slow one. It asks for one row more than it shows, so "this is all
 of it" and "this is the first page" are distinguishable.
 
-#### Explore: point-and-click data-to-chart
+#### Quick chart: point-and-click data-to-chart
 
-`laurelin/ui/webapp/src/views/Explore.tsx`, `views/explore/model.ts`, one route
+`laurelin/ui/webapp/src/views/analyses/QuickChart.tsx` (the Analyses landing
+page's zero-commitment entry — formerly the standalone Explore screen;
+`/explore` redirects here param-for-param), the shared shaping layer
+`views/shaping/model.ts` + `views/shaping/ShapingCards.tsx`, one route
 (`POST /explore/preview`), and two `DashboardPanel` fields (`flow`, `top`).
 This is the Contour/Quiver half of the product: an analyst who cannot write SQL
 picks a dataset or an object type, shapes it by clicking — filter, group by
 (with date buckets and numeric bins), summarise, order, top-N — watches the
 chart update live, and saves it to a dashboard.
 
-**Explore has no representation of its own.** There is no ExploreSpec type on
-the server, on the wire, or in storage. The screen's state is synthesized into
-a linear `FlowDef` (`exploreFlow` in `model.ts`:
+**The quick chart has no representation of its own.** There is no ExploreSpec
+type on the server, on the wire, or in storage. The screen's state is
+synthesized into a linear `FlowDef` (`exploreFlow` in `shaping/model.ts`:
 source → [filter] → [cast]\* → [derive]\* → aggregate → [sort]) and that
 FlowDef is both the preview's wire format and the saved panel's stored format.
 Everything below the synthesis seam is the Flow stack byte for byte: Tier-A
@@ -546,7 +549,7 @@ bin is `mul(floor(div(col, w)), w)` as a derive. No new IR either way.
 `POST /explore/preview` is `/flows/preview` minus exactly one call:
 `check_flow_governance` is **not** run, because its row-policy and
 referenced-mask refusals guard *materialization* ("a flow's result is a new
-dataset without that policy") and Explore materializes nothing — every result
+dataset without that policy") and the quick chart materializes nothing — every result
 is computed by `_execute_sql` under the caller's own ACL, row policy and
 masks, and a saved flow panel re-compiles and re-executes per **viewer**, so
 two viewers get different rows from the same panel. That divergence is pinned
@@ -574,13 +577,13 @@ instead of forcing zero; sub-0.01 domains get tick labels derived from the
 tick step rather than a fixed two decimals; a nonzero KPI never rounds to
 "0"; pies fold their tail into "other" past 12 slices.
 
-**What Explore deliberately cannot do:** no heatmap, dual axes, KPI deltas,
-boxplots, or maps (tiles fight the zero-CDN constraint — a separate future
-decision); no percentiles beyond median; no viewer-facing Explore (viewers
-consume saved panels); no pushdown of Explore/flow SQL to StarRocks or
-ClickHouse; and a flow whose shape the Flow builder authored beyond Explore's
-linear grammar reopens with "cannot edit here" rather than being silently
-flattened. Two measures of very different scales share one axis and get a
+**What the quick chart deliberately cannot do:** no heatmap, dual axes, KPI
+deltas, boxplots, or maps (tiles fight the zero-CDN constraint — a separate
+future decision); no percentiles beyond median; no viewer-facing shaping
+(viewers consume saved panels); no pushdown of quick-chart/flow SQL to
+StarRocks or ClickHouse; and a flow whose shape the Flow builder authored
+beyond the linear grammar reopens with "cannot edit here" rather than being
+silently flattened. Two measures of very different scales share one axis and get a
 visible warning, not a second axis.
 
 #### Analyses: the multi-cell governed notebook
@@ -589,7 +592,8 @@ visible warning, not a second axis.
 `analyses` table, `AnalysisInfo`/`AnalysisCell` in `core/models.py`, and the
 `/api/v1/analyses` routes. This is Foundry's Code Workbook minus the code: a
 saveable, shareable document of cells, where each cell is EITHER a governed
-SQL query (the SQL page, inline) OR a shaping step (Explore's card stack),
+SQL query (the SQL page, inline) OR a shaping step (the shared card stack the
+quick chart uses, from `views/shaping/`),
 each renders a result table and an optional chart, and a later shaping cell
 may take an earlier shaping cell's output as its source.
 
@@ -1516,7 +1520,7 @@ until the React shell replaced it at feature parity — see the roadmap's Phase 
 
 Sidebar navigation (`src/Layout.tsx`, `NAV_GROUPS`), role-filtered and grouped
 by job: **Data** (Datasets, Ontology) / **Analyze** (Dashboards, Analyses,
-Explore (editor), SQL, Apps) / **Build** (Pipelines (editor), with Visual and
+SQL, Apps) / **Build** (Pipelines (editor), with Visual and
 Python tabs) / **Operate** (Builds, Schedules (editor), Health) / **Govern**
 (Audit, Admin for admins, Workspaces for superadmins in multi-workspace mode).
 A group whose every item is role-hidden disappears with its header. In
@@ -1535,10 +1539,13 @@ multi-workspace mode a switcher sits above the nav.
 - Dashboards: SVG chart grid (table / bar / line / area / stat / pie /
   scatter); a panel's rows come from
   `POST /dashboards/{name}/panels/{id}/run`, not from the panel's query.
-- Explore: the point-and-click data-to-chart screen (see the Flows section's
-  Explore subsection) — source rail, shaping cards, live preview, save to
-  dashboard. Its shaping state survives a reload via sessionStorage; a saved
-  flow panel's "Edit in Explore" reopens the exact state.
+- Analyses: one door from question to shared answer. The landing page's
+  **quick chart** (formerly the standalone Explore screen; /explore
+  redirects) is the point-and-click data-to-chart entry — source rail,
+  shaping cards, live preview, save to dashboard, "keep going" into an
+  analysis. Its shaping state survives a reload via sessionStorage; a saved
+  flow panel's Edit reopens the exact state. Below it: the multi-cell
+  documents (see the Analyses subsection).
 - Admin: users, groups, dataset + ontology access, row & column security,
   markings and clearances, workspace files on disk, and Portability
   (export / import / governance fingerprint diff).

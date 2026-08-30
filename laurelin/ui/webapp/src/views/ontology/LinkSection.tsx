@@ -32,7 +32,7 @@ export function LinkSection({
     <div>
       <h3>{link.display_name || link.api_name}</h3>
       {q.isLoading && <div className="dim">Loading…</div>}
-      {q.isError && <ErrorBox error={q.error} />}
+      {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
       {q.data &&
         (q.data.objects.length === 0 ? (
           <div className="faint" style={{ fontSize: 12.5 }}>

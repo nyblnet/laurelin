@@ -6,7 +6,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { Role, User, WorkspaceMember, WorkspaceSummary } from "../../types";
-import { Badge, EmptyState, Spinner } from "../../ui";
+import { Badge, EmptyState, Modal, Spinner } from "../../ui";
 import { InlineError, apiPut } from "../admin/shared";
 
 const ROLES: Role[] = ["viewer", "editor", "admin"];
@@ -81,12 +81,7 @@ export function ManageMembersModal({
   const canAdd = newUser.trim().length > 0 && !upsert.isPending;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className="modal"
-        onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: 560 }}
-      >
+    <Modal label={`Members of ${workspace.slug}`} onClose={onClose} width={560}>
         <h2 style={{ fontSize: 16, marginBottom: 4 }}>
           Members of <span className="mono">{workspace.slug}</span>
         </h2>
@@ -215,6 +210,12 @@ export function ManageMembersModal({
               Every global user is already a member.
             </div>
           )}
+          {/* Accounts are not created here — say where they are, so "add a
+              person who has no account yet" is one hop, not a search. */}
+          <div className="hint" style={{ marginTop: 8 }}>
+            Need a new account? <a href="#/admin?section=users">Create the user
+            in Admin → Users</a>, then add them here.
+          </div>
           {usersQuery.error && <InlineError err={usersQuery.error} />}
           <InlineError err={upsert.error} />
         </div>
@@ -224,7 +225,6 @@ export function ManageMembersModal({
             Done
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

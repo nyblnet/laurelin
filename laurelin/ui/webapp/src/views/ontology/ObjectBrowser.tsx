@@ -13,7 +13,7 @@ import {
   DataTable,
   ErrorBox,
   Spinner,
-  fmtNum,
+  fmtCount,
   fmtValue,
 } from "../../ui";
 import { useDebounced } from "./useDebounced";
@@ -36,10 +36,16 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
     if (routePk) setSelectedPk(routePk);
   }, [routePk]);
 
-  // Reset paging when the query changes.
-  useEffect(() => {
+  // Reset paging when the query changes — during render, not in an effect.
+  // The effect version ran AFTER the query keyed on the new search and the
+  // old offset had already fired, so every keystroke cost two requests (and
+  // briefly showed page N of the new result). Adjusting state during render
+  // re-renders before anything fetches, so only the right query runs.
+  const [searchApplied, setSearchApplied] = useState(debouncedSearch);
+  if (debouncedSearch !== searchApplied) {
+    setSearchApplied(debouncedSearch);
     setOffset(0);
-  }, [debouncedSearch]);
+  }
 
   const q = useQuery({
     queryKey: ["objects", type, debouncedSearch, offset],
@@ -49,6 +55,11 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
           debouncedSearch,
         )}&limit=${PAGE}&offset=${offset}`,
       ),
+    // Keep the previous page on screen while the next one loads: without
+    // this, every page turn and every keystroke unmounted the table AND the
+    // pager (killing the focused Next button mid-click-stream). The stale
+    // data dims instead — see the isFetching style below.
+    placeholderData: (prev) => prev,
   });
 
   // First ~5 declared property names for the table's columns.
@@ -77,12 +88,29 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
         </div>
 
         {q.isLoading && <Spinner />}
-        {q.isError && <ErrorBox error={q.error} />}
+        {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
         {q.data &&
           (q.data.objects.length === 0 ? (
-            <EmptyState>No objects match.</EmptyState>
+            debouncedSearch ? (
+              <EmptyState>
+                No objects match “{debouncedSearch}”.{" "}
+                <button
+                  type="button"
+                  className="small"
+                  onClick={() => setSearch("")}
+                >
+                  Clear the search
+                </button>
+              </EmptyState>
+            ) : (
+              <EmptyState>
+                No objects. This type reads its rows from the dataset{" "}
+                <code>{detail.backing_dataset}</code> — when that has rows you
+                can read, they appear here as objects.
+              </EmptyState>
+            )
           ) : (
-            <>
+            <div style={q.isFetching ? { opacity: 0.6 } : undefined}>
               <DataTable
                 columns={columns}
                 rows={q.data.objects}
@@ -102,7 +130,7 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
                   {total === 0
                     ? "0"
                     : `${offset + 1}–${Math.min(offset + PAGE, total)}`}{" "}
-                  of {fmtNum(total)}
+                  of {fmtCount(q.data)}
                 </span>
                 <button
                   className="small"
@@ -112,7 +140,7 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
                   Next
                 </button>
               </div>
-            </>
+            </div>
           ))}
       </div>
 
@@ -121,7 +149,10 @@ export function ObjectBrowser({ detail }: { detail: ObjectTypeDetail }) {
         {selectedPk ? (
           <ObjectDetail detail={detail} type={type} pk={selectedPk} />
         ) : (
-          <EmptyState>Select an object.</EmptyState>
+          <EmptyState>
+            Select an object to see all of its properties, the objects linked
+            to it, and the actions that can change it.
+          </EmptyState>
         )}
       </div>
     </div>

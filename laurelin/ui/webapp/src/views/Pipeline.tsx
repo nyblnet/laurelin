@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   useMutation,
   useQuery,
@@ -22,6 +23,7 @@ import {
   ErrorBox,
   FailureBadge,
   FailureNote,
+  LiveStatus,
   PageHeader,
   Spinner,
   Withheld,
@@ -241,24 +243,72 @@ function Expectations({ results }: { results?: ExpectationResult[] }) {
   }
   const blocking = failed.some((r) => r.severity === "error");
   return (
-    <span title={failed.map((r) => r.message).join("\n")}>
+    // The messages are visible text, not a tooltip: "1 of 1 failed" with the
+    // author's sentence hidden behind a hover left operators counting rows in
+    // the dark, and a tooltip never reaches a keyboard or a screen reader.
+    <div>
       <Badge tone={blocking ? "red" : "gold"}>
         {failed.length} of {results.length} failed
       </Badge>
-    </span>
+      <div className="dim" style={{ fontSize: 12, marginTop: 2 }}>
+        {failed.map((r, i) => (
+          <div key={i}>{r.message}</div>
+        ))}
+      </div>
+    </div>
   );
 }
 
 // -------------------------------------------------------------- build card
 
-function BuildCard({ build }: { build: Build }) {
-  const [open, setOpen] = useState(false);
+/** `/pipelines/<name>` for a visual pipeline, the Python tab for code — the
+ *  file list there carries the name. Plain text when the transform is gone
+ *  from the registry (a build outlives its pipeline), and plain text for a
+ *  reader below editor: /pipelines is an editor door (needs:"editor" in the
+ *  nav), and rendering the link anyway reopened it from inside this page —
+ *  a viewer clicking through landed on a bare 403. The same rule this file
+ *  already applies to its Build buttons. */
+function pipelineLink(name: string, kind: string | undefined, canEdit: boolean) {
+  if (kind === undefined || !canEdit) return <>{name}</>;
+  const to =
+    kind === "flow" ? `/pipelines/${encodeURIComponent(name)}` : "/pipelines?tab=python";
+  return (
+    <Link to={to} className="mono">
+      {name}
+    </Link>
+  );
+}
+
+function BuildCard({
+  build,
+  kindOf,
+  focused,
+}: {
+  build: Build;
+  /** Transform name -> kind, from the registry listing; undefined = unknown. */
+  kindOf: (name: string) => string | undefined;
+  /** True when `?build=<id>` names this build: open it and scroll it into view. */
+  focused: boolean;
+}) {
+  const auth = useAuth();
+  const [open, setOpen] = useState(focused);
+  const ref = useRef<HTMLDivElement | null>(null);
+  // On `focused` — at mount (a link from Health, Schedules or version
+  // history landed here) or when the param changes while the page is already
+  // up — open the card and bring it into view.
+  useEffect(() => {
+    if (focused) {
+      setOpen(true);
+      ref.current?.scrollIntoView({ block: "start" });
+    }
+  }, [focused]);
 
   const taskColumns: Column<Build["tasks"][number]>[] = [
     {
       label: "Transform",
       className: "mono",
-      render: (t) => t.transform_name,
+      render: (t) =>
+        pipelineLink(t.transform_name, kindOf(t.transform_name), auth.can("editor")),
     },
     {
       label: "Status",
@@ -293,31 +343,49 @@ function BuildCard({ build }: { build: Build }) {
   // projection. A viewer's copy of both is `{code, subject}`, so printing them
   // one under the other just says the same sentence twice.
   const failedTasks = build.tasks.filter((t) => t.failure?.detail_ref);
+  // The collapsed card names the failed step. "failed" alone made an operator
+  // expand every red card to learn which transform to go fix.
+  const failedNames = build.tasks
+    .filter((t) => t.status === "failed")
+    .map((t) => t.transform_name);
 
   return (
-    <div className="card">
-      <div
-        className="clickable"
+    <div className="card" ref={ref}>
+      <button
+        type="button"
+        aria-expanded={open}
         style={{
           display: "flex",
           alignItems: "center",
           gap: 12,
           cursor: "pointer",
+          width: "100%",
+          textAlign: "left",
+          background: "none",
+          border: "none",
+          padding: 0,
+          color: "inherit",
+          font: "inherit",
         }}
         onClick={() => setOpen((o) => !o)}
       >
-        <span className="dim" style={{ width: 12 }}>
+        <span className="dim" style={{ width: 12 }} aria-hidden="true">
           {open ? "▾" : "▸"}
         </span>
         <span className="mono">{shortId(build.id)}</span>
         <Badge tone={statusTone(build.status)}>{build.status}</Badge>
+        {failedNames.length > 0 && (
+          <span className="mono" style={{ fontSize: 12 }}>
+            failed: {failedNames.join(", ")}
+          </span>
+        )}
         <span className="dim">{fmtTime(build.started_at)}</span>
         <span className="dim" style={{ marginLeft: "auto" }}>
           {build.targets.length > 0 ? build.targets.join(", ") : "all targets"}
         </span>
-      </div>
+      </button>
 
-      {build.failure && <FailureNote failure={build.failure} />}
+      {build.failure && <FailureNote failure={build.failure} role={auth.role} />}
 
       {open && (
         <div style={{ marginTop: 12 }}>
@@ -329,7 +397,7 @@ function BuildCard({ build }: { build: Build }) {
               <div className="mono dim" style={{ fontSize: 12 }}>
                 {t.transform_name}
               </div>
-              <FailureNote failure={t.failure!} />
+              <FailureNote failure={t.failure!} role={auth.role} />
             </div>
           ))}
           {build.tasks.length === 0 ? (
@@ -352,6 +420,12 @@ function BuildCard({ build }: { build: Build }) {
 export function BuildsView() {
   const auth = useAuth();
   const qc = useQueryClient();
+  // `?build=<id>` is the page's deep link: Health, Schedules and a dataset's
+  // version history all name build ids, and this param gives them somewhere
+  // to point without a per-build route (which would need its own viewer
+  // projection — pending task #75). The named card opens and scrolls into view.
+  const [params] = useSearchParams();
+  const focusedBuild = params.get("build");
 
   const lineageQ = useQuery({
     queryKey: ["lineage"],
@@ -376,7 +450,10 @@ export function BuildsView() {
   });
 
   const runBuild = useMutation({
-    mutationFn: () => api.post<Build>(`${API}/builds`, {}),
+    // `targets` scopes the build to the named outputs (the server already
+    // accepted this; only the scheduler used it). Undefined = build everything.
+    mutationFn: (targets?: string[]) =>
+      api.post<Build>(`${API}/builds`, targets && targets.length > 0 ? { targets } : {}),
     onSuccess: () => {
       // The POST returns a pending build immediately; polling picks it up.
       qc.invalidateQueries({ queryKey: ["builds"] });
@@ -390,11 +467,18 @@ export function BuildsView() {
     runBuild.isPending ||
     (buildsQ.data?.some((b) => b.status === "pending" || b.status === "running") ?? false);
 
+  // The build this session started, found in the polled history — so the
+  // click converges to an outcome on screen instead of a fire-and-forget
+  // "started" that never says how it went.
+  const startedBuild = runBuild.data
+    ? buildsQ.data?.find((b) => b.id === runBuild.data.id) ?? runBuild.data
+    : undefined;
+
   const actions = canEdit ? (
     <button
       className="primary"
       disabled={buildInFlight}
-      onClick={() => runBuild.mutate()}
+      onClick={() => runBuild.mutate(undefined)}
     >
       {buildInFlight ? "Building…" : "Build now"}
     </button>
@@ -402,8 +486,11 @@ export function BuildsView() {
     <span className="dim">Viewer — builds are read-only.</span>
   );
 
+  const kindOf = (name: string) =>
+    transformsQ.data?.find((t) => t.name === name)?.kind;
+
   const transformColumns: Column<TransformSummary>[] = [
-    { label: "Name", className: "mono", render: (t) => t.name },
+    { label: "Name", className: "mono", render: (t) => pipelineLink(t.name, t.kind, canEdit) },
     {
       label: "Kind",
       render: (t) => (
@@ -424,6 +511,23 @@ export function BuildsView() {
     },
     { label: "Output", className: "mono", render: (t) => t.output },
   ];
+  if (canEdit) {
+    // Per-target build: rebuild one pipeline's output (and what it needs)
+    // without re-running the whole workspace.
+    transformColumns.push({
+      label: "",
+      render: (t) => (
+        <button
+          className="small"
+          aria-label={`Build ${t.output}`}
+          disabled={buildInFlight}
+          onClick={() => runBuild.mutate([t.output])}
+        >
+          Build
+        </button>
+      ),
+    });
+  }
 
   return (
     <div>
@@ -443,13 +547,23 @@ export function BuildsView() {
           <div className="withheld-head">Python authoring is locked on this server</div>
           <p>
             Pipeline files are managed on disk (<code>--lock-pipelines</code>); existing
-            pipelines still build. The visual Pipelines builder and Explore remain available
-            for authoring without code.
+            pipelines still build. The Visual tab and the quick chart on Analyses remain
+            available for authoring without code.
           </p>
         </div>
       )}
 
       {runBuild.isError && <ErrorBox error={runBuild.error} />}
+      {startedBuild && (
+        // A live region, so the outcome of the click is announced when it
+        // lands — the polling below is what moves it from running to done.
+        <LiveStatus className="dim" style={{ fontSize: 13, marginTop: 8 }}>
+          Build <span className="mono">{shortId(startedBuild.id)}</span>{" "}
+          {startedBuild.status === "pending" || startedBuild.status === "running"
+            ? `${startedBuild.status} — the history below follows it.`
+            : `finished: ${startedBuild.status}.`}
+        </LiveStatus>
+      )}
 
       {/* ----------------------------------------------------- lineage */}
       <section style={{ marginTop: 16 }}>
@@ -494,7 +608,12 @@ export function BuildsView() {
           <div style={{ display: "grid", gap: 10, marginTop: 8 }}>
             {/* The API returns builds newest-first (ORDER BY rowid DESC). */}
             {buildsQ.data!.map((b) => (
-              <BuildCard key={b.id} build={b} />
+              <BuildCard
+                key={b.id}
+                build={b}
+                kindOf={kindOf}
+                focused={b.id === focusedBuild}
+              />
             ))}
           </div>
         )}

@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { Group, User } from "../../types";
-import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
+import { Badge, EmptyState, ErrorBox, Modal, Spinner } from "../../ui";
 import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const NAME_RE = /^[a-z0-9][a-z0-9_.-]{1,31}$/;
@@ -99,12 +99,7 @@ function ManageMembersPanel({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className="modal"
-        onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: 480 }}
-      >
+    <Modal label={`Members of ${group.name}`} onClose={onClose} width={480}>
         <h2 style={{ fontSize: 16, marginBottom: 4 }}>
           Members of <span className="mono">{group.name}</span>
         </h2>
@@ -163,8 +158,7 @@ function ManageMembersPanel({
             Cancel
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

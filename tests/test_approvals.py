@@ -671,7 +671,8 @@ def test_disable_grant_enable_cannot_bypass_second_approver_mode(clients, store)
     # mole has NO access: the loosening is still pending, unapproved.
     mole = TestClient(app)
     mole.post("/api/v1/auth/login", json={"username": "mole", "password": "password123"})
-    assert mole.get("/api/v1/datasets/secret_ds").status_code == 403
+    # 404 not 403: hidden reads as nonexistent (deliberate; see test_dataset_acls)
+    assert mole.get("/api/v1/datasets/secret_ds").status_code == 404
     assert any(p["kind"] == "dataset_grants" and p["target"] == "secret_ds"
                for p in _pending(root))
 

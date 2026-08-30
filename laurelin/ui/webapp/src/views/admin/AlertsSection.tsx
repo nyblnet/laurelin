@@ -16,6 +16,7 @@ import {
   ErrorBox,
   FailureBadge,
   FailureNote,
+  NAME_RULE,
   Spinner,
   fmtTime,
 } from "../../ui";
@@ -117,7 +118,7 @@ function CreateWebhookPanel({ onSaved }: { onSaved: () => void }) {
         </div>
       </div>
       {name !== "" && !nameValid && (
-        <p className="hint">Lowercase letters, digits, `-` and `_`; start with a letter.</p>
+        <p className="hint">{NAME_RULE}</p>
       )}
       <InlineError err={create.error} />
       <div className="toolbar" style={{ justifyContent: "flex-end" }}>

@@ -18,7 +18,7 @@
 //   * if a source dataset is restricted, the dataset this flow produces will be
 //     restricted to you until an admin grants access.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -39,6 +39,7 @@ import type {
   FlowSchemaResult,
   FlowCompiledSql,
   FlowWriteResult,
+  PipelineFileInfo,
 } from "../types";
 import {
   Badge,
@@ -46,13 +47,16 @@ import {
   EmptyState,
   ErrorBox,
   FailureNote,
+  LiveStatus,
+  Modal,
+  NAME_RULE_NO_HYPHEN,
   PageHeader,
   Spinner,
   fmtNum,
   fmtValue,
 } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
-import { PipelinesTabs } from "./Pipelines";
+import { PIPELINES_SUBTITLE, PipelinesTabs } from "./Pipelines";
 import { StepForm, ExpectationsForm } from "./flow/StepForm";
 import type { TypeHints } from "./flow/ExprEditor";
 import {
@@ -67,6 +71,7 @@ import {
   rightSchema,
   schemaAt,
   sourceDatasets,
+  saveConflict,
   spine,
   stepIssue,
   summarise,
@@ -108,15 +113,33 @@ function FlowList() {
     queryFn: () => api.get<FlowListEntry[]>(`${API}/flows`),
   });
 
+  // The Python tab's files, for two jobs: the first-run hero must only claim
+  // "start here" when the workspace truly has no pipelines of EITHER kind
+  // (a visual-empty list over a workspace full of Python pipelines used to
+  // read as "nothing exists yet"), and the naming dialog can refuse a name a
+  // code transform already owns before the server has to.
+  const pipelinesQ = useQuery({
+    queryKey: ["pipelines"],
+    queryFn: () => api.get<PipelineFileInfo[]>(`${API}/pipelines`),
+  });
+
+  // A pipeline's name is also the name of the dataset it builds, so a name an
+  // existing dataset owns is refused at the dialog, not by a 409 after it.
+  const datasetsQ = useQuery({
+    queryKey: ["datasets"],
+    queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
+  });
+
   const [naming, setNaming] = useState(!!fromDataset);
 
   const flows = flowsQ.data ?? [];
+  const pythonFiles = pipelinesQ.data ?? [];
 
   return (
     <div>
       <PageHeader
         title="Pipelines"
-        subtitle="Turn datasets into new datasets. Build one step by step here — no code — or write Python on the other tab. Either way it is a real transform on the same build, lineage and permissions as everything else."
+        subtitle={PIPELINES_SUBTITLE}
         actions={
           <button type="button" className="primary" onClick={() => setNaming(true)}>
             + New pipeline
@@ -131,7 +154,26 @@ function FlowList() {
       {flowsQ.isLoading ? (
         <Spinner />
       ) : flowsQ.error ? (
-        <ErrorBox error={flowsQ.error} />
+        <ErrorBox error={flowsQ.error} onRetry={() => flowsQ.refetch()} />
+      ) : flows.length === 0 && pythonFiles.length > 0 ? (
+        // Not the first-run hero: this workspace HAS pipelines, they are just
+        // all Python. Saying "start your first pipeline" here told an analyst
+        // the workspace was empty when it was not.
+        <EmptyState>
+          <div>
+            No visual pipelines yet — but {pythonFiles.length} Python pipeline{" "}
+            {pythonFiles.length === 1 ? "file exists" : "files exist"} on the{" "}
+            <Link to="/pipelines?tab=python">Python tab</Link>.
+          </div>
+          <button
+            type="button"
+            className="primary"
+            style={{ marginTop: 10 }}
+            onClick={() => setNaming(true)}
+          >
+            + New visual pipeline
+          </button>
+        </EmptyState>
       ) : flows.length === 0 ? (
         <div className="fx-onboard">
           <h2>Build a pipeline without writing code.</h2>
@@ -154,7 +196,15 @@ function FlowList() {
             <div
               key={f.name}
               className="card clickable"
+              role="button"
+              tabIndex={0}
               onClick={() => navigate(`/pipelines/${encodeURIComponent(f.name)}`)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  navigate(`/pipelines/${encodeURIComponent(f.name)}`);
+                }
+              }}
             >
               <div className="fx-card-head">
                 <strong>{f.name}</strong>
@@ -187,7 +237,14 @@ function FlowList() {
             </>
           }
           confirmLabel="Start building"
-          taken={flows.map((f) => f.name)}
+          taken={[
+            ...flows.map((f) => f.name),
+            // Transforms the Python tab's files declare: the server refuses a
+            // flow that shares a name with a code transform, so the dialog
+            // refuses it first, with the same rule.
+            ...pythonFiles.flatMap((f) => f.transforms ?? []),
+          ]}
+          takenDatasets={(datasetsQ.data ?? []).map((d) => d.name)}
           onCancel={() => setNaming(false)}
           onSubmit={(name) => {
             setNaming(false);
@@ -237,6 +294,12 @@ function FlowBuilder({ name }: { name: string }) {
   const [dirty, setDirty] = useState(false);
   const [saveResult, setSaveResult] = useState<FlowWriteResult | null>(null);
   const [showSql, setShowSql] = useState(false);
+  // Save was clicked while a step is unfinished. The click used to be a
+  // silent no-op: the button stayed enabled, nothing near it changed, and the
+  // only explanation sat lower on the page where it had already been before
+  // the click — nothing connected "I clicked Save" to "here is why nothing
+  // happened", on a path where closing the tab loses the whole draft.
+  const [saveRefused, setSaveRefused] = useState(false);
   const [ejectOpen, setEjectOpen] = useState(false);
   const [addAfter, setAddAfter] = useState<string | null>(null);
   const [builtId, setBuiltId] = useState<string | null>(null);
@@ -403,6 +466,25 @@ function FlowBuilder({ name }: { name: string }) {
     },
   });
 
+  // Follow the build this screen started until it lands somewhere. "Build
+  // started — watch it on Builds" was a static sentence that stayed on screen
+  // after the build had failed; the Builds page's own in-flight pattern
+  // (refetchInterval while pending/running) is copied here so the note
+  // converges to the outcome without the author leaving the builder.
+  const buildQ = useQuery<Build>({
+    queryKey: ["flow-build", builtId],
+    queryFn: () => api.get<Build>(`${API}/builds/${encodeURIComponent(builtId!)}`),
+    enabled: !!builtId,
+    refetchInterval: (query) => {
+      const s = query.state.data?.status;
+      return s === "pending" || s === "running" || s === undefined ? 1500 : false;
+    },
+    // The app disables refetch-on-focus globally (App.tsx), so if this
+    // interval paused while the tab was unfocused the note would stay at
+    // "Build started…" forever for anyone who switched away and came back.
+    refetchIntervalInBackground: true,
+  });
+
   // Fetched whenever the flow is saved, not only when "Show SQL" is open: the
   // response's `params` COUNT is shown under the compiled SQL, so an author can
   // see that their filter values are held apart from the query text. It no
@@ -447,6 +529,10 @@ function FlowBuilder({ name }: { name: string }) {
     setDirty(true);
     save.reset();
     setSaveResult(null);
+    // A build outcome describes the flow that was built. Once the author is
+    // editing again the note is about the past, and "Build succeeded" above
+    // unsaved changes reads as "these changes succeeded".
+    setBuiltId(null);
   }
 
   function addStep(afterId: string, kind: FlowNodeKind) {
@@ -466,7 +552,7 @@ function FlowBuilder({ name }: { name: string }) {
     // a step that no longer exists — a flow the server refuses with a message
     // about a step id nobody has seen.
     if (node.inputs.length === 0) {
-      const where = consumerOf(draft, id) ? "this side of the combine" : "this flow";
+      const where = consumerOf(draft, id) ? "this side of the combine" : "this pipeline";
       window.alert(
         `${where[0].toUpperCase()}${where.slice(1)} has to start somewhere. ` +
           "Change the dataset instead of removing this step — or remove the whole " +
@@ -483,7 +569,7 @@ function FlowBuilder({ name }: { name: string }) {
   // --------------------------------------------------------------- render
 
   if (!name) return <EmptyState>No pipeline named.</EmptyState>;
-  if (flowQ.isLoading && !draft) return <Spinner label="Opening flow…" />;
+  if (flowQ.isLoading && !draft) return <Spinner label="Opening pipeline…" />;
   if (flowQ.error && !draft) {
     const err = flowQ.error;
     if (err instanceof ApiError && err.status === 404) {
@@ -496,7 +582,46 @@ function FlowBuilder({ name }: { name: string }) {
         </div>
       );
     }
-    return <ErrorBox error={err} />;
+    return <ErrorBox error={err} onRetry={() => flowQ.refetch()} />;
+  }
+  if (!draft && flowQ.data && !flowQ.data.flow) {
+    // The file exists but is not a pipeline — hand-edited JSON, usually. The
+    // read deliberately answers 200 with `{flow: null, error}` so this page
+    // can say what is wrong; it used to fall through to the `!draft` spinner
+    // below and spin forever, with the list card promising "open it to see
+    // what to fix". The one repair this screen can offer is delete (the
+    // DELETE route has always existed; the door did not).
+    return (
+      <div>
+        <PageHeader title={name} subtitle="This pipeline will not load" />
+        <div className="fx-note fx-note-bad">
+          <strong>The saved file for this pipeline is not a valid pipeline.</strong>{" "}
+          {flowQ.data.error ?? "No further detail was recorded for this failure."}
+        </div>
+        <p className="dim">
+          The file was probably edited outside Laurelin. Fix{" "}
+          <span className="mono">pipelines/{name}.flow.json</span> in the workspace (or restore
+          it from version control) — or delete the pipeline here. Deleting removes only the
+          pipeline definition; the dataset it built and that dataset&apos;s lineage are kept.
+        </p>
+        {del.error != null && <ErrorBox error={del.error} />}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <Link to="/pipelines">← Pipelines</Link>
+          <button
+            type="button"
+            className="danger"
+            disabled={del.isPending}
+            onClick={() => {
+              if (window.confirm(`Delete the broken pipeline ${name}? The dataset it built is kept.`)) {
+                del.mutate();
+              }
+            }}
+          >
+            {del.isPending ? "Deleting…" : "Delete this pipeline"}
+          </button>
+        </div>
+      </div>
+    );
   }
   if (!draft) return <Spinner />;
 
@@ -519,7 +644,15 @@ function FlowBuilder({ name }: { name: string }) {
   const maskedByDataset = previewQ.data?.masked_columns ?? {};
   const maskedList = Object.entries(maskedByDataset);
 
-  const blockedByWorkspace = save.error instanceof ApiError && save.error.status === 409;
+  // A 409 is not one thing. "Someone else owns this name" is a naming problem
+  // with an on-screen fix; "the workspace will not collect" is an operator
+  // problem with no on-screen fix. `saveConflict` reads the server's
+  // discriminator (falling back to the route's two known collision sentences)
+  // so the rename-sized problem stops being announced as a broken workspace.
+  const conflict =
+    save.error instanceof ApiError && save.error.status === 409
+      ? saveConflict(save.error.detail)
+      : null;
   // `--lock-pipelines` no longer covers flows — that flag locks *code* (a
   // pipeline file is exec'd as the server), while a flow compiles to bound,
   // schema-checked SQL and cannot reach exec. Flows have their own lock,
@@ -573,7 +706,14 @@ function FlowBuilder({ name }: { name: string }) {
             type="button"
             className="primary"
             disabled={save.isPending || !dirty}
-            onClick={() => save.mutate(draft)}
+            onClick={() => {
+              if (!previewable) {
+                setSaveRefused(true);
+                return;
+              }
+              setSaveRefused(false);
+              save.mutate(draft);
+            }}
           >
             {save.isPending ? "Saving…" : "Save"}
           </button>
@@ -583,7 +723,7 @@ function FlowBuilder({ name }: { name: string }) {
             title={dirty ? "Save first — a build runs what is saved, not what is on screen." : undefined}
             onClick={() => build.mutate()}
           >
-            {build.isPending ? "Starting…" : "Build now"}
+            {build.isPending ? "Building…" : "Build now"}
           </button>
           <button type="button" onClick={() => setShowSql(!showSql)}>
             {showSql ? "Hide SQL" : "Show SQL"}
@@ -640,6 +780,17 @@ function FlowBuilder({ name }: { name: string }) {
 
       {/* ------------------------------------------------ header-level notes */}
 
+      {/* The Save click's receipt, adjacent to the button that refused it.
+          Rendered from the LIVE issue list, so it disappears the moment the
+          step is finished; role=status so the refusal is announced. */}
+      {saveRefused && !previewable && (
+        <div className="fx-note fx-note-warn" role="status">
+          <strong>Not saved</strong> —{" "}
+          {issues.length === 1 ? "one step is unfinished" : `${issues.length} steps are unfinished`}:{" "}
+          {issues.map((x) => `${KINDS[x.node.kind].label} — ${x.issue}`).join("; ")}. Finish
+          {issues.length === 1 ? " that step" : " those steps"} below, then Save again.
+        </div>
+      )}
       {restricted && (
         <div className="fx-note fx-note-gov">
           A dataset this pipeline reads is restricted, so <strong>{draft.output}</strong> will be
@@ -668,14 +819,24 @@ function FlowBuilder({ name }: { name: string }) {
           anyone — this is the server's posture, not your permissions. Nothing you have on screen is
           lost; it just cannot be saved here. The pipelines that already exist still build and run.
         </div>
-      ) : blockedByWorkspace ? (
+      ) : conflict?.kind === "name_collision" ? (
+        <div className="fx-note fx-note-bad">
+          <strong>The name {name} is taken.</strong> {conflict.message}
+          <div style={{ marginTop: 6 }}>
+            Nothing else is wrong with these steps — they just need a name of their own.{" "}
+            <button type="button" className="small" onClick={() => { duplicate.reset(); setDuplicating(true); }}>
+              Save these steps under a different name…
+            </button>
+          </div>
+        </div>
+      ) : conflict?.kind === "workspace_collect_failed" ? (
         <div className="fx-note fx-note-bad">
           <strong>Nothing can be saved or built in this workspace right now.</strong> Another
           pipeline file will not load, and Laurelin has to read them all together to work out
           which pipeline produces which dataset. That includes this one, so saving a repair is
           blocked too.
           <div style={{ marginTop: 6 }}>
-            The server said: <em>{(save.error as ApiError).detail}</em> Someone with access to the
+            The server said: <em>{conflict.message}</em> Someone with access to the
             workspace files has to fix or remove that file — or, if the broken one is a visual
             pipeline, it can be deleted from <Link to="/pipelines">Pipelines</Link>.
           </div>
@@ -689,9 +850,36 @@ function FlowBuilder({ name }: { name: string }) {
       {del.error != null && <ErrorBox error={del.error} />}
       {build.error != null && <ErrorBox error={build.error} />}
       {builtId && (
-        <div className="fx-note fx-note-ok">
-          Build started. Watch it on <Link to="/builds">Builds</Link>.
-        </div>
+        <LiveStatus
+          className={`fx-note ${buildQ.data?.status === "failed" ? "fx-note-bad" : "fx-note-ok"}`}
+        >
+          {/* One sentence family for a kicked build, everywhere it is
+              kicked: "Build … finished: <outcome>." with a "See the build"
+              link — the Builds page's own phrasing, which Schedules already
+              copies. Three screens, one voice. */}
+          {buildQ.data?.status === "succeeded" ? (
+            <>
+              Build finished: succeeded — <span className="mono">{draft.output}</span>
+              {(() => {
+                const rows = buildQ.data.tasks.find((t) => t.output_dataset === draft.output)
+                  ?.rows_written;
+                return rows != null ? <> has {fmtNum(rows)} row{rows === 1 ? "" : "s"}</> : null;
+              })()}
+              . <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>.
+            </>
+          ) : buildQ.data?.status === "failed" ? (
+            <>
+              <strong>Build finished: failed.</strong>{" "}
+              <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>{" "}
+              for what went wrong.
+            </>
+          ) : (
+            <>
+              Build running…{" "}
+              <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>.
+            </>
+          )}
+        </LiveStatus>
       )}
       {save.isSuccess && !dirty && (
         <div className="fx-note fx-note-ok">
@@ -761,8 +949,9 @@ function FlowBuilder({ name }: { name: string }) {
           />
 
           <div className="field fx-desc">
-            <label>What is this pipeline for?</label>
+            <label htmlFor="fx-desc-input">What is this pipeline for?</label>
             <input
+              id="fx-desc-input"
               className="fx-in fx-wide"
               type="text"
               placeholder="One line, for whoever finds it later"
@@ -925,6 +1114,7 @@ function FlowBuilder({ name }: { name: string }) {
           }
           confirmLabel="Duplicate"
           taken={(flowsQ.data ?? []).map((f) => f.name)}
+          takenDatasets={(datasetsQ.data ?? []).map((d) => d.name)}
           busy={duplicate.isPending}
           error={duplicate.error}
           onCancel={() => setDuplicating(false)}
@@ -1247,6 +1437,7 @@ function NameDialog({
   intro,
   confirmLabel,
   taken,
+  takenDatasets = [],
   busy,
   error,
   onCancel,
@@ -1256,34 +1447,38 @@ function NameDialog({
   intro: ReactNode;
   confirmLabel: string;
   taken: string[];
+  /** Existing dataset names. A pipeline's name is also the name of the
+   *  dataset it builds, so a name a dataset already owns would be refused by
+   *  the server with a 409 — this refuses it at the dialog, with the reason. */
+  takenDatasets?: string[];
   busy?: boolean;
   error?: unknown;
   onCancel: () => void;
   onSubmit: (name: string) => void;
 }) {
   const [value, setValue] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => inputRef.current?.focus(), []);
 
   const name = value.trim();
   const problem = !name
     ? null
     : !NAME_RE.test(name)
-      ? "Use lowercase letters, digits and underscores, starting with a letter — for example late_orders."
+      ? NAME_RULE_NO_HYPHEN
       : taken.includes(name)
         ? `There is already a pipeline called ${name}.`
-        : null;
+        : takenDatasets.includes(name)
+          ? `There is already a dataset called ${name}, and a pipeline shares its name with the dataset it builds. Pick another name.`
+          : null;
   const ok = !!name && !problem;
 
   return (
-    <div className="modal-backdrop" onClick={onCancel}>
-      <div className="modal fx-modal" onClick={(e) => e.stopPropagation()}>
+    <Modal label={title} onClose={onCancel} width={540}>
+      <div className="fx-modal">
         <h2>{title}</h2>
         <p>{intro}</p>
         <div className="field">
-          <label>Name</label>
+          <label htmlFor="fx-name-input">Name</label>
           <input
-            ref={inputRef}
+            id="fx-name-input"
             className="fx-in fx-wide"
             value={value}
             placeholder="late_orders"
@@ -1296,7 +1491,7 @@ function NameDialog({
             <div className="hint bad">{problem}</div>
           ) : (
             <div className="hint">
-              Lowercase letters, digits and underscores. This is also the name of the dataset it
+              {NAME_RULE_NO_HYPHEN} This is also the name of the dataset it
               produces, and it cannot be changed later.
             </div>
           )}
@@ -1316,7 +1511,7 @@ function NameDialog({
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -1340,8 +1535,6 @@ function EjectDialog({
   onDone: () => void;
 }) {
   const [typed, setTyped] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => inputRef.current?.focus(), []);
 
   const eject = useMutation<FlowEjectResult, unknown, void>({
     mutationFn: () => api.post<FlowEjectResult>(`${API}/flows/${encodeURIComponent(name)}/eject`),
@@ -1351,8 +1544,8 @@ function EjectDialog({
   });
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal fx-modal" onClick={(e) => e.stopPropagation()}>
+    <Modal label="Open this pipeline in Python?" onClose={onClose} width={540}>
+      <div className="fx-modal">
         <h2>Open this pipeline in Python?</h2>
         <p>
           <strong>This is one way.</strong> Laurelin will write{" "}
@@ -1365,11 +1558,11 @@ function EjectDialog({
           always look at the SQL with <strong>Show SQL</strong> without giving anything up.
         </p>
         <div className="field">
-          <label>
+          <label htmlFor="fx-eject-confirm">
             Type <span className="mono">{name}</span> to confirm
           </label>
           <input
-            ref={inputRef}
+            id="fx-eject-confirm"
             className="fx-in fx-wide"
             value={typed}
             onChange={(e) => setTyped(e.target.value)}
@@ -1399,6 +1592,6 @@ function EjectDialog({
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

@@ -32,6 +32,7 @@ import type {
   DashboardPanel,
   ObjectTypeDef,
   PanelRunResult,
+  QueryResult,
 } from "../types";
 import { panelIsWhole } from "../types";
 import {
@@ -39,11 +40,14 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  Modal,
+  NAME_RULE,
   PageHeader,
   Spinner,
   WarningBox,
   Withheld,
   fmtTime,
+  truncationNote,
 } from "../ui";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -138,6 +142,12 @@ function DashboardList() {
               {create.isPending ? "Creating…" : "Create dashboard"}
             </button>
           </div>
+          {/* The silent-disable ban: a disabled Create with no visible reason
+              is a dead button, not a rule. State the rule the moment the
+              typed name breaks it. */}
+          {newName.trim() !== "" && !nameOk && (
+            <p className="hint">{NAME_RULE}</p>
+          )}
           {create.isError && <ErrorBox error={create.error} />}
         </div>
       )}
@@ -151,12 +161,12 @@ function DashboardList() {
           {auth.can("editor") ? (
             <>
               {/* Both doors here can actually put a panel on a dashboard.
-                  This used to point at Analyses, which cannot — a user who
-                  obeyed the hint built a chart there and then stalled with no
-                  way to finish the task. */}
-              {" "}— create one above, shape a chart by clicking in{" "}
-              <Link to="/explore">Explore</Link> and save it here, or send a query
-              from <Link to="/workbench">SQL</Link>.
+                  Post-merge there is exactly one charting door: Analyses'
+                  quick chart absorbed Explore, and its save dialog lands
+                  panels here. */}
+              {" "}— create one above, shape a quick chart in{" "}
+              <Link to="/analyses?mode=chart">Analyses</Link> and save it here,
+              or send a query from <Link to="/workbench">SQL</Link>.
             </>
           ) : (
             "."
@@ -203,7 +213,10 @@ function PanelBody({ dashboard, panel }: { dashboard: string; panel: DashboardPa
   });
 
   if (q.isLoading) return <Spinner />;
-  if (q.isError) return <ErrorBox error={q.error} />;
+  // Retry, because the app never refetches on its own (App.tsx pins
+  // retry:false + no refetch-on-focus): without this button a transient 503
+  // is terminal until a full-page reload.
+  if (q.isError) return <ErrorBox error={q.error} onRetry={() => q.refetch()} />;
   const result = q.data!;
 
   if (panel.chart === "table" || result.columns.length === 0) {
@@ -294,7 +307,7 @@ function PanelTable({ result }: { result: PanelRunResult }) {
             className="badge badge-gold"
             title="The result is larger than what was fetched. Sorting here reorders only the loaded rows."
           >
-            first {result.row_count.toLocaleString("en-US")} of a larger result
+            {truncationNote(result.row_count)}
           </span>
         )}
         {sort && result.truncated && <span>· sorted within loaded rows</span>}
@@ -359,7 +372,7 @@ function ObjectSourceFields({
       </div>
 
       <div className="field">
-        <label>Metrics</label>
+        <label>Summaries</label>
         {metrics.map((m, i) => (
           <div className="toolbar" key={i} style={{ gap: 8, marginBottom: 6 }}>
             <select value={m.op} onChange={(e) => setMetric(i, { op: e.target.value })}>
@@ -388,7 +401,7 @@ function ObjectSourceFields({
             <button
               className="small"
               disabled={metrics.length === 1}
-              title={metrics.length === 1 ? "a panel needs at least one metric" : undefined}
+              title={metrics.length === 1 ? "a panel needs at least one summary" : undefined}
               onClick={() => set({ metrics: metrics.filter((_, j) => j !== i) })}
             >
               Remove
@@ -399,7 +412,7 @@ function ObjectSourceFields({
           className="small"
           onClick={() => set({ metrics: [...metrics, { op: "count", alias: `metric_${metrics.length + 1}` }] })}
         >
-          Add metric
+          + add a summary
         </button>
       </div>
 
@@ -416,6 +429,13 @@ function ObjectSourceFields({
 }
 
 // ------------------------------------------------------------- panel editor
+
+/** `cols` plus any already-bound names that the preview did not return, so a
+ *  select never silently blanks a binding the panel arrived with. */
+function optionsWith(cols: string[], ...bound: (string | undefined)[]): string[] {
+  const extra = bound.filter((b): b is string => Boolean(b) && !cols.includes(b!));
+  return [...cols, ...extra];
+}
 
 function PanelEditor({
   initial,
@@ -441,9 +461,30 @@ function PanelEditor({
     ? Boolean(p.metrics?.length)
     : Boolean((p.sql ?? "").trim());
 
+  // The editor's eyes. Authoring used to be blind: SQL was written, bindings
+  // were typed from memory, and the first sight of the result was the saved
+  // panel on the board — where a typo'd Y column silently dropped the series.
+  // Running the SQL here (same POST /query, same permissions as everywhere
+  // else) shows the chart before the save, and its columns turn the X/Y/Split
+  // free-text fields into pickers. `previewSql` remembers what was run so a
+  // later edit is flagged as stale instead of quietly lying.
+  const [previewSql, setPreviewSql] = useState<string | null>(null);
+  const preview = useMutation<QueryResult, unknown, string>({
+    mutationFn: (sql: string) =>
+      api.post<QueryResult>(`${API}/query`, { sql, max_rows: 200 }),
+    onSuccess: (_r, sql) => setPreviewSql(sql),
+  });
+  // Pickers only for the SQL source: the Objects source already picks its
+  // group-by and metrics from the type's own properties.
+  const previewCols = !p.object_type ? preview.data?.columns ?? null : null;
+  const previewStale = previewSql !== null && (p.sql ?? "") !== previewSql;
+
   return (
-    <div className="modal-backdrop" onClick={onCancel}>
-      <div className="modal" style={{ width: 620, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
+    <Modal
+      label={initial.sql || initial.object_type ? "Edit panel" : "Add panel"}
+      onClose={onCancel}
+      width={620}
+    >
         <div className="card-title">
           {initial.sql || initial.object_type ? "Edit panel" : "Add panel"}
         </div>
@@ -505,14 +546,16 @@ function PanelEditor({
         {!p.object_type ? (
           <div className="field">
             {/* The no-code path, offered beside the SQL wall — only for a NEW
-                panel: Explore cannot reopen a raw-SQL panel, so pointing an
-                edit there would dead-end. The link carries the dashboard name
-                so Explore's save dialog is already aimed back here. */}
+                panel: the quick chart cannot reopen a raw-SQL panel, so
+                pointing an edit there would dead-end. The link carries the
+                dashboard name so the quick chart's save dialog is already
+                aimed back here. */}
             {!(initial.sql || initial.object_type) && (
               <p className="hint" style={{ marginTop: 0 }}>
-                Prefer clicking to writing SQL? Build this panel in{" "}
-                <Link to={`/explore?dashboard=${encodeURIComponent(dashboard)}`}>
-                  Explore
+                Prefer clicking to writing SQL? Build this panel with a quick
+                chart in{" "}
+                <Link to={`/analyses?mode=chart&dashboard=${encodeURIComponent(dashboard)}`}>
+                  Analyses
                 </Link>{" "}
                 — pick a dataset, shape it, and save it to this dashboard.
               </p>
@@ -531,36 +574,97 @@ function PanelEditor({
               placeholder="SELECT region, sum(amount) AS total FROM sales GROUP BY region"
               style={{ width: "100%", resize: "vertical" }}
             />
+            <div className="toolbar" style={{ gap: 8, marginTop: 6, alignItems: "center" }}>
+              <button
+                className="small"
+                disabled={!(p.sql ?? "").trim() || preview.isPending}
+                title={!(p.sql ?? "").trim() ? "write the SQL first" : undefined}
+                onClick={() => preview.mutate(p.sql ?? "")}
+              >
+                {preview.isPending ? "Running…" : "Run preview"}
+              </button>
+              {previewStale && (
+                <span className="hint" style={{ margin: 0 }}>
+                  The SQL changed since this preview — run it again.
+                </span>
+              )}
+            </div>
+            {preview.isError && <ErrorBox error={preview.error} />}
           </div>
         ) : (
           <ObjectSourceFields p={p} set={set} types={types} />
         )}
+        {/* Free text is the fallback for a never-previewed panel; once the
+            preview has run, the bindings are picked from the result's actual
+            columns, so a typo'd binding stops being possible to type. */}
         <div className="toolbar" style={{ gap: 12, flexWrap: "wrap" }}>
           <div className="field">
             <label>X column (optional)</label>
-            <input className="mono" value={p.x} onChange={(e) => set({ x: e.target.value })} placeholder="inferred" />
+            {previewCols ? (
+              <select className="mono" value={p.x} onChange={(e) => set({ x: e.target.value })}>
+                <option value="">inferred</option>
+                {optionsWith(previewCols, p.x).map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            ) : (
+              <input className="mono" value={p.x} onChange={(e) => set({ x: e.target.value })} placeholder="inferred" />
+            )}
           </div>
           <div className="field" style={{ flex: "1 1 200px" }}>
-            <label>Y columns (comma-separated, optional)</label>
-            <input
-              className="mono"
-              value={p.y.join(", ")}
-              onChange={(e) =>
-                set({ y: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })
-              }
-              placeholder="all numeric columns"
-            />
+            <label>
+              {previewCols ? "Y columns (optional)" : "Y columns (comma-separated, optional)"}
+            </label>
+            {previewCols ? (
+              <select
+                multiple
+                className="mono"
+                value={p.y}
+                onChange={(e) =>
+                  set({ y: Array.from(e.target.selectedOptions, (o) => o.value) })
+                }
+                size={Math.min(4, Math.max(2, previewCols.length))}
+              >
+                {optionsWith(previewCols, ...p.y).map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                className="mono"
+                value={p.y.join(", ")}
+                onChange={(e) =>
+                  set({ y: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })
+                }
+                placeholder="all numeric columns"
+              />
+            )}
           </div>
           <div className="field">
             <label>Split by (optional)</label>
-            <input
-              className="mono"
-              value={p.series ?? ""}
-              onChange={(e) => set({ series: e.target.value })}
-              placeholder="a category column"
-              title="A result column whose values become the series"
-              style={{ width: 140 }}
-            />
+            {previewCols ? (
+              <select
+                className="mono"
+                value={p.series ?? ""}
+                onChange={(e) => set({ series: e.target.value })}
+                title="A result column whose values become the series"
+                style={{ width: 140 }}
+              >
+                <option value="">—</option>
+                {optionsWith(previewCols, p.series).map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                className="mono"
+                value={p.series ?? ""}
+                onChange={(e) => set({ series: e.target.value })}
+                placeholder="a category column"
+                title="A result column whose values become the series"
+                style={{ width: 140 }}
+              />
+            )}
           </div>
           {p.chart === "bar" && (
             <label className="check-inline" style={{ alignSelf: "flex-end", paddingBottom: 8 }}>
@@ -573,14 +677,35 @@ function PanelEditor({
             </label>
           )}
         </div>
+        {/* The preview itself, rendered with the panel's own bindings, so
+            what the author sees here is what the board will show. */}
+        {!p.object_type && preview.data && (
+          <div className="field" style={{ marginTop: 8 }}>
+            {/* A caption div, not a form label: it names a result. */}
+            <div className="dim" style={{ fontSize: 12, marginBottom: 4 }}>
+              Preview{previewStale ? " (stale)" : ""}
+            </div>
+            {p.chart === "table" || preview.data.columns.length === 0 ? (
+              <PanelTable result={preview.data} />
+            ) : (
+              <Chart
+                data={preview.data}
+                kind={p.chart}
+                x={p.x}
+                y={p.y}
+                series={p.series}
+                stacked={p.stacked}
+              />
+            )}
+          </div>
+        )}
         <div className="toolbar" style={{ marginTop: 12, justifyContent: "flex-end" }}>
           <button onClick={onCancel}>Cancel</button>
           <button className="primary" disabled={!complete} onClick={() => onSave(p)}>
             Save panel
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -706,7 +831,8 @@ function DashboardPage() {
           No panels yet
           {canEdit ? (
             <>
-              {" "}— add one, shape a chart in <Link to="/explore">Explore</Link>, or send a
+              {" "}— add one, shape a quick chart in{" "}
+              <Link to="/analyses?mode=chart">Analyses</Link>, or send a
               query here from the SQL page.
             </>
           ) : (
@@ -749,18 +875,19 @@ function DashboardPage() {
                       // once sent SQL panels into Explore, which crashed the
                       // whole app trying to read `.nodes` of undefined.
                       Array.isArray((p.flow as any)?.nodes) && (p.flow as any).nodes.length > 0 ? (
-                        // A flow panel was shaped in Explore, so it is edited
-                        // there — one shaping UI, not two drifting copies.
+                        // A flow panel was shaped in the quick chart, so it is
+                        // edited there — one shaping UI, not two drifting
+                        // copies.
                         <button
                           className="small"
-                          title="Reopens this panel's shaping in Explore"
+                          title="Reopens this panel's shaping in Analyses' quick chart"
                           onClick={() =>
                             navigate(
-                              `/explore?dashboard=${encodeURIComponent(dash.name)}&panel=${encodeURIComponent(p.id)}`,
+                              `/analyses?mode=chart&dashboard=${encodeURIComponent(dash.name)}&panel=${encodeURIComponent(p.id)}`,
                             )
                           }
                         >
-                          Edit in Explore
+                          Edit in Analyses
                         </button>
                       ) : (
                         <button className="small" onClick={() => setEditing(p)}>
@@ -781,7 +908,13 @@ function DashboardPage() {
                     <button
                       className="small danger"
                       disabled={deletePanel.isPending}
-                      onClick={() => deletePanel.mutate(p.id)}
+                      aria-label={`Delete panel ${p.title}`}
+                      // The same confirm the dashboard-level Delete has had
+                      // all along: a mis-click on a 20-line query's ✕ was the
+                      // only destructive control in the app with no gate.
+                      onClick={() => {
+                        if (window.confirm(`Delete panel "${p.title}"?`)) deletePanel.mutate(p.id);
+                      }}
                     >
                       ✕
                     </button>

@@ -315,13 +315,24 @@ def test_a_cell_over_a_dataset_the_viewer_cannot_view_fails_as_an_unknown_table(
                     "can_view": True, "can_edit": True}]}).status_code == 200
 
     viewer = _client(app, "vic")
-    for cell_id in ("c2", "c3"):
-        r = viewer.post(f"/api/v1/analyses/rev/cells/{cell_id}/run", json={})
-        assert r.status_code == 400, (cell_id, r.text)
-        # The viewer's refusal must not name the dataset's columns or echo
-        # the instruction; they get the laundered brief.
-        assert "amount" not in r.text
-        assert "SELECT" not in r.text
+    # The flow cell (c2): DELIBERATE change from the old 400/definition_stale
+    # brief, which told the viewer the analysis "refers to something that no
+    # longer exists" — false: the dataset exists, the analysis works for the
+    # entitled, and no edit can fix access. The refusal is now an honest
+    # access sentence that still names NO dataset, no column, no instruction.
+    r = viewer.post("/api/v1/analyses/rev/cells/c2/run", json={})
+    assert r.status_code == 403, r.text
+    assert "not shared with your role" in r.text
+    assert "orders" not in r.text
+    assert "amount" not in r.text
+    assert "no longer exists" not in r.text
+    # The SQL cell (c3): unchanged — for the viewer the table is simply not
+    # registered, so it fails exactly as an unknown table would, confirming
+    # nothing about what exists behind the ACL.
+    r = viewer.post("/api/v1/analyses/rev/cells/c3/run", json={})
+    assert r.status_code == 400, r.text
+    assert "amount" not in r.text
+    assert "SELECT" not in r.text
 
 
 def test_no_cell_result_is_ever_persisted(ws):

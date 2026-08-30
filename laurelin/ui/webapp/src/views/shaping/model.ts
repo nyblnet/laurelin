@@ -1,19 +1,24 @@
-// Explore's client model: screen state and ONE pure function that turns it
-// into a FlowDef.
+// The ONE shaping model: screen state and the pure functions that turn it
+// into Flow IR, shared by the quick chart (Analyses' zero-commitment entry,
+// formerly the Explore screen) and Analyses' document cells.
 //
-// This file is the whole representation layer of Explore. There is no
-// ExploreSpec on the server, on the wire, or in storage — the UI holds the
-// state below and `exploreFlow` synthesizes a linear flow
-// (source → filter → derive* → aggregate → sort) that goes through the exact
-// stack every Flow goes through: Tier A validation, the one compiler with
-// every value bound, the one SQL execution path. If you are tempted to add a
-// "lighter" wire format here, that is a second compiler and a second
+// Explore and Analyses each carried a private copy of this layer, and the
+// copies drifted measurably: eight verified courtesy gaps (auto-chronological
+// sort, value suggestions, masked-column greying, duplicate-group refusal,
+// chart defaults, …) existed on one surface and not the other. This module is
+// where each of those behaviors now lives exactly once. The two callers
+// differ in precisely two parameters, so that is the parameterization:
+//
+//   * measures REQUIRED (a chart needs at least one summary — quick chart)
+//     versus OPTIONAL (a cell with none returns the shaped rows — documents);
+//   * the source is a dataset (quick chart) or a dataset-or-earlier-cell
+//     (documents; the cell wiring stays in views/analyses/model.ts).
+//
+// There is still no query language on the wire and no ExploreSpec anywhere:
+// the synthesized nodes go through `FlowDef.from_json` (Tier A), the one
+// compiler with every value bound, and the one SQL execution path. A
+// "lighter" wire format here would be a second compiler and a second
 // injection surface — the mistake this seam exists to prevent.
-//
-// The reverse function `stateFromFlow` exists so a saved panel can be
-// reopened in Explore. It parses ONLY the shapes `exploreFlow` emits; a flow
-// authored in the Flow builder that wandered off that shape parses to null
-// and the UI says so instead of silently flattening it.
 
 import type {
   FlowAggFn,
@@ -25,7 +30,7 @@ import type {
 
 // ------------------------------------------------------------------- state
 
-/** Filter operators Explore offers — the condition subset of the Flow vocab. */
+/** Filter operators the cards offer — the condition subset of the Flow vocab. */
 export type ExploreFilterOp =
   | "eq" | "ne" | "gt" | "gte" | "lt" | "lte"
   | "like" | "is_null" | "is_not_null" | "in" | "not_in";
@@ -68,15 +73,23 @@ export interface ExploreSort {
   dir: "asc" | "desc";
 }
 
-export interface ExploreState {
-  dataset: string;
+/** The shaping fields every surface shares. The quick chart adds `dataset`;
+ *  a document cell adds `source` (dataset or earlier cell). */
+export interface ShapingFields {
   filters: ExploreFilter[];
   groups: ExploreGroup[];
+  /** Optional on document cells: empty = the cell returns the shaped rows. */
   measures: ExploreMeasure[];
   sort: ExploreSort | null;
-  /** Top-N, free-typed. "" = no limit. Travels as the panel's `top`, which
-   *  the server binds as LIMIT ? at the terminal — never a mid-flow node. */
+  /** Top-N, free-typed. "" = no limit. Travels as the panel's/cell's `top`,
+   *  which the server binds as LIMIT ? at the terminal — never mid-flow. */
   top: string;
+}
+
+/** The quick chart's state (ex-Explore). Measures are always required here:
+ *  a chart needs at least one summary. */
+export interface ExploreState extends ShapingFields {
+  dataset: string;
 }
 
 export function emptyExplore(dataset = ""): ExploreState {
@@ -172,7 +185,7 @@ export function literalFor(kind: FlowKind, text: string): FlowExpr | null {
 
 // ---------------------------------------------------------------- synthesis
 
-/** The name the bucketed column gets in the result — also what the chart's x
+/** The name a bucketed column gets in the result — also what the chart's x
  *  binding and the aggregate's group_by use. Must satisfy the server's
  *  invented-identifier rule (letters, digits, underscores, spaces). */
 export function groupResultName(g: ExploreGroup, taken: Set<string>): string {
@@ -184,7 +197,7 @@ export function groupResultName(g: ExploreGroup, taken: Set<string>): string {
   return name.slice(0, 128);
 }
 
-function filterExpr(f: ExploreFilter, kinds: Record<string, FlowKind>): FlowExpr | null {
+export function filterExpr(f: ExploreFilter, kinds: Record<string, FlowKind>): FlowExpr | null {
   if (!f.column) return null;
   const col: FlowExpr = { t: "col", name: f.column };
   if (f.op === "is_null" || f.op === "is_not_null") {
@@ -209,17 +222,16 @@ function filterExpr(f: ExploreFilter, kinds: Record<string, FlowKind>): FlowExpr
  *  on step 's2'", about a step the analyst has never seen. */
 const NEW_NAME_RE = /^[A-Za-z_][A-Za-z0-9_ ]{0,127}$/;
 
-/** Why this state cannot preview yet, as sentences for the card. Empty = go.
- *  Everything the server would refuse in compiler vocabulary is caught here
- *  first, in analyst vocabulary — both states (duplicate groups, punctuation
- *  in a summary name) are reachable in two clicks, so "synthesized shapes
- *  make refusals rare" was wishful. */
-export function exploreIssues(
-  state: ExploreState,
+/** Why these shaping fields cannot preview yet, as sentences for the cards.
+ *  Empty = go. Everything the server would refuse in compiler vocabulary is
+ *  caught here first, in analyst vocabulary — both surfaces reach the same
+ *  states (duplicate groups, punctuation in a summary name) in two clicks. */
+export function shapingFieldIssues(
+  state: ShapingFields,
   kinds: Record<string, FlowKind>,
+  opts: { measuresRequired: boolean },
 ): string[] {
   const issues: string[] = [];
-  if (!state.dataset) issues.push("Pick a dataset.");
   for (const f of state.filters) {
     if (!f.column) {
       issues.push("A filter needs a column.");
@@ -232,6 +244,13 @@ export function exploreIssues(
           ? `Fill in a value for “${f.column}”.`
           : `“${f.value}” is not a valid ${kind === "time" ? "date (YYYY-MM-DD)" : kind || "value"} for “${f.column}”.`,
       );
+    }
+  }
+  if (state.measures.length === 0) {
+    if (opts.measuresRequired) {
+      issues.push("Add at least one summary.");
+    } else if (state.groups.length > 0) {
+      issues.push("Grouping needs at least one summary — or remove the grouping to keep the rows.");
     }
   }
   const seenGroupNames = new Set<string>();
@@ -251,7 +270,6 @@ export function exploreIssues(
     }
     seenGroupNames.add(name);
   }
-  if (state.measures.length === 0) issues.push("Add at least one summary.");
   const seenAliases = new Set<string>();
   for (const m of state.measures) {
     if (m.fn !== "count_star" && !m.column) issues.push("Pick a column to summarise.");
@@ -279,8 +297,25 @@ export function exploreIssues(
   return issues;
 }
 
-/** The columns the synthesized flow's result will have, in order. */
-export function resultColumns(state: ExploreState): string[] {
+/** The quick chart's issue list: a dataset and at least one summary. */
+export function exploreIssues(
+  state: ExploreState,
+  kinds: Record<string, FlowKind>,
+): string[] {
+  const issues: string[] = [];
+  if (!state.dataset) issues.push("Pick a dataset.");
+  issues.push(...shapingFieldIssues(state, kinds, { measuresRequired: true }));
+  return issues;
+}
+
+/** The columns a shaping's result will have, in order. Aggregating: group
+ *  names then measure aliases. Not aggregating (documents only): the
+ *  source's own columns, which the caller knows and this module does not. */
+export function shapedResultColumns(
+  state: ShapingFields,
+  sourceColumns: string[],
+): string[] {
+  if (state.measures.length === 0) return sourceColumns;
   const taken = new Set<string>();
   const groups = state.groups
     .filter((g) => g.column)
@@ -292,27 +327,29 @@ export function resultColumns(state: ExploreState): string[] {
   return [...groups, ...state.measures.map((m) => m.alias).filter(Boolean)];
 }
 
+/** The quick chart's result columns (measures always present there). */
+export function resultColumns(state: ExploreState): string[] {
+  return shapedResultColumns(state, []);
+}
+
 /**
- * Synthesize the FlowDef. Call only when `exploreIssues` is empty; an
- * unfinished state returns null rather than a flow the server must refuse.
- *
- * Shape, always linear:
- * source → [filter] → [cast]* → [derive]* → aggregate → [sort].
+ * Synthesize the shared spine of nodes after the source:
+ * [filter] → [cast]* → [derive]* → [aggregate?] → [sort?].
+ * `prev` is the input of the first synthesized step (a source step's id, or
+ * a document cell's `cell:<id>` reference); ids continue s{offset+1}….
  * A time bucket is derive(date_trunc(unit, col)); a group with `parse` casts
  * its text column to timestamp first (the compiler's own `cast` step); a
  * numeric bin is derive(mul(floor(div(col, w)), w)) — the binning runs inside
  * the governed, parameter-bound statement, never in the browser over raw rows.
  */
-export function exploreFlow(
-  state: ExploreState,
+function synthesizeSpine(
+  state: ShapingFields,
   kinds: Record<string, FlowKind>,
-  author: string,
-): FlowDef | null {
-  if (exploreIssues(state, kinds).length > 0) return null;
-
+  prev: string,
+  offset: number,
+): { nodes: FlowNode[]; terminal: string } {
   const nodes: FlowNode[] = [];
-  let prev = "s1";
-  nodes.push({ id: "s1", kind: "source", inputs: [], params: { dataset: state.dataset } });
+  const nextId = () => `s${offset + nodes.length + 1}`;
 
   const predicates = state.filters
     .map((f) => filterExpr(f, kinds))
@@ -322,7 +359,7 @@ export function exploreFlow(
       predicates.length === 1
         ? predicates[0]
         : { t: "op", op: "and", args: predicates };
-    const id = `s${nodes.length + 1}`;
+    const id = nextId();
     nodes.push({ id, kind: "filter", inputs: [prev], params: { predicate } });
     prev = id;
   }
@@ -334,7 +371,7 @@ export function exploreFlow(
       parseCols.push(g.column);
   }
   for (const column of parseCols) {
-    const id = `s${nodes.length + 1}`;
+    const id = nextId();
     nodes.push({ id, kind: "cast", inputs: [prev], params: { column, to: "timestamp" } });
     prev = id;
   }
@@ -377,65 +414,180 @@ export function exploreFlow(
             op: "date_trunc",
             args: [{ t: "lit", type: "string", value: g.bucket }, col],
           };
-    const id = `s${nodes.length + 1}`;
+    const id = nextId();
     nodes.push({ id, kind: "derive", inputs: [prev], params: { name, expr } });
+    prev = id;
+  }
+
+  if (state.measures.length > 0) {
+    const id = nextId();
+    nodes.push({
+      id,
+      kind: "aggregate",
+      inputs: [prev],
+      params: {
+        group_by: groupCols,
+        aggs: state.measures.map((m) => ({
+          fn: m.fn,
+          column: m.fn === "count_star" ? null : m.column,
+          as: m.alias,
+        })),
+      },
+    });
     prev = id;
   }
 
   // A sort that names a column the result no longer produces (the author
   // renamed the measure it pointed at) is silently dropped rather than
   // refused: the refusal would arrive in compiler vocabulary ("step 's3'")
-  // about a control the author never sees as a step. `sortColumn` below and
-  // the select in the Order card apply the same rule, so what previews is
-  // what the card shows.
+  // about a control the author never sees as a step. The Order card's select
+  // applies the same rule, so what previews is what the card shows. A
+  // non-aggregated document cell passes rows through, so any sort column may
+  // stand — its validity is the source schema's, which the server checks.
   const sortColumn =
-    state.sort && resultColumns(state).includes(state.sort.column)
-      ? state.sort.column
-      : null;
-
-  const aggId = `s${nodes.length + 1}`;
-  nodes.push({
-    id: aggId,
-    kind: "aggregate",
-    inputs: [prev],
-    params: {
-      group_by: groupCols,
-      aggs: state.measures.map((m) => ({
-        fn: m.fn,
-        column: m.fn === "count_star" ? null : m.column,
-        as: m.alias,
-      })),
-    },
-  });
-  prev = aggId;
-
-  if (sortColumn) {
-    const id = `s${nodes.length + 1}`;
+    state.sort && state.measures.length > 0
+      ? (shapedResultColumns(state, []).includes(state.sort.column) ? state.sort.column : null)
+      : state.sort?.column ?? null;
+  if (sortColumn && state.sort) {
+    const id = nextId();
     nodes.push({
       id,
       kind: "sort",
       inputs: [prev],
-      params: { by: [{ column: sortColumn, dir: state.sort!.dir, nulls: "last" }] },
+      params: { by: [{ column: sortColumn, dir: state.sort.dir, nulls: "last" }] },
     });
     prev = id;
   }
 
+  return { nodes, terminal: prev };
+}
+
+/** Synthesize the shared spine for a document cell: no source step when the
+ *  cell reads an earlier cell (`prev` = "cell:<id>"), s1 source otherwise.
+ *  Exposed for views/analyses/model.ts; quick-chart callers use exploreFlow. */
+export function synthesizeShapingNodes(
+  state: ShapingFields,
+  kinds: Record<string, FlowKind>,
+  start: { dataset: string } | { cellInput: string },
+): { nodes: FlowNode[]; terminal: string } {
+  if ("dataset" in start) {
+    const source: FlowNode = {
+      id: "s1", kind: "source", inputs: [], params: { dataset: start.dataset },
+    };
+    const spine = synthesizeSpine(state, kinds, "s1", 1);
+    return { nodes: [source, ...spine.nodes], terminal: spine.nodes.length ? spine.terminal : "s1" };
+  }
+  return synthesizeSpine(state, kinds, start.cellInput, 0);
+}
+
+/**
+ * Synthesize the quick chart's FlowDef. Call only when `exploreIssues` is
+ * empty; an unfinished state returns null rather than a flow the server must
+ * refuse. Shape, always linear:
+ * source → [filter] → [cast]* → [derive]* → aggregate → [sort].
+ */
+export function exploreFlow(
+  state: ExploreState,
+  kinds: Record<string, FlowKind>,
+  author: string,
+): FlowDef | null {
+  if (exploreIssues(state, kinds).length > 0) return null;
+  const { nodes, terminal } = synthesizeShapingNodes(state, kinds, { dataset: state.dataset });
   return {
-    // A fixed, valid flow name. Nothing in the Explore path checks output-name
-    // collisions because nothing is ever materialized under this name.
+    // A fixed, valid flow name. Nothing in the quick-chart path checks
+    // output-name collisions because nothing is materialized under this name.
     name: "explore",
     output: "explore",
     author,
     description: "",
-    terminal: prev,
+    terminal,
     nodes,
     expectations: [],
   };
 }
 
+// -------------------------------------------------------- card transitions
+
+/** Pick a group row's column: the bucket belongs to the old column's kind,
+ *  so it resets — and a fresh grouping with no order yet defaults to its own
+ *  ascending order, visibly, in the Order card where the author can change
+ *  it. Grouped-and-unordered charts render in whatever order the engine
+ *  returns — plausible-looking noise. */
+export function withGroupColumn(s: ShapingFields, i: number, column: string): ShapingFields {
+  return {
+    ...s,
+    groups: s.groups.map((x, j) =>
+      j === i ? { column, bucket: "" as ExploreBucket, binWidth: "", parse: false } : x,
+    ),
+    sort: column && !s.sort ? { column, dir: "asc" as const } : s.sort,
+  };
+}
+
+/** Choose a date bucket for a group row. A text column bucketed by date needs
+ *  reading as one first — the compiler's own cast step, synthesized for the
+ *  analyst. And a time series nobody ordered charts in whatever order the
+ *  engine grouped it, so the sort defaults to chronological the moment a
+ *  bucket is chosen — visibly, in the Order card — unless the author's own
+ *  sort still names a real result column. */
+export function withGroupBucket(
+  s: ShapingFields,
+  i: number,
+  bucket: ExploreBucket,
+  kind: FlowKind | "",
+  sourceColumns: string[] = [],
+): ShapingFields {
+  const parse = kind === "text" && !!bucket;
+  const groups = s.groups.map((x, j) => (j === i ? { ...x, bucket, parse } : x));
+  const keep =
+    s.sort && shapedResultColumns({ ...s, groups }, sourceColumns).includes(s.sort.column);
+  const sort =
+    bucket && !keep
+      ? { column: groupResultName(groups[i], new Set<string>()), dir: "asc" as const }
+      : s.sort;
+  return { ...s, groups, sort };
+}
+
+/** Toggle a numeric group row between exact values and ranges. Same rule as
+ *  the date buckets: a histogram whose bins render in arbitrary order is a
+ *  shuffled distribution that looks like a valid chart. */
+export function withGroupBin(
+  s: ShapingFields,
+  i: number,
+  bin: boolean,
+  sourceColumns: string[] = [],
+): ShapingFields {
+  const groups = s.groups.map((x, j) =>
+    j === i
+      ? {
+          ...x,
+          bucket: (bin ? "bin" : "") as ExploreBucket,
+          binWidth: bin ? x.binWidth || "10" : "",
+          parse: false,
+        }
+      : x,
+  );
+  const keep =
+    s.sort && shapedResultColumns({ ...s, groups }, sourceColumns).includes(s.sort.column);
+  const sort =
+    bin && !keep
+      ? { column: groupResultName(groups[i], new Set<string>()), dir: "asc" as const }
+      : s.sort;
+  return { ...s, groups, sort };
+}
+
+/** Pick a sort column. Direction defaults by what the column *is*: a
+ *  grouping ascends (a time column sorted "largest first" is a time series
+ *  running backwards), a measure descends (biggest first is what "sort by
+ *  the count" means). */
+export function withSortColumn(s: ShapingFields, column: string): ShapingFields {
+  if (!column) return { ...s, sort: null };
+  const isMeasure = s.measures.some((m) => m.alias === column);
+  return { ...s, sort: { column, dir: isMeasure ? ("desc" as const) : ("asc" as const) } };
+}
+
 // ------------------------------------------------------------ reverse parse
 
-function parseFilter(e: FlowExpr): ExploreFilter | null {
+export function parseFilter(e: FlowExpr): ExploreFilter | null {
   if (e.t !== "op") return null;
   const [head, ...rest] = e.args;
   if (!head || head.t !== "col") return null;
@@ -456,39 +608,29 @@ function parseFilter(e: FlowExpr): ExploreFilter | null {
   return null;
 }
 
-/** Reopen a saved panel's flow as Explore state. Returns null for any flow
- *  that is not exactly the shape `exploreFlow` writes — including the `{}` a
- *  raw-SQL panel stores in its `flow` field (the model's default), which once
- *  reached `.nodes.map` and took the whole app down with it. */
-export function stateFromFlow(flow: FlowDef, top: number | null | undefined): ExploreState | null {
-  if (!flow || !Array.isArray(flow.nodes) || typeof flow.terminal !== "string") return null;
-  const byId = new Map(flow.nodes.map((n) => [n.id, n]));
-  // Walk the spine terminal-up; it must be linear.
-  const spine: FlowNode[] = [];
-  let cur = byId.get(flow.terminal);
-  while (cur) {
-    spine.unshift(cur);
-    if (cur.inputs.length === 0) break;
-    if (cur.inputs.length > 1) return null;
-    cur = byId.get(cur.inputs[0]);
-  }
-  if (spine.length === 0 || spine.length !== flow.nodes.length) return null;
-  if (spine[0].kind !== "source") return null;
-
-  const state = emptyExplore(spine[0].params.dataset ?? "");
-  state.measures = [];
-  state.top = top != null ? String(top) : "";
+/**
+ * Walk the post-source spine of a synthesized shaping, filling `state`'s
+ * fields. Parses ONLY the shapes `synthesizeShapingNodes` emits; anything a
+ * Flow-builder author wandered onto returns false and the caller says so
+ * instead of silently flattening it. When `requireAggregate` (quick chart),
+ * the walk must end at an aggregate or its sort.
+ */
+export function parseShapingSpine(
+  rest: FlowNode[],
+  state: ShapingFields,
+  opts: { requireAggregate: boolean },
+): boolean {
   const derived = new Map<string, ExploreGroup>();
   const parsed = new Set<string>();
   let seen: "source" | "filter" | "cast" | "derive" | "aggregate" | "sort" = "source";
 
-  for (const node of spine.slice(1)) {
+  for (const node of rest) {
     if (node.kind === "filter" && seen === "source") {
       const p = node.params.predicate as FlowExpr;
       const parts = p.t === "op" && p.op === "and" ? p.args : [p];
       for (const part of parts) {
         const f = parseFilter(part);
-        if (!f) return null;
+        if (!f) return false;
         state.filters.push(f);
       }
       seen = "filter";
@@ -496,9 +638,9 @@ export function stateFromFlow(flow: FlowDef, top: number | null | undefined): Ex
       node.kind === "cast" &&
       (seen === "source" || seen === "filter" || seen === "cast")
     ) {
-      // Only the cast `exploreFlow` writes: text read as timestamps for a
+      // Only the cast the synthesis writes: text read as timestamps for a
       // date bucket. Anything else is Flow-builder territory.
-      if (node.params.to !== "timestamp" || typeof node.params.column !== "string") return null;
+      if (node.params.to !== "timestamp" || typeof node.params.column !== "string") return false;
       parsed.add(node.params.column);
       seen = "cast";
     } else if (
@@ -530,7 +672,7 @@ export function stateFromFlow(flow: FlowDef, top: number | null | undefined): Ex
           };
         }
       }
-      if (!g) return null;
+      if (!g) return false;
       derived.set(node.params.name, g);
       seen = "derive";
     } else if (node.kind === "aggregate" && seen !== "aggregate" && seen !== "sort") {
@@ -541,21 +683,51 @@ export function stateFromFlow(flow: FlowDef, top: number | null | undefined): Ex
         state.measures.push({ fn: a.fn, column: a.column ?? "", alias: a.as ?? "" });
       }
       seen = "aggregate";
-    } else if (node.kind === "sort" && seen === "aggregate") {
+    } else if (
+      node.kind === "sort" &&
+      (opts.requireAggregate ? seen === "aggregate" : seen !== "sort")
+    ) {
       const by = (node.params.by ?? [])[0];
-      if (!by) return null;
+      if (!by) return false;
       state.sort = { column: by.column, dir: by.dir === "desc" ? "desc" : "asc" };
       seen = "sort";
     } else {
-      return null;
+      return false;
     }
   }
-  if (seen !== "aggregate" && seen !== "sort") return null;
-  // Every cast must be claimed by a parsed group; otherwise reopening would
-  // silently drop the cast and saving would silently change the query.
+  if (opts.requireAggregate && seen !== "aggregate" && seen !== "sort") return false;
+  // Derives claimed by no aggregate, or casts claimed by no parsed group,
+  // would be silently dropped on the next save — refuse to parse instead.
+  if (derived.size > 0 && state.groups.length === 0) return false;
   for (const column of parsed) {
-    if (!state.groups.some((g) => g.column === column && g.parse)) return null;
+    if (!state.groups.some((g) => g.column === column && g.parse)) return false;
   }
+  return true;
+}
+
+/** Reopen a saved panel's flow as quick-chart state. Returns null for any
+ *  flow that is not exactly the shape `exploreFlow` writes — including the
+ *  `{}` a raw-SQL panel stores in its `flow` field (the model's default),
+ *  which once reached `.nodes.map` and took the whole app down with it. */
+export function stateFromFlow(flow: FlowDef, top: number | null | undefined): ExploreState | null {
+  if (!flow || !Array.isArray(flow.nodes) || typeof flow.terminal !== "string") return null;
+  const byId = new Map(flow.nodes.map((n) => [n.id, n]));
+  // Walk the spine terminal-up; it must be linear.
+  const spine: FlowNode[] = [];
+  let cur = byId.get(flow.terminal);
+  while (cur) {
+    spine.unshift(cur);
+    if (cur.inputs.length === 0) break;
+    if (cur.inputs.length > 1) return null;
+    cur = byId.get(cur.inputs[0]);
+  }
+  if (spine.length === 0 || spine.length !== flow.nodes.length) return null;
+  if (spine[0].kind !== "source") return null;
+
+  const state = emptyExplore(spine[0].params.dataset ?? "");
+  state.measures = [];
+  state.top = top != null ? String(top) : "";
+  if (!parseShapingSpine(spine.slice(1), state, { requireAggregate: true })) return null;
   return state;
 }
 
@@ -563,9 +735,10 @@ export function stateFromFlow(flow: FlowDef, top: number | null | undefined): Ex
 
 /** The kind a *result* column will have, for defaulting the sort direction
  *  and labeling it: a date bucket is time however its source was typed, a bin
- *  is a number, a measure is almost always a number. */
+ *  is a number, a measure is almost always a number. A pass-through column
+ *  (a document cell with no summaries) keeps its source kind. */
 export function resultColumnKind(
-  state: ExploreState,
+  state: ShapingFields,
   kinds: Record<string, FlowKind>,
   column: string,
 ): FlowKind | "" {
@@ -585,17 +758,17 @@ export function resultColumnKind(
       return kinds[m.column] ?? "number";
     return "number";
   }
-  return "";
+  return kinds[column] ?? "";
 }
 
 // ---------------------------------------------------------- refusal rewrite
 
 /** What each synthesized node is called on screen. The compiler's refusals
  *  name steps ("Step 's3' groups by the same column more than once") because
- *  Flow authors see steps; Explore analysts see cards. `exploreIssues`
- *  catches everything we know how to say first — this is the net under it,
+ *  Flow authors see steps; shaping analysts see cards. The issue functions
+ *  catch everything we know how to say first — this is the net under them,
  *  so a refusal that still gets through arrives in the card's vocabulary. */
-const CARD_OF: Record<string, string> = {
+export const CARD_OF: Record<string, string> = {
   source: "the data source",
   filter: "the Filter card",
   cast: "the “read as dates” setting",
@@ -624,10 +797,12 @@ export function explainRefusal(detail: string, flow: FlowDef | null): string {
 
 // ------------------------------------------------------------------- drafts
 
-/** Everything on the Explore screen, as one serializable draft. Kept in
- *  sessionStorage: an accidental reload used to wipe an eight-interaction
- *  shaping session with no warning, for an audience that takes minutes, not
- *  seconds, to rebuild it. */
+/** Everything on the quick chart, as one serializable draft. Kept in
+ *  sessionStorage, not localStorage, deliberately: shaping state names
+ *  datasets and filter values, which should die with the browser session
+ *  rather than persist on a shared machine. An accidental reload used to
+ *  wipe an eight-interaction shaping session with no warning, for an
+ *  audience that takes minutes, not seconds, to rebuild it. */
 export interface ExploreDraft {
   tab: "datasets" | "objects";
   state: ExploreState;
@@ -641,42 +816,33 @@ export interface ExploreDraft {
   bindings: { chart: string; x: string; y: string[]; series: string; stacked: boolean };
 }
 
-export const DRAFT_KEY = "laurelin.explore.draft.v1";
+/** The quick chart's scratch state, under the merged surface's own name. */
+export const SCRATCH_KEY = "laurelin.analyses.scratch.v1";
+/** The pre-merge Explore screen's draft key. Read once, on first mount with
+ *  no scratch of its own, so an in-flight shaping session survives the
+ *  release that merged the screens. Delete after one release. */
+export const LEGACY_SCRATCH_KEY = "laurelin.explore.draft.v1";
 
 export function serializeDraft(d: ExploreDraft): string {
   return JSON.stringify({ v: 1, ...d });
 }
 
-/** Parse a stored draft, returning null for anything that is not exactly the
- *  shape `serializeDraft` writes — a stale or hand-edited draft must degrade
- *  to a fresh screen, never to a crash on load. */
-export function parseDraft(text: string | null): ExploreDraft | null {
-  if (!text) return null;
-  let raw: any;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  if (!raw || raw.v !== 1) return null;
-  const s = raw.state;
-  const o = raw.obj;
-  const b = raw.bindings;
-  const strArray = (a: unknown) => Array.isArray(a) && a.every((x) => typeof x === "string");
+const strArray = (a: unknown): a is string[] =>
+  Array.isArray(a) && a.every((x) => typeof x === "string");
+
+/** Validate the shared shaping fields of a stored draft, tolerantly: any
+ *  entry that is not the shape the serializers write is dropped or nulled,
+ *  never crashed on. Both draft parsers (scratch and document) go through
+ *  this one function. */
+export function parseShapingFields(s: any): ShapingFields | null {
   if (
-    (raw.tab !== "datasets" && raw.tab !== "objects") ||
-    !s || typeof s.dataset !== "string" ||
+    !s ||
     !Array.isArray(s.filters) || !Array.isArray(s.groups) || !Array.isArray(s.measures) ||
-    typeof s.top !== "string" ||
-    !o || typeof o.typeName !== "string" || !strArray(o.groupBy) ||
-    !Array.isArray(o.metrics) || !Array.isArray(o.filters) || typeof o.search !== "string" ||
-    !b || typeof b.chart !== "string" || typeof b.x !== "string" || !strArray(b.y) ||
-    typeof b.series !== "string" || typeof b.stacked !== "boolean"
+    typeof s.top !== "string"
   ) {
     return null;
   }
-  const state: ExploreState = {
-    dataset: s.dataset,
+  return {
     filters: s.filters
       .filter((f: any) => f && typeof f.column === "string" && typeof f.op === "string")
       .map((f: any) => ({
@@ -702,13 +868,51 @@ export function parseDraft(text: string | null): ExploreDraft | null {
       })),
     sort:
       s.sort && typeof s.sort.column === "string"
-        ? { column: s.sort.column, dir: s.sort.dir === "asc" ? "asc" : "desc" }
+        ? { column: s.sort.column, dir: s.sort.dir === "asc" ? ("asc" as const) : ("desc" as const) }
         : null,
     top: s.top,
   };
+}
+
+function parseBindings(b: any): ExploreDraft["bindings"] | null {
+  if (
+    !b || typeof b.chart !== "string" || typeof b.x !== "string" || !strArray(b.y) ||
+    typeof b.series !== "string" || typeof b.stacked !== "boolean"
+  ) {
+    return null;
+  }
+  return { chart: b.chart, x: b.x, y: b.y, series: b.series, stacked: b.stacked };
+}
+
+/** Parse a stored draft, returning null for anything that is not exactly the
+ *  shape `serializeDraft` writes — a stale or hand-edited draft must degrade
+ *  to a fresh screen, never to a crash on load. */
+export function parseDraft(text: string | null): ExploreDraft | null {
+  if (!text) return null;
+  let raw: any;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!raw || raw.v !== 1) return null;
+  const o = raw.obj;
+  const fields =
+    raw.state && typeof raw.state.dataset === "string"
+      ? parseShapingFields(raw.state)
+      : null;
+  const bindings = parseBindings(raw.bindings);
+  if (
+    (raw.tab !== "datasets" && raw.tab !== "objects") ||
+    !fields || !bindings ||
+    !o || typeof o.typeName !== "string" || !strArray(o.groupBy) ||
+    !Array.isArray(o.metrics) || !Array.isArray(o.filters) || typeof o.search !== "string"
+  ) {
+    return null;
+  }
   return {
     tab: raw.tab,
-    state,
+    state: { dataset: raw.state.dataset, ...fields },
     obj: {
       typeName: o.typeName,
       groupBy: o.groupBy,
@@ -724,8 +928,76 @@ export function parseDraft(text: string | null): ExploreDraft | null {
         .map((f: any) => ({ property: f.property, value: typeof f.value === "string" ? f.value : "" })),
       search: o.search,
     },
-    bindings: { chart: b.chart, x: b.x, y: b.y, series: b.series, stacked: b.stacked },
+    bindings,
   };
+}
+
+/** The quick chart's draft, wherever it lives: its own key first, then — for
+ *  one release — the pre-merge Explore key, so nobody's in-flight shaping
+ *  session evaporates on upgrade day. */
+export function loadScratchDraft(storage: Pick<Storage, "getItem">): ExploreDraft | null {
+  return (
+    parseDraft(storage.getItem(SCRATCH_KEY)) ??
+    parseDraft(storage.getItem(LEGACY_SCRATCH_KEY))
+  );
+}
+
+// A document's unsaved cells, keyed per analysis. Same storage decision as
+// the scratch draft (sessionStorage; filter values die with the session).
+// AnalysisEditor state was useState-only, so one refresh destroyed every
+// unsaved cell — the verified worst data-loss cliff on the documents side.
+
+export function docDraftKey(name: string): string {
+  return `laurelin.analyses.doc.${name}.v1`;
+}
+
+/** One stored draft cell: the editable fields only — the saved record stays
+ *  the server's, and unparseable saved shapes ride as `shaping: null`. */
+export interface StoredDraftCell {
+  id: string | null;
+  title: string;
+  kind: "sql" | "shaping";
+  sql: string;
+  shaping: ({ source: string } & ShapingFields) | null;
+  bindings: ExploreDraft["bindings"];
+  width: number;
+  dirty: boolean;
+}
+
+export function serializeDocDraft(cells: StoredDraftCell[]): string {
+  return JSON.stringify({ v: 1, cells });
+}
+
+export function parseDocDraft(text: string | null): StoredDraftCell[] | null {
+  if (!text) return null;
+  let raw: any;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!raw || raw.v !== 1 || !Array.isArray(raw.cells)) return null;
+  const out: StoredDraftCell[] = [];
+  for (const c of raw.cells) {
+    if (!c || typeof c.title !== "string" || (c.kind !== "sql" && c.kind !== "shaping")) continue;
+    const bindings = parseBindings(c.bindings);
+    if (!bindings) continue;
+    const fields =
+      c.shaping && typeof c.shaping.source === "string"
+        ? parseShapingFields(c.shaping)
+        : null;
+    out.push({
+      id: typeof c.id === "string" ? c.id : null,
+      title: c.title,
+      kind: c.kind,
+      sql: typeof c.sql === "string" ? c.sql : "",
+      shaping: fields ? { source: c.shaping.source, ...fields } : null,
+      bindings,
+      width: typeof c.width === "number" ? c.width : 12,
+      dirty: c.dirty === true,
+    });
+  }
+  return out;
 }
 
 // -------------------------------------------------------- value suggestions

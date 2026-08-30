@@ -56,7 +56,7 @@ backwards for adoption.
 | Persona | What they want | First thing they try | Where they stall | Verdict today |
 |---|---|---|---|---|
 | **Platform / data engineer** (the decision-maker) | An open Foundry: pipelines, lineage, scale, ops | "Point it at my Postgres / S3 / warehouse" | No connector — upload only. Then: "how big can a dataset be?" | Impressed by the model, blocked on ingestion + unsure on scale |
-| **Analytics engineer / analyst** | Model data semantically, explore it | SQL workbench, then the ontology | Ontology is queryable but abstract — no dashboard/app to *show* the payoff | "Workbench is nice; ontology intriguing but what do I get?" |
+| **Analytics engineer / analyst** | Model data semantically, explore it | the SQL page, then the ontology | Ontology is queryable but abstract — no dashboard/app to *show* the payoff | "Workbench is nice; ontology intriguing but what do I get?" |
 | **Operational-app builder** (the *real* Foundry use case) | An app over an ontology with validated write-back | Object types, links, actions | The pieces exist but there's no app-builder — you'd hand-build a frontend | Differentiator is 80% there and invisible |
 | **Security / compliance** | Can it hold regulated data? | SSO, ACLs, RLS, markings, audit | *Selling* persona now — SSO, per-object/dataset ACLs, RLS+masking, marking propagation, per-workspace isolation are real and reviewed | Pleasantly surprised; a reason to say yes |
 | **OSS evaluator / small team** | `pip install`, kick tires, self-host | The demo, local-first story | Docs are architecture-oriented, no task tutorials | Converts easily if onboarding lands |

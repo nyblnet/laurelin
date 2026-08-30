@@ -155,9 +155,19 @@ def test_locked_dataset_hidden_from_viewer_everywhere(admin, viewer):
     _lock_to_admin(admin, "secret_ds")
     names = {d["name"] for d in viewer.get("/api/v1/datasets").json()}
     assert names == {"public_ds"}
-    assert viewer.get("/api/v1/datasets/secret_ds").status_code == 403
-    assert viewer.get("/api/v1/datasets/secret_ds/rows").status_code == 403
-    assert viewer.get("/api/v1/datasets/secret_ds/schema").status_code == 403
+    # 404, not 403 — DELIBERATE tightening. A 403 confirmed the hidden
+    # dataset's existence to a name-probing viewer while the SQL path answered
+    # the same probe with "the table does not exist". Hidden must be
+    # indistinguishable from nonexistent on every surface.
+    for probe in ("secret_ds", "no_such_ds"):
+        assert viewer.get(f"/api/v1/datasets/{probe}").status_code == 404
+        assert viewer.get(f"/api/v1/datasets/{probe}/rows").status_code == 404
+        assert viewer.get(f"/api/v1/datasets/{probe}/schema").status_code == 404
+    hidden = viewer.get("/api/v1/datasets/secret_ds")
+    missing = viewer.get("/api/v1/datasets/no_such_ds")
+    assert hidden.json()["detail"].replace("secret_ds", "X") == \
+        missing.json()["detail"].replace("no_such_ds", "X")
+    assert "access" not in hidden.text
 
 
 def test_query_respects_dataset_acl(admin, viewer):

@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from laurelin.core import metrics
-from laurelin.core.failure import Failure, FailureCode, Phase
+from laurelin.core.failure import Failure, FailureCode, Phase, is_first_party
 from laurelin.core.models import Role, ScheduleInfo, utcnow_iso
 
 log = logging.getLogger("laurelin.scheduler")
@@ -226,8 +226,23 @@ class Scheduler:
                 actor="scheduler",
             )
         except Exception as exc:  # noqa: BLE001 - any action failure
+            # Two different stories, told apart by where the raise lives.
+            # A *first-party* refusal here is the plan step saying the
+            # schedule's own definition cannot be honoured — "no transform
+            # produces 'ghost_dataset'" — which is DEFINITION_STALE: the
+            # stored instruction no longer (or never) matched the workspace.
+            # Recording it as TRANSFORM_FAILED made the UI blame "the
+            # pipeline's code" for a schedule that has no pipeline and no
+            # code, with no build record and no door to the real reason,
+            # which only ever existed as a save-time warning. Everything
+            # else (a pipeline file raising on import, a connector blowing
+            # up) keeps the TRANSFORM_FAILED classification.
+            first_party = is_first_party(exc)
             failure = Failure.from_exception(
-                exc, code=FailureCode.TRANSFORM_FAILED, phase=Phase.execute,
+                exc,
+                code=(FailureCode.DEFINITION_STALE if first_party
+                      else FailureCode.TRANSFORM_FAILED),
+                phase=Phase.plan if first_party else Phase.execute,
                 subject=f"schedule:{schedule.name}", driver="python",
             )
             store.record_schedule_run(

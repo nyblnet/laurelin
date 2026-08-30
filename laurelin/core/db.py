@@ -2263,6 +2263,10 @@ class MetadataStore:
         limit: int = 100,
         role: Role = Role.admin,
         actor: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        actor_filter: Optional[str] = None,
+        action: Optional[str] = None,
     ) -> list[AuditEvent]:
         """Audit rows, each carrying the level its writer declared.
 
@@ -2311,6 +2315,23 @@ class MetadataStore:
             allowed = [r.value for r in Role if Role(role).covers(r)]
             where = f"WHERE min_read_role IN ({', '.join('?' for _ in allowed)})"
             params = list(allowed)
+        # S4 filters: pure ANDs appended AFTER the visibility clause, so a
+        # filter narrows what the role may read and can never widen it.
+        # `since`/`until` are inclusive dates compared against the timestamp's
+        # date prefix (SUBSTR works on both SQLite and Postgres); the params
+        # are bound, never rendered.
+        if since is not None:
+            where += " AND SUBSTR(timestamp, 1, 10) >= ?"
+            params.append(since)
+        if until is not None:
+            where += " AND SUBSTR(timestamp, 1, 10) <= ?"
+            params.append(until)
+        if actor_filter is not None:
+            where += " AND actor = ?"
+            params.append(actor_filter)
+        if action is not None:
+            where += " AND action = ?"
+            params.append(action)
         params.append(limit)
         with self._conn() as c:
             rows = c.execute(

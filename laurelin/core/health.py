@@ -149,6 +149,7 @@ class HealthService:
         # Schedules that target this dataset. Build schedules with an empty
         # target list build everything, so they target every dataset.
         overdue = False
+        schedule_failed: list[ScheduleInfo] = []
         last_scheduled_run_at = None
         for sched in schedules:
             if not sched.enabled:
@@ -167,6 +168,18 @@ class HealthService:
             if self._schedule_overdue(sched, now):
                 overdue = True
                 detail.setdefault("overdue_schedules", []).append(sched.name)
+            # S3: a schedule whose last firing failed *before a build existed*
+            # (a plan refusal — nothing to queue, so no build task ever
+            # carries it) used to leave this rollup all-clear while the
+            # Schedules page showed the row red. Schedule *names* are
+            # editor-and-above, so they ride `detail` exactly like
+            # overdue_schedules; a viewer learns "failing", not which
+            # schedule. Failures that DID queue a build are already counted
+            # through the dataset's latest build task, so this looks only at
+            # the recorded firing outcome.
+            if sched.action == "build" and sched.last_status == "failed":
+                schedule_failed.append(sched)
+                detail.setdefault("schedule_run_failed", []).append(sched.name)
 
         sync_failing = source is not None and source.last_sync_status == "failed"
         if source is not None:
@@ -180,6 +193,13 @@ class HealthService:
         )
         if task_failed:
             failure = task.failure or latest_task.get("build_failure")
+        elif schedule_failed and schedule_failed[0].last_failure is not None:
+            # Re-subjected like the sync branch below, and for the same
+            # reason: `last_failure` is PRESENTATION and its stored subject
+            # is "schedule:<name>" — a schedule name a viewer must not read.
+            failure = schedule_failed[0].last_failure.model_copy(
+                update={"subject": f"dataset:{name}"}
+            )
         elif sync_failing and source.last_sync_failure is not None:
             # Re-subjected: the recorded failure's subject is "source:<name>",
             # and a source *name* is editor-and-above on this record (it rides
@@ -200,7 +220,7 @@ class HealthService:
             # promise, and a promise nobody has kept yet is not "unknown".
             stale = success_dt is None or (now - success_dt) > timedelta(seconds=fresh_within)
 
-        if task_failed or exp_error or sync_failing:
+        if task_failed or exp_error or sync_failing or schedule_failed:
             status = HealthStatus.failing
         elif overdue:
             status = HealthStatus.overdue

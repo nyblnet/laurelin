@@ -1,26 +1,36 @@
 // Admin view: user + role management and API token management. Admin-only —
 // the router gates this route, but every mutating control also degrades
 // gracefully and the server is the real authority.
+//
+// The page is long (a dozen sections), so it carries its own in-page table of
+// contents — sticky, anchor-per-section — and a dataset-name filter that
+// narrows the three per-dataset card lists (Dataset access, Row & column
+// security, Classification markings) at once. Deep links carry search params
+// (`#/admin?dataset=flights&section=access`), because with hash routing a
+// second `#` fragment does not exist.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { API, ApiError, api } from "../api";
 import { useAuth } from "../auth";
-import type { ApiToken, Role, User } from "../types";
+import type { ApiToken, Role, User, WorkspaceSummary } from "../types";
 import {
   Badge,
   DataTable,
   EmptyState,
   ErrorBox,
+  Modal,
   PageHeader,
   Spinner,
   fmtTime,
   type Column,
 } from "../ui";
+import { apiPut } from "./admin/shared";
 import { ApprovalsSection } from "./admin/ApprovalsSection";
 import { ApprovalSettingsCard } from "./admin/ApprovalSettingsCard";
 import { AlertsSection } from "./admin/AlertsSection";
@@ -50,20 +60,123 @@ function InlineError({ err }: { err: unknown }) {
   );
 }
 
+// ----------------------------------------------------------------- contents
+//
+// One row per rendered section, in render order. `datasetScoped` marks the
+// three card lists the dataset filter narrows.
+
+export const ADMIN_SECTIONS: {
+  id: string;
+  label: string;
+  datasetScoped?: boolean;
+}[] = [
+  { id: "users", label: "Users" },
+  { id: "tokens", label: "API tokens" },
+  { id: "approvals", label: "Approvals" },
+  { id: "groups", label: "Groups" },
+  { id: "ontology-access", label: "Ontology access" },
+  { id: "access", label: "Dataset access", datasetScoped: true },
+  { id: "security", label: "Row & column security", datasetScoped: true },
+  { id: "markings", label: "Markings", datasetScoped: true },
+  { id: "engines", label: "Delegated engines" },
+  { id: "alerts", label: "Alerts" },
+  { id: "files", label: "File security" },
+  { id: "portability", label: "Portability" },
+];
+
+function scrollToSection(id: string) {
+  document.getElementById(`admin-${id}`)?.scrollIntoView({ block: "start" });
+}
+
+function AdminToc({
+  datasetFilter,
+  onFilterChange,
+}: {
+  datasetFilter: string;
+  onFilterChange: (v: string) => void;
+}) {
+  return (
+    <nav
+      aria-label="Admin sections"
+      className="admin-toc"
+      style={{
+        position: "sticky",
+        top: 0,
+        zIndex: 5,
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        flexWrap: "wrap",
+        padding: "8px 0",
+        marginBottom: 16,
+        background: "var(--bg-0)",
+        borderBottom: "1px solid var(--border)",
+      }}
+    >
+      {ADMIN_SECTIONS.map((s) => (
+        <button
+          key={s.id}
+          type="button"
+          className="small"
+          onClick={() => scrollToSection(s.id)}
+        >
+          {s.label}
+        </button>
+      ))}
+      <span style={{ flex: 1 }} />
+      <div className="field" style={{ margin: 0 }}>
+        <label htmlFor="admin-dataset-filter" className="faint" style={{ fontSize: 11 }}>
+          Filter dataset cards
+        </label>
+        <input
+          id="admin-dataset-filter"
+          className="mono"
+          placeholder="dataset name"
+          value={datasetFilter}
+          onChange={(e) => onFilterChange(e.target.value)}
+          style={{ width: 180 }}
+        />
+      </div>
+    </nav>
+  );
+}
+
 // --------------------------------------------------------------- users
 
 function CreateUserPanel({ onCreated }: { onCreated: () => void }) {
+  const auth = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<Role>("viewer");
+  const [wsSlug, setWsSlug] = useState("");
+
+  // In multi-workspace mode a fresh account is a door to nowhere until it is
+  // a member of some workspace — so membership is offered at creation rather
+  // than as a second trip through Workspaces → Manage members. Listing
+  // workspaces is a control-plane (superadmin) call, hence the gate.
+  const offerMembership = auth.multi && auth.isSuperadmin;
+  const wsQuery = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => api.get<WorkspaceSummary[]>(`${API}/workspaces`),
+    enabled: offerMembership,
+  });
 
   const create = useMutation({
-    mutationFn: () =>
-      api.post<User>(`${API}/users`, { username, password, role }),
+    mutationFn: async () => {
+      const user = await api.post<User>(`${API}/users`, { username, password, role });
+      if (offerMembership && wsSlug) {
+        await apiPut<unknown>(
+          `/workspaces/${encodeURIComponent(wsSlug)}/members`,
+          { username: user.username, role },
+        );
+      }
+      return user;
+    },
     onSuccess: () => {
       setUsername("");
       setPassword("");
       setRole("viewer");
+      setWsSlug("");
       onCreated();
     },
   });
@@ -76,8 +189,9 @@ function CreateUserPanel({ onCreated }: { onCreated: () => void }) {
     <div className="card" style={{ marginTop: 12 }}>
       <div style={{ fontWeight: 600, marginBottom: 12 }}>Create user</div>
       <div className="field">
-        <label>Username</label>
+        <label htmlFor="admin-new-username">Username</label>
         <input
+          id="admin-new-username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           placeholder="jdoe"
@@ -85,8 +199,9 @@ function CreateUserPanel({ onCreated }: { onCreated: () => void }) {
         />
       </div>
       <div className="field">
-        <label>Password</label>
+        <label htmlFor="admin-new-password">Password</label>
         <input
+          id="admin-new-password"
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -97,8 +212,12 @@ function CreateUserPanel({ onCreated }: { onCreated: () => void }) {
         </div>
       </div>
       <div className="field">
-        <label>Role</label>
-        <select value={role} onChange={(e) => setRole(e.target.value as Role)}>
+        <label htmlFor="admin-new-role">Role</label>
+        <select
+          id="admin-new-role"
+          value={role}
+          onChange={(e) => setRole(e.target.value as Role)}
+        >
           {ROLES.map((r) => (
             <option key={r} value={r}>
               {r}
@@ -106,6 +225,28 @@ function CreateUserPanel({ onCreated }: { onCreated: () => void }) {
           ))}
         </select>
       </div>
+      {offerMembership && (
+        <div className="field">
+          <label htmlFor="admin-new-workspace">Workspace membership</label>
+          <select
+            id="admin-new-workspace"
+            value={wsSlug}
+            onChange={(e) => setWsSlug(e.target.value)}
+          >
+            <option value="">— none yet —</option>
+            {(wsQuery.data ?? []).map((w) => (
+              <option key={w.slug} value={w.slug}>
+                {w.slug}
+              </option>
+            ))}
+          </select>
+          <div className="hint">
+            Adds the new user to this workspace with the same role. Without a
+            membership they cannot enter any workspace until one is granted in
+            Workspaces → Manage members.
+          </div>
+        </div>
+      )}
       <button
         className="button primary"
         disabled={!canSubmit}
@@ -245,7 +386,7 @@ function UsersSection({ me }: { me: User | null }) {
       {usersQuery.isLoading ? (
         <Spinner />
       ) : usersQuery.error ? (
-        <ErrorBox error={usersQuery.error} />
+        <ErrorBox error={usersQuery.error} onRetry={() => usersQuery.refetch()} />
       ) : usersQuery.data && usersQuery.data.length > 0 ? (
         <DataTable
           columns={columns}
@@ -299,25 +440,23 @@ function TokenCreatedModal({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ fontSize: 16, marginBottom: 8 }}>API token created</h2>
-        <div className="token-value">{token}</div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button className="button" onClick={copy}>
-            {copied ? "Copied" : "Copy"}
-          </button>
-        </div>
-        <div className="hint bad" style={{ marginTop: 12 }}>
-          Copy it now — you won't see this token again.
-        </div>
-        <div style={{ marginTop: 16 }}>
-          <button className="button primary" onClick={onClose}>
-            Done
-          </button>
-        </div>
+    <Modal label="API token created" onClose={onClose}>
+      <h2 style={{ fontSize: 16, marginBottom: 8 }}>API token created</h2>
+      <div className="token-value">{token}</div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <button className="button" onClick={copy}>
+          {copied ? "Copied" : "Copy"}
+        </button>
       </div>
-    </div>
+      <div className="hint bad" style={{ marginTop: 12 }}>
+        Copy it now — you won't see this token again.
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <button className="button primary" onClick={onClose}>
+          Done
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -341,8 +480,9 @@ function CreateTokenPanel({ onCreated }: { onCreated: (token: string) => void })
     <div className="card" style={{ marginTop: 12 }}>
       <div style={{ fontWeight: 600, marginBottom: 12 }}>Create token</div>
       <div className="field">
-        <label>Name</label>
+        <label htmlFor="admin-new-token-name">Name</label>
         <input
+          id="admin-new-token-name"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="ci-pipeline"
@@ -417,7 +557,7 @@ function TokensSection() {
       {tokensQuery.isLoading ? (
         <Spinner />
       ) : tokensQuery.error ? (
-        <ErrorBox error={tokensQuery.error} />
+        <ErrorBox error={tokensQuery.error} onRetry={() => tokensQuery.refetch()} />
       ) : tokensQuery.data && tokensQuery.data.length > 0 ? (
         <DataTable
           columns={columns}
@@ -447,6 +587,24 @@ function TokensSection() {
 export function AdminView() {
   const auth = useAuth();
   const me = auth.user;
+  const [searchParams] = useSearchParams();
+
+  // Deep links: `?dataset=flights` pre-fills the card filter; `?section=access`
+  // scrolls there. A dataset link with no section means "the access question",
+  // so it lands on Dataset access.
+  const [datasetFilter, setDatasetFilter] = useState(
+    () => searchParams.get("dataset") ?? "",
+  );
+  useEffect(() => {
+    const section =
+      searchParams.get("section") ??
+      (searchParams.get("dataset") ? "access" : null);
+    if (!section) return;
+    // After first paint, so the sections exist to scroll to.
+    const t = window.setTimeout(() => scrollToSection(section), 50);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div>
@@ -459,22 +617,47 @@ export function AdminView() {
         <ErrorBox error={new ApiError(403, "Admin access required")} />
       ) : (
         <>
-          <UsersSection me={me} />
-          <TokensSection />
+          <AdminToc datasetFilter={datasetFilter} onFilterChange={setDatasetFilter} />
+          <div id="admin-users">
+            <UsersSection me={me} />
+          </div>
+          <div id="admin-tokens">
+            <TokensSection />
+          </div>
           {/* The inbox sits above the sections whose writes it gates, with its
               mode toggle attached, so "why did my grant queue?" has its answer
               one scroll up. */}
-          <ApprovalsSection />
-          <ApprovalSettingsCard />
-          <GroupsSection />
-          <OntologyAccessSection />
-          <DatasetAccessSection />
-          <DataSecuritySection />
-          <MarkingsSection />
-          <EnginesSection />
-          <AlertsSection />
-          <FileSecuritySection />
-          <PortabilitySection />
+          <div id="admin-approvals">
+            <ApprovalsSection />
+            <ApprovalSettingsCard />
+          </div>
+          <div id="admin-groups">
+            <GroupsSection />
+          </div>
+          <div id="admin-ontology-access">
+            <OntologyAccessSection />
+          </div>
+          <div id="admin-access">
+            <DatasetAccessSection filter={datasetFilter} />
+          </div>
+          <div id="admin-security">
+            <DataSecuritySection filter={datasetFilter} />
+          </div>
+          <div id="admin-markings">
+            <MarkingsSection filter={datasetFilter} />
+          </div>
+          <div id="admin-engines">
+            <EnginesSection />
+          </div>
+          <div id="admin-alerts">
+            <AlertsSection />
+          </div>
+          <div id="admin-files">
+            <FileSecuritySection />
+          </div>
+          <div id="admin-portability">
+            <PortabilitySection />
+          </div>
         </>
       )}
     </div>

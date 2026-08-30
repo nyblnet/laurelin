@@ -327,7 +327,15 @@ export function OntologyAccessSection() {
           />
         ))
       ) : (
-        <EmptyState>No object types defined.</EmptyState>
+        // Rule E4: an empty state that describes a capability must name its
+        // mechanism, not dead-end. Object types are authored in the
+        // workspace's YAML, not in this UI.
+        <EmptyState>
+          No object types defined. Object types are defined in{" "}
+          <span className="mono">ontology/*.yml</span> in the workspace — see
+          the tutorial at{" "}
+          <span className="mono">docs/tutorials/02-ontology-and-actions.md</span>.
+        </EmptyState>
       )}
     </section>
   );

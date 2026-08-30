@@ -14,9 +14,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AuthContext } from "../../laurelin/ui/webapp/src/auth";
-import { DatasetOpenIn } from "../../laurelin/ui/webapp/src/views/Datasets";
+import { DatasetOpenIn, DatasetsView } from "../../laurelin/ui/webapp/src/views/Datasets";
+import { SourcesSection } from "../../laurelin/ui/webapp/src/views/Sources";
 import { DashboardsView } from "../../laurelin/ui/webapp/src/views/Dashboards";
-import { ExploreView } from "../../laurelin/ui/webapp/src/views/Explore";
+import { AnalysesView } from "../../laurelin/ui/webapp/src/views/Analyses";
 import { FlowsView } from "../../laurelin/ui/webapp/src/views/Flows";
 
 const out: Record<string, unknown> = {};
@@ -119,14 +120,34 @@ const seedOps = (qc: QueryClient) =>
 out.dashboard_page_editor = mount(dashboardsApp, "editor", "/dashboards/ops", seedOps);
 out.dashboard_page_viewer = mount(dashboardsApp, "viewer", "/dashboards/ops", seedOps);
 
-// --------------------------------------------------------- explore ?dataset=
+// ------------------------------------------- quick chart ?dataset= + landing
 
-// Opened from a dataset's "Open in Explore" door, the named dataset is the
-// active source — not the resumed draft, not an empty screen.
+// The views own nested <Routes>; mount under the wildcard as App.tsx does.
+const analysesApp = (
+  <Routes>
+    <Route path="/analyses/*" element={<AnalysesView />} />
+  </Routes>
+);
+
+// Opened from a dataset's "chart it" door (via the /explore redirect), the
+// named dataset is the active source on the merged quick-chart surface — not
+// the resumed draft, not an empty screen.
 store.clear();
-out.explore_preset = mount(
-  <ExploreView />, "editor", "/explore?dataset=flights",
+out.quick_chart_preset = mount(
+  analysesApp, "editor", "/analyses?mode=chart&dataset=flights",
   (qc) => qc.setQueryData(["datasets"], [{ name: "orders" }, { name: "flights" }]),
+);
+
+// The landing page is the disambiguation: both entries, each naming its job.
+store.clear();
+out.analyses_landing = mount(
+  analysesApp, "editor", "/analyses",
+  (qc) => qc.setQueryData(["analyses"], []),
+);
+store.clear();
+out.analyses_landing_viewer = mount(
+  analysesApp, "viewer", "/analyses",
+  (qc) => qc.setQueryData(["analyses"], []),
 );
 
 // ------------------------------------------------------- pipelines ?from=
@@ -145,6 +166,51 @@ out.pipelines_from = mount(
 out.pipelines_plain = mount(
   pipelinesApp, "editor", "/pipelines",
   (qc) => qc.setQueryData(["flows"], []),
+);
+
+// -------------------------------------------------- data screens (Datasets)
+
+// The Data sources section's empty state, per role: an editor is told the
+// gate ("requires an admin"), an admin is told the action.
+out.sources_empty_editor = mount(
+  <SourcesSection />, "editor", "/datasets",
+  (qc) => qc.setQueryData(["sources"], []),
+);
+out.sources_empty_admin = mount(
+  <SourcesSection />, "admin", "/datasets",
+  (qc) => qc.setQueryData(["sources"], []),
+);
+
+// A managed dataset with no versions yet: an empty state, not a red error box.
+const datasetsApp = (
+  <Routes>
+    <Route path="/datasets/*" element={<DatasetsView />} />
+  </Routes>
+);
+out.dataset_detail_empty = mount(
+  datasetsApp, "editor", "/datasets/newborn",
+  (qc) =>
+    qc.setQueryData(["dataset", "newborn"], {
+      name: "newborn",
+      description: "",
+      kind: "managed",
+      versions: [],
+      latest_version: null,
+      created_at: "2026-08-30T00:00:00Z",
+    }),
+);
+
+// The Datasets LIST when it is empty, per role. The editor's empty state
+// sells the import path; the viewer's must not — every door it named
+// ("import a file above", the quick chart) is role-hidden from a viewer,
+// and "No datasets yet" is a false absence when datasets exist withheld.
+out.datasets_list_empty_editor = mount(
+  datasetsApp, "editor", "/datasets",
+  (qc) => qc.setQueryData(["datasets"], []),
+);
+out.datasets_list_empty_viewer = mount(
+  datasetsApp, "viewer", "/datasets",
+  (qc) => qc.setQueryData(["datasets"], []),
 );
 
 process.stdout.write(JSON.stringify(out));

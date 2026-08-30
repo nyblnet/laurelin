@@ -14,9 +14,9 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { ApiError, api, API } from "../api";
 import type { PipelineFileContent, PipelineFileInfo, PipelineWriteResult } from "../types";
 import { useAuth } from "../auth";
-import { EmptyState, ErrorBox, FailureNote, Note, PageHeader, Spinner } from "../ui";
+import { EmptyState, ErrorBox, FailureNote, NAME_RULE_NO_HYPHEN, Note, PageHeader, Spinner } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
-import { PipelinesTabs } from "./Pipelines";
+import { PIPELINES_SUBTITLE, PipelinesTabs } from "./Pipelines";
 
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -152,6 +152,12 @@ export function TransformsView() {
   }, [ready, contentQ.data, buffer?.name]);
 
   function openFile(info: PipelineFileInfo) {
+    // Re-selecting the open file must be a no-op. It used to blank the editor
+    // (setDoc("")) while contentQ's cached data — unchanged, so the effect
+    // that reloads the doc never re-fired — left the buffer empty, and the
+    // next Save wrote that emptiness over the real file. A click on the file
+    // you are already in is not a request to discard it.
+    if (buffer && !buffer.isNew && buffer.name === info.name) return;
     setSaveResult(null);
     saveMut.reset();
     setBuffer({ name: info.name, isNew: false });
@@ -165,7 +171,7 @@ export function TransformsView() {
     if (raw == null) return;
     const base = raw.trim().replace(/\.py$/, "");
     if (!NAME_RE.test(base)) {
-      window.alert("Invalid name. Use lowercase letters, digits and underscores, starting with a letter (e.g. aviation).");
+      window.alert(`Invalid name. ${NAME_RULE_NO_HYPHEN}`);
       return;
     }
     // Compare stems, not filenames. The API returns `name` as the bare module
@@ -189,7 +195,7 @@ export function TransformsView() {
     <div>
       <PageHeader
         title="Pipelines"
-        subtitle="Turn datasets into new datasets. This tab is the advanced surface: pipeline code in Python — @transform / @sql_transform. Build from the Builds page."
+        subtitle={PIPELINES_SUBTITLE}
         actions={
           canEdit ? (
             <button
@@ -234,9 +240,9 @@ export function TransformsView() {
           <p>
             An operator started it with <code>--lock-pipelines</code>, so pipeline files can be
             read here but only edited on disk (through git and review). This is the server&apos;s
-            posture, not your permissions. The <Link to="/pipelines">Visual</Link> tab and{" "}
-            <Link to="/explore">Explore</Link> remain available — they build the same kind of
-            transform without code.
+            posture, not your permissions. The <Link to="/pipelines">Visual</Link> tab and the
+            quick chart on <Link to="/analyses">Analyses</Link> remain available — they build the
+            same kind of transform without code.
           </p>
         </div>
       )}
@@ -339,7 +345,10 @@ export function TransformsView() {
                   className="danger"
                   disabled={!buffer || buffer.isNew || delMut.isPending}
                   onClick={() => {
-                    if (buffer && window.confirm(`Delete ${buffer.name}? This cannot be undone.`)) {
+                    // Same data-loss story as the Visual tab's delete: the
+                    // file goes, the datasets it built stay. Two tabs of one
+                    // screen must not give opposite signals for one action.
+                    if (buffer && window.confirm(`Delete the pipeline file ${buffer.name}? The datasets it built are kept, and so is their lineage.`)) {
                       delMut.mutate(buffer.name);
                     }
                   }}

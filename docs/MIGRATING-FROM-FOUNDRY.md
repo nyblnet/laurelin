@@ -87,7 +87,7 @@ Confirm all of these before mutating anything.
 | Ontology link type | Link type | `put_link_type` | Foreign-key style: `from_property` → `to_property`. |
 | Ontology action type | Action type | `put_action_type` | Kinds: `create`, `update`, `delete`. |
 | Object Storage V2 edits | Object index + writeback overlay | `build_object_index`, `enable_writeback` | **Current state only — Foundry edit history does not migrate.** |
-| Contour / Quiver analysis | Dashboard panel (`sql`, `object_type` or `flow`) | `upsert_dashboard`, `run_dashboard_panel` | Explore-style point-and-click analyses are flow panels. |
+| Contour / Quiver analysis | Dashboard panel (`sql`, `object_type` or `flow`) | `upsert_dashboard`, `run_dashboard_panel` | Quick-chart point-and-click analyses (the Analyses page) are flow panels. |
 | Markings / Organizations | Markings + user clearances | `create_marking`, `set_dataset_markings`, `set_user_clearances` | Markings propagate down lineage automatically. |
 | Project roles (Owner/Editor/Viewer…) | Global role (viewer/editor/admin) + groups + per-dataset grants | `create_user`, `create_group`, `set_group_members`, `set_dataset_grants`, `set_object_type_grants` | Lossy; map fail-closed. See § Hard translations. |
 | Restricted views / row policies | Dataset row policy + column masks | `set_dataset_policy` | Value-list rules per subject; masks: `null`/`redact`/`hash`. **Row-policy only datasets no flow reads** (§ 6.3): a row policy on a flow's source refuses that flow's builds and edits, fail-closed. |

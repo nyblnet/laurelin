@@ -49,7 +49,7 @@ export function AppsView() {
 
 function AppList() {
   const navigate = useNavigate();
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["apps"],
     queryFn: () => api.get<ObjectApp[]>(`${API}/apps`),
   });
@@ -78,16 +78,19 @@ function AppList() {
     <div>
       <PageHeader
         title="Apps"
-        subtitle="Focused views over the ontology — the objects, filters and actions for one job."
+        subtitle="Ready-made working screens — one kind of object, with just the columns, filters and actions for one job."
       />
       {isLoading && <Spinner />}
-      {error && <ErrorBox error={error} />}
+      {error && <ErrorBox error={error} onRetry={() => refetch()} />}
       {data &&
         (data.length === 0 ? (
           <EmptyState>
-            No apps yet. An admin can define one over any object type — pick the
-            columns that matter, scope it with filters, and surface just the
-            actions an operator needs.
+            No apps yet. An app is a trimmed-down screen over one object type
+            from the Ontology page — just the columns, filters and actions
+            someone needs for a job, like “Aircraft in maintenance”. Creating
+            one requires an admin, who defines it through the REST API (
+            <code>PUT /api/v1/apps/&lt;name&gt;</code> — the request shape is in{" "}
+            <code>docs/ARCHITECTURE.md</code>); there is no in-app editor yet.
           </EmptyState>
         ) : (
           <DataTable
@@ -111,7 +114,7 @@ function AppPage() {
   });
 
   if (appQ.isLoading) return <Spinner />;
-  if (appQ.isError) return <ErrorBox error={appQ.error} />;
+  if (appQ.isError) return <ErrorBox error={appQ.error} onRetry={() => appQ.refetch()} />;
   return <AppBody app={appQ.data!} selectedPk={pk ?? null} />;
 }
 
@@ -120,6 +123,17 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
   const debounced = useDebounced(search, 250);
+
+  // Reset paging when the search changes — during render, before the query
+  // fires. Resetting in the input's onChange (the old shape) raced the
+  // debounce: offset hit the query key immediately while the search string
+  // arrived 250ms later, so a page-2 search cost an extra request for page 1
+  // of the OLD search on every first keystroke.
+  const [searchApplied, setSearchApplied] = useState(debounced);
+  if (debounced !== searchApplied) {
+    setSearchApplied(debounced);
+    setOffset(0);
+  }
 
   // The object type carries the property/action/link definitions; the app
   // only narrows which of them to show.
@@ -145,10 +159,13 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
         `${API}/apps/${encodeURIComponent(app.name)}/objects?limit=${PAGE}&offset=${offset}` +
           (debounced ? `&search=${encodeURIComponent(debounced)}` : ""),
       ),
+    // Keep the previous page visible (dimmed) while the next loads, so the
+    // pager and the table never unmount under the user mid-pagination.
+    placeholderData: (prev) => prev,
   });
 
   if (typeQ.isLoading) return <Spinner />;
-  if (typeQ.isError) return <ErrorBox error={typeQ.error} />;
+  if (typeQ.isError) return <ErrorBox error={typeQ.error} onRetry={() => typeQ.refetch()} />;
   const type = typeQ.data!;
 
   // Empty config means "everything the type declares" — an app narrows, it
@@ -210,11 +227,9 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
 
       <div className="toolbar">
         <input
+          type="search"
           value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setOffset(0);
-          }}
+          onChange={(e) => setSearch(e.target.value)}
           placeholder={app.search_placeholder || `Search ${type.display_name || type.api_name}…`}
           style={{ maxWidth: 320 }}
         />
@@ -228,40 +243,41 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
       {objectsQ.isLoading ? (
         <Spinner />
       ) : objectsQ.isError ? (
-        <ErrorBox error={objectsQ.error} />
+        <ErrorBox error={objectsQ.error} onRetry={() => objectsQ.refetch()} />
       ) : objectsQ.data!.objects.length === 0 ? (
-        <EmptyState>Nothing matches.</EmptyState>
+        debounced ? (
+          <EmptyState>
+            Nothing matches “{debounced}”.{" "}
+            <button type="button" className="small" onClick={() => setSearch("")}>
+              Clear the search
+            </button>
+          </EmptyState>
+        ) : (
+          <EmptyState>
+            Nothing here right now. This app shows only the objects that fit
+            its scope — when one does, it appears in this list.
+          </EmptyState>
+        )
       ) : (
-        <>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  {columns.map((c) => (
-                    <th key={c}>
-                      {type.properties[c]?.display_name || c}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {objectsQ.data!.objects.map((o: OntologyObject) => (
-                  <tr
-                    key={o.__pk}
-                    onClick={() => navigate(`/apps/${app.name}/${encodeURIComponent(o.__pk)}`)}
-                    className={o.__pk === selectedPk ? "selected" : undefined}
-                    style={{ cursor: "pointer" }}
-                  >
-                    {columns.map((c) => (
-                      <td key={c} className="mono">
-                        {fmtValue(o[c])}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        // DataTable rather than a raw table element: rows are controls (they open
+        // the object), and the primitive is what makes them tabbable and
+        // Enter/Space-activatable instead of mouse-only.
+        <div style={objectsQ.isFetching ? { opacity: 0.6 } : undefined}>
+          <DataTable
+            columns={columns.map(
+              (c): Column<OntologyObject> => ({
+                label: type.properties[c]?.display_name || c,
+                render: (o) => fmtValue(o[c]),
+                className: "mono",
+              }),
+            )}
+            rows={objectsQ.data!.objects}
+            rowKey={(o) => o.__pk}
+            onRowClick={(o) =>
+              navigate(`/apps/${app.name}/${encodeURIComponent(o.__pk)}`)
+            }
+            isSelected={(o) => o.__pk === selectedPk}
+          />
           <div className="pager">
             <button
               className="small"
@@ -282,7 +298,7 @@ function AppBody({ app, selectedPk }: { app: ObjectApp; selectedPk: string | nul
               {fmtCount(objectsQ.data!)}
             </span>
           </div>
-        </>
+        </div>
       )}
 
       {selectedPk && (
@@ -325,7 +341,7 @@ function SelectedObject({
       {objQ.isLoading ? (
         <Spinner />
       ) : objQ.isError ? (
-        <ErrorBox error={objQ.error} />
+        <ErrorBox error={objQ.error} onRetry={() => objQ.refetch()} />
       ) : (
         <div className="card" style={{ marginBottom: 18 }}>
           <dl

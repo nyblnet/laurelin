@@ -267,7 +267,7 @@ Be clear-eyed about these. They are design consequences, not oversights:
 
    Editors are trusted with code execution only where Python authoring is
    enabled. With `--lock-pipelines`, editors can still author **flows and
-   Explore charts** — no-code artifacts that compile to bound,
+   Analyses charts** — no-code artifacts that compile to bound,
    schema-checked SQL, are governance-checked against their recorded author
    at every build, and cannot reach `exec` — while pipeline files are
    managed on disk. Ejecting a flow to Python writes a `.py`, so it is
@@ -365,7 +365,7 @@ A short checklist; details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - [ ] Terminate TLS at the ingress; run with `--secure-cookies`; ensure
       `X-Forwarded-Proto` reaches the app.
 - [ ] Set `--lock-pipelines` unless every editor is trusted with code
-      execution. Editors keep Flows and Explore — no-code authoring that
+      execution. Editors keep Flows and Analyses charts — no-code authoring that
       cannot reach `exec` — which is the intended production posture; add
       `--lock-flows` only if you want no authoring surface at all.
 - [ ] Use PostgreSQL for the control plane in any multi-replica deployment,

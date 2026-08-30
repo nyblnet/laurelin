@@ -67,7 +67,7 @@ governs the table without holding it, and you reduce at the boundary.
 - **Not a multi-tenant SaaS with hostile tenants.** Pipelines are Python the
   server executes; an editor who can write a pipeline has code execution.
   `--lock-pipelines` exists for exactly this — and editors keep Flows and
-  Explore, no-code authoring that cannot reach `exec` — but the honest
+  Analyses charts, no-code authoring that cannot reach `exec` — but the honest
   posture is: editors are trusted colleagues. See
   [SECURITY.md](../SECURITY.md).
 - **Not battle-tested.** It is early. It has 3,132 tests, run against both

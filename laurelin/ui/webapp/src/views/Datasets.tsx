@@ -30,9 +30,11 @@ import {
   RedactedValue,
   Spinner,
   WithheldBox,
+  NAME_RULE_NO_HYPHEN,
   fmtNum,
   fmtTime,
   fmtValue,
+  truncationNote,
 } from "../ui";
 import { SourcesSection } from "./Sources";
 import { IcebergManager } from "./IcebergManager";
@@ -127,12 +129,25 @@ function DatasetList() {
       {error && <ErrorBox error={error} />}
       {data &&
         (data.length === 0 ? (
+          !auth.can("editor") ? (
+            // A viewer's empty list is not "no datasets yet": datasets may
+            // exist and be withheld, and every door the editor branch names
+            // (the import panel, the quick chart) is role-hidden from this
+            // reader — phantom doors on a false absence. The honest form is
+            // the Audit page's: say what the reader could have seen.
+            <EmptyState>
+              No datasets you can read. Datasets shared with your role appear
+              here; ask an editor or an administrator for access.
+            </EmptyState>
+          ) : (
           <EmptyState>
             No datasets yet — import a file above to make one.
             {/* First-run next steps: three plain links, role-filtered like the
                 nav. No modal tours, no checklists. */}
             <div style={{ marginTop: 8 }}>
-              Then: chart it in <Link to="/analyses">Analyses</Link>
+              {/* Every "chart it" string in the product points at the same
+                  door: the quick-chart entry of the merged Analyses page. */}
+              Then: chart it in <Link to="/analyses?mode=chart">Analyses</Link>
               {auth.can("editor") && (
                 <>
                   {" "}· clean it with a <Link to="/pipelines">Pipeline</Link>
@@ -156,6 +171,7 @@ function DatasetList() {
               .
             </div>
           </EmptyState>
+          )
         ) : (
           <DataTable
             columns={columns}
@@ -189,6 +205,16 @@ function ImportPanel() {
   const [dragging, setDragging] = useState(false);
 
   const canEdit = user?.role === "editor" || user?.role === "admin";
+
+  // Same cache key as the list this panel sits above, so this costs no extra
+  // request. It exists to catch a name collision BEFORE the upload: importing
+  // under an existing name silently became "version N+1 of that dataset",
+  // which repurposes an identity the user may not have meant to touch.
+  const existingQ = useQuery({
+    queryKey: ["datasets"],
+    queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
+    enabled: canEdit,
+  });
 
   const previewM = useMutation({
     mutationFn: (f: File) => {
@@ -236,6 +262,7 @@ function ImportPanel() {
 
   const preview = previewM.data;
   const nameValid = /^[a-z][a-z0-9_]*$/.test(name);
+  const collided = existingQ.data?.find((d) => d.name === name);
 
   return (
     <div className="card" style={{ marginBottom: 24 }}>
@@ -258,10 +285,25 @@ function ImportPanel() {
           <p>Drop a CSV or Parquet file here</p>
           <label className="link-button">
             or choose a file
+            {/* Visually hidden, NOT display:none: a display:none input is out
+                of the tab order, which made the whole import flow
+                mouse-only — and made .link-button:focus-within unreachable.
+                This keeps the input focusable so Tab + Enter opens the
+                picker. */}
             <input
               type="file"
               accept=".csv,.parquet"
-              style={{ display: "none" }}
+              style={{
+                position: "absolute",
+                width: 1,
+                height: 1,
+                padding: 0,
+                margin: -1,
+                overflow: "hidden",
+                clip: "rect(0 0 0 0)",
+                whiteSpace: "nowrap",
+                border: 0,
+              }}
               onChange={(e) => choose(e.target.files?.[0])}
             />
           </label>
@@ -297,13 +339,28 @@ function ImportPanel() {
                   disabled={!nameValid || importM.isPending}
                   onClick={() => importM.mutate({ f: file, target: name })}
                 >
-                  {importM.isPending ? "Importing…" : "Import"}
+                  {importM.isPending
+                    ? "Importing…"
+                    : collided
+                      ? `Add v${(collided.latest_version ?? 0) + 1} to existing "${name}"`
+                      : "Import"}
                 </button>
               </div>
               {!nameValid && (
                 <p className="hint" style={{ marginTop: 0 }}>
-                  Lowercase letters, digits and underscores; must start with a
-                  letter.
+                  {NAME_RULE_NO_HYPHEN}
+                </p>
+              )}
+              {/* Importing under an existing name is a decision about that
+                  dataset's identity, not a naming accident — so it is stated
+                  on the button itself, never done silently. */}
+              {collided && (
+                <p className="hint" style={{ marginTop: 0 }}>
+                  A dataset named <span className="mono">{name}</span> already
+                  exists. Importing will add version{" "}
+                  {(collided.latest_version ?? 0) + 1} to it rather than create
+                  a new dataset — pick another name if that is not what you
+                  mean.
                 </p>
               )}
               <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 8px" }}>
@@ -324,7 +381,10 @@ function ImportPanel() {
                 {preview.columns.length === 1 ? "" : "s"}, showing{" "}
                 {preview.sampled_rows} row
                 {preview.sampled_rows === 1 ? "" : "s"}
-                {preview.truncated ? " (first of more)" : ""} — types inferred
+                {preview.truncated
+                  ? ` (${truncationNote(preview.sampled_rows)})`
+                  : ""}{" "}
+                — types inferred
                 from the file.
               </p>
 
@@ -367,6 +427,15 @@ function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * In-page hop between the two ingest doors. A plain href can't do this under
+ * hash routing (`#/datasets#data-sources` is a route, not an anchor), so the
+ * cross-links scroll instead.
+ */
+export function jumpToSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 // --------------------------------------------------------------- federated
@@ -456,16 +525,26 @@ function FederatedPanel() {
 
   if (!open) {
     return (
-      <div style={{ margin: "0 0 24px" }}>
+      <div id="external-table" style={{ margin: "0 0 24px" }}>
         <button className="small" onClick={() => setOpen(true)}>
           Register an external table…
         </button>
+        {/* The other ingest door, named up front: the two look alike until
+            the data is stale, and by then the choice was already made. */}
+        <span className="hint" style={{ marginLeft: 10 }}>
+          scans a table in place, copying nothing — to <em>copy</em> external
+          data in on each sync, add a connector under{" "}
+          <button className="link-button" onClick={() => jumpToSection("data-sources")}>
+            Data sources
+          </button>{" "}
+          below.
+        </span>
       </div>
     );
   }
 
   return (
-    <div className="card" style={{ marginBottom: 24 }}>
+    <div id="external-table" className="card" style={{ marginBottom: 24 }}>
       <div className="toolbar" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
         <label style={{ marginBottom: 0 }}>Register an external table</label>
         <button className="small" onClick={() => setOpen(false)}>Cancel</button>
@@ -473,7 +552,13 @@ function FederatedPanel() {
       <p className="hint" style={{ marginTop: 4 }}>
         A table Laurelin governs and scans where it already lives — it isn't
         copied, and it has no versions. Which engine does the scanning depends on
-        the kind you pick; the ACLs and policies are the same either way.
+        the kind you pick; the ACLs and policies are the same either way. To{" "}
+        <em>copy</em> external data into a versioned dataset on each sync, use a
+        connector under{" "}
+        <button className="link-button" onClick={() => jumpToSection("data-sources")}>
+          Data sources
+        </button>{" "}
+        below instead.
       </p>
 
       <div className="toolbar" style={{ gap: 12, flexWrap: "wrap", marginTop: 8 }}>
@@ -585,8 +670,8 @@ function FederatedPanel() {
  * new user successfully did stranded them.
  *
  * Same filter as the nav: a door renders only when the caller's role passes
- * the target's `needs` (Explore, Pipelines and Schedules are editor-gated;
- * SQL is the one authoring-adjacent surface a viewer can use). No
+ * the target's `needs` (Analyses quick chart, Pipelines and Schedules are
+ * editor-gated; SQL is the one authoring-adjacent surface a viewer can use). No
  * permissions/grants display for non-admins — revealing restriction-existence
  * to editors is a governance decision the attack passes have not reviewed —
  * so the admin door is one link to the Admin page, nothing more.
@@ -602,8 +687,8 @@ export function DatasetOpenIn({ name }: { name: string }) {
     >
       <span className="faint" style={{ fontSize: 12.5 }}>Open in:</span>
       {canEdit && (
-        <Link to={`/explore?dataset=${ds}`} title="Shape this dataset into a chart by clicking, then save it to a dashboard">
-          Explore — chart it
+        <Link to={`/analyses?mode=chart&dataset=${ds}`} title="Shape this dataset into a chart by clicking, then save it to a dashboard">
+          Analyses — chart it
         </Link>
       )}
       <Link to={`/workbench?dataset=${ds}`} title="Query this dataset with SQL">
@@ -614,13 +699,20 @@ export function DatasetOpenIn({ name }: { name: string }) {
           New pipeline from this dataset
         </Link>
       )}
+      {/* Both doors carry which dataset the reader is looking at — the
+          receiving pages support the param (Admin prefills its Dataset-access
+          filter and scrolls; Schedules opens the editor with the target
+          ticked), and a bare link made the user re-find this dataset there. */}
       {canEdit && (
-        <Link to="/schedules" title="Build pipelines on a schedule">
+        <Link to={`/schedules?target=${ds}`} title="Build this dataset on a schedule">
           Schedule builds
         </Link>
       )}
       {auth.can("admin") && (
-        <Link to="/admin" title="Who can read this dataset — Admin → Dataset access">
+        <Link
+          to={`/admin?dataset=${ds}`}
+          title="Who can read this dataset — Admin → Dataset access"
+        >
           Dataset access
         </Link>
       )}
@@ -726,11 +818,22 @@ function DatasetDetailBody({ detail }: { detail: DatasetDetail }) {
       {!needsCredentials(detail) && (
         <>
           <h3>Row preview</h3>
-          <RowPreview
-            name={detail.name}
-            schema={schemaVersion?.schema}
-            atSource={atSource}
-          />
+          {/* A managed dataset with no versions has no rows to fetch, and the
+              rows endpoint answers 404 — which rendered here as a red error
+              box on a dataset that is merely NEW. An empty dataset is an
+              empty state, not a failure. */}
+          {!atSource && detail.latest_version == null ? (
+            <EmptyState>
+              No data yet — upload a file above, or point a pipeline at this
+              dataset.
+            </EmptyState>
+          ) : (
+            <RowPreview
+              name={detail.name}
+              schema={schemaVersion?.schema}
+              atSource={atSource}
+            />
+          )}
         </>
       )}
     </div>
@@ -1043,8 +1146,16 @@ function VersionHistory({ versions }: { versions: DatasetVersion[] }) {
     {
       label: "Build",
       className: "mono",
+      // The build id was dead text; `?build=` expands and scrolls to that
+      // build's card, so "where did v3 come from" is one click, not a hunt.
       render: (v) =>
-        v.build_id ? v.build_id : <span className="faint">—</span>,
+        v.build_id ? (
+          <Link to={`/builds?build=${encodeURIComponent(v.build_id)}`}>
+            {v.build_id}
+          </Link>
+        ) : (
+          <span className="faint">—</span>
+        ),
     },
   ];
   return (
@@ -1068,12 +1179,16 @@ function RowPreview({
   atSource?: boolean;
 }) {
   const [offset, setOffset] = useState(0);
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isFetching, refetch } = useQuery({
     queryKey: ["rows", name, offset],
     queryFn: () =>
       api.get<RowsPage>(
         `${API}/datasets/${name}/rows?limit=${PAGE_SIZE}&offset=${offset}`,
       ),
+    // Paging keeps the previous page on screen (dimmed) instead of
+    // unmounting the table and the pager under the cursor — the same
+    // stale-visible pattern the Explore/Analyses previews shipped with.
+    placeholderData: (prev) => prev,
   });
 
   if (isLoading) return <Spinner />;
@@ -1091,7 +1206,9 @@ function RowPreview({
       atSource && error instanceof ApiError && error.status >= 500;
     return (
       <>
-        <ErrorBox error={error} />
+        {/* Retries are cheap and the global query config never retries, so a
+            transient failure here was terminal until a full reload. */}
+        <ErrorBox error={error} onRetry={() => refetch()} />
         {opaque && (
           <p className="hint" style={{ marginTop: 0 }}>
             This table is scanned where it lives, so a failure here is usually
@@ -1117,7 +1234,7 @@ function RowPreview({
 
   return (
     <div>
-      <div className="table-wrap">
+      <div className="table-wrap" style={isFetching ? { opacity: 0.55 } : undefined}>
         <table>
           <thead>
             <tr>
@@ -1144,7 +1261,7 @@ function RowPreview({
       <div className="pager">
         <button
           className="small"
-          disabled={offset === 0}
+          disabled={isFetching || offset === 0}
           onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
         >
           Prev
@@ -1154,7 +1271,8 @@ function RowPreview({
           // For a federated dataset the total is unknown (row_count null), so
           // fall back to "was this page full?" — a short page means the end.
           disabled={
-            row_count == null ? rows.length < PAGE_SIZE : offset + rows.length >= row_count
+            isFetching ||
+            (row_count == null ? rows.length < PAGE_SIZE : offset + rows.length >= row_count)
           }
           onClick={() => setOffset(offset + PAGE_SIZE)}
         >

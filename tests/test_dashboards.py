@@ -919,3 +919,51 @@ def test_saving_an_explore_over_an_object_type_is_exactly_an_object_panel(object
     run = viewer.post("/api/v1/dashboards/exp/panels/o1/run", json={}).json()
     assert run["columns"] == ["status", "n"]
     assert run["rows"] == [{"status": "maintenance", "n": 2}]
+
+
+def test_a_panel_over_a_withheld_dataset_tells_the_viewer_access_not_breakage(clients):
+    """The DEFINITION_STALE brief told a viewer whose role simply cannot read
+    the panel's source that the panel "refers to something that no longer
+    exists; whoever can edit it can see which" — false three ways: the dataset
+    exists, nothing is broken, and an entitled colleague sees a working chart.
+    Access answers as access: an honest sentence naming NO dataset, with the
+    door that can actually help. The editor-and-above copy still carries the
+    refusal's own sentence, because they could have authored the panel."""
+    admin, viewer = clients
+    assert admin.put("/api/v1/dashboards/kpis",
+                     json={"title": "K", "panels": []}).status_code == 200
+    assert admin.post("/api/v1/dashboards/kpis/panels",
+                      json=FLOW_PANEL).status_code == 200
+    # Restrict the panel's source to the admin alone.
+    assert admin.put("/api/v1/datasets/sales/permissions", json={
+        "grants": [{"subject_kind": "user", "subject": "root",
+                    "can_view": True, "can_edit": True}]}).status_code == 200
+
+    r = viewer.post("/api/v1/dashboards/kpis/panels/f1/run", json={})
+    assert r.status_code == 403, r.text
+    assert "not shared with your role" in r.json()["detail"]
+    assert "no longer exists" not in r.text, "the false 'broken' story is back"
+    assert "sales" not in r.text, "the withheld dataset's name leaked"
+
+    # The admin (could author it) reads the refusal's own sentence and still
+    # gets rows on their own run.
+    mine = admin.post("/api/v1/dashboards/kpis/panels/f1/run", json={})
+    assert mine.status_code == 200, mine.text
+
+
+def test_a_panel_with_an_unaddressable_id_is_refused_at_write(clients):
+    """A panel id is a URL path segment: the per-panel run/update/delete
+    routes are `/panels/{id}/...`, so a stored empty id creates a panel whose
+    run 405s and whose Edit/✕ can never work — recovery needed a whole-board
+    PUT. Reject at both write doors (the incremental POST and the whole-board
+    PUT), before anything is stored."""
+    admin, _viewer = clients
+    assert admin.put("/api/v1/dashboards/ids",
+                     json={"title": "I", "panels": []}).status_code == 200
+    bad = {"id": "", "title": "big", "sql": "SELECT 1", "chart": "table"}
+    r = admin.post("/api/v1/dashboards/ids/panels", json=bad)
+    assert r.status_code == 400 and "panel id" in r.text
+    r = admin.put("/api/v1/dashboards/ids", json={"title": "I", "panels": [bad]})
+    assert r.status_code == 400 and "panel id" in r.text
+    # Nothing unaddressable was stored.
+    assert admin.get("/api/v1/dashboards/ids").json()["panels"] == []

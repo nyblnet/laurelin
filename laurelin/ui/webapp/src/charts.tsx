@@ -361,6 +361,21 @@ function numericAxis(
   return { labels: fLabels, values: fValues };
 }
 
+/** True when the caller's result already states an order the chart should
+ * keep: x labels sorted (either direction), or the first measure monotonic
+ * (either direction, nulls skipped). Anything else is the engine's arbitrary
+ * group-by order — not information, and not worth preserving. Two or fewer
+ * categories are always "ordered" (any two labels are sorted one way). */
+function looksOrdered(labels: string[], firstSeries: Cell[]): boolean {
+  const asc = [...labels].sort((a, b) => a.localeCompare(b));
+  if (labels.every((l, i) => l === asc[i])) return true;
+  if (labels.every((l, i) => l === asc[labels.length - 1 - i])) return true;
+  const vals = firstSeries.filter((v): v is number => v !== null);
+  const up = vals.every((v, i) => i === 0 || v >= vals[i - 1]);
+  const down = vals.every((v, i) => i === 0 || v <= vals[i - 1]);
+  return up || down;
+}
+
 export function Chart({
   data: raw,
   kind,
@@ -368,6 +383,7 @@ export function Chart({
   y = [],
   series = "",
   stacked = false,
+  keepOrder = false,
 }: {
   data: ChartData;
   kind: ChartKind;
@@ -375,6 +391,9 @@ export function Chart({
   y?: string[];
   series?: string;
   stacked?: boolean;
+  /** The caller vouches that the result's row order is deliberate (an ORDER
+   *  BY the user chose), so the categorical default sort must not apply. */
+  keepOrder?: boolean;
 }) {
   // Bindings first, then the series pivot: the pivot needs to know which
   // column is x and which holds the values.
@@ -429,10 +448,26 @@ export function Chart({
     0,
   );
 
-  if (xCol && rows.length > 1 && rows.every((r) => isNumeric(r[xCol]))) {
+  const numericX = !!xCol && rows.length > 1 && rows.every((r) => isNumeric(r[xCol]));
+  if (numericX && xCol) {
     const na = numericAxis(labels, values, rows.map((r) => r[xCol] as number));
     labels = na.labels;
     values = na.values;
+  }
+
+  // A categorical bar chart whose result carries no ordering of its own (no
+  // ORDER BY: the engine's arbitrary group-by order) gets a stable default —
+  // first measure descending, the pie's largest-first rule generalized. An
+  // order the data DOES state survives untouched: sorted labels (a chosen
+  // x order, and ISO date buckets sort chronologically) or a monotonic
+  // measure (a chosen value order) are kept, and `keepOrder` lets a caller
+  // assert deliberate order the heuristic cannot see. Null-valued categories
+  // sort last: a gap is not a small value.
+  if (kind === "bar" && !numericX && !keepOrder && !looksOrdered(labels, values[0] ?? [])) {
+    const key = (i: number) => values[0][i] ?? -Infinity;
+    const order = labels.map((_, i) => i).sort((a, b) => key(b) - key(a));
+    labels = order.map((i) => labels[i]);
+    values = values.map((s) => order.map((i) => s[i]));
   }
 
   // Domain over the values that exist. A stacked bar's extent is the
@@ -1007,6 +1042,10 @@ function ScatterChart({
 // --------------------------------------------------------------------- stat
 
 function StatChart({ data, yCols }: { data: ChartData; yCols: string[] }) {
+  // A stat is a claim that the result IS one number. Given several rows it
+  // can only show the first — so it must say so, or a per-region result
+  // silently reads as the total.
+  const n = data.rows.length;
   const row = data.rows[0];
   const col = yCols[0] ?? data.columns[0];
   const value = row?.[col];
@@ -1033,6 +1072,11 @@ function StatChart({ data, yCols }: { data: ChartData; yCols: string[] }) {
         {display}
       </div>
       {col && <div className="faint" style={{ fontSize: 11.5, marginTop: 4 }}>{col}</div>}
+      {n > 1 && (
+        <FootNote>
+          first of {n} rows — filter to one row, or use a chart
+        </FootNote>
+      )}
     </div>
   );
 }

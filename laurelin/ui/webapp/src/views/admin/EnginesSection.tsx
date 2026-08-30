@@ -16,6 +16,7 @@ import {
   ErrorBox,
   FailureBadge,
   FailureNote,
+  NAME_RULE,
   RedactedValue,
   Spinner,
 } from "../../ui";
@@ -84,7 +85,7 @@ function CreateEnginePanel({ onCreated }: { onCreated: () => void }) {
       </div>
       {create.isError && <InlineError err={create.error} />}
       {name !== "" && !nameValid && (
-        <p className="hint">Lowercase letters, digits, `-` and `_`; start with a letter.</p>
+        <p className="hint">{NAME_RULE}</p>
       )}
       <div className="toolbar" style={{ justifyContent: "flex-end" }}>
         <button

@@ -39,7 +39,15 @@ interface AuthContextValue {
   // SSO:
   oidc: OidcStatus | undefined;
   saml: OidcStatus | undefined;
+  /** Re-probe /auth/status and sync workspace state without a reload. In
+   *  multi mode this re-reads the membership list and, when no valid active
+   *  workspace cookie exists, activates the first workspace — so a
+   *  superadmin who just created their first workspace lands in it instead
+   *  of staying stranded on a stale "no workspace" state. Workspaces calls
+   *  this after create/join; `refreshAuth` is the same function under the
+   *  name the UX spec assigns it. */
   refresh: () => Promise<void>;
+  refreshAuth: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -173,6 +181,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       oidc: status.oidc,
       saml: status.saml,
       refresh,
+      refreshAuth: refresh,
       login,
       setup,
       logout,

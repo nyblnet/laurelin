@@ -474,7 +474,13 @@ export function ConditionEditor({
             <option value="or">{OPS.or.label}</option>
           </select>
           {onRemove && (
-            <button type="button" className="fx-x" title="Remove this group" onClick={onRemove}>
+            <button
+              type="button"
+              className="fx-x"
+              title="Remove this group"
+              aria-label="Remove this group"
+              onClick={onRemove}
+            >
               ×
             </button>
           )}
@@ -620,6 +626,8 @@ export function ConditionEditor({
                 <button
                   type="button"
                   className="fx-x"
+                  title="Remove this value"
+                  aria-label="Remove this value"
                   onClick={() => onChange({ ...e, args: e.args.filter((_, j) => j !== i + 1) })}
                 >
                   ×
@@ -671,7 +679,13 @@ export function ConditionEditor({
       )}
 
       {onRemove && (
-        <button type="button" className="fx-x" title="Remove this condition" onClick={onRemove}>
+        <button
+          type="button"
+          className="fx-x"
+          title="Remove this condition"
+          aria-label="Remove this condition"
+          onClick={onRemove}
+        >
           ×
         </button>
       )}

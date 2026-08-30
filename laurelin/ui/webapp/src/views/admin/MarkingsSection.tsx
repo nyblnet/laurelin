@@ -471,7 +471,7 @@ function UserClearancesEditor({
 
 // --------------------------------------------------------------- section
 
-export function MarkingsSection() {
+export function MarkingsSection({ filter = "" }: { filter?: string }) {
   const qc = useQueryClient();
 
   const markingsQuery = useQuery({
@@ -495,7 +495,11 @@ export function MarkingsSection() {
     [markingsQuery.data],
   );
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data]);
-  const entries = datasetMarkingsQuery.data ?? [];
+  const all = datasetMarkingsQuery.data ?? [];
+  const needle = filter.trim().toLowerCase();
+  const entries = needle
+    ? all.filter((e) => e.dataset.toLowerCase().includes(needle))
+    : all;
 
   // Deleting/creating a marking can change dataset & clearance markings too.
   const invalidateMarkings = () => {
@@ -543,6 +547,11 @@ export function MarkingsSection() {
             onSaved={invalidateDatasetMarkings}
           />
         ))
+      ) : needle ? (
+        <EmptyState>
+          No dataset named like "{filter.trim()}" — clear the filter above to
+          see all {all.length}.
+        </EmptyState>
       ) : (
         <EmptyState>No datasets defined.</EmptyState>
       )}

@@ -221,7 +221,7 @@ actor.
    inherent to the feature, not a bug, and it's why in-browser transform
    authoring is editor-gated. On a multi-tenant or untrusted-editor
    deployment, serve with `--lock-pipelines` and manage pipelines through git.
-   Editors keep visual Pipelines and Explore under the lock — no-code authoring that
+   Editors keep visual Pipelines and Analyses charts under the lock — no-code authoring that
    compiles to bound SQL and cannot reach `exec` — so locking Python does not
    take authoring away from analysts. (`--lock-flows` exists if you want no
    authoring at all.)

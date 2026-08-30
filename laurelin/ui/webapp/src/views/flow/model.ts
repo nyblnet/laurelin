@@ -460,6 +460,51 @@ export function flowIssues(flow: FlowDef): { node: FlowNode; issue: string }[] {
     .filter((x): x is { node: FlowNode; issue: string } => x.issue !== null);
 }
 
+// ------------------------------------------------------------------ conflicts
+
+export interface SaveConflict {
+  kind: "name_collision" | "workspace_collect_failed";
+  message: string;
+}
+
+/**
+ * Tell a 409 that means "pick another name" apart from a 409 that means "the
+ * workspace itself will not collect".
+ *
+ * `PUT /flows/{name}` answers 409 for both, and the builder used to render
+ * the workspace-broken banner for every one of them — so a rename-sized
+ * problem ("dataset X is already produced by transform Y") was announced as
+ * "nothing can be saved or built in this workspace". The server is growing a
+ * machine-readable discriminator in the detail payload ({code: ...}); this
+ * reads it when present and falls back to matching the two collision
+ * sentences the route has always used, so the split works against either
+ * server generation.
+ */
+export function saveConflict(detail: string): SaveConflict {
+  try {
+    const parsed = JSON.parse(detail);
+    if (parsed && typeof parsed === "object" && typeof parsed.code === "string") {
+      const message =
+        typeof parsed.message === "string"
+          ? parsed.message
+          : typeof parsed.detail === "string"
+            ? parsed.detail
+            : detail;
+      return {
+        kind: parsed.code === "name_collision" ? "name_collision" : "workspace_collect_failed",
+        message,
+      };
+    }
+  } catch {
+    /* a plain-string detail — the legacy shape */
+  }
+  const collision =
+    detail.includes("already uses this name or produces") ||
+    detail.includes("is already produced by transform") ||
+    detail.includes("already produces");
+  return { kind: collision ? "name_collision" : "workspace_collect_failed", message: detail };
+}
+
 // ------------------------------------------------------------------ refusals
 
 /**

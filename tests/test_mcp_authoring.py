@@ -235,9 +235,12 @@ def test_a_flow_authored_over_mcp_builds_only_while_its_stamped_author_can_read_
     assert build["status"] == "failed"
     tasks = {t["transform_name"]: t for t in build["tasks"]}
     assert tasks["busy_regions"]["status"] == "failed"
-    # FlowRefused, not TransformRefused: a flow's build-time entitlement runs
-    # through flow_governance.check_flow_sources, refusing as its author.
-    assert tasks["busy_regions"]["failure"]["exc_class"] == "FlowRefused"
+    # FlowSourceDenied (a FlowRefused subclass), not TransformRefused: a
+    # flow's build-time entitlement runs through
+    # flow_governance.check_flow_sources, refusing as its author. The
+    # subclass names *which* refusal it was, so the operator sees "the author
+    # cannot read this source" rather than a generic refusal.
+    assert tasks["busy_regions"]["failure"]["exc_class"] == "FlowSourceDenied"
     ed.close()
     admin.close()
 

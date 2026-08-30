@@ -88,7 +88,7 @@ from laurelin.transforms.flow_governance import (
     output_will_be_restricted,
     restrict_output_to_author,
 )
-from laurelin.transforms.flow_ir import FlowDef, FlowRefused
+from laurelin.transforms.flow_ir import FlowDef, FlowRefused, FlowSourceDenied
 
 log = logging.getLogger("laurelin.api")
 
@@ -272,9 +272,15 @@ UserDep = Annotated[User, Depends(require_user)]
 
 
 def _require_dataset_view(perms: PermissionService, user: User, name: str) -> None:
+    # A 404 shaped exactly like the nonexistent case, NOT a 403 that names the
+    # dataset. The SQL path already answers a probe for a hidden dataset with
+    # "The table does not exist" — deliberately, so a viewer cannot enumerate
+    # names — while this helper confirmed existence with a 403 one URL over.
+    # The withholding boundary is only real if every surface honours it.
+    # (Edit refusals below stay 403: the caller can already *see* the dataset.)
     if not perms.can_view_dataset(user, name):
         raise HTTPException(
-            status_code=403, detail=f"You do not have access to dataset {name!r}"
+            status_code=404, detail=f"Dataset not found: {name!r}"
         )
 
 
@@ -358,6 +364,38 @@ def stored_instruction_error(
         # They could have written it, so they may read why it did not run.
         return HTTPException(status_code=400, detail=first_party_message(exc))
     return HTTPException(status_code=400, detail=failure.render_brief())
+
+
+def stored_source_denied(
+    exc: "FlowSourceDenied", *, what: str, author: Role
+) -> HTTPException:
+    """Running a stored instruction failed because the CALLER may not read a
+    source it uses. Not a `stored_instruction_error` case, on purpose.
+
+    That path classifies every first-party refusal as DEFINITION_STALE, so a
+    viewer running a shared panel over a dataset withheld from their role was
+    told it "refers to something that no longer exists; whoever can edit it can
+    see which" — false three ways: the dataset exists, nothing is broken, and
+    an entitled colleague sees a working chart. Governance was preserved (no
+    name leaked) while the story was wrong and the suggested door (edit it)
+    could not help.
+
+    So: a principal who could have authored the instruction reads the refusal's
+    own sentence (it names the dataset — authoring text, same rule as
+    `stored_instruction_error`). Everyone else gets an honest access sentence
+    that names NO dataset: what happened, why, and the door that can actually
+    help — the person who shared it.
+    """
+    if serialize.effective_role().covers(author):
+        return HTTPException(status_code=403, detail=first_party_message(exc))
+    return HTTPException(
+        status_code=403,
+        detail=(
+            f"This {what} reads data that is not shared with your role, so it "
+            "cannot run for you. Nothing is broken — whoever shared it can ask "
+            "an administrator about access."
+        ),
+    )
 
 
 def _driver_failure(exc: Exception, source: Any, subject: str) -> Failure:
@@ -722,6 +760,27 @@ def run_query(body: QueryRequest, catalog: CatalogDep, store: StoreDep, perms: P
 
 _DASHBOARD_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
+# A panel id is a client-generated handle, but it is also a URL path segment:
+# the per-panel run/update/delete routes are `/panels/{panel_id}/...`, so an
+# empty id creates a panel whose run route 405s (`/panels//run` does not
+# route) and whose Edit/✕ can never work — recovery needed a whole-board PUT.
+# Reject the ids those routes cannot address.
+_PANEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _require_addressable_panel_ids(panels) -> None:
+    for panel in panels:
+        pid = panel.id if hasattr(panel, "id") else panel.get("id", "")
+        if not _PANEL_ID_RE.match(str(pid or "")):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid panel id {str(pid)!r}: must match "
+                    "^[A-Za-z0-9_-]{1,64}$ so the per-panel routes can "
+                    "address it."
+                ),
+            )
+
 
 class DashboardUpsertRequest(BaseModel):
     title: str = ""
@@ -864,6 +923,13 @@ def run_dashboard_panel(
             limit = (top if top is not None and top <= body.max_rows
                      else body.max_rows + 1)
             compiled = compile_flow_now(catalog, flow, limit=limit)
+        except FlowSourceDenied as exc:
+            # Access, not staleness: the caller may not read a source. The
+            # DEFINITION_STALE brief would tell them the panel is broken;
+            # it is not — it is withheld.
+            raise stored_source_denied(
+                exc, what="panel", author=Role.editor
+            ) from None
         except Exception as exc:
             # `FlowRefused` included: its message names steps, columns and —
             # on a source refusal — dataset schemas, which is authoring text.
@@ -940,6 +1006,7 @@ def add_dashboard_panel(
         )
     if len(dash.panels) >= 50:
         raise HTTPException(status_code=400, detail="A dashboard is limited to 50 panels")
+    _require_addressable_panel_ids([panel])
     _check_flow_panel(catalog, store, perms, user, panel)
     return _save_panels(store, dash, [*dash.panels, panel], actor)
 
@@ -996,6 +1063,7 @@ def upsert_dashboard(
         raise HTTPException(status_code=400, detail="A dashboard is limited to 50 panels")
     existing = store.get_dashboard(name)
     panels = _preserve_operational(body.panels, existing)
+    _require_addressable_panel_ids(panels)
     info = DashboardInfo(
         name=name,
         title=body.title.strip(),
@@ -1514,6 +1582,13 @@ def run_analysis_cell(
             limit = (top if top is not None and top <= body.max_rows
                      else body.max_rows + 1)
             compiled = compile_flow_now(catalog, flow, limit=limit)
+        except FlowSourceDenied as exc:
+            # Access, not staleness — same split as the panel run route: a
+            # viewer running a shared cell over a dataset withheld from them
+            # is not looking at a broken analysis.
+            raise stored_source_denied(
+                exc, what="cell", author=Role.editor
+            ) from None
         except FlowRefused as exc:
             # The editor's copy of a run-time refusal (the world changed under
             # a stored chain) speaks cell vocabulary too; the viewer's brief
@@ -3057,7 +3132,20 @@ def put_approval_settings(
 
 @router.get("/audit", dependencies=[EDITOR])
 def list_audit(
-    store: StoreDep, user: UserDep, limit: int = Query(100, ge=0, le=10_000)
+    store: StoreDep,
+    user: UserDep,
+    limit: int = Query(100, ge=0, le=10_000),
+    # S4: server-side filters, applied INSIDE `list_audit` as further ANDs
+    # *after* the min_read_role filter — a filter can only narrow what the
+    # caller's role may read, never widen it. `since`/`until` are inclusive
+    # dates (yyyy-mm-dd), matching the UI's date inputs; `actor`/`action` are
+    # exact matches. Before these existed the UI advertised the filter bar and
+    # re-filtered a 200-row window client-side, which claimed "No events
+    # match" about events the window simply did not reach.
+    since: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    until: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    actor: Optional[str] = Query(None, max_length=256),
+    action: Optional[str] = Query(None, max_length=256),
 ) -> list[dict]:
     """The audit trail, filtered to the rows this principal may read.
 
@@ -3090,7 +3178,13 @@ def list_audit(
     `min_read_role` also closes the editor↔admin crossing — an editor used to
     read `source_updated` details written by an admin.
     """
-    return [_dump(entry) for entry in store.list_audit(limit, role=user.role)]
+    return [
+        _dump(entry)
+        for entry in store.list_audit(
+            limit, role=user.role,
+            since=since, until=until, actor_filter=actor, action=action,
+        )
+    ]
 
 
 @router.get("/audit/mine", dependencies=[VIEWER])

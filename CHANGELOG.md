@@ -10,6 +10,174 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### The audit pass after the merge: 19 confirmed findings, fixed
+
+A consistency-and-honesty sweep drove the merged product across four
+adversarial lenses and every confirmed finding was reproduced, fixed, and
+pinned by a regression test:
+
+- **Schedules tell the truth about the night's run.** `last_status` recorded
+  "succeeded" when a firing *queued* its build; the row read green while the
+  build failed moments later. The schedule routes now project `last_status`
+  through the queued build's own outcome ("running" while it is in flight),
+  and the Run-now watcher waits for a terminal state.
+- **A schedule that cannot plan is no longer invisible.** A plan refusal
+  (e.g. a target no pipeline produces) is recorded as `definition_stale` at
+  phase `plan` — not `transform_failed`, which made the UI blame "the
+  pipeline's code" for a schedule with no pipeline — and the health rollup
+  marks every existing dataset such a schedule targets as `failing`, with
+  the schedule named for editors (`detail.schedule_run_failed`, the chip the
+  Health page already renders) and never for viewers.
+- **A withheld panel stops claiming to be broken.** A viewer running a
+  dashboard panel (or analysis cell) over a dataset their role cannot read
+  used to get "refers to something that no longer exists; whoever can edit
+  it can see which" — false three ways. Access now answers as access: an
+  honest sentence naming no dataset, with the door that can help (403;
+  `FlowSourceDenied` discriminates access from staleness). Editors keep the
+  refusal's own sentence.
+- **The existence oracle is closed on every surface.** `GET /datasets/{name}`
+  and friends answered a hidden dataset with `403 "You do not have access to
+  dataset 'x'"` while SQL deliberately said "the table does not exist". A
+  dataset the caller cannot view is now a 404 shaped exactly like the
+  nonexistent case. (Deliberate test updates in the governance suites; the
+  invariant got stronger, not weaker.)
+- **Audit filters are real.** `GET /audit` accepts `since`/`until`/`actor`/
+  `action`, applied in SQL *after* the min-read-role clause (narrowing only)
+  and *before* the limit — so filtering for something older than the newest
+  200 events finds it instead of claiming "No events match".
+- **Panel ids are validated** at both write doors; an empty id used to store
+  a panel whose run route 405s and whose Edit/✕ could never work.
+- **A viewer's Builds page no longer links into the editor-gated /pipelines**
+  (plain text instead — the in-page links were reopening a door the nav
+  correctly hides); the Builds lock notice stopped naming the retired
+  Explore screen; a viewer's empty Datasets page stopped naming doors their
+  role lacks ("No datasets you can read…", the Audit page's honest form).
+- **The flow builder's Save always answers**: clicking Save with an
+  unfinished step renders a "Not saved — …" receipt beside the button
+  instead of silently doing nothing over an unsaved draft.
+- **Context travels with the doors**: a dataset page's "Schedule builds"
+  opens the schedule editor with that dataset preticked
+  (`/schedules?target=…`), and "Dataset access" lands on Admin with the
+  dataset filter applied.
+- **One voice, enforced**: the name-format rule is a single sentence
+  (`NAME_RULE`/`NAME_RULE_NO_HYPHEN` in ui.tsx) across every gate that used
+  to phrase it five ways or disable silently; result truncation has one
+  phrasing (`truncationNote`); the aggregate-measure concept is "summary"
+  on Dashboards too ("metric" retired); both Pipelines tabs' delete confirms
+  state that built datasets are kept; every screen that kicks a build
+  converges with the same sentence family; and terminal 503s on Schedules,
+  Health, Workspaces, Sources and Admin gained the Retry button Audit
+  already had (pinned by a per-file ratchet).
+
+### One charting door: Explore merges into Analyses (the merge proper)
+
+Explore and Analyses were two adjacent, near-identical click-to-chart doors;
+a user asking "clean this dataset and chart the result" faced a coin flip.
+There is one door now:
+
+- **Quick chart on the Analyses landing page** — the entire Explore surface
+  (dataset + object tabs, shaping cards, live preview, save-to-dashboard,
+  panel-edit round trip), verbatim in capability, as the zero-commitment
+  top-of-page entry. No name, no server record; the draft lives in
+  sessionStorage under `laurelin.analyses.scratch.v1`, and a pre-merge
+  Explore draft is imported for one release so upgrade day eats nobody's
+  in-flight session. `views/Explore.tsx` is deleted.
+- **"Keep going → analysis"** promotes a quick chart in place to cell 1 of a
+  new analysis; an aggregated, dataset-sourced document cell gained its own
+  **Save to dashboard** (chained cells say why they can't, instead of
+  greying silently).
+- **One shared shaping core** (`views/shaping/model.ts` +
+  `ShapingCards.tsx`) replaces the two drifted private copies. Analyses
+  cells thereby inherit every courtesy Explore had learned alone:
+  auto-chronological sort when a date bucket is picked, value suggestions in
+  filter boxes, masked-column greying, duplicate-group prevention,
+  shaping-derived chart defaults, the top-N-without-order and
+  empty-result-after-filter hints — and one vocabulary ("+ one row per…",
+  "No particular order", both pinned as retired phrases).
+- **Unsaved work survives a refresh everywhere**: analysis documents persist
+  their unsaved cells per analysis (`laurelin.analyses.doc.<name>.v1`,
+  sessionStorage); an earlier *unsaved* shaping cell now appears in the
+  source picker as a disabled "save it to read from it here" option instead
+  of silently not existing.
+- Name inputs state their format rule inline instead of disabling silently.
+- Guards re-pinned deliberately: `test_explore_mount.py` mounts the merged
+  surface (plus the legacy-draft import, viewer-gains-no-surface,
+  doc-draft-restore and chaining-hint invariants), the two-doors copy test
+  is replaced by a landing-offers-both-entries test, and the chart-model
+  tests moved with the model.
+
+### One charting door: Explore merges into Analyses (shell/nav phase)
+
+The nav's Analyze group is now Dashboards / Analyses / SQL / Apps — the
+`/explore` door is retired and redirects, params intact, to
+`/analyses?mode=chart` (`?dataset=…` and `?dashboard=…&panel=…` deep links
+survive). The quick-chart surface itself lands inside Analyses in the same
+pass; the shell layer here is the route, nav, palette and guard changes
+(`tests/test_ui_information_architecture.py` re-pinned deliberately: viewer
+door count unchanged at 9, every editor-and-above count shrank by one).
+
+### Govern + SQL + Workspaces: "who can see this dataset" in one place
+
+- **Effective access on the card that controls it** (Admin → Dataset access):
+  every dataset card gained an "Effective access" expander that recomputes
+  the governance fingerprint for that one dataset — per principal: view/edit,
+  markings in force, and the rendered row decision as visible text. An admin
+  answers "who can see this dataset" without cross-referencing grants,
+  groups, markings and row policy across three screens.
+- **Admin table of contents**: the page carries a sticky per-section TOC and
+  a dataset-name filter that narrows the three per-dataset card lists
+  (Dataset access, Row & column security, Markings) at once. Deep links:
+  `#/admin?dataset=<name>` lands filtered on Dataset access;
+  `&section=<id>` scrolls anywhere.
+- **Audit filters and honest emptiness**: the audit log gained a filter bar
+  (since/until/actor/action — sent as the server's query params and applied
+  with identical exact-match semantics to the fetched window), sign-in noise
+  is collapsed by default (declared and one click to reveal), and an empty
+  page no longer claims "nothing recorded" to a reader whose level cuts the
+  list — an editor is told events above their read level are not shown, with
+  no count disclosed.
+- **SQL page**: the editor doc, chosen view and last result survive
+  navigation (sessionStorage, `laurelin.workbench.draft.v1`); a running
+  query has a Cancel that frees its admission slot (AbortSignal); a
+  comment-only Run is refused before the POST ("Nothing to run — the editor
+  only contains a comment."); results announce via a live region and scroll
+  inside a capped pane; and "Save as analysis cell" hands the query to
+  `/analyses?mode=doc&sql=…` — a quick query's lightweight home, no new
+  server surface.
+- **Workspaces**: creating a workspace re-probes auth and activates the
+  first one (no more stranded superadmin); Manage members signposts Admin →
+  Users for account creation; in multi mode, Admin's create-user form offers
+  workspace membership at creation.
+- All dialogs on these screens migrated to the `Modal` primitive; their
+  ratchet entries are gone. New guards in `tests/test_govern_sql_ui.py`.
+
+### Shared UI primitives: dialogs, keyboard reach, honest failure copy
+
+- **`Modal` primitive** (`ui.tsx`): role=dialog, aria-modal, focus in on
+  open, Escape closes, Tab contained, focus restored — the command palette's
+  proven pattern, now shared; hand-rolled `.modal-backdrop` divs are ratcheted
+  down (`tests/test_ui_consistency.py`). The palette gained the same Tab
+  containment.
+- **DataTable keyboard contract**: a row with `onRowClick` is tabbable and
+  Enter/Space activate it, with a visible focus state.
+- **Failure copy**: "Laurelin's own code raised" is retired — the pipeline's
+  code raising is attributed to the pipeline; a new `blocked_by_upstream`
+  code renders "Skipped: its input '<upstream>' failed" with no log pointer;
+  and the missing-detail fallback no longer tells an admin that an editor
+  sees more (`FailureNote` now takes the caller's `role`).
+- **Chart honesty** (deliberate appearance change): a *stat* of a multi-row
+  result declares "first of N rows — filter to one row, or use a chart"; an
+  *unordered* categorical bar chart (no sorted labels, no monotonic measure —
+  the engine's arbitrary group-by order) now draws first-measure-descending,
+  the pie's largest-first rule generalized. Results whose order was chosen
+  (ORDER BY either axis) render exactly as before; `keepOrder` opts out.
+- **Access-to-what-you-can-see**: `Withheld`, `RedactedValue` and
+  `FailureBadge` explanations are focusable and announced (tabIndex +
+  aria-label), not tooltip-only; `ErrorBox` grew an optional Retry;
+  `LiveStatus` (role=status) announces async outcomes; `--text-faint` now
+  clears 4.5:1 on every surface; the sidebar scrolls at short heights;
+  `color-scheme: dark` renders native controls dark.
+
 ### Point-of-decision guidance: the paths a new user actually walks
 
 An adversarial novice walkthrough of the consolidated UI found that every
