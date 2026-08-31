@@ -446,3 +446,37 @@ def test_ejecting_a_flow_stamps_the_generated_pipeline_with_the_ejecting_user(
     build, _store, catalog = _build(ws)
     assert build.status == BuildStatus.succeeded
     assert catalog.read("copyflow").num_rows == 2
+
+
+def test_a_build_over_a_workspace_with_no_pipelines_refuses_instead_of_succeeding(tmp_path):
+    """A build over "all targets" with nothing to build reported `succeeded`.
+
+    Measured on a fresh `laurelin init` workspace: the Builds page's own
+    "Build now" button — the first control a novice presses there — produced
+    `{"targets": [], "status": "succeeded", "tasks": []}`, and the history
+    grew a green row reading "all targets", on the same screen that
+    simultaneously read "No pipelines yet". Three clicks, three vacuous green
+    builds. It is the schedule row that said "succeeded" over a failed build,
+    pointed the other way: self-consistent, and a lie about what happened.
+    """
+    ws = Workspace.init(tmp_path / "empty", name="empty")
+    app = create_app(ws)
+    c = TestClient(app)
+    assert c.post("/api/v1/auth/setup", json=ADMIN_CREDS).status_code == 200
+    assert c.post("/api/v1/auth/login", json=ADMIN_CREDS).status_code == 200
+
+    r = c.post("/api/v1/builds", json={"wait": True})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == (
+        "There are no pipelines in this workspace yet, so there is nothing to build."
+    )
+    # The async door refuses identically — the UI uses that one.
+    assert c.post("/api/v1/builds", json={}).status_code == 400
+    assert c.get("/api/v1/builds").json() == [], "no vacuous build was recorded"
+
+    # And once a pipeline exists, the same request builds.
+    (ws.pipelines_dir / "p.py").write_text(OPEN_COPY)
+    cat = DatasetCatalog(ws, MetadataStore(ws.metadata_path))
+    cat.write("open_ds", pa.table({"a": [1]}))
+    ok = c.post("/api/v1/builds", json={"wait": True})
+    assert ok.status_code == 200 and ok.json()["status"] == "succeeded"

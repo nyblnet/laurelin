@@ -421,6 +421,13 @@ class OntologyService:
             "current_dataset_version": current,
             "stale_version": current is None or int(state["dataset_version"]) != current,
             "stale_definition": state["fingerprint"] != self._type_fingerprint(ot),
+            # A fourth way to be wrong, and the only one a rebuild does not
+            # fix: a write after a fold may have overwritten the rows the fold
+            # produced, so the hand edit is in the log and no longer in the
+            # data. Nothing surfaced it — the object simply read its pre-edit
+            # value again. Reported here; never replayed (see
+            # `superseded_folds` for why automatic unfolding is refused).
+            "superseded_folds": self.superseded_folds(ot),
         }
 
     def _system_view(self) -> "OntologyService":
@@ -1763,6 +1770,55 @@ class OntologyService:
     #: probably did not, because the cost of being wrong is asymmetric.
     _FOLD_PRESERVING_SOURCES = frozenset({"writeback", "compact"})
 
+    def _superseding_version(self, dataset: str, versions=None) -> tuple[int, Optional[str]]:
+        """The newest version of ``dataset`` that may have overwritten a fold.
+
+        A fold below this line had its rows rewritten by something that did not
+        read the overlay, so its *effect* is gone from the dataset even though
+        the edit rows survive. Returns ``(0, None)`` when nothing since could
+        have done that — the cheap answer, and the common one.
+        """
+        rows = versions if versions is not None else self.catalog.store.list_versions(dataset)
+        superseding = [v for v in rows if v.source not in self._FOLD_PRESERVING_SOURCES]
+        below = max((v.version for v in superseding), default=0)
+        source = next((v.source for v in superseding if v.version == below), None)
+        return below, source
+
+    def superseded_folds(self, ot: ObjectTypeDef) -> dict:
+        """Folded edits whose effect a later write may have silently undone.
+
+        Reproduced: fold a hand edit into ``cities`` v2, then write v3 from an
+        upload or a transform build, and the object view returns the pre-edit
+        value again. The *record* survives — pruning refuses exactly these rows
+        and names the superseding version — but the *effect* is gone, and until
+        now no surface said so. This is the projection that says it.
+
+        It is a report, never a repair. Automatic unfolding is deliberately NOT
+        implemented and is not going to be: an edit is an absolute assignment
+        plus a per-column ``__set__`` flag (see the overlay merge in
+        ``_build_sql``), so
+        replaying one over a corrected upstream value would silently resurrect
+        a stale hand edit — the same silent wrongness pointed the other way,
+        and harder to notice, because the data then looks edited on purpose.
+
+        Cost: the version list is read first, and when nothing could have
+        superseded a fold (``below == 0``, the ordinary case) the edit log is
+        never listed at all. Only a workspace that actually has this problem
+        pays for counting it.
+        """
+        empty = {"edits": 0, "version": None, "source": None}
+        below, source = self._superseding_version(ot.backing_dataset)
+        if not below:
+            return empty
+        edits = [
+            e for e in self.store.list_folded_edits(ot.api_name)
+            if e["folded_into_version"] is not None
+            and e["folded_into_version"] < below
+        ]
+        if not edits:
+            return empty
+        return {"edits": len(edits), "version": below, "source": source}
+
     def prune_plan(self, type_name: str, keep: int) -> dict:
         """What pruning this type's edit log would delete, and what it would not.
 
@@ -1787,13 +1843,8 @@ class OntologyService:
         # The newest version that could have overwritten a fold. An edit folded
         # into a version at or above this line still has its rows in the
         # dataset; one below it may not, and nothing else records what it did.
-        superseding = [
-            v for v in versions.values()
-            if v.source not in self._FOLD_PRESERVING_SOURCES
-        ]
-        supersedes_below = max((v.version for v in superseding), default=0)
-        supersedes_source = next(
-            (v.source for v in superseding if v.version == supersedes_below), None
+        supersedes_below, supersedes_source = self._superseding_version(
+            ot.backing_dataset, versions.values()
         )
         high = int(totals["max_edit_seq"])
         # Newest `keep` folded edits are retained whatever else is true; the
@@ -1802,6 +1853,16 @@ class OntologyService:
 
         prunable: list[dict] = []
         retained: dict[str, dict] = {}
+        # Folds a later non-preserving write may have undone. Same population
+        # the "may have overwritten" retention reason describes, counted
+        # independently of the retention ladder so the number means the same
+        # thing whatever `keep` is.
+        superseded = [
+            e for e in folded
+            if e["folded_into_version"] is not None
+            and supersedes_below
+            and e["folded_into_version"] < supersedes_below
+        ]
 
         def hold(edit: dict, reason: str) -> None:
             slot = retained.setdefault(reason, {"reason": reason, "edits": 0, "bytes": 0})
@@ -1846,6 +1907,14 @@ class OntologyService:
             "prunable_bytes": sum(e["payload_bytes"] for e in prunable),
             "prunable_ids": [e["id"] for e in prunable],
             "retained": sorted(retained.values(), key=lambda r: -r["edits"]),
+            # Reported, never repaired: see `superseded_folds`. Computed from
+            # the rows already in hand rather than by calling it, so the report
+            # costs one pass over the log rather than two.
+            "superseded_folds": {
+                "edits": len(superseded),
+                "version": supersedes_below if superseded else None,
+                "source": supersedes_source if superseded else None,
+            },
         }
 
     def prune_object_edits(

@@ -23,10 +23,16 @@ import { TransformsView } from "./Transforms";
  * that happened to share a header. The header is the product; the tabs are
  * idioms.
  */
+// The tabs are not symmetric and the blurb must not pretend they are. A
+// visual pipeline is one pipeline; a `.py` file declares as many as its author
+// writes, which is why the Python tab names its artifact a "pipeline file" and
+// why its delete confirm says "the datasets" in the plural. "Two ways to write
+// it" flattened that into a style choice.
 export const PIPELINES_SUBTITLE =
-  "Turn datasets into new datasets. One kind of thing, two ways to write it: " +
-  "step by step with no code on the Visual tab, or as Python on the Python tab. " +
-  "Either way it is a real transform on the same builds, lineage and permissions.";
+  "Turn datasets into new datasets. One kind of thing; written one at a time, " +
+  "or several to a file: step by step with no code on the Visual tab, or as " +
+  "Python on the Python tab. Either way it is a real transform on the same " +
+  "builds, lineage and permissions.";
 
 export function PipelinesView() {
   const location = useLocation();

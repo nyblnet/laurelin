@@ -14,6 +14,8 @@ The invariants under test, in the order they matter:
   timestamps and names of things they can already see.
 """
 
+import json
+
 import pyarrow as pa
 import pytest
 from fastapi.testclient import TestClient
@@ -142,10 +144,10 @@ def test_health_rollup_omits_datasets_the_caller_cannot_view(admin, viewer):
     # leaking through any stray field is exactly what this test exists to catch.
     assert "secret_ds" not in r.text
     assert "classified_ds" not in r.text
-    assert {h["dataset"] for h in r.json()} == {"public_ds"}
+    assert {h["dataset"] for h in r.json()["datasets"]} == {"public_ds"}
 
     # The admin still sees the whole workspace.
-    names = {h["dataset"] for h in admin.get("/api/v1/health/datasets").json()}
+    names = {h["dataset"] for h in admin.get("/api/v1/health/datasets").json()["datasets"]}
     assert names == {"public_ds", "secret_ds", "classified_ds"}
 
 
@@ -155,8 +157,8 @@ def test_health_rollup_has_no_unfiltered_totals(admin, viewer):
         json={"grants": [{"subject_kind": "user", "subject": "root",
                           "can_view": True}]},
     )
-    va = admin.get("/api/v1/health/datasets").json()
-    vv = viewer.get("/api/v1/health/datasets").json()
+    va = admin.get("/api/v1/health/datasets").json()["datasets"]
+    vv = viewer.get("/api/v1/health/datasets").json()["datasets"]
     # Different viewers legitimately see different totals; the totals ARE the
     # list lengths, and there is no count field anywhere for them to disagree
     # in. A global count would leak existence deltas when a hidden dataset
@@ -327,7 +329,7 @@ def test_expectation_message_and_measured_are_withheld_below_editor(
     assert "133737" not in v.text
     # The viewer still learns WHICH expectation failed — name, severity — which
     # is schema-shaped and viewer-visible through the query path anyway.
-    row = next(h for h in v.json() if h["dataset"] == "public_ds")
+    row = next(h for h in v.json()["datasets"] if h["dataset"] == "public_ds")
     assert row["failing_expectations"] == [{
         "name": "not_null(order_id)", "column": "", "severity": "error",
         "passed": False,
@@ -341,7 +343,7 @@ def test_expectation_message_and_measured_are_withheld_below_editor(
 def test_viewer_sees_failure_as_code_and_subject_only(admin, viewer, store):
     _seed_failing_task(store, "public_ds", endpoint="secret-db.internal:5432")
     row = next(
-        h for h in viewer.get("/api/v1/health/datasets").json()
+        h for h in viewer.get("/api/v1/health/datasets").json()["datasets"]
         if h["dataset"] == "public_ds"
     )
     assert set(row["failure"] if "failure" in row else row["last_failure"]) == {
@@ -366,7 +368,7 @@ def test_schedule_and_source_names_do_not_reach_a_viewer(
     v = viewer.get("/api/v1/health/datasets")
     assert "sekrit-sched" not in v.text
     assert "sekrit_source" not in v.text
-    row = next(h for h in v.json() if h["dataset"] == "public_ds")
+    row = next(h for h in v.json()["datasets"] if h["dataset"] == "public_ds")
     # The viewer learns the booleans, not the names.
     assert row["schedule_overdue"] is True
     assert row["sync_failing"] is True
@@ -400,7 +402,7 @@ def test_freshness_declaration_is_editor_gated(admin, viewer, editor):
     )
     assert r.status_code == 200
     row = next(
-        h for h in editor.get("/api/v1/health/datasets").json()
+        h for h in editor.get("/api/v1/health/datasets").json()["datasets"]
         if h["dataset"] == "public_ds"
     )
     assert row["expected_fresh_within"] == 3600
@@ -410,7 +412,7 @@ def test_freshness_declaration_is_editor_gated(admin, viewer, editor):
         json={"expected_fresh_seconds": None},
     ).status_code == 200
     row = next(
-        h for h in editor.get("/api/v1/health/datasets").json()
+        h for h in editor.get("/api/v1/health/datasets").json()["datasets"]
         if h["dataset"] == "public_ds"
     )
     assert row["expected_fresh_within"] is None
@@ -453,9 +455,39 @@ def test_a_schedule_whose_firing_failed_marks_its_target_failing(
 
     v = viewer.get("/api/v1/health/datasets")
     assert "sekrit-sched" not in v.text
-    row = next(h for h in v.json() if h["dataset"] == "public_ds")
+    row = next(h for h in v.json()["datasets"] if h["dataset"] == "public_ds")
     assert row["status"] == "failing"
 
     e = editor.get("/api/v1/health/datasets")
-    erow = next(h for h in e.json() if h["dataset"] == "public_ds")
+    erow = next(h for h in e.json()["datasets"] if h["dataset"] == "public_ds")
     assert erow["detail"]["schedule_run_failed"] == ["sekrit-sched"]
+
+
+def test_an_empty_workspace_is_told_apart_from_a_withholding_one(admin, viewer):
+    """`others_exist` — the one bit that distinguishes "nothing here yet" from
+    "nothing here for you".
+
+    Without it the rollup was a bare array, and the Health page said "No
+    datasets you can read." unconditionally — withholding language for plain
+    emptiness. Measured on a fresh `laurelin init` workspace served with
+    `--no-auth`: a sole administrator, on a workspace they had just created,
+    was told data was being kept from them.
+
+    It is a BOOLEAN and never a count or a name: a count would turn the health
+    page into an enumeration oracle for hidden datasets, and one bit is exactly
+    what a 404 for a withheld dataset already concedes.
+    """
+    # Everything is visible to the admin, so nothing is withheld from them.
+    assert admin.get("/api/v1/health/datasets").json()["others_exist"] is False
+
+    admin.put(
+        "/api/v1/datasets/secret_ds/permissions",
+        json={"grants": [{"subject_kind": "user", "subject": "root",
+                          "can_view": True}]},
+    )
+    v = viewer.get("/api/v1/health/datasets").json()
+    assert v["others_exist"] is True
+    assert "secret_ds" not in json.dumps(v)
+    # A bit, not a count: no number anywhere says how many were withheld.
+    assert set(v) == {"datasets", "others_exist"}
+    assert admin.get("/api/v1/health/datasets").json()["others_exist"] is False

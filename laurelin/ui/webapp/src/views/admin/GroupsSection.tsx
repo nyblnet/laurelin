@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../../api";
 import type { Group, User } from "../../types";
-import { Badge, EmptyState, ErrorBox, Modal, Spinner } from "../../ui";
+import { Badge, EmptyState, ErrorBox, Modal, NAME_RULE_GROUP, Spinner } from "../../ui";
 import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 const NAME_RE = /^[a-z0-9][a-z0-9_.-]{1,31}$/;
@@ -43,8 +43,7 @@ function CreateGroupPanel({ onCreated }: { onCreated: () => void }) {
           }}
         />
         <div className={`hint${showBad ? " bad" : ""}`}>
-          Lowercase letters, digits, and <span className="mono">_ . -</span>; 2–32
-          characters.
+          {NAME_RULE_GROUP}
         </div>
       </div>
       <button
@@ -191,10 +190,15 @@ export function GroupsSection() {
 
   return (
     <section style={{ marginBottom: 32 }}>
-      <h2 style={{ fontSize: 15, marginBottom: 12 }}>Groups</h2>
+      <h2 id="groups" style={{ fontSize: 15, marginBottom: 12 }}>Groups</h2>
       <div className="subtitle" style={{ marginTop: -6, marginBottom: 12 }}>
-        Named sets of users. Reference a group as the subject of an ontology
-        access grant below.
+        {/* The old sentence said "an ontology access grant" and stopped there,
+            while the Dataset access section's SUBJECT KIND select offers
+            `group` too — so a reader who took the blurb at its word concluded
+            groups do not apply to datasets and granted to individual users
+            instead. Name both, because both are true. */}
+        Named sets of users. Use a group as the subject of a dataset access
+        grant or an ontology access grant below.
       </div>
 
       {removeGroup.error && <InlineError err={removeGroup.error} />}

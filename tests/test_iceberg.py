@@ -225,6 +225,78 @@ def test_the_iceberg_compaction_audit_counts_real_files(cat):
     assert entry.details["format"] == "iceberg"
 
 
+# -- what compaction does NOT reclaim, as a number ----------------------------
+#
+# `compact()` reclaims scan cost, not disk, and nothing expires snapshots.
+# Both were documented limitations and neither was measurable from inside the
+# product: the snapshot table said "6 snapshots" and nothing said what they
+# cost or why they were all still there. Expiry stays refused — measured on
+# pyiceberg 0.11.1, `expire_snapshots()` left disk unchanged (it is a metadata
+# edit) and then broke `read(version=1)` with "Snapshot not found", because a
+# Laurelin version row is a promise the snapshot is still readable and
+# pyiceberg protects refs, not promises.
+
+def test_iceberg_storage_report_names_which_snapshots_a_version_row_pins(cat):
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+    compacted = cat.compact("orders")
+
+    report = cat.iceberg_storage_report("orders")
+
+    assert report["dataset"] == "orders"
+    by_id = {r["snapshot_id"]: r for r in report["snapshots"]}
+    for version in cat.store.list_versions("orders"):
+        row = by_id[version.snapshot_id]
+        assert version.version in row["versions"], (
+            "a version row is a pin, and the report has to name it as one"
+        )
+        assert row["pinned"] is True
+    assert by_id[compacted.snapshot_id]["refs"] == ["main"], "main is the other pin"
+
+    # Measured: compaction's overwrite commits *two* snapshots, a `delete` and
+    # an `append`, and only the append gets the version row. So a table can
+    # hold a snapshot no promise pins — which is exactly the population an
+    # expiry would be allowed to touch, and the reason the report counts it
+    # rather than the product acting on it.
+    unpinned = [r for r in report["snapshots"] if not r["pinned"]]
+    assert [r["operation"] for r in unpinned] == ["delete"]
+    assert report["unpinned_snapshots"] == 1
+    assert unpinned[0]["data_files"] == 0, "it pins no data either"
+
+
+def test_the_storage_report_shows_compaction_reclaiming_no_disk(cat):
+    """The honest number behind the documented sentence. Compaction merges two
+    data files into one, so a *scan* opens one file — and the table on disk
+    holds all three, because the earlier snapshots keep their own."""
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+    before = cat.iceberg_storage_report("orders")
+    cat.compact("orders")
+    after = cat.iceberg_storage_report("orders")
+
+    current = after["snapshots"][-1]
+    assert current["data_files"] == 1, "a scan opens one file after compaction"
+    assert after["bytes"] > current["bytes"], (
+        "the table still holds every earlier snapshot's files — this is the "
+        "'reclaims scan cost, not disk' limitation, as a number"
+    )
+    assert after["bytes"] > before["bytes"], "compaction ADDS bytes; it frees none"
+    assert after["data_files"] == before["data_files"] + 1
+
+
+def test_the_storage_report_counts_a_shared_file_once(cat):
+    """Union, not sum. An appended snapshot re-lists the previous snapshot's
+    file, so adding the per-snapshot figures would report the table as larger
+    than it is by the sharing factor."""
+    cat.write_iceberg("orders", FIRST)
+    cat.write_iceberg("orders", MORE, mode="append")
+
+    report = cat.iceberg_storage_report("orders")
+    summed = sum(r["bytes"] for r in report["snapshots"])
+    assert report["bytes"] < summed
+    assert report["data_files"] == 2
+
+
 def test_compacting_a_dataset_with_no_versions_is_an_error(cat):
     cat.create_iceberg_dataset("orders")
     with pytest.raises(KeyError, match="no versions"):
@@ -425,6 +497,23 @@ def test_create_and_snapshot_over_http(tmp_path):
 
     snaps = c.get("/api/v1/datasets/orders/iceberg/snapshots").json()
     assert len(snaps) == 2
+
+
+def test_the_storage_report_is_reachable_over_http(tmp_path):
+    """An operator reading "compaction reclaims scan cost, not disk" needs the
+    bytes on the same screen as the snapshot list, or the sentence is a claim
+    they cannot check."""
+    c = _client(tmp_path)
+    assert c.post("/api/v1/datasets/orders/iceberg", files=_csv()).status_code == 200
+    assert c.post("/api/v1/datasets/orders/iceberg?mode=append",
+                  files=_csv("id,region\n4,apac\n")).status_code == 200
+
+    r = c.get("/api/v1/datasets/orders/iceberg/storage")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dataset"] == "orders"
+    assert body["bytes"] > 0 and body["data_files"] == 2
+    assert [row["versions"] for row in body["snapshots"]] == [[1], [2]]
 
 
 def test_branch_lifecycle_over_http(tmp_path):

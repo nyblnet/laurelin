@@ -160,7 +160,10 @@ def test_an_app_over_a_hidden_type_is_invisible(clients):
     ]})
 
     assert viewer.get("/api/v1/apps").json() == [], "hidden type -> hidden app"
-    assert viewer.get("/api/v1/apps/fleet_ops").status_code == 403
+    # 404 and not 403: the list already omits the app, so a 403 naming it one
+    # URL over handed its existence — and its hidden object type's, and that
+    # type's hidden backing dataset's — straight back.
+    assert viewer.get("/api/v1/apps/fleet_ops").status_code == 404
     assert admin.get("/api/v1/apps/fleet_ops").status_code == 200
 
 
@@ -174,7 +177,7 @@ def test_an_app_over_a_locked_backing_dataset_is_invisible(clients):
               can_view=True).model_dump(mode="json")
     ]})
     assert viewer.get("/api/v1/apps").json() == []
-    assert viewer.get("/api/v1/apps/fleet_ops").status_code == 403
+    assert viewer.get("/api/v1/apps/fleet_ops").status_code == 404
 
 
 def test_app_objects_come_from_the_ordinary_ontology_endpoints(clients):
@@ -228,7 +231,7 @@ def test_the_app_objects_route_grants_no_access_of_its_own(clients):
         Grant(subject_kind=SubjectKind.user, subject="root",
               can_view=True).model_dump(mode="json")
     ]})
-    assert viewer.get("/api/v1/apps/fleet_ops/objects").status_code == 403
+    assert viewer.get("/api/v1/apps/fleet_ops/objects").status_code == 404
 
 
 def test_a_caller_cannot_widen_an_apps_scope_through_the_query_string(clients):

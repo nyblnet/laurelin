@@ -423,7 +423,10 @@ def build_server(client: LaurelinClient):
         """Per-dataset health rollup: failing / overdue / stale / healthy /
         unknown, with last success time, last build status and failing
         expectations. Filtered to datasets this credential can view — the same
-        answer GET /health/datasets gives, because it is that route."""
+        answer GET /health/datasets gives, because it is that route:
+        `{"datasets": [...], "others_exist": bool}`, where `others_exist` says
+        only THAT the workspace holds datasets this credential cannot view —
+        never how many, never which."""
         return _j(client.dataset_health())
 
     # -- pipeline authoring (flows) --------------------------------------------

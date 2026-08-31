@@ -156,3 +156,29 @@ def test_the_shared_cards_grey_masked_columns_and_suggest_values(mounted):
     assert opt and "disabled" in opt.group(0)
     assert 'list="t-vals-region"' in html
     assert '<datalist id="t-vals-region"' in html
+
+
+def test_the_objects_tab_renders_the_same_four_shaping_cards_as_datasets(mounted):
+    """Switching the source tab used to swap the vocabulary and silently drop
+    a capability: the object side titled its filter card "Narrow the objects",
+    omitted the Group-by explanation the dataset side has always shown, and
+    ended one card early where "Order & top N" sits — an absence a reader can
+    only read as "I broke something", never as "this does not exist here".
+
+    Asserted against the markup the real component emits, not the source."""
+    html = assert_rendered(mounted, "draft_objects")
+    for card in ("Filter", "Group by", "Summarise", "Order &amp; top N"):
+        assert f'ex-card-title">{card}<' in html, f"the objects tab lost the {card} card"
+    assert "Narrow the objects" not in html
+    assert "+ keep only objects where…" in html
+    # The capability gap is stated where the missing control would be.
+    # React escapes the apostrophe, so match either side of it.
+    assert "Ordering and top-N aren" in html and "available for object charts yet." in html
+
+
+def test_the_objects_tab_explains_an_empty_group_by_the_way_the_dataset_tab_does(mounted):
+    """A draft that groups by something must NOT show the no-grouping note;
+    the note is the explanation of an aggregate over everything, and showing
+    it beside a live grouping would be false."""
+    html = assert_rendered(mounted, "draft_objects")
+    assert "No grouping = one summary row over everything." not in html

@@ -399,3 +399,67 @@ def test_the_edit_log_is_visible_and_prunable_over_http(tmp_path):
     dry = client.post(
         "/api/v1/ontology/object-types/city/edit-log/prune?keep=0&dry_run=true")
     assert dry.status_code == 200 and dry.json()["pruned"] == 0
+
+
+# -- a rebuild that supersedes a fold ------------------------------------------
+#
+# The other half of condition 3. Pruning already refuses those rows; what
+# nothing did was *say* they were superseded — the object silently returned its
+# pre-edit value and no surface mentioned it. Reporting is the whole fix:
+# replaying the edit is deliberately not implemented, because an edit is an
+# absolute assignment and a replay would put a stale hand value back over
+# corrected upstream data.
+
+def test_a_rebuild_that_supersedes_a_fold_is_reported_not_replayed(svc):
+    three_edits(svc)
+    version = svc.writeback("city")["version"]
+    before = {o["__pk"]: o["realm"] for o in objects(svc)}
+    assert before["city-a"] == "one", "the fold is in the dataset"
+
+    # A transform build writes the rows again from upstream, without the
+    # overlay: this is the supersession.
+    svc.catalog.write("cities", cities(), source="transform")
+    after = {o["__pk"]: o["realm"] for o in objects(svc)}
+    assert after["city-a"] == "beleriand", (
+        "the hand edit's EFFECT is gone — this is the state being reported"
+    )
+
+    report = svc.superseded_folds(svc.ontology.object_type("city"))
+    assert report["edits"] == 3
+    assert report["version"] == version + 1
+    assert report["source"] == "transform"
+    assert svc.prune_plan("city", keep=0)["superseded_folds"] == report
+    # And on the object type's own status block, which is where someone looking
+    # at the type — rather than at the log — would have to be told.
+    svc.reindex("city")
+    assert svc.index_state(svc.ontology.object_type("city"))["superseded_folds"] == report
+
+    # Reported, NOT replayed: no unfold happened, the objects still read their
+    # rebuilt values, and the log still holds every edit as the record.
+    assert {o["__pk"]: o["realm"] for o in objects(svc)} == after
+    assert len(edit_ids(svc)) == 3
+    assert svc.prune_object_edits("city", keep=0)["pruned"] == 0
+
+
+def test_a_fold_nothing_overwrote_is_not_reported_as_superseded(svc):
+    """The report has to be quiet in the ordinary case, or it is noise: a
+    writeback carries the fold forward, so there is nothing to say."""
+    three_edits(svc)
+    svc.writeback("city")
+    empty = {"edits": 0, "version": None, "source": None}
+    assert svc.superseded_folds(svc.ontology.object_type("city")) == empty
+    assert svc.prune_plan("city", keep=0)["superseded_folds"] == empty
+
+
+def test_edit_log_auto_prune_is_off_unless_an_operator_asks(svc, monkeypatch):
+    """Deleting history is something an operator asks for, so every way of
+    *not* asking has to mean off — unset, "0", and the empty string a shell
+    supplies for an exported-but-blank variable all read the same."""
+    three_edits(svc)
+    for value in (None, "0", ""):
+        if value is None:
+            monkeypatch.delenv(svc.PRUNE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(svc.PRUNE_ENV, value)
+        assert svc._prune_after_fold("city", actor="test") == 0
+        assert len(edit_ids(svc)) == 3

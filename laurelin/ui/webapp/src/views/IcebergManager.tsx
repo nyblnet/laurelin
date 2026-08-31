@@ -20,6 +20,32 @@ interface Snapshot {
   snapshot_id: number;
   timestamp_ms: number;
   operation: string | null;
+  /** What a scan of THIS snapshot opens, and what those files weigh. */
+  data_files: number;
+  bytes: number;
+  /** Laurelin version rows that pin this snapshot, and Iceberg refs that do.
+   *  Both are promises the snapshot stays readable; only the second kind is a
+   *  promise Iceberg's own tooling knows about. */
+  versions: number[];
+  refs: string[];
+  pinned: boolean;
+}
+
+interface StorageReport {
+  dataset: string;
+  snapshots: Snapshot[];
+  /** Distinct data files across every snapshot, and their union in bytes —
+   *  the table's actual footprint. Summing the per-snapshot figures would
+   *  double-count files that several snapshots share. */
+  data_files: number;
+  bytes: number;
+  unpinned_snapshots: number;
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 const COLUMN_TYPES = ["string", "integer", "float", "boolean", "timestamp"];
@@ -271,10 +297,17 @@ function DropColumnHint({ onDrop }: { onDrop: (column: string) => void }) {
 // ---------------------------------------------------------------- snapshots
 
 function SnapshotsPanel({ name, compact }: { name: string; compact?: ReactNode }) {
+  // The storage report rather than the bare snapshot list: it is the same
+  // history plus the two numbers the history could not explain — what each
+  // snapshot costs, and what is holding it. "Compaction reclaims scan cost,
+  // not disk" and "nothing expires snapshots" were sentences in a doc; this is
+  // the panel where they become checkable. It costs one manifest plan per
+  // snapshot, which is metadata I/O and the only way to attribute bytes at all.
   const q = useQuery({
-    queryKey: ["iceberg-snapshots", name],
-    queryFn: () => api.get<Snapshot[]>(`${API}/datasets/${name}/iceberg/snapshots`),
+    queryKey: ["iceberg-storage", name],
+    queryFn: () => api.get<StorageReport>(`${API}/datasets/${name}/iceberg/storage`),
   });
+  const report = q.data;
 
   return (
     <div className="card">
@@ -292,31 +325,68 @@ function SnapshotsPanel({ name, compact }: { name: string; compact?: ReactNode }
         {compact}
       </div>
       {q.isLoading && <Spinner />}
-      {q.isError && <ErrorBox error={q.error} />}
-      {q.data &&
-        (q.data.length === 0 ? (
-          <EmptyState>No snapshots yet.</EmptyState>
+      {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
+      {report &&
+        (report.snapshots.length === 0 ? (
+          <EmptyState>
+            {/* no in-app door: a snapshot is a side effect of a write. */}
+            No snapshots yet — one appears each time this table is written.
+          </EmptyState>
         ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Operation</th>
-                  <th>When</th>
-                  <th>Snapshot</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...q.data].reverse().map((s) => (
-                  <tr key={s.snapshot_id}>
-                    <td>{s.operation ?? "—"}</td>
-                    <td className="dim">{fmtTime(new Date(s.timestamp_ms).toISOString())}</td>
-                    <td className="mono faint" style={{ fontSize: 12 }}>{s.snapshot_id}</td>
+          <>
+            <p className="hint" style={{ marginTop: 6 }}>
+              {report.data_files.toLocaleString()} data file
+              {report.data_files === 1 ? "" : "s"}, {fmtBytes(report.bytes)} on
+              disk across every snapshot. Compaction merges the files a{" "}
+              <em>scan</em> opens; earlier snapshots keep their own, so it makes
+              reads cheaper and frees no disk. Nothing expires snapshots here —
+              a snapshot a version row pins is a promise that version is still
+              readable, and Iceberg's own expiry protects branches and tags
+              without knowing about those rows.
+            </p>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Operation</th>
+                    <th>When</th>
+                    <th>Files</th>
+                    <th>Scan size</th>
+                    <th>Held by</th>
+                    <th>Snapshot</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {[...report.snapshots].reverse().map((s) => (
+                    <tr key={s.snapshot_id}>
+                      <td>{s.operation ?? "—"}</td>
+                      <td className="dim">
+                        {fmtTime(new Date(s.timestamp_ms).toISOString())}
+                      </td>
+                      <td className="mono">{s.data_files.toLocaleString()}</td>
+                      <td className="mono">{fmtBytes(s.bytes)}</td>
+                      <td>
+                        {s.versions.map((v) => (
+                          <Badge key={`v${v}`} tone="green">{`v${v}`}</Badge>
+                        ))}
+                        {s.refs.map((r) => (
+                          <Badge key={r}>{r}</Badge>
+                        ))}
+                        {!s.pinned && (
+                          <span className="faint" title="No version row and no branch or tag holds this snapshot.">
+                            nothing
+                          </span>
+                        )}
+                      </td>
+                      <td className="mono faint" style={{ fontSize: 12 }}>
+                        {s.snapshot_id}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
         ))}
     </div>
   );

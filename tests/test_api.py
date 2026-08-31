@@ -246,6 +246,9 @@ def test_list_transforms(client):
         "output": "planes",
         "inputs": ["raw_planes"],
         "kind": "python",
+        # #75: `inputs` is row-filtered to what this reader may view, and the
+        # boolean says whether anything was dropped. Never a count.
+        "hidden_inputs": False,
     }
     assert by_name["agg_plane_models"]["kind"] == "sql"
 

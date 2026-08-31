@@ -171,6 +171,11 @@ class ImportOptions(BaseModel):
     rename_prefix: Optional[str] = None
     metadata_only: bool = False
     actor: str = "import"
+    #: The sha256 the operator was handed with the archive, out of band. Not a
+    #: signature: it proves the bytes are the ones whoever gave you the digest
+    #: meant, and nothing about who that was. Checked before the first member
+    #: is parsed, because everything downstream reads these bytes.
+    expect_sha256: Optional[str] = None
 
 
 class Collision(BaseModel):
@@ -912,6 +917,61 @@ def _require_safe_key(dataset: Any, key: str) -> None:
         )
 
 
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _expect_digest(
+    archive: Path | str | IO[bytes], expected: str, workspace: Workspace
+) -> tuple[Path | str | IO[bytes], Optional[Path]]:
+    """Refuse unless the archive's bytes hash to ``expected``. Before anything.
+
+    This is a **digest handshake, not a signature** — the same distinction
+    PORTABILITY.md keeps: there is no key here, so it proves the bytes are the
+    ones whoever gave you the digest was holding, and says nothing about who
+    that was. The trailer inside the archive cannot do this job, because
+    whoever rewrites a member can rewrite the trailer; a digest that travelled
+    by a different route than the archive cannot be rewritten with it.
+
+    Ordering is the point. The check happens before the manifest is parsed, so
+    a mismatch never reaches the code that reads an untrusted member. For a
+    stream (``laurelin import -``) that means spooling first: a digest cannot
+    be computed from bytes that are already being consumed, and "we verified it
+    as we imported it" would verify nothing.
+    """
+    expected = expected.strip().lower()
+    if not _DIGEST_RE.match(expected):
+        raise ImportRefused(
+            f"--expect-sha256 {expected!r} is not a sha256: it must be 64 hex "
+            "characters, as printed by `laurelin export` and by `sha256sum`."
+        )
+    spooled: Optional[Path] = None
+    if hasattr(archive, "read"):
+        # 0600 in the workspace, not /tmp: this is the whole workspace's
+        # governance and data, and /tmp is world-traversable on a normal box.
+        # Same reasoning as the export spool.
+        spooled = workspace.root / f".laurelin-verify-{uuid.uuid4().hex[:8]}.tar"
+        fd = os.open(spooled, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            shutil.copyfileobj(archive, out, COPY_CHUNK)
+        source: Path | str | IO[bytes] = spooled
+    else:
+        source = archive
+    digest = hashlib.sha256()
+    with open(source, "rb") as fh:  # type: ignore[arg-type]
+        for chunk in iter(lambda: fh.read(COPY_CHUNK), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        if spooled is not None:
+            spooled.unlink(missing_ok=True)
+        raise ImportRefused(
+            f"Archive sha256 is {actual}, not the {expected} you expected. "
+            "Nothing was read from it. Either this is not the archive whose "
+            "digest you were given, or it changed on the way here."
+        )
+    return source, spooled
+
+
 def import_workspace(
     archive: Path | str | IO[bytes],
     workspace: Workspace,
@@ -928,6 +988,10 @@ def import_workspace(
     options = options or ImportOptions()
     storage = storage or storage_for(workspace)
     require_data_filter()
+
+    spooled: Optional[Path] = None
+    if options.expect_sha256:
+        archive, spooled = _expect_digest(archive, options.expect_sha256, workspace)
 
     tar, handle = _open_stream(archive)
     staging = workspace.root / f".laurelin-import-{uuid.uuid4().hex[:8]}"
@@ -1143,6 +1207,8 @@ def import_workspace(
         tar.close()
         if handle is not None:
             handle.close()
+        if spooled is not None:
+            spooled.unlink(missing_ok=True)
 
 
 class _Observed:

@@ -623,22 +623,37 @@ export function QuickChart() {
       <div className="qc-head">
         <div>
           <h2 className="qc-title">Quick chart</h2>
+          {/* The promise used to be unconditional — "keep going from here when
+              the chart turns into a question" — and it is false for half the
+              sources this page offers: an analysis cell reads datasets, so an
+              object chart cannot become one. A page that promises a door half
+              its readers do not have is the phantom-door problem the Datasets
+              empty state already had to fix. Qualify it here rather than let
+              the reader discover it on a disabled button. */}
           <p className="hint" style={{ margin: "2px 0 0" }}>
             One chart, no name, no saved record — shape it by clicking and send
-            it to a dashboard. Everything runs with your own data access. For
-            multi-step work, start a <strong>new analysis</strong> below, or
-            keep going from here when the chart turns into a question.
+            it to a dashboard. Everything runs with your own data access. A
+            chart over a <strong>dataset</strong> can also keep going as a{" "}
+            <strong>new analysis</strong>; a chart over <strong>objects</strong>{" "}
+            goes to a dashboard.
           </p>
         </div>
-        <span style={{ display: "inline-flex", gap: 8, flexShrink: 0 }}>
+        <span style={{ display: "inline-flex", gap: 8, flexShrink: 0, alignItems: "flex-start" }}>
+          <span style={{ display: "inline-flex", flexDirection: "column", gap: 4 }}>
           <button
             title={
               tab === "objects"
-                ? "Object charts can't become analysis cells yet — analyses read datasets. Save to a dashboard instead."
+                ? undefined
                 : tab === "datasets" && issues.length > 0
                   ? issues[0]
                   : "Continue this shaping as cell 1 of a new analysis"
             }
+            // The reason this is dark is a permanent product limitation, not a
+            // transient state, and it lived only in a `title` — invisible to
+            // touch, to keyboard (a disabled button never takes focus, so the
+            // tooltip is unreachable), and to anyone who does not think to
+            // hover a control that looks broken. It is stated inline below.
+            aria-disabled={tab === "objects" || !chartReady ? true : undefined}
             disabled={tab === "objects" || !chartReady}
             onClick={() => {
               promote.reset();
@@ -649,6 +664,13 @@ export function QuickChart() {
           >
             Keep going → analysis
           </button>
+          {tab === "objects" && (
+            <span className="hint" style={{ maxWidth: 220, fontSize: 12 }}>
+              An analysis reads datasets, so an object chart can't become one
+              yet. Save it to a dashboard instead.
+            </span>
+          )}
+          </span>
           <button
             className="primary"
             // `result` alone is not enough: it can be the STALE preview of a
@@ -707,10 +729,25 @@ export function QuickChart() {
             ) : (
               <>
                 <ul className="ex-src-list">
-                  {(datasetsQ.data ?? []).map((d) => (
+                  {/* A dataset declared but never built has no version, so
+                      there is no data to shape: picking it used to fetch a
+                      schema and a preview, and print `Error 404` twice on one
+                      screen for a name this picker offered. Grey it and say
+                      why — the reader sees the name on Datasets, so removing
+                      it would only move the confusion. */}
+                  {(datasetsQ.data ?? []).map((d) => {
+                    const noVersion = d.latest_version == null;
+                    return (
                     <li key={d.name}>
                       <button
                         className={`ex-src-item mono${state.dataset === d.name ? " active" : ""}`}
+                        aria-disabled={noVersion ? true : undefined}
+                        disabled={noVersion}
+                        title={
+                          noVersion
+                            ? "No versions yet — build or import into this dataset before charting it."
+                            : undefined
+                        }
                         onClick={() => {
                           if (state.dataset !== d.name) {
                             // Columns belong to a dataset: carrying shaping over
@@ -721,9 +758,11 @@ export function QuickChart() {
                         }}
                       >
                         {d.name}
+                        {noVersion && <span className="faint"> (no versions yet)</span>}
                       </button>
                     </li>
-                  ))}
+                    );
+                  })}
                 </ul>
                 {(datasetsQ.data ?? []).length === 0 && (
                   <EmptyState>
@@ -1031,7 +1070,13 @@ function ObjectShaping({
   return (
     <>
       <div className="ex-card">
-        <div className="ex-card-title">Narrow the objects</div>
+        {/* Card titles are the same four words on both source tabs — Filter,
+            Group by, Summarise, Order & top N — because switching tabs must
+            change the *nouns* the data has ("rows" vs "objects"), never the
+            names of the controls. A reader who learned the stack on datasets
+            was previously handed a differently-titled stack on objects and had
+            to re-learn a UI they already knew. */}
+        <div className="ex-card-title">Filter</div>
         {obj.filters.map((f, i) => (
           <div key={i} className="ex-row">
             <select
@@ -1074,7 +1119,10 @@ function ObjectShaping({
           className="ex-add"
           onClick={() => set((s) => ({ ...s, filters: [...s.filters, { property: "", value: "" }] }))}
         >
-          + only objects where…
+          {/* Same sentence shape as the dataset tab's "+ keep only rows
+              where…"; only the noun changes, because the thing being kept
+              genuinely is an object and not a row. */}
+          + keep only objects where…
         </button>
         <div className="ex-row" style={{ marginTop: 6 }}>
           <span className="ex-kw">search</span>
@@ -1123,6 +1171,13 @@ function ObjectShaping({
             );
           })}
         </div>
+        {/* The dataset tab has said this since the shaping cards merged; the
+            object tab did not, so an author who ticked nothing had no way to
+            know an aggregate over everything was what they were about to get.
+            Same sentence, so the fact has one voice. */}
+        {obj.groupBy.length === 0 && (
+          <div className="hint">No grouping = one summary row over everything.</div>
+        )}
       </div>
 
       <div className="ex-card">
@@ -1228,6 +1283,21 @@ function ObjectShaping({
         >
           + add a summary
         </button>
+      </div>
+
+      {/* The dataset tab's fourth card is "Order & top N". The object
+          aggregate endpoint (POST /ontology/objects/{type}/aggregate) has no
+          ordering or limit, so there is no card to render — and the object tab
+          simply ended one card early, which reads as "you missed something"
+          rather than "this does not exist here". A capability gap the reader
+          can see is a limitation; a capability gap they cannot is a bug they
+          will hunt for. State it in the card's place. */}
+      <div className="ex-card">
+        <div className="ex-card-title">Order &amp; top N</div>
+        <div className="hint">
+          Ordering and top-N aren't available for object charts yet. Charting a
+          dataset gives you both.
+        </div>
       </div>
     </>
   );

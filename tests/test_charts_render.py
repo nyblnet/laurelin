@@ -182,8 +182,10 @@ def test_a_stat_of_a_multirow_result_declares_it_shows_one_of_n(rendered):
     # result it can only show the first row — silently, that reads as the
     # total. The badge is mandatory, and a single-row stat never carries it.
     html = rendered["stat_multirow"]
-    assert "first of 3 rows — filter to one row, or use a chart" in html
-    assert "first of" not in rendered["stat_small"]
+    # The phrase is `truncationNote()`'s, not this mark's own: "first of {n}
+    # rows" was a FIFTH rendering of the one fact ui.tsx exists to state once.
+    assert "first 3 of a larger result — filter to one row, or use a chart" in html
+    assert "of a larger result" not in rendered["stat_small"]
 
 
 def test_axis_tick_labels_are_distinct_for_sub_hundredth_domains(rendered):
@@ -290,7 +292,10 @@ def test_duplicate_group_columns_refuse_in_plain_english_before_preview(rendered
 
 def test_a_parenthesized_summary_name_refuses_in_plain_english_before_preview(rendered):
     issues = json.loads(rendered["paren_alias_issues"])
-    assert any("letters, digits, underscores and spaces" in i for i in issues), issues
+    # The sentence is NAME_RULE_LABEL, shared with the flow builder's rename
+    # hint, so the same rule stops being worded two ways one screen apart.
+    assert any("Letters, digits, underscores and spaces" in i for i in issues), issues
+    assert any("— for example " in i for i in issues), issues
     assert any("Avg delay (min)" in i for i in issues)
 
 

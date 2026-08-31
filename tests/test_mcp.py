@@ -96,8 +96,12 @@ def test_client_end_to_end(env):
     assert edit["kind"] == "update"
     assert c.get_object("city", "valmar")["pop"] == 150
 
-    build = c.run_build(wait=True)
-    assert build["status"] in ("succeeded", "failed")  # no transforms -> trivially succeeded
+    # No pipelines in this workspace, so a build over "all targets" refuses
+    # instead of manufacturing a green vacuous success. The agent gets the
+    # same sentence a person does.
+    with pytest.raises(LaurelinError) as build_err:
+        c.run_build(wait=True)
+    assert "no pipelines in this workspace" in str(build_err.value)
     c.close()
 
 

@@ -281,3 +281,59 @@ def test_accepted_values_binds_its_values_instead_of_escaping_them():
     results = check(con, [exp], "out")
     con.close()
     assert results[0]["measured"] == 1  # only "bad" violates
+
+
+# -- what the BUILD says the cause was ---------------------------------------
+
+def test_a_build_reports_the_cause_its_only_failed_task_recorded(env):
+    """The build-level `Failure.code` was hard-coded `TRANSFORM_FAILED`.
+
+    Measured on the Builds page: an expanded failed row stacked two
+    contradictory diagnoses. The build-level one, first and louder — "The
+    pipeline's code raised — fix the code it names" — sat directly above the
+    task-level one, "A data expectation failed. The transform ran and its
+    output did not meet a declared expectation." A novice reads the first and
+    goes hunting for a bug in SQL that is correct: the DATA was wrong, not the
+    code. Health had it right all along, which is how the contradiction was
+    visible at all.
+
+    The rule, and it is deliberately minimal: one code when the failed tasks
+    agree, the generic code when they do not. No new `MIXED` enum member — a
+    word no task ever recorded has no business on the row.
+    """
+    def declare():
+        @expect(accepted_values("status", ["open", "shipped"]))
+        @transform(output=Output("out"), src=Input("src"))
+        def picky(src):
+            return src
+
+    _, info = build(env, registry_with(declare))
+    assert info.status.value == "failed"
+    assert [t.failure.code.value for t in info.tasks] == ["expectation_failed"]
+    assert info.failure is not None
+    assert info.failure.code.value == "expectation_failed", (
+        "the build must report the cause its only failed task recorded"
+    )
+    # The subject stays the build; only the CODE is inherited.
+    assert info.failure.subject == f"build:{info.id}"
+    assert info.failure.counters == {"failed_tasks": 1}
+
+
+def test_a_build_whose_failed_tasks_disagree_keeps_the_generic_cause(env):
+    """Two tasks fail for genuinely different reasons, so there is no single
+    true cause and the generic code is the honest answer."""
+    def declare():
+        @expect(accepted_values("status", ["open", "shipped"]))
+        @transform(output=Output("out_a"), src=Input("src"))
+        def picky(src):
+            return src
+
+        @transform(output=Output("out_b"), src=Input("src"))
+        def raiser(src):
+            raise RuntimeError("boom")
+
+    _, info = build(env, registry_with(declare))
+    assert info.status.value == "failed"
+    codes = {t.failure.code.value for t in info.tasks}
+    assert len(codes) == 2, codes
+    assert info.failure.code.value == "transform_failed"

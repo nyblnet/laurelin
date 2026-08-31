@@ -679,6 +679,45 @@ class DatasetCatalog:
     def iceberg_snapshots(self, name: str) -> list[dict]:
         return self._iceberg().snapshots(name)
 
+    def iceberg_storage_report(self, name: str) -> dict:
+        """Per-snapshot disk, and who pins each snapshot.
+
+        Two kinds of pin, and only one of them is Iceberg's own:
+
+        * a **ref** — a branch or tag — which pyiceberg's own expiry protects;
+        * a Laurelin **version row**, which it knows nothing about.
+
+        That second one is why snapshot expiry is not offered. Measured on
+        pyiceberg 0.11.1: ``expire_snapshots()`` took a table from 6 snapshots
+        to 1, left disk *unchanged* at 25,781 bytes (it is a metadata edit —
+        there is no orphan-file removal in ``MaintenanceTable``), and then
+        ``catalog.read('orders', version=1)`` raised ``ValueError: Snapshot not
+        found``, because every version row here is a standing promise that the
+        version is still readable. So this reports rather than reclaims: it
+        names, per snapshot, which promise is holding it.
+        """
+        report = self._iceberg().storage_report(name)
+        pinned: dict[int, list[int]] = {}
+        for v in self.store.list_versions(name):
+            if v.snapshot_id is not None:
+                pinned.setdefault(v.snapshot_id, []).append(v.version)
+        refs = report.pop("refs", {})
+        by_snapshot: dict[int, list[str]] = {}
+        for ref, snapshot_id in refs.items():
+            by_snapshot.setdefault(snapshot_id, []).append(ref)
+        for row in report["snapshots"]:
+            versions = sorted(pinned.get(row["snapshot_id"], []))
+            row["versions"] = versions
+            row["refs"] = sorted(by_snapshot.get(row["snapshot_id"], []))
+            # An unpinned snapshot is the only kind expiry could take without
+            # breaking a promise. Naming it is not an offer to take it.
+            row["pinned"] = bool(versions or row["refs"])
+        report["dataset"] = name
+        report["unpinned_snapshots"] = sum(
+            1 for row in report["snapshots"] if not row["pinned"]
+        )
+        return report
+
     def read_iceberg(self, name: str, version: Optional[int] = None) -> pa.Table:
         """Read an Iceberg dataset, optionally as of one of its versions."""
         snapshot_id = None

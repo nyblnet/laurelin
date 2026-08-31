@@ -184,11 +184,18 @@ def test_locking_dataset_hides_its_object_type(admin, viewer):
     _lock_to_admin(admin, "secret_ds")
     types = {t["api_name"] for t in viewer.get("/api/v1/ontology/object-types").json()}
     assert types == {"public_obj"}  # secret_obj hidden via its backing dataset
-    assert viewer.get("/api/v1/ontology/objects/secret_obj").status_code == 403
+    # 404, in the same words an unknown type gets: the type is withheld
+    # BECAUSE its backing dataset is, so a 403 naming it would be an oracle on
+    # the dataset one indirection away.
+    hidden = viewer.get("/api/v1/ontology/objects/secret_obj")
+    assert hidden.status_code == 404
+    assert hidden.json()["detail"] == "Unknown object type: 'secret_obj'"
+    # Same rule on the write door: a reader who may not SEE the type learns
+    # nothing from an edit refusal either.
     assert viewer.post(
         "/api/v1/ontology/actions/touch_secret/apply",
         json={"pk": "s1", "parameters": {"id": "s1"}},
-    ).status_code == 403
+    ).status_code == 404
 
 
 def test_dataset_edit_grant_lets_viewer_upload(admin, viewer):

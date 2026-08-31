@@ -153,7 +153,7 @@ class LaurelinClient:
     def get_build(self, build_id: str) -> dict:
         return self._req("GET", f"/builds/{build_id}")
 
-    def dataset_health(self) -> list[dict]:
+    def dataset_health(self) -> dict:
         # Filtered server-side to datasets this credential can view, exactly
         # like the REST rollup — the client adds nothing and removes nothing.
         return self._req("GET", "/health/datasets")

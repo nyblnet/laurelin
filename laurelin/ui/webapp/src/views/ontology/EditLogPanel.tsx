@@ -46,6 +46,10 @@ interface EditLogReport {
   prunable_bytes?: number;
   retained?: RetainedReason[];
   pruned?: number;
+  /** Folded edits a later write to the backing dataset may have overwritten:
+   *  the record survives, the effect does not. Reported, never replayed — the
+   *  server refuses to unfold automatically, and says why. */
+  superseded_folds?: { edits: number; version: number | null; source: string | null };
 }
 
 function fmtBytes(n: number): string {
@@ -116,6 +120,7 @@ export function EditLogPanel({ type }: { type: ObjectTypeDetail }) {
 
   const prunable = r.prunable ?? 0;
   const retained = r.retained ?? [];
+  const superseded = r.superseded_folds;
 
   function confirmText(): string {
     return [
@@ -154,6 +159,25 @@ export function EditLogPanel({ type }: { type: ObjectTypeDetail }) {
         and indexes are on top of it, so treat it as a floor rather than a disk
         measurement.
       </p>
+
+      {superseded && superseded.edits > 0 && (
+        // The one state where the log and the data disagree, and the reason
+        // this panel says anything at all about versions: the rows a fold
+        // wrote were rewritten by a later version that never read the overlay,
+        // so those objects show their pre-edit values again. Nothing replays
+        // them — an edit is an absolute assignment, so replaying it would
+        // resurrect a stale hand value over corrected upstream data. Saying so
+        // is the honest half; a silent overwrite was the whole problem.
+        <div className="warn-box">
+          {superseded.edits.toLocaleString()} folded edit
+          {superseded.edits === 1 ? " was" : "s were"} overtaken by version{" "}
+          {superseded.version} of <code>{r.backing_dataset}</code>
+          {superseded.source ? ` (written by ${superseded.source})` : ""}, which
+          did not carry them forward — those objects read their pre-edit values
+          again. The edits are kept as the record of what was changed and are
+          never replayed automatically: re-apply the ones that still apply.
+        </div>
+      )}
 
       <div className="toolbar" style={{ gap: 8, alignItems: "center" }}>
         <span className="faint" style={{ fontSize: 12 }}>Keep newest folded</span>

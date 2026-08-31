@@ -49,6 +49,8 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  NotFound,
+  isNotFound,
   Modal,
   Note,
   PageHeader,
@@ -636,6 +638,19 @@ function EditorCell({
       out.push({ value: `cell:${d.id}`, label: `Cell ${i + 1} — ${d.title || d.id}` });
     }
     for (const d of datasetsQ.data ?? []) {
+      // A dataset with no version has nothing to read: picking it fetched a
+      // schema that 404s and left the cell wedged on a source the picker
+      // itself offered. Same treatment as an unsaved upstream cell — listed,
+      // disabled, and told why.
+      if (d.latest_version == null) {
+        out.push({
+          value: `ds:${d.name}`,
+          label: `${d.name} — no versions yet`,
+          hint: "Build or import into this dataset before reading from it.",
+          disabled: true,
+        });
+        continue;
+      }
       out.push({ value: `ds:${d.name}`, label: d.name });
     }
     return out;
@@ -757,6 +772,16 @@ function EditorCell({
                   </option>
                 ))}
               </select>
+              {/* The Objects/datasets seam, stated where the reader meets it.
+                  Quick chart offers both sources; an analysis cell reads
+                  datasets only, and the absence was previously visible only as
+                  a missing tab — an absence nobody can read as deliberate.
+                  Naming the limit is not the same as fixing it, and it is what
+                  this surface owes until it is fixed. */}
+              <div className="hint" style={{ marginTop: 4 }}>
+                Cells read datasets and earlier cells. To chart object types,
+                use the quick chart on <Link to="/analyses?mode=chart">Analyses</Link>.
+              </div>
             </div>
           </div>
           {draft.shaping.source && (
@@ -992,7 +1017,11 @@ function AnalysisPage() {
   });
 
   if (anaQ.isLoading) return <Spinner />;
-  if (anaQ.isError) return <ErrorBox error={anaQ.error} />;
+  if (isNotFound(anaQ.error))
+    return (
+      <NotFound what="analysis" name={name} backTo="/analyses" backLabel="Back to Analyses" />
+    );
+  if (anaQ.isError) return <ErrorBox error={anaQ.error} onRetry={() => anaQ.refetch()} />;
   const ana = anaQ.data!;
 
   if (!auth.can("editor")) {
@@ -1242,7 +1271,7 @@ function AnalysisEditor({ ana, onDeleted }: { ana: Analysis; onDeleted: () => vo
       {drafts.length === 0 ? (
         <EmptyState>
           No cells yet — add a shaping cell (point-and-click, chainable) or a
-          SQL cell.
+          SQL cell with the buttons above.
         </EmptyState>
       ) : (
         drafts.map((d, i) => (

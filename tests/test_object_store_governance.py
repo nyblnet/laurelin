@@ -1156,10 +1156,14 @@ def test_the_index_routes_are_gated_per_object_type_like_every_other(tmp_path):
     assert admin.put("/api/v1/ontology/permissions/city", json={"grants": [
         {"subject_kind": "user", "subject": "root",
          "can_view": True, "can_edit": True}]}).status_code == 200
-    assert elf.get("/api/v1/ontology/object-types/city").status_code == 403
-    assert elf.get("/api/v1/ontology/objects/city").status_code == 403
-    assert elf.post("/api/v1/ontology/object-types/city/index").status_code == 403
-    assert elf.delete("/api/v1/ontology/object-types/city/index").status_code == 403
+    # 404 and not 403, on the read AND the write doors: a withheld object type
+    # answers exactly like an unknown one, because the list route already omits
+    # it and a 403 one URL over handed its existence back. The gate is the
+    # same; only what the refusal discloses changed.
+    assert elf.get("/api/v1/ontology/object-types/city").status_code == 404
+    assert elf.get("/api/v1/ontology/objects/city").status_code == 404
+    assert elf.post("/api/v1/ontology/object-types/city/index").status_code == 404
+    assert elf.delete("/api/v1/ontology/object-types/city/index").status_code == 404
     # The owner's index is still theirs to build, and still there afterwards.
     assert admin.post("/api/v1/ontology/object-types/city/index").status_code == 200
     assert admin.get(

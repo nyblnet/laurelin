@@ -26,6 +26,8 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  NotFound,
+  isNotFound,
   PageHeader,
   RedactedValue,
   Spinner,
@@ -74,7 +76,7 @@ export function DatasetsView() {
 function DatasetList() {
   const navigate = useNavigate();
   const auth = useAuth();
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["datasets"],
     queryFn: () => api.get<Dataset[]>(`${API}/datasets`),
   });
@@ -126,7 +128,11 @@ function DatasetList() {
       <ImportPanel />
       <FederatedPanel />
       {isLoading && <Spinner />}
-      {error && <ErrorBox error={error} />}
+      {/* The app never self-retries (retry:false, refetchOnWindowFocus:false),
+          so a transient 503 on the most-visited page in the product was a dead
+          end whose only exit was a browser reload. Every other list surface
+          offers the retry; this one owed it most. */}
+      {error && <ErrorBox error={error} onRetry={() => refetch()} />}
       {data &&
         (data.length === 0 ? (
           !auth.can("editor") ? (
@@ -153,32 +159,57 @@ function DatasetList() {
                   {" "}· clean it with a <Link to="/pipelines">Pipeline</Link>
                 </>
               )}{" "}
-              · or follow the{" "}
-              <a
-                href="https://github.com/laurelin-data/laurelin/blob/main/docs/tutorials/01-ingest-transform-build.md"
-                target="_blank"
-                rel="noreferrer"
-              >
-                10-minute tutorial
-              </a>{" "}
               {/* The docs ship in the repo but are not served by this app yet,
-                  so on an offline or air-gapped install the link is dead —
-                  name the in-repo path so the tutorial is still findable. */}
+                  so on an air-gapped install the github.com link is dead and
+                  the reader is left with nothing. Lead with the path that is
+                  already on their disk; the URL is the fallback, not the
+                  primary door. */}
+              · or follow the 10-minute tutorial at{" "}
+              docs/tutorials/01-ingest-transform-build.md in the Laurelin repo{" "}
               <span className="faint">
-                (docs/tutorials/01-ingest-transform-build.md in the Laurelin
-                repo)
+                (also{" "}
+                <a
+                  href="https://github.com/laurelin-data/laurelin/blob/main/docs/tutorials/01-ingest-transform-build.md"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  on GitHub
+                </a>
+                )
               </span>
               .
             </div>
           </EmptyState>
           )
         ) : (
-          <DataTable
-            columns={columns}
-            rows={data}
-            rowKey={(d) => d.name}
-            onRowClick={(d) => navigate(`/datasets/${d.name}`)}
-          />
+          <>
+            {/* Orientation must not live ONLY in the empty state. Measured on
+                the `laurelin demo` workspace — the documented first-run
+                experience, which lands on this exact URL: the empty state's
+                three doors are the only guidance the product ever offers, and
+                a populated workspace replaced all of it with a bare table. A
+                novice asking "what is this, what do I do first" got nothing,
+                because the answer was emitted only when there was no data to
+                act on. Same three doors, one line, role-filtered like the
+                nav. */}
+            <p className="hint" style={{ marginTop: 0 }}>
+              Pick a dataset to see its columns, versions and lineage — or{" "}
+              <Link to="/analyses?mode=chart">chart one in Analyses</Link>
+              {auth.can("editor") && (
+                <>
+                  , <Link to="/pipelines">clean one with a Pipeline</Link>, or see{" "}
+                  <Link to="/builds">Builds</Link>
+                </>
+              )}
+              .
+            </p>
+            <DataTable
+              columns={columns}
+              rows={data}
+              rowKey={(d) => d.name}
+              onRowClick={(d) => navigate(`/datasets/${d.name}`)}
+            />
+          </>
         ))}
       <SourcesSection />
     </div>
@@ -722,7 +753,7 @@ export function DatasetOpenIn({ name }: { name: string }) {
 
 function DatasetDetailPage() {
   const { name = "" } = useParams();
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["dataset", name],
     queryFn: () => api.get<DatasetDetail>(`${API}/datasets/${name}`),
   });
@@ -733,7 +764,11 @@ function DatasetDetailPage() {
         <Link to="/datasets">← Datasets</Link>
       </div>
       {isLoading && <Spinner />}
-      {error && <ErrorBox error={error} />}
+      {isNotFound(error) ? (
+        <NotFound what="dataset" name={name} backTo="/datasets" backLabel="Back to Datasets" />
+      ) : (
+        error && <ErrorBox error={error} onRetry={() => refetch()} />
+      )}
       {data && <DatasetDetailBody detail={data} />}
     </div>
   );
@@ -1133,7 +1168,14 @@ function SchemaSection({ version }: { version: DatasetVersion | undefined }) {
 
 function VersionHistory({ versions }: { versions: DatasetVersion[] }) {
   if (versions.length === 0) {
-    return <EmptyState>No versions yet.</EmptyState>;
+    return (
+      <EmptyState>
+        {/* no in-app door: a version is written by an import above, a source
+            sync, or a build — never by a control on this panel. */}
+        No versions yet — a version appears when a file is imported into this
+        dataset, a source syncs it, or a pipeline builds it.
+      </EmptyState>
+    );
   }
   const columns: Column<DatasetVersion>[] = [
     { label: "Version", className: "mono", render: (v) => `v${v.version}` },

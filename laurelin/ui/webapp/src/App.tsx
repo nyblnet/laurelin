@@ -18,7 +18,7 @@ import {
   flowsRedirectTarget,
 } from "./Layout";
 import { LoginScreen, SetupScreen } from "./screens/AuthScreens";
-import { Spinner } from "./ui";
+import { NotFound, ServerUnreachable, Spinner } from "./ui";
 import { DatasetsView } from "./views/Datasets";
 import { DashboardsView } from "./views/Dashboards";
 import { AnalysesView } from "./views/Analyses";
@@ -58,6 +58,18 @@ export function App() {
     );
   }
 
+  // Before any auth decision: a bootstrap probe that FAILED is not a signed-out
+  // user. See the comment on `bootstrap` in auth.tsx — this branch is what
+  // stops a `--no-auth` server showing a credential form that cannot succeed.
+  if (auth.bootstrapFailure !== null) {
+    return (
+      <ServerUnreachable
+        status={auth.bootstrapFailure}
+        onRetry={auth.retryBootstrap}
+      />
+    );
+  }
+
   if (auth.authRequired && auth.setupRequired) return <SetupScreen />;
   if (auth.authRequired && !auth.user) return <LoginScreen />;
 
@@ -87,7 +99,21 @@ export function App() {
             <Route path="/analyses/*" element={scoped(<AnalysesView />)} />
             <Route path="/explore" element={<ExploreRedirect />} />
             <Route path="/builds" element={scoped(<BuildsView />)} />
+            {/* A deep link under a surface that has no detail route used to
+                rewrite the hash to #/datasets and render the dataset list, so
+                anyone following a shared build link landed somewhere else with
+                no explanation. A redirect is itself a signal; say so instead. */}
+            <Route
+              path="/builds/*"
+              element={<NotFound what="build" backTo="/builds" backLabel="Back to Builds" />}
+            />
             <Route path="/schedules" element={scoped(<SchedulesView />)} />
+            <Route
+              path="/schedules/*"
+              element={
+                <NotFound what="schedule" backTo="/schedules" backLabel="Back to Schedules" />
+              }
+            />
             <Route path="/health" element={scoped(<HealthView />)} />
             <Route path="/pipelines/*" element={scoped(<PipelinesView />)} />
             {/* Retired routes (see RETIRED_ROUTES in Layout.tsx). Kept

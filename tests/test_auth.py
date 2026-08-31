@@ -519,7 +519,11 @@ def test_rbac_viewer_cannot_mutate(role_clients):
 def test_rbac_editor_can_mutate_data_but_not_admin(role_clients):
     editor = role_clients["editor"]
     assert editor.post("/api/v1/datasets", json={"name": "e_ds"}).status_code == 200
-    assert editor.post("/api/v1/builds", json={}).status_code == 200
+    # 400, not 200: this fixture's workspace has no pipelines, and a build
+    # over "all targets" with nothing to build used to answer `succeeded`.
+    # What this line is testing is the ROLE gate, so what matters is that it is
+    # not 403 — see tests/test_build_governance.py for the refusal itself.
+    assert editor.post("/api/v1/builds", json={}).status_code == 400
     assert editor.post("/api/v1/tokens", json={"name": "edtok"}).status_code == 200
     # ...but user management is admin-only.
     assert editor.get("/api/v1/users").status_code == 403

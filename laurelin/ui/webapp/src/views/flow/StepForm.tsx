@@ -28,6 +28,7 @@ import {
   SORT_DIRS,
 } from "./vocab";
 import { nodeById } from "./model";
+import { NAME_RULE_LABEL } from "../../ui";
 
 export interface StepFormProps {
   flow: FlowDef;
@@ -244,7 +245,7 @@ export function StepForm(props: StepFormProps) {
             + rename another
           </button>
           <div className="hint">
-            New names may use letters, digits, underscores and spaces.
+            {NAME_RULE_LABEL}
           </div>
         </div>
       )}

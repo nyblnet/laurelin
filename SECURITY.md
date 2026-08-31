@@ -67,14 +67,14 @@ role (viewer/editor/admin)
 The composition is the point: object-type access requires the ontology grant
 *and* backing-dataset access, so there is no path through the object API to
 data you cannot read directly. Row and column policy is applied at a single
-choke point shared by the rows API, SQL workbench, dashboard panels, ontology
+choke point shared by the rows API, the SQL page, dashboard panels, ontology
 materialization, and the MCP tools.
 
 **Markings propagate through lineage.** A derived dataset inherits its inputs'
 classifications on every build, so a pipeline cannot launder classified data
 into an unmarked output.
 
-**The SQL surface is sandboxed.** Workbench and dashboard queries run with
+**The SQL surface is sandboxed.** Ad-hoc SQL and dashboard queries run with
 DuckDB external access disabled (`catalog.py`, `SET enable_external_access=false`),
 over only the datasets the caller may view. `read_csv('/etc/passwd')`,
 `COPY … TO`, path traversal, and attempts to widen the sandbox with `SET` are
@@ -90,7 +90,7 @@ can read" capability**, because `federation.connect` disables
 filesystem restriction to disable at all. It is therefore admin-only, and
 exposing such datasets to ad-hoc SQL is additionally off by default behind
 `LAURELIN_FEDERATION_WORKBENCH=1`. This is a property of the registration
-route, not a hole in the workbench: callers receive an Arrow table, never a
+route, not a hole in the SQL surface: callers receive an Arrow table, never a
 connection, so only server-generated SQL reaches those engines.
 
 **The `object_store` ingestion source is secret-bearing, and its endpoint is
@@ -252,6 +252,36 @@ datasets the caller cannot see. An outbound webhook payload is mechanically the
 *viewer-role* projection of the health record, so it cannot carry a masked
 value, a row count, a `cursor_value` or editor prose; the link is a relative
 path, never an absolute URL.
+
+**The withholding boundary: what a name discloses, and where it stops.** A
+route may name a dataset — or a transform whose name *is* a dataset name — only
+to a principal who may view that dataset. Where a name is withheld the response
+drops the whole node **and both its edges**, and marks the surviving endpoint
+with a single unquantified boolean (`has_hidden_upstream`,
+`has_hidden_downstream`, `hidden_inputs`, `hidden_tasks`, `hidden_targets`,
+`hidden_transforms`, `hidden_downstream`, `others_exist`). Never a count, never
+a placeholder node: a placeholder preserves topology and cardinality, which is
+enough to fingerprint a pipeline and to notice when a new hidden dataset
+appears. **No status is falsified to make a projection self-consistent** — a
+build whose withheld task failed still reads `failed`, and a `failed_tasks`
+counter that recounts to zero is dropped rather than emitted.
+
+A withheld resource and an absent one answer **identically**: 404, in the same
+words, on `GET /datasets/{n}`, `GET /builds/{id}`, the Iceberg dataset routes,
+`GET /pipelines/{n}`, `GET /schedules/{n}` and the ontology object-type routes;
+400, in the same words, for a build target. The UI's not-found screen carries no
+status code for the same reason.
+
+**Where the boundary deliberately stops: a name the principal supplied
+themselves.** `POST /flows/preview` — authoring, with a body the caller wrote —
+tells its author whether a source they typed is absent or withheld, and the two
+sentences differ. That is intentional: the flow source *picker* offers only
+readable datasets, so this path is reached only by typing a name; the
+discriminator is load-bearing for the stored-flow run path, whose viewer-facing
+refusal is identical for both cases; and collapsing the two would make the
+authoring surface lie to the author about why their flow will not compile. The
+boundary is over names a principal **did not supply**. A principal who types a
+name learns whether it is theirs — and nothing about any name they did not type.
 
 ### What is *not* a boundary
 

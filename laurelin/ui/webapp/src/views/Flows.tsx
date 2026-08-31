@@ -19,7 +19,6 @@
 //     restricted to you until an admin grants access.
 
 import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
 import { Link, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, ApiError, api } from "../api";
@@ -49,14 +48,15 @@ import {
   FailureNote,
   LiveStatus,
   Modal,
-  NAME_RULE_NO_HYPHEN,
   PageHeader,
   Spinner,
   fmtNum,
   fmtValue,
+  truncationNote,
 } from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
 import { PIPELINES_SUBTITLE, PipelinesTabs } from "./Pipelines";
+import { NameDialog } from "./flow/NameDialog";
 import { StepForm, ExpectationsForm } from "./flow/StepForm";
 import type { TypeHints } from "./flow/ExprEditor";
 import {
@@ -80,7 +80,6 @@ import {
 import { KINDS, KIND_ORDER } from "./flow/vocab";
 import { FLOW_STYLES } from "./flow/styles";
 
-const NAME_RE = /^[a-z][a-z0-9_]*$/;
 /** How many rows a preview asks for. Stated in the banner below — the banner
  *  used to quote `FLOW_PREVIEW_MAX_ROWS` (200) while the panel requested 50,
  *  so the one honest sentence on the screen cited the wrong number. */
@@ -101,6 +100,7 @@ export function FlowsView() {
 // ------------------------------------------------------------------ the list
 
 function FlowList() {
+  const auth = useAuth();
   const navigate = useNavigate();
   const [params] = useSearchParams();
   // `?from=` is the dataset detail page's "New pipeline from this dataset"
@@ -111,6 +111,7 @@ function FlowList() {
   const flowsQ = useQuery({
     queryKey: ["flows"],
     queryFn: () => api.get<FlowListEntry[]>(`${API}/flows`),
+    enabled: auth.can("editor"),
   });
 
   // The Python tab's files, for two jobs: the first-run hero must only claim
@@ -121,6 +122,7 @@ function FlowList() {
   const pipelinesQ = useQuery({
     queryKey: ["pipelines"],
     queryFn: () => api.get<PipelineFileInfo[]>(`${API}/pipelines`),
+    enabled: auth.can("editor"),
   });
 
   // A pipeline's name is also the name of the dataset it builds, so a name an
@@ -141,9 +143,15 @@ function FlowList() {
         title="Pipelines"
         subtitle={PIPELINES_SUBTITLE}
         actions={
-          <button type="button" className="primary" onClick={() => setNaming(true)}>
-            + New pipeline
-          </button>
+          // Role-gated like every other authoring control. A viewer was shown
+          // "+ New pipeline" and, behind it, a 403 — an offer the product
+          // cannot keep. The nav already hides Pipelines from a viewer; this
+          // is the direct-link path.
+          auth.can("editor") ? (
+            <button type="button" className="primary" onClick={() => setNaming(true)}>
+              + New pipeline
+            </button>
+          ) : undefined
         }
       />
 
@@ -151,7 +159,17 @@ function FlowList() {
 
       <ImportedPipelinesNotice />
 
-      {flowsQ.isLoading ? (
+      {!auth.can("editor") ? (
+        // Prose, and NO Retry: a role refusal cannot change by asking again,
+        // and the Schedules page already answers this situation this way.
+        // The raw "Insufficient permissions (403)" with a futile Retry was the
+        // only place in the product that offered a control that could not work.
+        <EmptyState>
+          Pipelines are not shown to your role. They reach an editor and above,
+          because a pipeline is code this workspace runs. Ask an editor or an
+          administrator if you need to see one.
+        </EmptyState>
+      ) : flowsQ.isLoading ? (
         <Spinner />
       ) : flowsQ.error ? (
         <ErrorBox error={flowsQ.error} onRetry={() => flowsQ.refetch()} />
@@ -300,6 +318,8 @@ function FlowBuilder({ name }: { name: string }) {
   // the click — nothing connected "I clicked Save" to "here is why nothing
   // happened", on a path where closing the tab loses the whole draft.
   const [saveRefused, setSaveRefused] = useState(false);
+  // A refused step removal, said in the page rather than in an OS dialog.
+  const [stepRefusal, setStepRefusal] = useState<string | null>(null);
   const [ejectOpen, setEjectOpen] = useState(false);
   const [addAfter, setAddAfter] = useState<string | null>(null);
   const [builtId, setBuiltId] = useState<string | null>(null);
@@ -553,7 +573,12 @@ function FlowBuilder({ name }: { name: string }) {
     // about a step id nobody has seen.
     if (node.inputs.length === 0) {
       const where = consumerOf(draft, id) ? "this side of the combine" : "this pipeline";
-      window.alert(
+      // Not window.alert. The refusal is a page state, not an OS interrupt: an
+      // alert steals focus, cannot be styled, is not announced as a status,
+      // and vanishes on OK leaving no trace of what was refused or why. This
+      // screen already renders its Save refusal as an inline role=status note
+      // — one screen, one way of saying no.
+      setStepRefusal(
         `${where[0].toUpperCase()}${where.slice(1)} has to start somewhere. ` +
           "Change the dataset instead of removing this step — or remove the whole " +
           "step that uses it.",
@@ -561,6 +586,7 @@ function FlowBuilder({ name }: { name: string }) {
       return;
     }
     if (node.kind === "join" && !window.confirm("Remove this combine step and the dataset it brings in?")) return;
+    setStepRefusal(null);
     const next = removeStep(draft, id);
     edit(next);
     setSelected(next.terminal);
@@ -612,7 +638,12 @@ function FlowBuilder({ name }: { name: string }) {
             className="danger"
             disabled={del.isPending}
             onClick={() => {
-              if (window.confirm(`Delete the broken pipeline ${name}? The dataset it built is kept.`)) {
+              // The other two delete confirms (the healthy-pipeline one below and the
+              // Python tab's) promise BOTH halves. This one promised only the dataset,
+              // so the same action reassured differently depending on whether the
+              // pipeline happened to be loadable. Lineage survival is the half a
+              // reader is least sure of, so it is the half that must not be dropped.
+              if (window.confirm(`Delete the broken pipeline ${name}? The dataset it built is kept, and so is its lineage.`)) {
                 del.mutate();
               }
             }}
@@ -783,12 +814,27 @@ function FlowBuilder({ name }: { name: string }) {
       {/* The Save click's receipt, adjacent to the button that refused it.
           Rendered from the LIVE issue list, so it disappears the moment the
           step is finished; role=status so the refusal is announced. */}
+      {stepRefusal && (
+        <div className="fx-note fx-note-warn" role="status">
+          <strong>Step kept</strong> — {stepRefusal}{" "}
+          <button type="button" className="small" onClick={() => setStepRefusal(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
       {saveRefused && !previewable && (
         <div className="fx-note fx-note-warn" role="status">
           <strong>Not saved</strong> —{" "}
           {issues.length === 1 ? "one step is unfinished" : `${issues.length} steps are unfinished`}:{" "}
-          {issues.map((x) => `${KINDS[x.node.kind].label} — ${x.issue}`).join("; ")}. Finish
-          {issues.length === 1 ? " that step" : " those steps"} below, then Save again.
+          {/* Each `issue` is already a sentence ending in a full stop, so
+              appending one produced "Pick a column.." on screen. Strip the
+              step's own terminator; the joiner supplies the punctuation. */}
+          {issues
+            .map((x) => `${KINDS[x.node.kind].label} — ${x.issue.replace(/\.$/, "")}`)
+            .join("; ") +
+            ". Finish" +
+            (issues.length === 1 ? " that step" : " those steps") +
+            " below, then Save again."}
         </div>
       )}
       {restricted && (
@@ -853,29 +899,31 @@ function FlowBuilder({ name }: { name: string }) {
         <LiveStatus
           className={`fx-note ${buildQ.data?.status === "failed" ? "fx-note-bad" : "fx-note-ok"}`}
         >
-          {/* One sentence family for a kicked build, everywhere it is
-              kicked: "Build … finished: <outcome>." with a "See the build"
-              link — the Builds page's own phrasing, which Schedules already
-              copies. Three screens, one voice. */}
-          {buildQ.data?.status === "succeeded" ? (
+          {/* One sentence family for a kicked build, everywhere a build is
+              kicked (here, the Builds page, and Schedules). Measured across
+              the three screens this had drifted into three subjects
+              ("Build <id>" / "Run of <name>" / a bare "Build"), two failure
+              trailers ("for what went wrong" / none) and three pending
+              sentences. The TERMINAL fact converges completely —
+              "Build <id> finished: <outcome>." then "See the build." and
+              nothing after it. A second trailer is where the drift started:
+              once a screen is allowed to append its own explanation of what
+              the outcome means, each screen invents one. The row count that
+              used to hang off "succeeded" here was exactly that, and it is
+              one click away on the build itself.
+              The PENDING sentence shares the subject and may carry a
+              page-specific tail, because a reader standing on a history that
+              is following the build needs to be told so. */}
+          {buildQ.data?.status === "succeeded" || buildQ.data?.status === "failed" ? (
             <>
-              Build finished: succeeded — <span className="mono">{draft.output}</span>
-              {(() => {
-                const rows = buildQ.data.tasks.find((t) => t.output_dataset === draft.output)
-                  ?.rows_written;
-                return rows != null ? <> has {fmtNum(rows)} row{rows === 1 ? "" : "s"}</> : null;
-              })()}
-              . <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>.
-            </>
-          ) : buildQ.data?.status === "failed" ? (
-            <>
-              <strong>Build finished: failed.</strong>{" "}
-              <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>{" "}
-              for what went wrong.
+              <strong>
+                Build <span className="mono">{builtId}</span> finished: {buildQ.data.status}.
+              </strong>{" "}
+              <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>.
             </>
           ) : (
             <>
-              Build running…{" "}
+              Build <span className="mono">{builtId}</span> is running…{" "}
               <Link to={`/builds?build=${encodeURIComponent(builtId)}`}>See the build</Link>.
             </>
           )}
@@ -1071,8 +1119,7 @@ function FlowBuilder({ name }: { name: string }) {
             <div className="result-meta">
               {previewQ.data.truncated ? (
                 <>
-                  <strong>first {fmtNum(previewQ.data.row_count)} rows</strong> of a larger
-                  result ·{" "}
+                  <strong>{truncationNote(previewQ.data.row_count)}</strong> ·{" "}
                 </>
               ) : (
                 <>
@@ -1416,102 +1463,6 @@ function StepIcon({ kind }: { kind: FlowNodeKind }) {
         {paths[kind]}
       </g>
     </svg>
-  );
-}
-
-// ------------------------------------------------------------------ naming
-
-/**
- * Name a flow. Used for "New flow" and for "Duplicate".
- *
- * Not `window.prompt`, which is what the Transforms screen uses for the same
- * job. A prompt cannot show the rule, cannot show that a name is already
- * taken, and cannot say the one thing that matters here — that a flow's name is
- * the name of the dataset it produces and there is no rename afterwards,
- * because `spec.name` is the primary key of lineage and nothing in this tree
- * deletes lineage. That is too much to learn from a failed submit, and this
- * screen's audience is precisely the one that should not have to.
- */
-function NameDialog({
-  title,
-  intro,
-  confirmLabel,
-  taken,
-  takenDatasets = [],
-  busy,
-  error,
-  onCancel,
-  onSubmit,
-}: {
-  title: string;
-  intro: ReactNode;
-  confirmLabel: string;
-  taken: string[];
-  /** Existing dataset names. A pipeline's name is also the name of the
-   *  dataset it builds, so a name a dataset already owns would be refused by
-   *  the server with a 409 — this refuses it at the dialog, with the reason. */
-  takenDatasets?: string[];
-  busy?: boolean;
-  error?: unknown;
-  onCancel: () => void;
-  onSubmit: (name: string) => void;
-}) {
-  const [value, setValue] = useState("");
-
-  const name = value.trim();
-  const problem = !name
-    ? null
-    : !NAME_RE.test(name)
-      ? NAME_RULE_NO_HYPHEN
-      : taken.includes(name)
-        ? `There is already a pipeline called ${name}.`
-        : takenDatasets.includes(name)
-          ? `There is already a dataset called ${name}, and a pipeline shares its name with the dataset it builds. Pick another name.`
-          : null;
-  const ok = !!name && !problem;
-
-  return (
-    <Modal label={title} onClose={onCancel} width={540}>
-      <div className="fx-modal">
-        <h2>{title}</h2>
-        <p>{intro}</p>
-        <div className="field">
-          <label htmlFor="fx-name-input">Name</label>
-          <input
-            id="fx-name-input"
-            className="fx-in fx-wide"
-            value={value}
-            placeholder="late_orders"
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && ok && !busy) onSubmit(name);
-            }}
-          />
-          {problem ? (
-            <div className="hint bad">{problem}</div>
-          ) : (
-            <div className="hint">
-              {NAME_RULE_NO_HYPHEN} This is also the name of the dataset it
-              produces, and it cannot be changed later.
-            </div>
-          )}
-        </div>
-        {error != null && <ErrorBox error={error} />}
-        <div className="fx-modal-actions">
-          <button type="button" onClick={onCancel}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="primary"
-            disabled={!ok || busy}
-            onClick={() => onSubmit(name)}
-          >
-            {busy ? "Working…" : confirmLabel}
-          </button>
-        </div>
-      </div>
-    </Modal>
   );
 }
 

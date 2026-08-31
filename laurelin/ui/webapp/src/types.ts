@@ -415,11 +415,27 @@ export interface TransformSummary {
   output: string;
   inputs: string[];
   kind: string;
+  /** #75. `inputs` holds only the datasets this reader may view; this says
+   *  whether any were dropped. A boolean, never a count — see LineageNode. */
+  hidden_inputs: boolean;
 }
 
 export interface LineageNode {
   id: string;
   type: "dataset" | "transform";
+  /** #75. A node the reader may not view is dropped along with BOTH its
+   *  edges, and each surviving neighbour carries one bit saying there is
+   *  something there.
+   *
+   *  Not a silent drop: the graph would *look* complete and be wrong (a
+   *  viewer would read `raw_pay` as a leaf and conclude nothing consumes it).
+   *  Not an anonymised placeholder either: a placeholder preserves topology
+   *  and count — two hidden datasets between two visible ones tells you there
+   *  are exactly two, their fan-in and their fan-out — and counts are the
+   *  thing #75 is about. One unquantified bit is the same thing the 404 on a
+   *  hidden dataset already concedes. */
+  has_hidden_upstream: boolean;
+  has_hidden_downstream: boolean;
 }
 
 export interface LineageGraph {
@@ -460,6 +476,12 @@ export interface Build {
   finished_at: string | null;
   failure: Failure | null;
   tasks: BuildTask[];
+  /** #75. `targets` and `tasks` hold only what this reader may view; this says
+   *  whether any task was dropped. `status` is NOT adjusted to match — a build
+   *  whose only failed task is hidden still reads `failed`, because falsifying
+   *  the outcome to make the projection self-consistent is exactly the bug
+   *  where a schedule row read "succeeded" over a failed build. */
+  hidden_tasks: boolean;
 }
 
 export interface PropertyDef {
@@ -605,6 +627,9 @@ export interface Schedule {
   upstream_dataset: string;
   action: ScheduleAction;
   targets: string[];
+  /** #75: true when a target (or the upstream dataset) was dropped because
+   *  this reader may not view it. One unquantified bit — never a count. */
+  hidden_targets?: boolean;
   source: string;
   next_run_at: string | null;
   last_run_at: string | null;

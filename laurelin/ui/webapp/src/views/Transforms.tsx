@@ -14,11 +14,18 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { ApiError, api, API } from "../api";
 import type { PipelineFileContent, PipelineFileInfo, PipelineWriteResult } from "../types";
 import { useAuth } from "../auth";
-import { EmptyState, ErrorBox, FailureNote, NAME_RULE_NO_HYPHEN, Note, PageHeader, Spinner } from "../ui";
+import {
+  EmptyState,
+  ErrorBox,
+  FailureNote,
+  NAME_RULE_NO_HYPHEN,
+  Note,
+  PageHeader,
+  Spinner,
+} from "../ui";
 import { ImportedPipelinesNotice } from "./ImportedPipelinesNotice";
 import { PIPELINES_SUBTITLE, PipelinesTabs } from "./Pipelines";
-
-const NAME_RE = /^[a-z][a-z0-9_]*$/;
+import { NameDialog } from "./flow/NameDialog";
 
 const NEW_FILE_TEMPLATE = `from laurelin.transforms import transform, sql_transform, Input, Output
 
@@ -37,6 +44,7 @@ export function TransformsView() {
   const qc = useQueryClient();
 
   const [buffer, setBuffer] = useState<Buffer | null>(null);
+  const [naming, setNaming] = useState(false);
   // Result of the most recent save (declared transforms + any DAG collect error).
   const [saveResult, setSaveResult] = useState<PipelineWriteResult | null>(null);
 
@@ -165,22 +173,15 @@ export function TransformsView() {
     setDoc("");
   }
 
-  function newFile() {
-    if (!canEdit) return;
-    const raw = window.prompt("New pipeline file name (without .py):");
-    if (raw == null) return;
-    const base = raw.trim().replace(/\.py$/, "");
-    if (!NAME_RE.test(base)) {
-      window.alert(`Invalid name. ${NAME_RULE_NO_HYPHEN}`);
-      return;
-    }
-    // Compare stems, not filenames. The API returns `name` as the bare module
-    // name; this used to compare it against `${base}.py`, so the guard never
-    // fired and "New file" over an existing name silently overwrote it on save.
-    if ((filesQ.data ?? []).some((f) => f.name === base)) {
-      window.alert(`A file named ${base}.py already exists.`);
-      return;
-    }
+  // The name is collected by the shared <NameDialog>, not by window.prompt.
+  // A prompt cannot show the rule, cannot say the name is already taken
+  // before you commit to it, and cannot be styled or announced to a screen
+  // reader — and the Visual tab, one tab away on the same screen, has never
+  // used one. Two dialog systems for one action on one page is the finding.
+  // The stem comparison the old code got right is preserved: the API returns
+  // `name` as the bare module name, so `taken` is stems, not filenames.
+  function createFile(base: string) {
+    setNaming(false);
     setSaveResult(null);
     saveMut.reset();
     setBuffer({ name: base, isNew: true });
@@ -201,7 +202,7 @@ export function TransformsView() {
             <button
               type="button"
               className="primary"
-              onClick={newFile}
+              onClick={() => setNaming(true)}
               disabled={auth.pipelinesLocked}
               title={
                 auth.pipelinesLocked
@@ -209,7 +210,7 @@ export function TransformsView() {
                   : undefined
               }
             >
-              + New file
+              + New pipeline file
             </button>
           ) : undefined
         }
@@ -229,6 +230,31 @@ export function TransformsView() {
       </div>
 
       <ImportedPipelinesNotice />
+
+      {naming && (
+        <NameDialog
+          title="New pipeline file"
+          intro={
+            <>
+              A file holds the Python for one or more pipelines. The name is the module name —
+              Laurelin adds <span className="mono">.py</span> — and it is what the file is called
+              in the workspace and in version control.
+            </>
+          }
+          confirmLabel="Create"
+          noun="pipeline file"
+          placeholder="payroll"
+          hint={
+            <>
+              {NAME_RULE_NO_HYPHEN} This names the file, not a dataset: the datasets come from
+              the <span className="mono">@transform</span> functions you write inside it.
+            </>
+          }
+          taken={files.map((f) => f.name)}
+          onCancel={() => setNaming(false)}
+          onSubmit={createFile}
+        />
+      )}
 
       {/* Said up front, from the boot probe — not discovered as a 403 after
           the author has already written the code they cannot save. The lock
@@ -277,8 +303,13 @@ export function TransformsView() {
             <EmptyState>
               <div>No pipeline files yet.</div>
               {canEdit && (
-                <button type="button" className="small" style={{ marginTop: 10 }} onClick={newFile}>
-                  + New file
+                <button
+                  type="button"
+                  className="small"
+                  style={{ marginTop: 10 }}
+                  onClick={() => setNaming(true)}
+                >
+                  + New pipeline file
                 </button>
               )}
             </EmptyState>

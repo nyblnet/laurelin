@@ -10,12 +10,14 @@ is generated in code — no downloads, no randomness, no clock reads.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 import pyarrow as pa
 
 from laurelin.catalog import DatasetCatalog
 from laurelin.core.config import Workspace
 from laurelin.core.db import MetadataStore
+from laurelin.core.models import BuildInfo
 from laurelin.transforms import Builder, collect_transforms
 
 MODELS = ["A320neo", "A321XLR", "B737-800", "B787-9", "E195-E2", "ATR72-600"]
@@ -206,7 +208,24 @@ def _flights_table() -> pa.Table:
     )
 
 
-def create_demo(path: Path, build: bool = True) -> Workspace:
+class DemoResult(NamedTuple):
+    """The workspace, and what the build actually did.
+
+    The build result used to be discarded, and the CLI printed a hardcoded
+    "Pipeline built: clean_aircraft, clean_flights, flight_stats" whenever
+    ``build=True`` — inspecting nothing. On today's template those three names
+    happen to be right, which is the worst kind of wrong: the sentence is a
+    literal, so it stays green when the build goes red, and the demo is the
+    first build a new operator ever reads. Add a transform to the template, or
+    let one fail, and the CLI reports a success that did not happen.
+    Reporting what actually built costs one return value.
+    """
+
+    workspace: Workspace
+    build: Optional[BuildInfo]
+
+
+def create_demo(path: Path, build: bool = True) -> DemoResult:
     """Create the aviation demo workspace at `path`; optionally run the build."""
     workspace = Workspace.init(
         path,
@@ -233,8 +252,9 @@ def create_demo(path: Path, build: bool = True) -> Workspace:
     (workspace.ontology_dir / "aviation.yml").write_text(_ONTOLOGY_TEMPLATE)
     store.log_audit("demo_created", {"workspace": str(workspace.root)})
 
+    info = None
     if build:
         registry = collect_transforms(workspace.pipelines_dir)
-        Builder(workspace, catalog, store, registry).build()
+        info = Builder(workspace, catalog, store, registry).build()
 
-    return workspace
+    return DemoResult(workspace, info)

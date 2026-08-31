@@ -654,8 +654,13 @@ def test_a_flow_whose_result_would_feed_itself_is_refused_at_save(client):
     assert r.status_code == 400
     assert "itself" in r.json()["detail"]
 
-    # And the workspace still builds.
-    assert client.post("/api/v1/builds", json={"wait": True}).status_code == 200
+    # And the workspace still builds — the refused flow did not poison the
+    # registry. (400 here is the empty-workspace refusal, not the 409 a broken
+    # registry raises: the point of this line is that the flow left nothing
+    # behind, and an unregistered flow means an empty registry.)
+    build = client.post("/api/v1/builds", json={"wait": True})
+    assert build.status_code == 400
+    assert "no pipelines in this workspace" in build.json()["detail"]
 
 
 def test_a_flow_definition_is_not_readable_by_someone_who_cannot_read_its_sources(

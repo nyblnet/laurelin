@@ -720,6 +720,12 @@ class ExportOptions:
     # when the workspace directory is read-only.
     spool_dir: Optional[str] = None
     governance_fingerprint: dict[str, Any] = field(default_factory=dict)
+    #: Set BY the writer, not by the caller: the sha256 of the archive's own
+    #: bytes, known only once the last of them is written. A stream cannot
+    #: carry its own digest (the trailer is inside the archive, so it can only
+    #: cover the members), which is why this comes back on the options object
+    #: and is reported after the bytes rather than embedded in them.
+    archive_sha256: str = ""
 
     @property
     def compress(self) -> bool:

@@ -53,6 +53,13 @@ interface AuthContextValue {
   logout: () => Promise<void>;
   /** Called by the query layer on a 401 to force re-auth. */
   onUnauthorized: () => void;
+  /** HTTP status of a FAILED bootstrap /auth/status call, or null when it did
+   *  not fail. 401 never lands here — that one is a signed-out user and is
+   *  handled as such. 0 means the request never reached the server. */
+  bootstrapFailure: number | null;
+  /** Re-run the bootstrap probe. The only control offered on the unreachable
+   *  screen, because it is the only one that can help. */
+  retryBootstrap: () => void;
 }
 
 const RANK: Record<Role, number> = { viewer: 0, editor: 1, admin: 2 };
@@ -81,6 +88,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user: null,
   });
   const [activeSlug, setActiveSlug] = useState<string | null>(null);
+  // The bootstrap call failed for a reason that is NOT "you are signed out".
+  // `null` means it did not fail. See `bootstrapFailure` in the context.
+  const [unreachable, setUnreachable] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     const s = await api.get<AuthStatus>(`${API}/auth/status`);
@@ -100,11 +110,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStatus(s);
   }, []);
 
-  useEffect(() => {
+  // A failed /auth/status is not evidence of a signed-out user.
+  //
+  // The old line was `.catch(() => setStatus({auth_required: true, ...}))`,
+  // which turned EVERY bootstrap failure into the login screen. Measured on a
+  // `--no-auth` server with the call blocked at the transport layer: the app
+  // rendered "Sign in to continue / USERNAME / PASSWORD / Sign in" — a
+  // credential form that can never succeed, on a server with no accounts, with
+  // no Retry and no other control on the page.
+  //
+  // `api.ts` already preserves what actually happened (`ApiError(0, "Network
+  // error: ...")` for transport, the real status for 5xx); the catch threw it
+  // away. 401 is the ONLY status that means signed out — everything else,
+  // including 0, is a server the client could not reach.
+  //
+  // Deliberately ONE message for every non-401 case, with no special wording
+  // for the no-auth server: when the call fails the client does not know the
+  // server's auth mode — that is precisely the fact it is missing — so
+  // claiming "this server runs with auth disabled" would be a guess.
+  const bootstrap = useCallback(() => {
+    setLoading(true);
+    setUnreachable(null);
     refresh()
-      .catch(() => setStatus({ auth_required: true, setup_required: false, user: null }))
+      .then(() => setUnreachable(null))
+      .catch((e: unknown) => {
+        const status = e instanceof ApiError ? e.status : 0;
+        if (status === 401) {
+          setStatus({ auth_required: true, setup_required: false, user: null });
+        } else {
+          setUnreachable(status);
+        }
+      })
       .finally(() => setLoading(false));
   }, [refresh]);
+
+  useEffect(() => {
+    bootstrap();
+  }, [bootstrap]);
 
   const login = useCallback(
     async (username: string, password: string) => {
@@ -180,6 +222,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setActiveWorkspace,
       oidc: status.oidc,
       saml: status.saml,
+      bootstrapFailure: unreachable,
+      retryBootstrap: bootstrap,
       refresh,
       refreshAuth: refresh,
       login,
@@ -187,7 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       onUnauthorized,
     }),
-    [loading, status, role, multi, isSuperadmin, pipelinesLocked, flowsLocked, workspaces, activeSlug, setActiveWorkspace, refresh, login, setup, logout, onUnauthorized],
+    [loading, status, role, multi, isSuperadmin, pipelinesLocked, flowsLocked, workspaces, activeSlug, setActiveWorkspace, refresh, login, setup, logout, onUnauthorized, unreachable, bootstrap],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

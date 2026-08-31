@@ -219,6 +219,129 @@ def test_missing_workspace_errors_clearly(tmp_path):
 
 
 def test_create_demo_returns_workspace(tmp_path):
-    ws = create_demo(tmp_path / "d", build=False)
+    ws, build = create_demo(tmp_path / "d", build=False)
     assert isinstance(ws, Workspace)
     assert ws.name == "aviation-demo"
+    assert build is None, "no build was asked for, so there is nothing to report"
+
+
+# -- a second run over an existing workspace ------------------------------------
+#
+# `Workspace.init` is documented idempotent and stays that way: two concurrent
+# callers of it must both succeed, and `api/context._bundle` relies on that.
+# What was wrong is that a CLI inherited the silence — `init ./ws --name X` on
+# an existing workspace discarded `--name` and announced the OLD name as though
+# it had just created it, and `demo` re-ran over a populated workspace,
+# overwriting the pipeline and ontology files and bumping every dataset a
+# version, while printing "created". Exit code 2 is this CLI's "refused, and
+# here is the flag that overrides it", the same as the export path.
+
+
+def test_init_and_demo_refuse_a_path_that_already_holds_a_workspace(tmp_path):
+    root = tmp_path / "ws"
+    assert runner.invoke(app, ["init", str(root), "--name", "first"]).exit_code == 0
+
+    again = runner.invoke(app, ["init", str(root), "--name", "clobbered"])
+    assert again.exit_code == 2, again.output
+    assert "already holds the workspace 'first'" in again.output
+    assert "--force" in again.output
+    assert Workspace(root).name == "first", "and the refusal changed nothing"
+
+    demo_again = runner.invoke(app, ["demo", str(root), "--no-build"])
+    assert demo_again.exit_code == 2, demo_again.output
+    assert Workspace(root).name == "first"
+
+    forced = runner.invoke(app, ["init", str(root), "--force", "--name", "ignored"])
+    assert forced.exit_code == 0, forced.output
+    assert Workspace(root).name == "first", (
+        "--force means proceed, not rename: the marker is still written once, "
+        "and saying otherwise would be a second silent surprise"
+    )
+
+
+def test_init_over_the_same_workspace_says_it_changed_nothing(tmp_path):
+    """The narrow rule, and the reason it is narrow. `Workspace.init` is
+    idempotent by design and two concurrent callers must both succeed, so a
+    re-run that would discard nothing is not an error — it is a no-op, and the
+    only bug was announcing it as an initialization."""
+    root = tmp_path / "ws"
+    assert runner.invoke(app, ["init", str(root), "--name", "Orders"]).exit_code == 0
+
+    again = runner.invoke(app, ["init", str(root), "--name", "Orders"])
+    assert again.exit_code == 0, again.output
+    assert "already exists" in again.output and "Nothing to do." in again.output
+    assert "Initialized" not in again.output
+
+
+def test_a_plain_reinit_never_blames_a_flag_the_operator_did_not_type(tmp_path):
+    """The refusal diffed an INVENTED `--name` against the stored one.
+
+    `wanted = name or Path(path).name` substituted the directory basename as
+    though the operator had typed it, so a bare `laurelin init clitest` — no
+    flags at all — exited 2 with "would leave it as it is and ignore --name",
+    naming a flag nobody passed, for every workspace whose name differs from
+    its directory. The documented-idempotent re-run stopped working, and the
+    rule it was supposed to enforce ("a run that would discard nothing
+    proceeds") held only by coincidence, when the directory happened to share
+    the workspace's name.
+    """
+    root = tmp_path / "clitest"
+    assert runner.invoke(app, ["init", str(root), "--name", "First"]).exit_code == 0
+
+    bare = runner.invoke(app, ["init", str(root)])
+    assert bare.exit_code == 0, bare.output
+    assert "--name" not in bare.output, (
+        "a run that passed no flags must not be refused for one"
+    )
+    assert "Nothing to do." in bare.output
+
+    # A --name that WOULD be discarded is still refused, naming only it.
+    clash = runner.invoke(app, ["init", str(root), "--name", "Second"])
+    assert clash.exit_code == 2, clash.output
+    assert "--name" in clash.output and "--description" not in clash.output
+
+
+def test_demo_reports_the_targets_that_actually_built(tmp_path):
+    """The old line was a literal — three names printed whenever a build was
+    requested, inspecting nothing. It is the first build result a new operator
+    reads, so it is the last place a sentence should be unable to go red."""
+    root = tmp_path / "demo"
+    result = runner.invoke(app, ["demo", str(root)])
+    assert result.exit_code == 0, result.output
+
+    _, store, _ = _engine(root)
+    build = store.list_builds()[0]
+    built = [t.output_dataset for t in build.tasks if t.status.value == "succeeded"]
+    assert built, "the demo build produced something"
+    assert f"Pipeline built: {', '.join(built)}" in result.output
+    assert "Did NOT build" not in result.output
+
+
+def test_the_demo_build_line_goes_red_when_the_build_does(capsys):
+    """The half a green demo cannot prove. Today's three demo transforms all
+    succeed, so a hardcoded line and an honest one print the same words — which
+    is exactly why the honest one has to be exercised against a build that
+    failed, or the guard is a coincidence."""
+    from laurelin.cli import _echo_build_result
+    from laurelin.core.models import BuildInfo, BuildStatus, BuildTaskInfo
+
+    info = BuildInfo(
+        id="b1",
+        status=BuildStatus.failed,
+        tasks=[
+            BuildTaskInfo(transform_name="clean_aircraft",
+                          output_dataset="clean_aircraft",
+                          status=BuildStatus.succeeded),
+            BuildTaskInfo(transform_name="flight_stats",
+                          output_dataset="flight_stats",
+                          status=BuildStatus.failed),
+        ],
+    )
+    _echo_build_result(info)
+    out = capsys.readouterr()
+    assert "Pipeline built: clean_aircraft" in out.out
+    assert "flight_stats" not in out.out, "a failed target is not a built one"
+    assert "Did NOT build: flight_stats" in out.err
+
+    _echo_build_result(BuildInfo(id="b2", status=BuildStatus.succeeded, tasks=[]))
+    assert "declares no pipelines" in capsys.readouterr().out

@@ -56,7 +56,7 @@ backwards for adoption.
 | Persona | What they want | First thing they try | Where they stall | Verdict today |
 |---|---|---|---|---|
 | **Platform / data engineer** (the decision-maker) | An open Foundry: pipelines, lineage, scale, ops | "Point it at my Postgres / S3 / warehouse" | No connector — upload only. Then: "how big can a dataset be?" | Impressed by the model, blocked on ingestion + unsure on scale |
-| **Analytics engineer / analyst** | Model data semantically, explore it | the SQL page, then the ontology | Ontology is queryable but abstract — no dashboard/app to *show* the payoff | "Workbench is nice; ontology intriguing but what do I get?" |
+| **Analytics engineer / analyst** | Model data semantically, explore it | the SQL page, then the ontology | Ontology is queryable but abstract — no dashboard/app to *show* the payoff | "The SQL page is nice; ontology intriguing but what do I get?" |
 | **Operational-app builder** (the *real* Foundry use case) | An app over an ontology with validated write-back | Object types, links, actions | The pieces exist but there's no app-builder — you'd hand-build a frontend | Differentiator is 80% there and invisible |
 | **Security / compliance** | Can it hold regulated data? | SSO, ACLs, RLS, markings, audit | *Selling* persona now — SSO, per-object/dataset ACLs, RLS+masking, marking propagation, per-workspace isolation are real and reviewed | Pleasantly surprised; a reason to say yes |
 | **OSS evaluator / small team** | `pip install`, kick tires, self-host | The demo, local-first story | Docs are architecture-oriented, no task tutorials | Converts easily if onboarding lands |
@@ -125,11 +125,11 @@ enterprise *governance and identity* gaps are effectively done — this is the
 **Closed since (first Tier-1 pass):** first connectors — PostgreSQL (streamed),
 HTTP CSV/Parquet, server-side file drops — with redacted-secret source configs
 and one-click sync in the UI; async builds (POST /builds returns immediately,
-worker pool executes, UI polls); a scale-honest workbench query path (lazy
+worker pool executes, UI polls); a scale-honest ad-hoc SQL query path (lazy
 Arrow scans with filter pushdown for un-policied datasets — query memory now
 scales with the result, not the dataset).
 
-**Closed since (Tier-2 pass):** charts on workbench results + dashboards
+**Closed since (Tier-2 pass):** charts on SQL results + dashboards
 (saved-query grids whose panels run with the viewer's credentials — RLS/ACLs
 per user); the MCP server (`laurelin mcp`) + `LaurelinClient` Python SDK —
 agents operate datasets, SQL, the ontology, actions, and builds through the

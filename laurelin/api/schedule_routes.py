@@ -15,9 +15,12 @@ from pydantic import BaseModel, Field
 from laurelin.api.routes import (
     EDITOR,
     ActorDep,
+    PermDep,
     StoreDep,
+    UserDep,
     WorkspaceDep,
     _dump,
+    _viewable,
     get_registry,
 )
 from laurelin.core import authoring_hints, scheduler
@@ -62,23 +65,66 @@ def _with_build_outcome(store: StoreDep, dumped: dict) -> dict:
     return dumped
 
 
+def _project_schedule(dumped: dict, visible: set[str]) -> dict | None:
+    """The same row-level rule #75 put on builds, lineage and transforms.
+
+    A schedule's `targets` and `upstream_dataset` are dataset names, and this
+    route handed them to an editor whose `GET /datasets/{n}` was 404 and whose
+    `/builds`, `/lineage` and `/transforms` had all just been projected — the
+    same principal denied the name on four surfaces and given it on a fifth.
+    Names go; one unquantified boolean stays.
+    """
+    targets = [t for t in (dumped.get("targets") or []) if t in visible]
+    hidden = len(targets) != len(dumped.get("targets") or [])
+    upstream = dumped.get("upstream_dataset") or ""
+    if upstream and upstream not in visible:
+        upstream, hidden = "", True
+    named = bool(dumped.get("targets")) or bool(dumped.get("upstream_dataset"))
+    if named and not targets and not upstream:
+        # Every dataset this schedule names is withheld, so the schedule is.
+        return None
+    return {**dumped, "targets": targets, "upstream_dataset": upstream,
+            "hidden_targets": hidden}
+
+
+def _schedule_names(infos) -> list[str]:
+    out: list[str] = []
+    for info in infos:
+        out += list(info.targets)
+        if info.upstream_dataset:
+            out.append(info.upstream_dataset)
+    return out
+
+
 @schedules_router.get("/schedules", dependencies=[EDITOR])
-def list_schedules(store: StoreDep) -> list[dict]:
-    return [_with_build_outcome(store, _dump(s)) for s in store.list_schedules()]
+def list_schedules(store: StoreDep, perms: PermDep, user: UserDep) -> list[dict]:
+    infos = store.list_schedules()
+    visible = _viewable(perms, user, _schedule_names(infos))
+    out = []
+    for s in infos:
+        projected = _project_schedule(_with_build_outcome(store, _dump(s)), visible)
+        if projected is not None:
+            out.append(projected)
+    return out
 
 
 @schedules_router.get("/schedules/{name}", dependencies=[EDITOR])
-def get_schedule(name: str, store: StoreDep) -> dict:
+def get_schedule(name: str, store: StoreDep, perms: PermDep, user: UserDep) -> dict:
     info = store.get_schedule(name)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Schedule not found: {name!r}")
-    return _with_build_outcome(store, _dump(info))
+    visible = _viewable(perms, user, _schedule_names([info]))
+    projected = _project_schedule(_with_build_outcome(store, _dump(info)), visible)
+    if projected is None:
+        # The same sentence an unknown name gets.
+        raise HTTPException(status_code=404, detail=f"Schedule not found: {name!r}")
+    return projected
 
 
 @schedules_router.put("/schedules/{name}", dependencies=[EDITOR])
 def upsert_schedule(
     name: str, body: ScheduleUpsertRequest, store: StoreDep, actor: ActorDep,
-    workspace: WorkspaceDep,
+    workspace: WorkspaceDep, perms: PermDep, user: UserDep,
 ) -> dict:
     if not _NAME_RE.match(name):
         raise HTTPException(
@@ -138,7 +184,14 @@ def upsert_schedule(
             # registry 409 is already reported by every graph-touching route.
             registry = None
         if registry is not None:
-            unknown = [t for t in body.targets if registry.by_output(t) is None]
+            # A target this author may not view is reported EXACTLY as one no
+            # pipeline produces. Otherwise the absence of a warning is itself
+            # the disclosure: silence would confirm the hidden name is real.
+            visible = _viewable(perms, user, body.targets)
+            unknown = [
+                t for t in body.targets
+                if registry.by_output(t) is None or t not in visible
+            ]
             if unknown:
                 # "pipeline", the settled word — this sentence renders in the
                 # UI's warning box, and it used to mix three retired nouns
@@ -181,7 +234,9 @@ def upsert_schedule(
     )
     saved = store.get_schedule(name)
     assert saved is not None
-    return _dump(saved) | {"warnings": warnings}
+    visible = _viewable(perms, user, _schedule_names([saved]))
+    projected = _project_schedule(_dump(saved), visible) or {"name": name}
+    return projected | {"warnings": warnings}
 
 
 @schedules_router.delete("/schedules/{name}", dependencies=[EDITOR])

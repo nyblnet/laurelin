@@ -153,6 +153,35 @@ def check_flow_sources(store, perms, author, flow: FlowDef) -> None:
     user = _author_user(store, author)
     who = user.username
     for dataset in flow.source_datasets():
+        # #75, settled: these two refusals stay DISTINGUISHABLE, deliberately.
+        #
+        # The withholding boundary is over names a principal did not supply.
+        # Here the principal typed the name themselves — the source picker
+        # lists only readable datasets, so an absent/withheld probe is reachable
+        # only by hand-crafting a request — and a principal who types a name
+        # learns whether it is theirs, exactly as `_require_dataset_view`'s 404
+        # tells them "not yours or not there" about a name they chose.
+        #
+        # Collapsing them would also break `FlowSourceDenied` as the
+        # discriminator the stored-run paths need (`stored_source_denied`,
+        # api/routes.py), which is what stopped a viewer's shared panel being
+        # diagnosed as "the definition went stale" when it was simply withheld
+        # — false three ways: the dataset exists, nothing is broken, and an
+        # entitled colleague sees a working chart.
+        #
+        # What a stored run's caller learns is therefore one unquantified bit
+        # ("this reads something not shared with your role"), naming no
+        # dataset — the SAME bit `has_hidden_upstream` concedes on the lineage
+        # graph. Measured, as a viewer, over a panel someone else saved:
+        #   withheld source -> 403 "This panel reads data that is not shared
+        #                           with your role…"
+        #   absent source   -> 400 "The saved definition … refers to something
+        #                           that no longer exists…"
+        # Neither sentence contains a dataset name, and the withheld sentence
+        # is the same for every withheld dataset, so it cannot be diffed into
+        # an enumeration. Pinned by
+        # tests/test_lineage_disclosure.py::test_running_a_stored_flow_
+        # discloses_one_bit_about_a_hidden_source_and_never_its_name.
         if store.get_dataset(dataset) is None:
             raise FlowRefused(
                 f"This flow reads {dataset!r}, which does not exist in this "

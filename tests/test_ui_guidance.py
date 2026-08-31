@@ -407,3 +407,105 @@ def test_a_viewers_empty_datasets_page_names_no_door_their_role_lacks(mounted):
     assert "import a file above" not in viewer
     assert "chart it" not in viewer
     assert "No datasets yet" not in viewer
+
+
+# ------------------------------------------ unbuilt sources, and saying so
+
+def test_a_dataset_with_no_versions_is_offered_but_says_why_it_cannot_be_used(mounted):
+    """A dataset that exists and has never been built has nothing to read.
+    Every source picker offered it anyway, and picking it fetched a schema and
+    a preview that both 404'd — two developer-shaped `Error 404:` lines on one
+    screen, for a name the picker itself suggested.
+
+    Hiding it would only move the confusion (the name is visible on Datasets),
+    so it stays listed, disabled, and carrying the reason and the fix."""
+    html = rendered(mounted, "quick_chart_unbuilt_source")
+    assert ">orders</button>" in html, "a built dataset stays plainly pickable"
+    # The unbuilt one is still listed…
+    assert "newborn" in html
+    # …disabled, annotated in the visible label, and giving the next step.
+    assert "(no versions yet)" in html
+    assert "No versions yet — build or import into this dataset" in html
+    unbuilt = html[html.index("newborn") - 400 : html.index("newborn") + 120]
+    assert "disabled" in unbuilt
+
+
+def test_every_source_picker_declines_an_unbuilt_dataset_the_same_way():
+    """One rule, three pickers: the quick chart's rail, the SQL page's
+    sidebar, and an analysis cell's "Reads from". A rule enforced on one
+    surface and not its neighbours is how the reader learns it is arbitrary."""
+    for rel in (
+        ("views", "analyses", "QuickChart.tsx"),
+        ("views", "Workbench.tsx"),
+        ("views", "Analyses.tsx"),
+    ):
+        src = SRC.joinpath(*rel).read_text(encoding="utf-8")
+        assert "latest_version == null" in src, f"{rel[-1]}: no unbuilt-source check"
+        assert "no versions yet" in src.lower(), f"{rel[-1]}: the reason is not stated"
+
+
+# ---------------------------------------------- empty vs withheld, on Health
+
+def test_health_tells_an_empty_workspace_apart_from_a_withheld_one(mounted):
+    """The inverse of the Datasets empty-state rule, which Health had wrong in
+    the other direction: it said "No datasets visible to you." unconditionally,
+    so an administrator standing on a brand-new workspace was told they were
+    being withheld from. The server sends one unquantified bit — never a count,
+    never a name — and the page branches on it."""
+    empty = rendered(mounted, "health_empty_nothing_exists")
+    withheld = rendered(mounted, "health_empty_others_withheld")
+    # Nothing exists: emptiness, with the door that fixes it.
+    assert "No datasets yet" in empty
+    assert "/datasets" in empty
+    assert "cannot read" not in empty and "visible to you" not in empty
+    # Something exists and is not this reader's: the withholding sentence,
+    # and no number anywhere near it.
+    assert "No datasets you can read" in withheld
+    assert "No datasets yet" not in withheld
+
+
+def test_the_health_empty_state_never_quantifies_what_is_withheld():
+    """`others_exist` is a boolean by design: a count of hidden datasets on a
+    health page is an enumeration oracle, and counts are exactly what the
+    withholding boundary is about. Pin the shape so a later "helpful" count
+    cannot slip in."""
+    src = (SRC / "views" / "Health.tsx").read_text(encoding="utf-8")
+    assert "others_exist?: boolean" in src
+    assert "boolean | undefined" in src, "the third state — server did not say"
+
+
+# ------------------------------------------------- the Objects/datasets seam
+
+def test_the_quick_chart_states_the_object_limit_where_the_reader_meets_it():
+    """M13: an analysis cell reads datasets, so an object chart cannot become
+    one. That limit lived in a `title` on a disabled button — unreachable by
+    keyboard (a disabled button never takes focus), invisible on touch, and
+    never seen by anyone who does not hover a control that looks broken."""
+    src = (SRC / "views" / "analyses" / "QuickChart.tsx").read_text(encoding="utf-8")
+    assert "aria-disabled" in src
+    assert "An analysis reads datasets, so an object chart can't become one" in src
+    # And the page's own promise no longer claims it for every source.
+    assert "goes to a dashboard" in src
+
+
+def test_both_source_tabs_shape_data_with_the_same_four_cards():
+    """M14: switching the source tab swapped the vocabulary and silently
+    dropped a capability — different card titles, no Group-by explanation, and
+    no Order & top N card at all, with nothing saying the ordering was missing
+    rather than misplaced. The nouns may differ ("rows" vs "objects", which is
+    honest); the card names and the explanations may not."""
+    src = (SRC / "views" / "analyses" / "QuickChart.tsx").read_text(encoding="utf-8")
+    cards = (SRC / "views" / "shaping" / "ShapingCards.tsx").read_text(encoding="utf-8")
+    for title in ('"ex-card-title">Filter<', '"ex-card-title">Group by<', '"ex-card-title">Summarise<'):
+        assert title in src, f"the object tab is missing the {title} card"
+        assert title in cards, f"the dataset tab is missing the {title} card"
+    assert "Narrow the objects" not in src, "a second name for the Filter card"
+    # The filter add-button is one sentence shape with one noun swapped.
+    assert "+ keep only objects where…" in src
+    assert "+ keep only rows where…" in cards
+    # The Group-by explanation the dataset tab has always shown.
+    assert src.count("No grouping = one summary row over everything.") == 1
+    assert "No grouping = one summary row over everything." in cards
+    # The capability gap is stated in the card's place, not left as a hole.
+    assert "Order &amp; top N" in src
+    assert "Ordering and top-N aren't available for object charts yet." in src

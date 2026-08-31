@@ -274,6 +274,16 @@ export function AuditView() {
   //    disclosed — that would leak how much is withheld);
   //  - admin, nothing at all  → admins read every row, so absence is real.
   function emptyMessage() {
+    // The FIRST cause, before any other: this component collapses sign-in
+    // noise by default, and when that is all there is the list is empty for a
+    // reason this very component created. Measured as a viewer: the page read
+    // "No events you can read. Events above your read level are not shown
+    // here." immediately above "5 sign-in events hidden." and a button that
+    // revealed five readable rows. The sentence was false AND it blamed
+    // governance for the client's own filter.
+    if (hiddenLogins > 0) {
+      return "Only sign-in events here, and those are collapsed by default.";
+    }
     if (filtersActive(filters)) {
       return "No events match these filters.";
     }

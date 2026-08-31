@@ -136,7 +136,7 @@ number that rotted at some earlier point and was carried forward, not a
 regression from the security work. Still comfortably interactive; just not the
 constant it was advertised as.
 
-**Verdict: the SQL workbench and dashboards are comfortable into the tens of
+**Verdict: the SQL page and dashboards are comfortable into the tens of
 millions of rows.** This is the part of Laurelin that scales the way you'd
 hope.
 
@@ -401,6 +401,16 @@ and why each retained edit stayed. See
 [ARCHITECTURE.md](ARCHITECTURE.md#pruning-the-edit-log) for the five conditions
 an edit must satisfy before it can go.
 
+**A fold a later write overtook is reported, not replayed.** Fold a hand edit
+into `cities` v2, then write v3 from an upload or a transform build, and the
+object reads its pre-edit value again: the edit rows survive (pruning refuses
+exactly those, naming the superseding version) but the effect is gone.
+`superseded_folds` — a count, the superseding version and its source — now
+appears on the object type's index status and in the edit-log report, with a
+banner on the type. Automatic unfolding is **refused**: an edit is an absolute
+assignment, so replaying it would resurrect a stale hand value over corrected
+upstream data. Re-applying the ones that still apply is a person's decision.
+
 Sizing guidance now: **≤ 1 M objects per type is comfortable** on the scan
 alone, 5 M is usable for lookups and tolerable for browsing, and an index makes
 key lookups flat at any size in that range. Modeling *entities* in the ontology
@@ -524,7 +534,7 @@ millions of rows hasn't reduced anything, and pulling it defeats the purpose.
 and a half-built version would be worse than the ones that exist: no shuffle,
 no distributed joins, no cluster manager, no cross-node query planner.
 
-**One v1 gap, stated rather than hidden:** ad-hoc workbench SQL can't be pushed
+**One v1 gap, stated rather than hidden:** ad-hoc SQL can't be pushed
 to a delegated engine, because Laurelin doesn't parse user SQL and so can't
 rewrite `FROM events` into a remote query. Delegated compute is reached through
 remote transforms; interactive querying happens against the managed result.
@@ -568,7 +578,7 @@ Three deliberate limits:
 - **Ontology object types cannot bind to a federated dataset.** Every object
   page would become a full remote scan. Materialize with a transform and bind
   to that — the error says so explicitly.
-- **Federated datasets are hidden from the ad-hoc SQL workbench by default**
+- **Federated datasets are hidden from ad-hoc SQL by default**
   (`LAURELIN_FEDERATION_WORKBENCH=1` to expose them). Enabling federation
   should not silently widen what every viewer can reach. Transforms can always
   use them.
@@ -841,9 +851,23 @@ scales with `LAURELIN_SOAK_ROUNDS`.
    evolution do work. Compaction works too, as of this release — but it is a
    **whole-table rewrite** into one new snapshot, not Iceberg's incremental
    `rewrite_data_files`, so it costs the whole table and reclaims *scan cost,
-   not disk*: earlier snapshots keep their data files and nothing expires them
-   yet. (Before this release it did not work at all, and did not say so — it
-   wrote a Parquet part nothing read and pinned no snapshot. See the CHANGELOG.)
+   not disk*: earlier snapshots keep their data files. (Before this release it
+   did not work at all, and did not say so — it wrote a Parquet part nothing
+   read and pinned no snapshot. See the CHANGELOG.)
+   **Snapshot expiry is refused, not merely missing.** Measured against
+   pyiceberg 0.11.1: `expire_snapshots()` took a table from 6 snapshots to 1
+   and left disk *unchanged* at 25,781 bytes — it is a metadata edit, and
+   `MaintenanceTable` has no orphan-file removal — and afterwards
+   `catalog.read('orders', version=1)` raised `ValueError: Snapshot not
+   found`, because Laurelin pins a snapshot id per version and every version
+   row is a promise that version is still readable. pyiceberg protects
+   branches and tags; it knows nothing about those rows. So expiry would cost
+   readable history and free no bytes. What ships instead is a **storage
+   report** (`GET /datasets/{name}/iceberg/storage`, and the snapshot table in
+   the UI): per-snapshot data files and bytes, the table's real footprint as
+   the union over shared files, and which version rows or refs pin each
+   snapshot — so "compaction reclaims scan cost, not disk" is a number you can
+   check rather than a sentence you have to trust.
 12. **The serving tier is read-only from Laurelin's side.** No writes into
    StarRocks or ClickHouse, no versions, no time travel, and no ontology
    object types on any source-scanned kind. ClickHouse is embedded (chdb)

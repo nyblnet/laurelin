@@ -88,7 +88,7 @@ Key bets, and why:
 - **Postgres for metadata, queue, and search in server mode.** One dependency,
   boring, HA story well-known. No Redis/Zookeeper/Kafka required to start.
 - **React + TypeScript for the web app.** The vanilla-JS SPA was right for the
-  alpha; an IDE-grade surface (SQL workbench, pipeline canvas, dashboard editor)
+  alpha; an IDE-grade surface (the SQL page, pipeline canvas, dashboard editor)
   needs a component model, routing, and typed API clients. Still zero-CDN,
   still served by the API process.
 
@@ -267,7 +267,7 @@ Key bets, and why:
       a data branch. CI helper (`laurelin ci check`) validates DAG + expectations
       offline.
 - ✅ **In-browser transform authoring** — a code editor over `pipelines/*.py`
-      (Python + `@sql_transform`), "save query as transform" from the workbench;
+      (Python + `@sql_transform`), "save query as transform" from the SQL page;
       editor-gated, disableable with `--lock-pipelines`. **done**
 - ✅ **Visual pipeline builder ("Flows")** — backend and UI landed. **done**
       A flow is a declarative artifact (`pipelines/<name>.flow.json`) compiled
@@ -430,7 +430,7 @@ Key bets, and why:
 
 ### WS5 — Analysis & visualization web app (Foundry: Contour/Quiver/Workshop/Object Explorer)
 
-The web app is rebuilt in React+TS as an extensible workbench ("everything is a
+The web app is rebuilt in React+TS as an extensible shell ("everything is a
 panel"), keeping the current information-dense dark aesthetic:
 
 - [ ] **Platform shell**: project switcher, global search (datasets, objects,
@@ -438,7 +438,7 @@ panel"), keeping the current information-dense dark aesthetic:
 - [ ] **Data manager**: dataset browser w/ schema/version/lineage/expectation
       tabs, branch switcher, upload wizard, retention controls, column stats
       (null %, distinct, min/max, histograms — computed on write).
-- [~] **SQL workbench**: *shipped* — a **CodeMirror** editor (not monaco),
+- [~] **The SQL page**: *shipped* — a **CodeMirror** editor (not monaco),
       DuckDB over the datasets the caller may view, a result grid, charting the
       result, and `POST /pipelines/from-query` to save a query as a
       `@sql_transform`. Still open: virtualized paging over millions of result
@@ -447,9 +447,9 @@ panel"), keeping the current information-dense dark aesthetic:
       filter, join, pivot, chart panels chained together; each board
       exportable as a pipeline; stored as YAML in the workspace.
 - [x] **Charts & dashboards v1**: zero-dependency SVG charts (bar, line,
-      area, big-number, table) on workbench results; dashboards as grids of
+      area, big-number, table) on SQL results; dashboards as grids of
       saved queries with an inline panel editor and "Add to dashboard" from
-      the workbench. Panels execute through /query with the *viewer's*
+      the SQL page. Panels execute through /query with the *viewer's*
       credentials, so RLS/ACLs/markings apply per user.
 - [x] **Object-backed panels**: a dashboard panel can chart an object type
       (group-by + metrics) instead of SQL, so it reflects the ontology's edit
@@ -538,7 +538,7 @@ Enterprise:
 - ✅ **Fine-grained policies**: per-object-type ontology access, per-dataset
       ACLs, AND row-level security + column masking (per-subject row rules;
       null/redact/hash masks with exemptions) — all enforced uniformly on the row
-      API, SQL workbench, and ontology objects, and composed together. **done**
+      API, the SQL page, and ontology objects, and composed together. **done**
 - ✅ **Markings (mandatory access control)**: classification labels (PII,
       CONFIDENTIAL, …) that *propagate through lineage* — a derived dataset
       inherits its inputs' markings on build; a non-admin needs clearance for
@@ -589,7 +589,7 @@ Enterprise:
 - [ ] MCP server (WS6) is the foundation: any agent, any vendor.
 - [ ] **Semantic search** over datasets/objects/docs (embeddings, pluggable
       providers incl. local).
-- [ ] **Assist features**: NL→SQL in workbench, NL→chart in dashboards,
+- [ ] **Assist features**: NL→SQL on the SQL page, NL→chart in dashboards,
       pipeline doc generation, anomaly summaries on expectations failures.
 - [ ] **Governed agent actions**: agents act as service accounts through the
       normal permission/audit path — no side door.
@@ -605,7 +605,7 @@ contributors; phases overlap in practice.
 The "you can put this on a server without embarrassment" release.
 - ✅ WS7: local auth (users, sessions, RBAC, API tokens, first-run setup, login UI) — **done**
 - ✅ WS5: React + TS shell replacing the vanilla SPA at feature parity + login/setup,
-  SQL workbench (first new surface) — **done**
+  the SQL page (first new surface) — **done**
 - [x] WS7: OIDC SSO + group→role mapping — **done** (also SAML and SCIM, which
       the WS7 section marks ✅; this line had been left unchecked)
 - [ ] WS8: projects with per-project roles; audit v2 (structured, exportable)

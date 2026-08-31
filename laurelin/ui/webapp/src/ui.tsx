@@ -14,6 +14,89 @@ export function EmptyState({ children }: { children: ReactNode }) {
 }
 
 /**
+ * The one not-found treatment, for a resource addressed BY NAME.
+ *
+ * There were six, measured by driving every `#/<surface>/nope` route:
+ * `#/dashboards/nope` and `#/analyses/nope` rendered a bare `Error 404: ...`
+ * with zero links and zero buttons — no way out but the browser's Back;
+ * `#/ontology/nope` and `#/apps/nope` offered a **Retry** for a 404 that can
+ * never be transient; `#/builds/nope` and `#/schedules/nope` silently rewrote
+ * the hash to `#/datasets`, so a shared link landed somewhere else with no
+ * explanation. Only `#/pipelines/nope` had the good prose form, which is the
+ * one generalised here.
+ *
+ * No Retry: a named-resource 404 cannot become a 200 by asking again. No
+ * status code in the copy: the body must be IDENTICAL for a resource that is
+ * absent and one that is withheld — that is the whole point of answering 404
+ * rather than 403 — and a number invites the reader to try to tell them apart.
+ */
+/** Is this the answer a named resource gives when it is absent OR withheld? */
+export function isNotFound(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 404;
+}
+
+export function NotFound({
+  what,
+  name,
+  backTo,
+  backLabel,
+}: {
+  what: string;
+  name?: string;
+  backTo: string;
+  backLabel: string;
+}) {
+  return (
+    <div className="empty">
+      <div>
+        <strong>No such {what}</strong>
+      </div>
+      <div>
+        {name
+          ? `There is no ${what} called ${name}.`
+          : `There is no ${what} at that address.`}
+      </div>
+      <div style={{ marginTop: 8 }}>
+        <a href={`#${backTo}`}>{backLabel}</a>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The server did not answer the bootstrap probe. NOT the login screen.
+ *
+ * One message for every non-401 outcome, deliberately: when `/auth/status`
+ * fails the client does not know whether the server requires auth, so any
+ * sentence that claimed to know would be a guess. Retry is the only control,
+ * because it is the only one that can help.
+ */
+export function ServerUnreachable({
+  status,
+  onRetry,
+}: {
+  status: number;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <h1>Cannot reach the Laurelin server.</h1>
+        <p>
+          {status
+            ? `The server did not answer (status ${status}).`
+            : "The server did not answer."}{" "}
+          This is not a sign-in problem.
+        </p>
+        <button type="button" onClick={onRetry}>
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * A failed surface's red box. `onRetry` matters for auto-run surfaces: the
  * app-wide query defaults are `retry: false, refetchOnWindowFocus: false`
  * (App.tsx), so without a Retry control a transient 503 on a dashboard panel
@@ -23,12 +106,22 @@ export function EmptyState({ children }: { children: ReactNode }) {
 export function ErrorBox({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   let msg: string;
   if (error instanceof ApiError) {
-    msg =
-      error.status === 403
-        ? `Insufficient permissions (403)${error.detail ? " — " + error.detail : ""}`
-        : `Error ${error.status || ""}: ${error.detail}`;
+    // No `Error 404:` developer prefix. It showed a person an HTTP status they
+    // cannot act on, it appeared twice on one screen when a picker offered a
+    // dataset with no versions, and it is now actively ambiguous: a 404 is the
+    // deliberate answer for a WITHHELD resource as well as an absent one, so
+    // printing the number invites the reader to tell the two apart. The
+    // server's sentence is the message; the status only stands in when there
+    // is no sentence at all.
+    if (error.status === 403) {
+      msg = error.detail
+        ? error.detail
+        : "You do not have permission to see this.";
+    } else {
+      msg = error.detail || "The server could not complete that request.";
+    }
   } else {
-    msg = `Error: ${String((error as Error)?.message ?? error)}`;
+    msg = String((error as Error)?.message ?? error);
   }
   return (
     <div className="error-box">
@@ -393,8 +486,32 @@ function failureLabel(f: Failure): string {
   return FAILURE_TEXT[f.code]?.label ?? f.code.replace(/_/g, " ");
 }
 
+/**
+ * `Failure.subject` is always `<namespace>:<name>` and the namespace set is
+ * fixed and validated server-side (laurelin/core/failure.py). It is the only
+ * thing that says which PRODUCT AREA a failure happened in, and the advice
+ * table ignored it — so a schedule whose build target no longer exists was
+ * explained with "A panel or an app still names a property that has been
+ * renamed or removed", which involves no panel, no app and no property.
+ *
+ * Only the pairs that genuinely need a different sentence live here; every
+ * other (code, subjectKind) falls through to the code's own advice.
+ */
+const ADVICE_BY_SUBJECT: Record<string, Partial<Record<FailureCode, string>>> = {
+  schedule: {
+    definition_stale:
+      "This schedule names a build target or an upstream dataset that no longer exists. Edit the schedule and check its targets against the pipelines this workspace has now.",
+  },
+};
+
+export function subjectKind(f: Failure): string {
+  const i = (f.subject ?? "").indexOf(":");
+  return i > 0 ? f.subject.slice(0, i) : "";
+}
+
 export function failureAdvice(f: Failure): string {
-  return FAILURE_TEXT[f.code]?.advice ?? "";
+  const bySubject = ADVICE_BY_SUBJECT[subjectKind(f)]?.[f.code];
+  return bySubject ?? FAILURE_TEXT[f.code]?.advice ?? "";
 }
 
 /** A one-word status for a table cell, with the whole explanation on hover —
@@ -636,6 +753,24 @@ export const NAME_RULE =
   "Lowercase letters, digits, underscores and hyphens, starting with a letter — for example nightly_rollup.";
 export const NAME_RULE_NO_HYPHEN =
   "Lowercase letters, digits and underscores, starting with a letter — for example late_orders.";
+/**
+ * ...and the four rules that are genuinely DIFFERENT, each of which had been
+ * hand-written at its call site in its own words. One shape for all six: the
+ * rule in words, then `— for example <x>.`, never a regex. A guard keys on
+ * these constants rather than on the prose, because keying on the prose is
+ * what let `MarkingsSection` evade it by simply not using the words
+ * "Lowercase letters".
+ */
+export const NAME_RULE_WORKSPACE =
+  "Lowercase letters, digits, underscores and hyphens, 2 to 48 characters, starting with a letter or digit — for example acme-finance.";
+export const NAME_RULE_GROUP =
+  "Lowercase letters, digits, underscores, dots and hyphens, 2 to 32 characters, starting with a letter or digit — for example finance.analysts.";
+export const NAME_RULE_MARKING =
+  "Lowercase letters, digits, underscores, dots and hyphens, up to 48 characters, starting with a letter or digit — for example pii.";
+export const NAME_RULE_USERNAME =
+  "Lowercase letters, digits, underscores, dots and hyphens, 2 to 32 characters — for example a.chen.";
+export const NAME_RULE_LABEL =
+  "Letters, digits, underscores and spaces, starting with a letter or an underscore — for example Total revenue.";
 
 /**
  * The one phrase for a truncated result, so "truncated at 1000",

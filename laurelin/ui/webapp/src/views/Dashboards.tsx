@@ -40,6 +40,8 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  NotFound,
+  isNotFound,
   Modal,
   NAME_RULE,
   PageHeader,
@@ -766,7 +768,11 @@ function DashboardPage() {
   });
 
   if (dashQ.isLoading) return <Spinner />;
-  if (dashQ.isError) return <ErrorBox error={dashQ.error} />;
+  if (isNotFound(dashQ.error))
+    return (
+      <NotFound what="dashboard" name={name} backTo="/dashboards" backLabel="Back to Dashboards" />
+    );
+  if (dashQ.isError) return <ErrorBox error={dashQ.error} onRetry={() => dashQ.refetch()} />;
   const dash = dashQ.data!;
   const canEdit = auth.can("editor");
 

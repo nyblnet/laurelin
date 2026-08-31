@@ -16,7 +16,7 @@ import type {
   User,
   UserClearances,
 } from "../../types";
-import { Badge, EmptyState, ErrorBox, Spinner } from "../../ui";
+import { Badge, EmptyState, ErrorBox, NAME_RULE_MARKING, Spinner } from "../../ui";
 import { InlineError, QueuedBanner, apiPut } from "./shared";
 
 // Server rule: ^[a-z0-9][a-z0-9_.-]{0,47}$ (name is lowercased server-side).
@@ -58,8 +58,7 @@ function CreateMarkingForm({ onCreated }: { onCreated: () => void }) {
           style={{ maxWidth: 260 }}
         />
         <div className={`hint${nameBad ? " bad" : ""}`}>
-          Lowercase; starts with a letter or digit; then letters, digits,{" "}
-          <span className="mono">_ . -</span>; up to 48 characters.
+          {NAME_RULE_MARKING}
         </div>
       </div>
       <div className="field">

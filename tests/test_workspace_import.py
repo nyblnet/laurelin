@@ -444,6 +444,134 @@ def test_a_metadata_only_import_leaves_the_data_loudly_missing(
         DatasetCatalog(dst_ws, dst_store).read("sales")
 
 
+# ------------------------------------------------------------------ the digest
+# handshake
+#
+# There is no trust root between an export here and an import there: no key
+# exchange, no PKI, no rotation, and PORTABILITY.md states that sessions and
+# tokens deliberately do not travel. So the archive is NOT signed and these
+# tests must never be read as saying it is. What is offered instead is the
+# same two-phase idiom the merge path already uses: the export prints a digest
+# of its own bytes, an operator carries it by another route, and the import
+# refuses anything else — before a single member is parsed, because everything
+# downstream reads those bytes.
+
+
+def _sha256_of(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_an_export_reports_the_digest_of_the_bytes_it_wrote(source, tmp_path):
+    src_ws, src_store = source
+    archive = tmp_path / "export.tar"
+    options = ExportOptions()
+    export_workspace(src_ws, src_store, archive, options)
+
+    assert options.archive_sha256 == _sha256_of(archive), (
+        "the number the CLI prints has to be the one `sha256sum` prints"
+    )
+
+
+def test_an_import_refuses_a_digest_the_operator_did_not_expect(
+    source, target, tmp_path, monkeypatch
+):
+    src_ws, src_store = source
+    dst_ws, dst_store = target
+    archive = tmp_path / "export.tar"
+    export_workspace(src_ws, src_store, archive, ExportOptions())
+
+    # If the archive is ever opened, this raises instead — which is how the
+    # test proves the refusal happens BEFORE a row is read rather than after.
+    import laurelin.export.reader as reader
+
+    def never(*a, **k):
+        raise AssertionError("the archive was opened despite a digest mismatch")
+
+    monkeypatch.setattr(reader, "_open_stream", never)
+
+    with pytest.raises(ImportRefused, match="Nothing was read"):
+        import_workspace(archive, dst_ws, dst_store,
+                         ImportOptions(expect_sha256="0" * 64))
+
+    monkeypatch.undo()
+    assert target_is_pristine(dst_store, dst_ws)[0], "and nothing landed"
+
+
+def test_an_import_accepts_the_digest_the_export_printed(source, target, tmp_path):
+    src_ws, src_store = source
+    dst_ws, dst_store = target
+    archive = tmp_path / "export.tar"
+    options = ExportOptions()
+    export_workspace(src_ws, src_store, archive, options)
+
+    report = import_workspace(
+        archive, dst_ws, dst_store,
+        ImportOptions(expect_sha256=options.archive_sha256.upper()),
+    )
+    assert report.applied, "case and surrounding whitespace are not the point"
+
+
+def test_a_streamed_archive_is_verified_before_it_is_read(source, target, tmp_path):
+    """`laurelin import -` cannot hash bytes it is already consuming, so the
+    stream is spooled and checked first. Verifying as we go would verify
+    nothing: by the time the mismatch showed up the rows would be in."""
+    src_ws, src_store = source
+    dst_ws, dst_store = target
+    archive = tmp_path / "export.tar"
+    export_workspace(src_ws, src_store, archive, ExportOptions())
+    raw = archive.read_bytes()
+
+    with pytest.raises(ImportRefused, match="Nothing was read"):
+        import_workspace(io.BytesIO(raw), dst_ws, dst_store,
+                         ImportOptions(expect_sha256="1" * 64))
+    assert target_is_pristine(dst_store, dst_ws)[0]
+    assert not list(dst_ws.root.glob(".laurelin-verify-*")), "the spool is cleaned up"
+
+    report = import_workspace(
+        io.BytesIO(raw), dst_ws, dst_store,
+        ImportOptions(expect_sha256=_sha256_of(archive)),
+    )
+    assert report.applied
+    assert not list(dst_ws.root.glob(".laurelin-verify-*"))
+
+
+def test_a_rewritten_archive_fails_the_digest_even_with_a_matching_trailer(
+    source, target, tmp_path
+):
+    """The gap the trailer cannot close, stated as a test: whoever rewrites a
+    member can rewrite the trailer with it. A digest that travelled by another
+    route cannot be rewritten by the same hand."""
+    src_ws, src_store = source
+    dst_ws, dst_store = target
+    archive = tmp_path / "export.tar"
+    options = ExportOptions()
+    export_workspace(src_ws, src_store, archive, options)
+
+    repacked = _repack(archive, tmp_path, extra=[("pipelines/extra.py", b"# hi\n")])
+    import hashlib
+
+    assert hashlib.sha256(repacked.getvalue()).hexdigest() != options.archive_sha256
+    repacked.seek(0)
+    with pytest.raises(ImportRefused, match="not the .* you expected"):
+        import_workspace(repacked, dst_ws, dst_store,
+                         ImportOptions(expect_sha256=options.archive_sha256))
+
+
+def test_a_digest_that_is_not_a_digest_is_refused_as_operator_error(
+    source, target, tmp_path
+):
+    src_ws, src_store = source
+    dst_ws, dst_store = target
+    archive = tmp_path / "export.tar"
+    export_workspace(src_ws, src_store, archive, ExportOptions())
+
+    with pytest.raises(ImportRefused, match="not a sha256"):
+        import_workspace(archive, dst_ws, dst_store,
+                         ImportOptions(expect_sha256="deadbeef"))
+
+
 # --------------------------------------------------------------------------- safety
 
 @pytest.mark.parametrize(

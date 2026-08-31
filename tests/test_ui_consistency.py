@@ -448,14 +448,11 @@ def test_the_name_rule_sentence_has_one_source():
     2–48 chars; group names admit dots) and may keep their own sentence —
     a new entry here needs a rule the shared constants cannot state.
     """
-    own_rule = {"Workspaces.tsx", "GroupsSection.tsx"}
     for path in view_sources():
-        if path.name in own_rule:
-            continue
         text = strip_comments(path.read_text(encoding="utf-8")).lower()
         assert "lowercase letters" not in text, (
-            f"{path.name} spells out the name rule; import NAME_RULE / "
-            "NAME_RULE_NO_HYPHEN from ui.tsx instead"
+            f"{path.name} spells out the name rule; import one of the "
+            "NAME_RULE_* constants from ui.tsx instead"
         )
         # And never the raw regex as user-facing copy.
         assert "must match ^" not in text, f"{path.name} shows a regex to a person"
@@ -463,18 +460,73 @@ def test_the_name_rule_sentence_has_one_source():
     assert "NAME_RULE" in ui and "NAME_RULE_NO_HYPHEN" in ui
 
 
+def test_the_name_rule_is_stated_only_through_the_shared_constants():
+    """Keying the guard above on the PROSE let a divergent sentence evade it
+    by simply not using the words "Lowercase letters": MarkingsSection said
+    "Lowercase; starts with a letter or digit; then letters, digits, _ . -",
+    Workspaces and Groups each had their own, AuthScreens said "2-32 chars:",
+    and two more sites in the flow builder and the shaping model wrote a third
+    and fourth. Six rules genuinely differ in the product; each one is a NAMED
+    CONSTANT in ui.tsx, in ONE shape (rule in words, then "— for example x."),
+    and this keys on the constants, which prose cannot dodge.
+
+    A new name gate adds a constant here or reuses one. It does not write a
+    seventh sentence at its call site.
+    """
+    ui = (SRC / "ui.tsx").read_text(encoding="utf-8")
+    constants = [
+        "NAME_RULE",
+        "NAME_RULE_NO_HYPHEN",
+        "NAME_RULE_WORKSPACE",
+        "NAME_RULE_GROUP",
+        "NAME_RULE_MARKING",
+        "NAME_RULE_USERNAME",
+        "NAME_RULE_LABEL",
+    ]
+    for c in constants:
+        assert f"export const {c} =" in ui, f"ui.tsx lost the {c} constant"
+        # One shape for all of them: an example, never a regex.
+        body = ui.split(f"export const {c} =", 1)[1].split(";", 1)[0]
+        assert "— for example " in body, f"{c} does not carry an example"
+        assert "^[" not in body, f"{c} shows a regex to a person"
+
+    # Every screen that gates a name states the rule by NAMING a constant.
+    gates = {
+        "Workspaces.tsx": "NAME_RULE_WORKSPACE",
+        "admin/GroupsSection.tsx": "NAME_RULE_GROUP",
+        "admin/MarkingsSection.tsx": "NAME_RULE_MARKING",
+        "flow/StepForm.tsx": "NAME_RULE_LABEL",
+        "shaping/model.ts": "NAME_RULE_LABEL",
+    }
+    for rel, const in gates.items():
+        text = (VIEWS / rel).read_text(encoding="utf-8")
+        assert const in text, f"views/{rel} must state its rule through {const}"
+    auth = (SRC / "screens" / "AuthScreens.tsx").read_text(encoding="utf-8")
+    assert "NAME_RULE_USERNAME" in auth
+
+
 def test_truncation_honesty_speaks_with_one_voice():
     """Four renderings of "this result is cut off" shipped at once —
     "truncated at 1000", "(first of more)", "Showing the first 200 rows…",
     "first 1,000 of a larger result". The fact has one phrasing now
     (ui.tsx's truncationNote); callers may only add an action to it."""
-    for path in view_sources():
-        text = strip_comments(path.read_text(encoding="utf-8")).lower()
+    # DELIBERATE STRENGTHENING: whitespace is normalised before the substring
+    # checks. Flows.tsx hand-rolled "<strong>first {n} rows</strong> of a larger\n
+    # result" and the guard passed, because the JSX line break sat inside the
+    # very phrase being matched. A rule a newline defeats is not a rule.
+    def norm(t: str) -> str:
+        return re.sub(r"\s+", " ", strip_comments(t).lower())
+
+    # charts.tsx is not under views/ and hand-rolled a FIFTH phrasing ("first
+    # of {n} rows") for the single-value stat mark, so it is scanned too.
+    for path in view_sources() + [SRC / "charts.tsx"]:
+        text = norm(path.read_text(encoding="utf-8"))
         assert "truncated at" not in text, f"{path.name}: use truncationNote()"
         assert "first of more" not in text, f"{path.name}: use truncationNote()"
         assert "of a larger result" not in text, (
             f"{path.name} hand-rolls the truncation phrase; use truncationNote()"
         )
+        assert "first of {n}" not in text, f"{path.name}: use truncationNote()"
     assert "of a larger result" in (SRC / "ui.tsx").read_text(encoding="utf-8")
 
 
@@ -485,7 +537,14 @@ def test_truncation_honesty_speaks_with_one_voice():
 # up means a new dead end shipped. The list-query boxes on Schedules, Health,
 # Workspaces, Sources, Admin and Audit all carry onRetry as of this baseline.
 RETRYLESS_ERRORBOX_ALLOWANCE = {
-    "views/Flows.tsx": 8,
+    # 8 -> 7: the naming dialog moved out of Flows.tsx into views/flow/
+    # NameDialog.tsx so the Python tab could stop using window.prompt for the
+    # same job. Its box is a mutation box — the dialog's own confirm button is
+    # the retry — so the allowance MOVED rather than grew: the total is
+    # unchanged and Flows ratcheted down, which is the direction this list is
+    # only ever allowed to go.
+    "views/Flows.tsx": 7,
+    "views/flow/NameDialog.tsx": 1,
     "views/Datasets.tsx": 7,
     "views/Analyses.tsx": 7,
     "views/Dashboards.tsx": 6,
@@ -530,7 +589,7 @@ def test_error_boxes_without_retry_never_multiply():
         )
 
 
-def test_both_pipeline_delete_confirms_promise_the_datasets_survive():
+def test_every_pipeline_delete_confirm_promises_the_datasets_and_lineage_survive():
     """Two tabs of one screen, one operation, opposite messages: the Visual
     tab's delete reassured "the dataset it built is kept" while the Python
     tab's threatened "This cannot be undone" (equally true of both — the
@@ -546,6 +605,20 @@ def test_both_pipeline_delete_confirms_promise_the_datasets_survive():
                 f"built datasets are kept: {c[:90]}"
             )
         assert "cannot be undone" not in src.lower()
+    # The THIRD confirm — the one on a pipeline that will not load — promised
+    # only the dataset half and dropped the lineage half, so the same action
+    # reassured differently depending on whether the file happened to parse.
+    # All three make the whole promise.
+    for name, src in (("Flows.tsx", flows), ("Transforms.tsx", transforms)):
+        text = re.sub(r"\s+", " ", strip_comments(src).lower())
+        for i, chunk in enumerate(text.split("delete")[1:]):
+            head = chunk[:400]
+            if "the dataset" not in head and "the datasets" not in head:
+                continue
+            assert "lineage" in head, (
+                f"{name}: a pipeline delete confirm promises the datasets "
+                f"survive but not their lineage (occurrence {i})"
+            )
 
 
 def test_the_flow_builders_save_click_always_answers():
@@ -559,3 +632,107 @@ def test_the_flow_builders_save_click_always_answers():
     # The guard runs in the Save click itself, before the mutation.
     click = src[src.index("setSaveRefused(true)") - 400 : src.index("setSaveRefused(true)") + 200]
     assert "previewable" in click and "save.mutate" in click
+
+
+def test_a_server_that_does_not_answer_is_not_a_signed_out_user():
+    """The bootstrap `/auth/status` call collapsed EVERY failure into the login
+    screen: `.catch(() => setStatus({auth_required: true, ...}))`. Measured on a
+    `--no-auth` server with the request blocked at the transport layer, the app
+    rendered "Sign in to continue / USERNAME / PASSWORD / Sign in" — a
+    credential form that cannot succeed, on a server with no accounts, with no
+    Retry and no other control on the screen.
+
+    `api.ts` already preserves what happened (status 0 for transport, the real
+    status for 5xx). Only 401 means signed out. Everything else is a server the
+    client could not reach, and gets a Retry.
+    """
+    auth = (SRC / "auth.tsx").read_text(encoding="utf-8")
+    body = strip_comments(auth)
+    assert "e instanceof ApiError ? e.status : 0" in body, (
+        "the bootstrap catch must inspect ApiError.status, not discard it"
+    )
+    assert "if (status === 401)" in body, (
+        "401 must be the only branch that yields the signed-out state"
+    )
+    assert "bootstrapFailure" in body and "retryBootstrap" in body
+
+    app = strip_comments((SRC / "App.tsx").read_text(encoding="utf-8"))
+    assert "auth.bootstrapFailure !== null" in app, (
+        "App must render the unreachable screen BEFORE any auth decision"
+    )
+    assert app.index("bootstrapFailure") < app.index("<LoginScreen />"), (
+        "a failed probe must be answered before the login screen is reached"
+    )
+    ui = strip_comments((SRC / "ui.tsx").read_text(encoding="utf-8"))
+    assert "Cannot reach the Laurelin server." in ui
+    assert "This is not a sign-in problem." in ui
+
+
+def test_no_view_shows_a_person_an_http_status_prefix():
+    """`Error 404: Dashboard not found: 'nope'` showed a reader a number they
+    cannot act on — and it is now actively ambiguous, because 404 is the
+    DELIBERATE answer for a withheld resource as well as an absent one. The
+    server's sentence is the message.
+    """
+    ui = strip_comments((SRC / "ui.tsx").read_text(encoding="utf-8"))
+    assert "`Error ${" not in ui, "ErrorBox must not prefix a status number"
+    assert "(403)" not in ui, "ErrorBox must not print the status number"
+    for path in view_sources():
+        text = strip_comments(path.read_text(encoding="utf-8"))
+        assert not re.search(r"Error \d{3}", text), (
+            f"{path.name} renders an HTTP status to a person"
+        )
+
+
+def test_a_build_kick_converges_with_one_sentence_shape():
+    """POSITIVE guard — there was only a negative ban before. Three screens
+    kick a build (Builds, Pipelines/visual, Schedules) and had drifted into
+    three subjects ("Build <id>" / "Run of <name>" / a bare "Build"), two
+    failure trailers and three pending sentences.
+
+    Settled: the TERMINAL fact converges completely — "Build <id> finished:
+    <outcome>." then "See the build." and nothing after it. The PENDING
+    sentence keeps the shared subject and may carry a page-specific tail.
+    """
+    sites = {
+        "Flows.tsx": (VIEWS / "Flows.tsx").read_text(encoding="utf-8"),
+        "Pipeline.tsx": (VIEWS / "Pipeline.tsx").read_text(encoding="utf-8"),
+        "Schedules.tsx": (VIEWS / "Schedules.tsx").read_text(encoding="utf-8"),
+    }
+    for name, src in sites.items():
+        text = re.sub(r"\s+", " ", strip_comments(src))
+        assert "finished:" in text, f"{name}: no terminal build sentence found"
+        # One subject for the terminal fact.
+        assert re.search(r"Build\b.{0,140}finished:", text), (
+            f"{name}: the terminal sentence must open with 'Build <id>'"
+        )
+        # One trailer, and it is a link to the build.
+        assert "See the build" in text, f"{name}: missing the 'See the build' trailer"
+        # No second trailer explaining what the outcome means.
+        assert "for what went wrong" not in text.lower(), (
+            f"{name}: a second failure trailer is where the drift started"
+        )
+    pipeline = re.sub(r"\s+", " ", strip_comments(sites["Pipeline.tsx"]))
+    assert "is running…" in pipeline, (
+        "the pending sentence shares one subject across the three screens"
+    )
+
+
+def test_no_authoring_surface_uses_a_native_browser_dialog():
+    """`window.prompt` / `window.alert` are OS interrupts that cannot be
+    styled, cannot be tested through the DOM, and are unreachable to a reader
+    who has blocked them. The Python tab used both for naming and refusing a
+    pipeline while the Visual tab, one tab over, shipped a styled NameDialog
+    for the same job — with a comment explaining exactly why.
+
+    `window.confirm` is deliberately NOT banned: a destructive confirm is the
+    one place the browser's own modal semantics are wanted, and all three
+    pipeline deletes use it consistently.
+    """
+    for path in view_sources():
+        text = strip_comments(path.read_text(encoding="utf-8"))
+        for banned in ("window.prompt", "window.alert"):
+            assert banned not in text, (
+                f"{path.name} calls {banned}; use the shared NameDialog / an "
+                "in-page note instead"
+            )

@@ -25,6 +25,7 @@ from laurelin.api.routes import (
     UserDep,
     _dump,
     _require_dataset_edit,
+    _require_existing_dataset_view,
     _spooled_upload,
     router,
 )
@@ -93,23 +94,35 @@ def create_iceberg_dataset(
 
 @router.get("/datasets/{name}/iceberg/snapshots")
 def iceberg_snapshots(
-    name: str, catalog: CatalogDep, perms: PermDep, user: UserDep
+    name: str, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep
 ) -> list[dict]:
     _require_iceberg()
-    from laurelin.api.routes import _require_dataset_view
-
-    _require_dataset_view(perms, user, name)
+    _require_existing_dataset_view(store, perms, user, name)
     return catalog.iceberg_snapshots(name)
+
+
+@router.get("/datasets/{name}/iceberg/storage")
+def iceberg_storage(
+    name: str, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep
+) -> dict:
+    """What this table's snapshots cost, and which of them cannot be expired.
+
+    The snapshot table above says a table has six snapshots; it never said what
+    they cost or why they are all still there. Compaction reclaims scan cost,
+    not disk, and nothing expires snapshots — both are documented limitations,
+    and this is the number that makes them checkable rather than merely stated.
+    """
+    _require_iceberg()
+    _require_existing_dataset_view(store, perms, user, name)
+    return catalog.iceberg_storage_report(name)
 
 
 @router.get("/datasets/{name}/iceberg/branches")
 def list_iceberg_branches(
-    name: str, catalog: CatalogDep, perms: PermDep, user: UserDep
+    name: str, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep
 ) -> list[dict]:
     _require_iceberg()
-    from laurelin.api.routes import _require_dataset_view
-
-    _require_dataset_view(perms, user, name)
+    _require_existing_dataset_view(store, perms, user, name)
     return catalog.iceberg_branches(name)
 
 
@@ -180,18 +193,31 @@ def merge_iceberg_branch(
 
 @router.get("/datasets/{name}/iceberg/schema/impact")
 def iceberg_schema_impact(
-    name: str, catalog: CatalogDep, perms: PermDep, user: UserDep
+    name: str, catalog: CatalogDep, store: StoreDep, perms: PermDep, user: UserDep
 ) -> dict:
     """What a breaking schema change on this dataset would affect.
 
     Surfaced before the change, not after: the question isn't "is dropping this
     column safe" — it's "what breaks when I do it", which this answers.
+
+    Row-filtered by dataset visibility, like `GET /lineage`. `downstream_of` is
+    the transitive closure over `store.list_lineage()` — the same edges #75
+    projected — and this route handed the whole closure back after checking
+    only the SUBJECT dataset. Measured: a viewer who saw four datasets read
+    `["downstream_of_secret","joined_public","pay_summary","topsecret_payroll"]`,
+    byte-identical to the admin's answer. That is the name AND the cardinality
+    of the hidden topology, which is precisely what the placeholder option was
+    rejected for. One unquantified boolean survives, as everywhere else.
     """
     _require_iceberg()
-    from laurelin.api.routes import _require_dataset_view
-
-    _require_dataset_view(perms, user, name)
-    return {"downstream": catalog.downstream_of(name)}
+    _require_existing_dataset_view(store, perms, user, name)
+    downstream = catalog.downstream_of(name)
+    visible = perms.viewable_datasets(user, downstream)
+    kept = [d for d in downstream if d in visible]
+    return {
+        "downstream": kept,
+        "hidden_downstream": len(kept) != len(downstream),
+    }
 
 
 @router.post("/datasets/{name}/iceberg/schema", dependencies=[EDITOR])

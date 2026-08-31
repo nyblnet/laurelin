@@ -31,12 +31,23 @@ Compaction is a whole-table rewrite into one new snapshot
 reclaims *scan* cost rather than disk, because every earlier snapshot keeps its
 own data files. That is the honest shape of what is implemented.
 
+Snapshot expiry is **refused rather than missing**, which is a different claim.
+Measured against pyiceberg 0.11.1: ``expire_snapshots()`` took a table from six
+snapshots to one and left disk unchanged at 25,781 bytes — it edits metadata,
+and ``MaintenanceTable`` has no orphan-file removal — and then
+``catalog.read('orders', version=1)`` raised ``ValueError: Snapshot not found``,
+because a Laurelin version row pins a snapshot id and is a standing promise that
+version is still readable. pyiceberg protects branches and tags and knows
+nothing about those rows. So expiry here would break history and free nothing.
+``storage_report`` is what ships instead: per-snapshot files and bytes, the
+table's real footprint as a union over shared files, and who pins what.
+
 What this still does *not* do, stated plainly because the Iceberg name implies
-all of it: no tags, no hidden partitioning, no row-level deletes, no expiry of
-old snapshots (so nothing here ever frees storage), and merges are
-**fast-forward only** — a three-way merge of two diverged histories needs a
-row-level conflict policy, and guessing one would silently pick a winner
-between two people's writes.
+all of it: no tags, no hidden partitioning, no row-level deletes, no snapshot
+expiry (so nothing here ever frees storage), and merges are **fast-forward
+only** — a three-way merge of two diverged histories needs a row-level conflict
+policy, and guessing one would silently pick a winner between two people's
+writes.
 """
 
 from __future__ import annotations
@@ -235,6 +246,52 @@ class IcebergTables:
         tbl = self.catalog.load_table(self._identifier(name))
         scan = tbl.scan(snapshot_id=snapshot_id) if snapshot_id else tbl.scan()
         return sum(1 for _ in scan.plan_files())
+
+    def storage_report(self, name: str) -> dict:
+        """What this table's snapshots cost on disk, snapshot by snapshot.
+
+        The number that was missing. ``compact()`` reclaims *scan* cost and
+        says so, and nothing expires snapshots, so a table's disk is the union
+        of every snapshot's data files — a quantity no surface reported, which
+        made "compaction reclaims nothing" a sentence in a doc rather than a
+        number an operator could see.
+
+        ``bytes`` per snapshot is what a scan of that snapshot would read;
+        ``bytes`` at the top is the union over distinct file paths, because a
+        file shared by five snapshots occupies disk once. Summing the
+        per-snapshot figures would therefore overstate the table by the sharing
+        factor — on the measured four-snapshot table, by 3.6x.
+
+        Cost: one manifest plan per snapshot. It is metadata I/O, not data, and
+        it is the only way to attribute bytes to a snapshot at all.
+        """
+        tbl = self.catalog.load_table(self._identifier(name))
+        union: dict[str, int] = {}
+        per_snapshot = []
+        for s in tbl.metadata.snapshots:
+            files = {
+                task.file.file_path: task.file.file_size_in_bytes
+                for task in tbl.scan(snapshot_id=s.snapshot_id).plan_files()
+            }
+            union.update(files)
+            per_snapshot.append({
+                "snapshot_id": s.snapshot_id,
+                "timestamp_ms": s.timestamp_ms,
+                "operation": (s.summary.operation.value if s.summary else None),
+                "data_files": len(files),
+                "bytes": sum(files.values()),
+            })
+        return {
+            "snapshots": per_snapshot,
+            "data_files": len(union),
+            "bytes": sum(union.values()),
+            # Every ref is a pin Iceberg itself honours; a Laurelin version row
+            # is a pin only Laurelin knows about, which is the whole reason
+            # expiry is refused. The caller joins that half.
+            "refs": {
+                ref: meta.snapshot_id for ref, meta in sorted(tbl.metadata.refs.items())
+            },
+        }
 
     def read(self, name: str, snapshot_id: Optional[int] = None,
              branch: Optional[str] = None) -> pa.Table:

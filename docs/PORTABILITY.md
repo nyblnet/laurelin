@@ -12,7 +12,8 @@ is the product.
 
 ```bash
 laurelin export workspace.tar --fingerprint -w /srv/laurelin/acme
-laurelin import workspace.tar -w /srv/laurelin/acme-new
+# stderr, after the bytes: "sha256: <digest>" — carry it by another route
+laurelin import workspace.tar -w /srv/laurelin/acme-new --expect-sha256 <digest>
 laurelin verify-governance --baseline workspace.tar -w /srv/laurelin/acme-new
 ```
 
@@ -176,6 +177,24 @@ other code path could have written, or does not match its own `TRAILER.json`.
 rewrites a member can rewrite the trailer with it. What the digests catch is
 corruption and *partial* rewrites — the case where two governance members are
 swapped and the trailer is left alone.
+
+**The digest handshake — a weaker, operator-supplied control, and not a
+signature either.** `laurelin export` prints the sha256 of the whole archive on
+**stderr, after the bytes** (a stream cannot know its own digest in advance),
+and `laurelin import --expect-sha256 <digest>` refuses anything else **before a
+single member is parsed** — for `import -` the stream is spooled and hashed
+first, because verifying as you go verifies nothing. It is the same two-phase
+idiom as `--merge --confirm <report_sha256>`.
+
+What it buys: a digest that travels by a *different route* than the archive
+cannot be rewritten by the hand that rewrote the archive, which is exactly the
+gap the trailer cannot close. What it does not buy: any statement about **who**
+produced the archive. Signing is deliberately out of scope — export here and
+import there share no key exchange, no PKI, no rotation and no revocation
+(sessions and tokens are never continuous, by design, as below), so a signature
+verified against a key carried *inside* the archive would be theater; and
+Ed25519 would add a runtime dependency this project does not take. Do not
+describe `--expect-sha256` as a signature check in a runbook.
 
 ---
 

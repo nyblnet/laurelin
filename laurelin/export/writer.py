@@ -595,6 +595,14 @@ def stream_export(
     spool_dir = options.spool_dir or str(workspace.root)
 
     mode = "w|gz" if options.compress else "w|"
+    # Every byte of the archive, hashed on the way out. NOT a signature and
+    # never described as one: there is no trust root between an export here and
+    # an import there (no key exchange, no PKI, no rotation — PORTABILITY.md
+    # says sessions and tokens are deliberately not continuous), so a digest an
+    # operator carries out of band is the strongest honest control. The
+    # trailer inside the archive catches corruption; this catches a rewrite
+    # that also rewrote the trailer, *if* the operator compares it.
+    out = _DigestingWriter(out)
     tar = tarfile.open(fileobj=out, mode=mode, format=tarfile.PAX_FORMAT)
     try:
         _add_bytes(tar, digests, MANIFEST_MEMBER,
@@ -618,7 +626,38 @@ def stream_export(
                    digests.trailer().model_dump_json(indent=2).encode() + b"\n", mtime)
     finally:
         tar.close()
+    # After close(), so it covers the tar padding and the gzip trailer too:
+    # the digest has to be over the bytes an operator will hash with
+    # `sha256sum`, not over some prefix of them.
+    options.archive_sha256 = out.hexdigest()
     return manifest
+
+
+class _DigestingWriter:
+    """Passes bytes through to ``out`` and hashes them on the way.
+
+    Not an ``io`` subclass on purpose: ``tarfile`` in stream mode uses only
+    ``write`` and ``flush``, and ``out`` may be a socket or a pipe that
+    supports nothing else.
+    """
+
+    def __init__(self, out: IO[bytes]):
+        import hashlib
+
+        self._out = out
+        self._digest = hashlib.sha256()
+
+    def write(self, data) -> int:
+        self._digest.update(data)
+        return self._out.write(data)
+
+    def flush(self) -> None:
+        flush = getattr(self._out, "flush", None)
+        if flush is not None:
+            flush()
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
 def _sorted_files(directory: Path, suffixes: tuple[str, ...]) -> list[Path]:

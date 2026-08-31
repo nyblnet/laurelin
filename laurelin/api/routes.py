@@ -59,6 +59,7 @@ from laurelin.core.limits import QueryRejected, QueryTimeout, QueryTooLarge
 from laurelin.core.models import (
     AnalysisCell,
     AnalysisInfo,
+    BuildStatus,
     ColumnMask,
     DashboardInfo,
     DashboardPanel,
@@ -284,6 +285,29 @@ def _require_dataset_view(perms: PermissionService, user: User, name: str) -> No
         )
 
 
+def _require_existing_dataset_view(
+    store: MetadataStore, perms: PermissionService, user: User, name: str
+) -> None:
+    """404, in the same words, for a dataset that is withheld AND for one that
+    is not there.
+
+    `_require_dataset_view` alone is not enough on a route that then goes and
+    touches storage: a name with no grants passes the guard (default view) and
+    the storage lookup raises, so the pair answered 404 for "exists, withheld"
+    and 500/200 for "does not exist". Measured on the Iceberg routes:
+
+        vic topsecret_payroll/snapshots -> 404 Dataset not found
+        vic no_such_zzz/snapshots       -> 500 NoSuchTableError
+        vic no_such_zzz/schema/impact   -> 200 {"downstream": []}
+
+    which is a clean binary enumeration oracle over the whole namespace — the
+    exact thing the 404 at `_require_dataset_view` exists to close.
+    """
+    _require_dataset_view(perms, user, name)
+    if store.get_dataset(name) is None:
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {name!r}")
+
+
 def _require_dataset_edit(perms: PermissionService, user: User, name: str) -> None:
     if not perms.can_edit_dataset(user, name):
         raise HTTPException(
@@ -302,15 +326,24 @@ def _ot_permission(
 
 
 def _require_ot_view(perms, user, service, type_name: str) -> None:
+    # The SAME answer an unknown type gets, not a 403 that names it. `GET
+    # /ontology/object-types` already filters the withheld type out of the
+    # list, so a 403 one URL over handed its existence straight back — and it
+    # is a *second-order* oracle on a hidden dataset, because
+    # `object_type_permission` composes the backing dataset's view right: the
+    # type is withheld precisely BECAUSE the dataset is. Measured as a viewer:
+    # list omits `secret_person`; `GET /ontology/object-types/secret_person`
+    # answered 403 naming it while `.../nope_xyz` answered 404.
     if not _ot_permission(perms, user, service, type_name)[0]:
-        raise HTTPException(
-            status_code=403,
-            detail=f"You do not have access to object type {type_name!r}",
-        )
+        raise KeyError(f"Unknown object type: {type_name!r}")
 
 
 def _require_ot_edit(perms, user, service, type_name: str) -> None:
-    if not _ot_permission(perms, user, service, type_name)[1]:
+    view, edit = _ot_permission(perms, user, service, type_name)
+    if not view:
+        # Cannot see it, so cannot learn of it from an edit refusal either.
+        raise KeyError(f"Unknown object type: {type_name!r}")
+    if not edit:
         raise HTTPException(
             status_code=403,
             detail=f"You do not have edit access to object type {type_name!r}",
@@ -2261,17 +2294,101 @@ def upload_dataset_file(
 # Transforms, builds, lineage
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Row-level projection for the build/lineage/transform surfaces (task #75)
+#
+# `_dump` enforces R2 at FIELD level: it decides which columns of a record a
+# role may read. It has no concept of a ROW, and these four routes are about
+# rows. `BuildInfo.targets`, `BuildTaskInfo.transform_name` and
+# `.output_dataset` are all `Audience.PRESENTATION` — deliberately, a viewer
+# needs to read their own build history — so a dataset withheld by ACL was
+# named to every viewer through /builds, /builds/{id}, /lineage and
+# /transforms while `GET /datasets` correctly withheld it. Measured on the #75
+# repro: `GET /transforms` returned
+# `{"name": "topsecret_payroll", "output": "topsecret_payroll", ...}` to a
+# viewer for whom `GET /datasets` returned `['raw_pay']`.
+#
+# The rule, and it is the same one `_require_dataset_view` already answers 404
+# to preserve: a route may name a dataset, or a transform whose name IS a
+# dataset name, only to a principal who may view that dataset. Where a name is
+# withheld the whole node and both its edges go, and the surviving endpoint
+# carries ONE UNQUANTIFIED BOOLEAN. Never a count, never a placeholder, and
+# never a falsified status — a build whose hidden task failed still reads
+# `failed`. See tests/test_lineage_disclosure.py for why each of those three
+# alternatives was rejected.
+# ---------------------------------------------------------------------------
+
+def _viewable(perms: PermissionService, user: User, names) -> set[str]:
+    """The viewable subset, computed once per request rather than per name."""
+    return perms.viewable_datasets(user, list(dict.fromkeys(names)))
+
+
+def _project_build_for_viewer(build, visible: set[str]) -> Optional[dict]:
+    """One `BuildInfo` as this reader may read it, or ``None`` if nothing in it
+    is theirs. Projection happens on the MODEL, before `_dump`, so R2's field
+    filtering still runs over the result and the two rules compose."""
+    targets = [t for t in build.targets if t in visible]
+    tasks = [t for t in build.tasks if t.output_dataset in visible]
+    if (build.targets or build.tasks) and not targets and not tasks:
+        # Every name this build carries is withheld, so the build is withheld.
+        # The guard is on the ORIGINAL lists, not the projected ones: a build
+        # with no targets means "build everything" and a pending build has no
+        # tasks yet, and neither names a dataset — there is nothing to withhold
+        # and dropping them 404'd `POST /builds` → `GET /builds/{id}` for
+        # everyone (measured: tests/test_api.py::test_async_build_default).
+        return None
+    hidden_tasks = len(tasks) != len(build.tasks)
+    failure = build.failure
+    if failure is not None and hidden_tasks:
+        # `counters={"failed_tasks": N}` is a count over tasks this reader may
+        # not see — a quantified leak, and counts are exactly what #75 is
+        # about. Recount over the visible projection; if the recount is 0,
+        # drop the counter rather than emit `0`, which would read as "nothing
+        # failed" over a build that says `failed`.
+        visible_failed = sum(
+            1 for t in tasks if t.status == BuildStatus.failed
+        )
+        counters = dict(failure.counters)
+        if "failed_tasks" in counters:
+            if visible_failed:
+                counters["failed_tasks"] = visible_failed
+            else:
+                counters.pop("failed_tasks")
+        failure = failure.model_copy(update={"counters": counters})
+    # `status` is NOT recomputed. A build whose visible tasks all succeeded and
+    # whose hidden task failed still reads `failed`. Making the projection
+    # self-consistent by lying about the outcome is the schedule-row bug.
+    projected = build.model_copy(update={
+        "targets": targets, "tasks": tasks, "failure": failure,
+    })
+    out = _dump(projected)
+    out["hidden_tasks"] = hidden_tasks
+    return out
+
+
 @router.get("/transforms", dependencies=[VIEWER])
-def list_transforms(registry: RegistryDep) -> list[dict]:
-    return [
-        {
+def list_transforms(registry: RegistryDep, perms: PermDep, user: UserDep) -> list[dict]:
+    specs = list(registry.all())
+    names = [s.output.dataset for s in specs]
+    names += [inp.dataset for s in specs for inp in s.inputs.values()]
+    visible = _viewable(perms, user, names)
+    out = []
+    for spec in specs:
+        # `name` and `kind` ride along with the output: for a flow the
+        # transform name IS the output dataset name, so they stand or fall
+        # together and there is nothing extra to withhold.
+        if spec.output.dataset not in visible:
+            continue
+        inputs = [i.dataset for i in spec.inputs.values()]
+        kept = [d for d in inputs if d in visible]
+        out.append({
             "name": spec.name,
             "output": spec.output.dataset,
-            "inputs": [inp.dataset for inp in spec.inputs.values()],
+            "inputs": kept,
             "kind": spec.kind,
-        }
-        for spec in registry.all()
-    ]
+            "hidden_inputs": len(kept) != len(inputs),
+        })
+    return out
 
 
 @router.post("/builds", dependencies=[EDITOR])
@@ -2281,6 +2398,8 @@ def run_build(
     catalog: CatalogDep,
     store: StoreDep,
     registry: RegistryDep,
+    perms: PermDep,
+    user: UserDep,
     actor: ActorDep,
     body: Optional[BuildRequest] = None,
 ) -> dict:
@@ -2292,13 +2411,72 @@ def run_build(
             status_code=400,
             detail="targets must be non-empty when provided; omit it to build everything",
         )
+    if targets:
+        # The write door must not disclose what the read door withholds. This
+        # route answered 200 with the hidden name echoed through `targets` and
+        # every task for an editor whose `GET /datasets/{n}` was 404 and whose
+        # `GET /builds/{id}` for the build he had just created was *also* 404 —
+        # so the same principal could mint the name he was not allowed to
+        # read. It was also an unmitigated oracle: a hidden target answered
+        # 200 and an absent one 400, so any name could be tested.
+        #
+        # The answer is the one an absent target already gets, word for word.
+        # A build over "everything" is unaffected: it names nothing, and its
+        # response is projected below like every other build body.
+        visible = _viewable(perms, user, targets)
+        for t in targets:
+            if t not in visible:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown build target {t!r}: no transform produces it",
+                )
     # ImportRefused -> 409, with a message naming the acknowledgement route. A
     # build is the moment imported pipeline code would actually run.
     require_pipelines_acknowledged(workspace)
+    if targets is None and not list(registry.all()):
+        # A build over "all targets" with nothing to build reported
+        # `succeeded` — a green row over an empty workspace, on the same page
+        # that simultaneously read "No pipelines yet". It is the schedule row
+        # that said "succeeded" over a failed build, pointed the other way.
+        #
+        # AFTER `require_pipelines_acknowledged`, deliberately: an imported
+        # workspace's registry is empty precisely BECAUSE its pipelines are not
+        # acknowledged yet, and the 409 that names the acknowledgement route is
+        # the answer that actually helps. Emptiness is only the cause when
+        # there is nothing withholding the pipelines.
+        raise HTTPException(
+            status_code=400,
+            detail="There are no pipelines in this workspace yet, "
+                   "so there is nothing to build.",
+        )
     store.log_audit("build_requested", {"targets": targets or []}, actor=actor)
     builder = Builder(workspace, catalog, store, registry)
+
+    def _answer(build) -> dict:
+        # The same projection `GET /builds/{id}` applies, so the two doors
+        # agree. A build-everything run performed by an editor who may not view
+        # some outputs still runs them — that is the system's job — but their
+        # names do not come back through the response.
+        names = list(build.targets) + [t.output_dataset for t in build.tasks]
+        projected = _project_build_for_viewer(build, _viewable(perms, user, names))
+        if projected is not None:
+            return projected
+        # Every name is withheld. The caller asked for this build and knows its
+        # id, so 404 would be a lie; the body keeps the true id and status and
+        # names nothing.
+        blank = build.model_copy(update={"targets": [], "tasks": []})
+        if blank.failure is not None:
+            counters = dict(blank.failure.counters)
+            counters.pop("failed_tasks", None)  # a count over invisible tasks
+            blank = blank.model_copy(update={
+                "failure": blank.failure.model_copy(update={"counters": counters})
+            })
+        out = _dump(blank)
+        out["hidden_tasks"] = True
+        return out
+
     if body and body.wait:
-        return _dump(builder.build(targets))
+        return _answer(builder.build(targets))
     # Async (default): validate the plan now so a bad target is still a 400,
     # create the pending record, and hand execution to the build pool.
     builder.plan(targets)  # ValueError -> 400 via handler
@@ -2307,46 +2485,102 @@ def run_build(
     request.app.state.build_executor.submit(
         builder.execute, build.id, targets, request.app.state.worker_id
     )
-    return _dump(build)
+    return _answer(build)
 
 
 @router.get("/builds", dependencies=[VIEWER])
-def list_builds(store: StoreDep) -> list[dict]:
-    return [_dump(b) for b in store.list_builds()]
+def list_builds(store: StoreDep, perms: PermDep, user: UserDep) -> list[dict]:
+    builds = store.list_builds()
+    names = [n for b in builds for n in b.targets]
+    names += [t.output_dataset for b in builds for t in b.tasks]
+    visible = _viewable(perms, user, names)
+    out = []
+    for build in builds:
+        projected = _project_build_for_viewer(build, visible)
+        if projected is not None:
+            out.append(projected)
+    return out
 
 
 @router.get("/builds/{build_id}", dependencies=[VIEWER])
-def get_build(build_id: str, store: StoreDep) -> dict:
+def get_build(build_id: str, store: StoreDep, perms: PermDep, user: UserDep) -> dict:
     build = store.get_build(build_id)
     if build is None:
         raise KeyError(f"Build not found: {build_id!r}")
-    return _dump(build)
+    names = list(build.targets) + [t.output_dataset for t in build.tasks]
+    projected = _project_build_for_viewer(build, _viewable(perms, user, names))
+    if projected is None:
+        # The SAME sentence an unknown id gets, not a 403. This route was an
+        # oracle by construction — 404 for unknown, a full body for known — so
+        # confirming the id exists is itself the disclosure. Same shape
+        # `_require_dataset_view` established for datasets.
+        raise KeyError(f"Build not found: {build_id!r}")
+    return projected
 
 
 @router.get("/lineage", dependencies=[VIEWER])
-def get_lineage(store: StoreDep) -> dict:
-    nodes: list[dict] = []
-    edges: list[dict] = []
-    seen_nodes: set[tuple[str, str]] = set()
+def get_lineage(store: StoreDep, perms: PermDep, user: UserDep) -> dict:
+    raw = store.list_lineage()
+    names = {e.upstream_dataset for e in raw} | {e.downstream_dataset for e in raw}
+    visible = _viewable(perms, user, sorted(names))
+
+    def survives(node_id: str, node_type: str, output: str) -> bool:
+        # A dataset node survives iff it is viewable; a transform node survives
+        # iff its OUTPUT dataset is viewable (for a flow they are the same
+        # name, and for a python transform the output is what the name is
+        # evidence of).
+        return (node_id if node_type == "dataset" else output) in visible
+
+    # Both bits are computed on the UNFILTERED edge set, before projection —
+    # that is the whole point: a node has to be able to say "there is more
+    # here" precisely about the neighbours that were removed.
+    up: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    down: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    all_nodes: dict[tuple[str, str], str] = {}
+    raw_edges: list[tuple[tuple[str, str], tuple[str, str]]] = []
+    for edge in raw:
+        u = (edge.upstream_dataset, "dataset")
+        t = (edge.transform_name, "transform")
+        d = (edge.downstream_dataset, "dataset")
+        all_nodes[u] = edge.upstream_dataset
+        all_nodes[t] = edge.downstream_dataset  # a transform's output
+        all_nodes[d] = edge.downstream_dataset
+        raw_edges += [(u, t), (t, d)]
+    for src, dst in raw_edges:
+        down.setdefault(src, []).append(dst + (all_nodes[dst],))
+        up.setdefault(dst, []).append(src + (all_nodes[src],))
+
+    kept = {k for k in all_nodes if survives(k[0], k[1], all_nodes[k])}
+    nodes = []
+    for key in all_nodes:
+        if key not in kept:
+            continue
+        nodes.append({
+            "id": key[0],
+            "type": key[1],
+            # One bit each. NOT a count, and no placeholder node stands in for
+            # what was dropped: a placeholder preserves topology and fan-in,
+            # which is enough to fingerprint a pipeline and to notice when a
+            # new hidden dataset appears.
+            "has_hidden_upstream": any(
+                (n[0], n[1]) not in kept for n in up.get(key, [])
+            ),
+            "has_hidden_downstream": any(
+                (n[0], n[1]) not in kept for n in down.get(key, [])
+            ),
+        })
+
     seen_edges: set[tuple[str, str]] = set()
-
-    def add_node(node_id: str, node_type: str) -> None:
-        key = (node_id, node_type)
-        if key not in seen_nodes:
-            seen_nodes.add(key)
-            nodes.append({"id": node_id, "type": node_type})
-
-    def add_edge(src: str, dst: str) -> None:
-        if (src, dst) not in seen_edges:
-            seen_edges.add((src, dst))
-            edges.append({"from": src, "to": dst})
-
-    for edge in store.list_lineage():
-        add_node(edge.upstream_dataset, "dataset")
-        add_node(edge.transform_name, "transform")
-        add_node(edge.downstream_dataset, "dataset")
-        add_edge(edge.upstream_dataset, edge.transform_name)
-        add_edge(edge.transform_name, edge.downstream_dataset)
+    edges = []
+    for src, dst in raw_edges:
+        # An edge survives iff BOTH endpoints survive: a dangling edge would
+        # name the node it points at.
+        if src not in kept or dst not in kept:
+            continue
+        if (src[0], dst[0]) in seen_edges:
+            continue
+        seen_edges.add((src[0], dst[0]))
+        edges.append({"from": src[0], "to": dst[0]})
 
     return {"nodes": nodes, "edges": edges}
 
@@ -2785,17 +3019,43 @@ def set_permissions(
 # ---------------------------------------------------------------------------
 
 @router.get("/dataset-permissions", dependencies=[ADMIN])
-def list_dataset_permissions(store: StoreDep) -> list[dict]:
-    """Grants for every dataset (empty list = default open per global RBAC)."""
+def list_dataset_permissions(store: StoreDep, workspace: WorkspaceDep) -> list[dict]:
+    """Grants for every dataset (empty list = default open per global RBAC).
+
+    Declared-but-not-yet-built outputs are listed too, so an admin can withhold
+    an intended-secret dataset BEFORE its first successful build rather than
+    after — see `_declared_outputs`.
+    """
     by_ds: dict[str, list[dict]] = {}
     for g in store.list_dataset_grants():
         by_ds.setdefault(g["dataset"], []).append(
             {k: v for k, v in g.items() if k != "dataset"}
         )
+    names = [d.name for d in store.list_datasets()]
+    pending = sorted(_declared_outputs(workspace) - set(names))
     return [
-        {"dataset": d.name, "grants": by_ds.get(d.name, [])}
-        for d in store.list_datasets()
+        {"dataset": name, "grants": by_ds.get(name, []),
+         "built": name not in pending}
+        for name in names + pending
     ]
+
+
+def _declared_outputs(workspace: Workspace) -> set[str]:
+    """Dataset names a pipeline declares but that have no version yet.
+
+    A build that fails writes no version, so its intended-secret output has no
+    row in `datasets` — and `PUT /datasets/{n}/permissions` answered 404, which
+    meant an output could not be withheld for the whole window before its first
+    SUCCESSFUL build, and permanently if the build never succeeded. Measured:
+    `secret_broken` reached a viewer through `GET /transforms` and `GET /builds`
+    with no door in the API to stop it. The projections were right; the
+    ACL-write door was the hole.
+    """
+    try:
+        registry = get_registry(workspace)
+    except HTTPException:
+        return set()  # a broken pipeline file must not block governance
+    return {s.output.dataset for s in registry.all()}
 
 
 @router.put("/datasets/{name}/permissions", dependencies=[ADMIN])
@@ -2803,11 +3063,12 @@ def set_dataset_permissions(
     name: str,
     body: GrantsRequest,
     store: StoreDep,
+    workspace: WorkspaceDep,
     perms: PermDep,
     user: UserDep,
     approvals: ApprovalsDep,
 ):
-    if store.get_dataset(name) is None:
+    if store.get_dataset(name) is None and name not in _declared_outputs(workspace):
         raise KeyError(f"Dataset not found: {name!r}")
     perms.validate_grants(body.grants)
     outcome = approvals.submit(
@@ -3239,13 +3500,61 @@ class QueryTransformRequest(BaseModel):
 # The viewer's legitimate need here is *lineage*, and it is already served
 # structurally and stays VIEWER: GET /transforms names every transform, GET
 # /lineage gives the edges. Names and edges, not authored prose.
+# The same row-level rule #75 put on `/transforms`, `/builds` and `/lineage`,
+# applied to the authoring surface. `transforms` here is a structured list of
+# dataset names — the identical shape — and it named withheld datasets to an
+# editor for whom `GET /datasets/{n}` was 404. Worse, the Builds page told that
+# same editor "Parts of this lineage are not shared with your role" while
+# `GET /pipelines/{name}` handed them the source containing
+# `Output('topsecret_payroll')` one click away, so the two surfaces contradicted
+# each other for one principal.
+#
+# The file *content* cannot be row-filtered — it is arbitrary authored Python —
+# so the read is refused whole, in the words an absent file gets. Fail-closed:
+# if you may not see what a file produces, you may not read or delete the file
+# that produces it.
+def _pipeline_outputs(entry: dict) -> list[str]:
+    return list(entry.get("transforms") or [])
+
+
+def _require_pipeline_readable(
+    name: str, files: PipelineFiles, perms: PermissionService, user: User
+) -> None:
+    stem = name[:-3] if name.endswith(".py") else name
+    for entry in files.list():
+        if entry["name"] != stem:
+            continue
+        outputs = _pipeline_outputs(entry)
+        if outputs and set(outputs) - _viewable(perms, user, outputs):
+            raise KeyError(f"Pipeline file not found: {stem!r}")
+        return
+
+
 @router.get("/pipelines", dependencies=[EDITOR])
-def list_pipelines(files: PipelineFilesDep) -> list[dict]:
-    return files.list()
+def list_pipelines(
+    files: PipelineFilesDep, perms: PermDep, user: UserDep
+) -> list[dict]:
+    entries = files.list()
+    names = [n for e in entries for n in _pipeline_outputs(e)]
+    visible = _viewable(perms, user, names)
+    out = []
+    for entry in entries:
+        outputs = _pipeline_outputs(entry)
+        kept = [n for n in outputs if n in visible]
+        if outputs and not kept:
+            # Every output withheld, so the file is withheld: listing it would
+            # disclose that something exists behind a name that is not shared.
+            continue
+        out.append({**entry, "transforms": kept,
+                    "hidden_transforms": len(kept) != len(outputs)})
+    return out
 
 
 @router.get("/pipelines/{name}", dependencies=[EDITOR])
-def read_pipeline(name: str, files: PipelineFilesDep) -> dict:
+def read_pipeline(
+    name: str, files: PipelineFilesDep, perms: PermDep, user: UserDep
+) -> dict:
+    _require_pipeline_readable(name, files, perms, user)
     return files.read(name)
 
 
@@ -3256,8 +3565,14 @@ def write_pipeline(
     body: PipelineWriteRequest,
     files: PipelineFilesDep,
     store: StoreDep,
+    perms: PermDep,
+    user: UserDep,
     actor: ActorDep,
 ) -> dict:
+    # Overwriting a file whose outputs are withheld is the write half of the
+    # same disclosure: the response echoes `transforms`, and the overwrite
+    # would silently retarget a dataset the author may not read.
+    _require_pipeline_readable(name, files, perms, user)
     result = files.write(name, body.content)
     # Server-side author stamp, same contract as FlowFiles.write: the recorded
     # author is whose read access every build of this file is checked against
@@ -3270,7 +3585,11 @@ def write_pipeline(
 
 
 @router.delete("/pipelines/{name}", dependencies=[EDITOR, Depends(require_pipelines_unlocked)])
-def delete_pipeline(name: str, files: PipelineFilesDep, store: StoreDep, actor: ActorDep) -> dict:
+def delete_pipeline(
+    name: str, files: PipelineFilesDep, store: StoreDep,
+    perms: PermDep, user: UserDep, actor: ActorDep,
+) -> dict:
+    _require_pipeline_readable(name, files, perms, user)
     files.delete(name)
     # A deleted file's stamp goes with it. A DISK edit to a stamped file does
     # NOT clear the stamp — the stamp means "last API author", and staying

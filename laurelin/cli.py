@@ -10,7 +10,7 @@ from typing import Optional
 import typer
 
 from laurelin.core import fileperms, serialize
-from laurelin.core.config import Workspace, WorkspaceNotFound
+from laurelin.core.config import MARKER, Workspace, WorkspaceNotFound
 from laurelin.core.roles import Role
 
 app = typer.Typer(
@@ -69,10 +69,90 @@ def init(
     path: Path = typer.Argument(..., help="Directory to initialize as a workspace."),
     name: str = typer.Option("", "--name", help="Workspace name."),
     description: str = typer.Option("", "--description", help="Workspace description."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Proceed even though the directory already holds a workspace. The "
+        "existing name and description are kept; nothing is deleted.",
+    ),
 ) -> None:
     """Create a new Laurelin workspace."""
+    existing = _existing_workspace(path)
+    if existing is not None and not force:
+        # ONLY what the operator actually typed. This used to be
+        # `name or Path(path).name`, which invented a `--name` from the
+        # directory basename and then diffed the invention against the stored
+        # name — so a plain `laurelin init clitest` with no flags at all exited
+        # 2 with "would ignore --name", naming a flag nobody passed, for any
+        # workspace whose name differs from its directory. The rule this
+        # command enforces is "a run that would discard something the operator
+        # asked for refuses"; a run that asked for nothing discards nothing.
+        discarded = [
+            what
+            for what, asked, have in (
+                ("--name", name, existing.name),
+                ("--description", description, existing.description),
+            )
+            if asked and asked != have
+        ]
+        if discarded:
+            _refuse_existing_workspace(
+                existing, path,
+                f"leave it as it is and ignore {', '.join(discarded)}",
+                verb="init",
+            )
+        # Nothing the operator asked for would be lost, so this stays the no-op
+        # `Workspace.init` documents — but it says so, instead of announcing an
+        # initialization that did not happen.
+        typer.echo(
+            f"Workspace '{existing.name}' already exists at {existing.root}. "
+            "Nothing to do."
+        )
+        return
     workspace = Workspace.init(path, name=name, description=description)
     typer.echo(f"Initialized workspace '{workspace.name}' at {workspace.root}")
+
+
+def _existing_workspace(path: Path) -> Optional[Workspace]:
+    """The workspace already at ``path``, or None. Never raises."""
+    if not (Path(path) / MARKER).exists():
+        return None
+    try:
+        return Workspace(Path(path))
+    except Exception:  # noqa: BLE001 — an unreadable marker is still a marker
+        return None
+
+
+def _refuse_existing_workspace(
+    existing: Optional[Workspace], path: Path, consequence: str, verb: str
+) -> None:
+    """Refuse rather than silently discard what the operator asked for.
+
+    ``Workspace.init`` is documented idempotent and stays that way — other
+    callers (``api/context._bundle`` for a registered-but-unmaterialised
+    workspace, every test fixture) depend on it, and ``_write_marker``'s
+    ``O_EXCL`` no-op is what makes two concurrent inits safe. The problem was
+    never idempotence, it was silence at the one caller with a human in front
+    of it: ``laurelin init ./ws --name Clobbered`` on an existing workspace
+    dropped ``--name`` on the floor and then printed "Initialized workspace
+    'aviation-demo'" — the operator asked for one thing, got another, and was
+    told it worked.
+
+    So the rule is narrow and about the *request*, not the directory: a run
+    that would discard something the operator typed refuses (exit 2, this
+    CLI's "refused, and here is the flag that overrides it"), and a run that
+    would discard nothing proceeds and says it changed nothing. ``demo`` is
+    stricter, because regenerating rewrites files and adds versions whatever
+    was asked for.
+    """
+    who = f"the workspace {existing.name!r}" if existing is not None else "a workspace"
+    typer.echo(
+        f"Refused: {path} already holds {who}. `laurelin {verb}` would "
+        f"{consequence}. Pick a different directory, or pass --force to work "
+        f"in this one anyway.",
+        err=True,
+    )
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -112,13 +192,13 @@ def serve(
         help="Disable in-browser Python pipeline authoring (pipeline files can "
         "only be edited on disk). Recommended for untrusted multi-user "
         "deployments, since writing a pipeline file is code-execution-equivalent. "
-        "Flows and Explore — no-code authoring that compiles to bound SQL and "
+        "Flows and Analyses — no-code authoring that compiles to bound SQL and "
         "cannot reach exec — stay available; add --lock-flows to close those too.",
     ),
     lock_flows: bool = typer.Option(
         False,
         "--lock-flows",
-        help="Disable no-code flow authoring (Flows and Explore saves). Combine "
+        help="Disable no-code flow authoring (Flows and Analyses saves). Combine "
         "with --lock-pipelines for a total authoring lockdown.",
     ),
 ) -> None:
@@ -367,15 +447,58 @@ def demo(
     build: bool = typer.Option(
         True, "--build/--no-build", help="Run the pipeline build after generating."
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Regenerate into a directory that already holds a workspace. The "
+        "demo's pipeline and ontology files are overwritten and every demo "
+        "dataset gains a version.",
+    ),
 ) -> None:
     """Generate the aviation demo workspace."""
     from laurelin.demo import create_demo
 
-    workspace = create_demo(path, build=build)
+    # Re-running into a populated workspace is not idempotent: it rewrites
+    # `pipelines/aviation.py` and `ontology/aviation.yml` and writes both raw
+    # datasets again, bumping every demo dataset a version — while printing
+    # "created". Whatever the operator had done in that workspace is now one
+    # version behind a regenerated copy of the demo, with no warning.
+    existing = _existing_workspace(path)
+    if existing is not None and not force:
+        _refuse_existing_workspace(
+            existing, path,
+            "overwrite its aviation pipeline and ontology files and add a "
+            "version to every demo dataset",
+            verb="demo",
+        )
+    workspace, info = create_demo(path, build=build)
     typer.echo(f"Demo workspace created at {workspace.root}")
-    if build:
-        typer.echo("Pipeline built: clean_aircraft, clean_flights, flight_stats")
+    if info is not None:
+        _echo_build_result(info)
     typer.echo(f"Next: laurelin serve --workspace {workspace.root}")
+
+
+def _echo_build_result(info) -> None:
+    """Report the build that ran, not the build the demo template used to have.
+
+    The old line was a literal — "Pipeline built: clean_aircraft,
+    clean_flights, flight_stats" — printed whenever a build was requested and
+    inspecting nothing. It is the first build output a new operator ever sees,
+    so it is the worst possible place for a sentence that cannot go red.
+    """
+    from laurelin.core.models import BuildStatus
+
+    built = [t.output_dataset for t in info.tasks if t.status == BuildStatus.succeeded]
+    failed = [t.output_dataset for t in info.tasks if t.status == BuildStatus.failed]
+    if built:
+        typer.echo(f"Pipeline built: {', '.join(built)}")
+    if failed:
+        # stderr, and named: a partial build is the case where the operator has
+        # to do something, and the exit code stays 0 because the workspace was
+        # still created and is still worth serving.
+        typer.echo(f"Did NOT build: {', '.join(failed)}", err=True)
+    if not built and not failed:
+        typer.echo("Nothing was built: this workspace declares no pipelines.")
 
 
 # -- portability: export / import / verify-governance -------------------------
@@ -580,6 +703,12 @@ def export_cmd(
     if output and output != "-":
         typer.echo(f"Wrote {output} (mode 0600)", err=True)
     _export_summary(manifest)
+    # After the bytes, and on stderr, because a stream cannot know its own
+    # digest in advance — the archive is finished before this number exists.
+    # It is NOT a signature and is not called one: carry it to the destination
+    # by a route the archive did not travel, and `laurelin import
+    # --expect-sha256 <digest>` refuses anything else before reading a row.
+    typer.echo(f"sha256: {options.archive_sha256}", err=True)
 
 
 @app.command("import")
@@ -594,6 +723,14 @@ def import_cmd(
     ),
     confirm: Optional[str] = typer.Option(
         None, "--confirm", help="The sha256 of the report you read (phase 2)."
+    ),
+    expect_sha256: Optional[str] = typer.Option(
+        None,
+        "--expect-sha256",
+        help="The sha256 `laurelin export` printed for this archive, carried "
+        "to you out of band. Checked before a single row is read. This is a "
+        "digest handshake, not a signature: it proves the bytes are the ones "
+        "whoever gave you the digest held, not who they were.",
     ),
     rename_prefix: Optional[str] = typer.Option(
         None, "--rename-prefix", help="Prefix imported dataset names on collision."
@@ -618,6 +755,7 @@ def import_cmd(
         confirm=confirm,
         rename_prefix=rename_prefix,
         metadata_only=metadata_only,
+        expect_sha256=expect_sha256,
         actor=os.environ.get("USER", "cli"),
     )
     source = sys.stdin.buffer if archive == "-" else Path(archive)

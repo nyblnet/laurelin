@@ -23,6 +23,8 @@ import {
   DataTable,
   EmptyState,
   ErrorBox,
+  NotFound,
+  isNotFound,
   PageHeader,
   Spinner,
   Withheld,
@@ -114,6 +116,8 @@ function AppPage() {
   });
 
   if (appQ.isLoading) return <Spinner />;
+  if (isNotFound(appQ.error))
+    return <NotFound what="app" name={name} backTo="/apps" backLabel="Back to Apps" />;
   if (appQ.isError) return <ErrorBox error={appQ.error} onRetry={() => appQ.refetch()} />;
   return <AppBody app={appQ.data!} selectedPk={pk ?? null} />;
 }

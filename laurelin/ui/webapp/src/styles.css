@@ -991,3 +991,16 @@ a.btn[aria-disabled="true"] {
   border-top: 1px solid var(--border);
   font-size: 11px;
 }
+
+/* A button that reads as a link. Used where an in-page destination is a
+   SCROLL, not a route: this app routes on the hash, so an `<a href="#x">`
+   anchor would navigate away instead of moving the page. */
+.linklike {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--link);
+  text-decoration: underline;
+  cursor: pointer;
+}

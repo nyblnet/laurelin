@@ -57,17 +57,27 @@ def _service(store) -> HealthService:
 # ---------------------------------------------------------------------------
 
 @health_router.get("/health/datasets")
-def health_rollup(store: StoreDep, perms: PermDep, user: UserDep) -> list[dict]:
+def health_rollup(store: StoreDep, perms: PermDep, user: UserDep) -> dict:
     """Health for every dataset the caller can view — and no other name.
 
     No role dependency beyond login: the filter is per dataset, so a viewer
     with two visible datasets gets a two-row answer, not a 403 and not the
     workspace's whole catalog.
+
+    `others_exist` is the one bit that tells emptiness apart from withholding.
+    Without it the page said "No datasets you can read." to a sole admin on a
+    brand-new workspace — withholding language for plain emptiness, the exact
+    inverse of the rule Datasets already enforces. It is the SAME unquantified
+    boolean the lineage marks concede (`has_hidden_upstream`): never a count,
+    never a name.
     """
     names = [d.name for d in store.list_datasets()]
     visible = perms.viewable_datasets(user, names)
     health = _service(store).dataset_health(sorted(visible))
-    return [_dump(h) for _, h in sorted(health.items())]
+    return {
+        "datasets": [_dump(h) for _, h in sorted(health.items())],
+        "others_exist": len(visible) != len(set(names)),
+    }
 
 
 @health_router.get("/health/events")

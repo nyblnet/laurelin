@@ -185,7 +185,7 @@ matters — every (policy, user) returns the same rows and values as
   chdb, and `readonly=1` rejects the whole query rather than restricting the
   filesystem. Registering a source is therefore "may read any file the server
   process can read", which is why it is admin-only and behind the same opt-in
-  workbench gate as federated. This is **parity with the federated path, not a
+  federation gate as federated datasets. This is **parity with that path, not a
   step down from it**: `federation.connect` sets `disabled_filesystems` only
   when `is_local_source(source)` is false, and a local Parquet path — the one
   source type ClickHouse supports — is a local source, so DuckDB reads it
@@ -896,10 +896,22 @@ latest: writeback stamps its own version `writeback` and compaction stamps
 `compact`, so the latest-only test erased the evidence and the guard fired
 exactly once per dataset.
 
-**NOT IMPLEMENTED:** automatic unfolding when a rebuild supersedes a folded
-version (which is *why* `folded_into_version` is a column), and automatic
-writeback triggers. Writeback on its own bounds **read cost, not disk** —
-pruning is what bounds disk, and it is below.
+**WILL NOT DO — automatic unfolding** when a rebuild supersedes a folded
+version (which is *why* `folded_into_version` is a column). An edit is an
+*absolute assignment* merged with a per-column `__set__` flag, so replaying one
+over rebuilt upstream data would put a stale hand value back over a corrected
+one — the same silent wrongness pointed the other way, and harder to notice,
+because the row then looks edited on purpose. What ships instead is
+**`superseded_folds`**: a count, the superseding version and its source,
+reported on the object type's index status and in the edit-log report, with a
+banner on the object type. The numbers come from `prune_plan`, which already
+had to compute them to refuse those rows. An explicit operator-invoked
+`unfold(type, versions)` is a separate change if it is ever wanted — it would
+be EDITOR-gated, audited, and have a dry run naming which edits land on which
+rows.
+
+Also **NOT IMPLEMENTED:** automatic writeback triggers. Writeback on its own
+bounds **read cost, not disk** — pruning is what bounds disk, and it is below.
 
 #### Pruning the edit log
 
@@ -922,8 +934,9 @@ world as it is now rather than inferred from how the edit got here:
    builds on the previous version and `compact` rewrites the same rows, so both
    carry a fold forward; anything else (a transform build, an upload, a sync, a
    merge) may have replaced those rows, and then the log rows are the only
-   surviving record of the hand edits. This is the same hazard the unfolding
-   entry above is about — until unfolding exists, those edits are load-bearing;
+   surviving record of the hand edits. This is the same population
+   `superseded_folds` reports: automatic unfolding is refused, so those edits
+   are load-bearing and stay;
 4. it is **not the row holding `MAX(edit_seq)`**. The allocator is `MAX + 1` and
    a materialization's watermark is compared against `max_edit_seq`; delete the
    top row and the next edit re-uses a number the store already claims to have
@@ -1502,8 +1515,8 @@ Python surface is disabled by
 reports both so the UI can say so up front). Writes validate syntax
 (`compile`) before an atomic write and return the file's transforms plus any
 cross-file `collect_error` (e.g. a duplicate output). Module names must match
-`^[a-z][a-z0-9_]*$` (no paths/dots — no traversal). `from-query` wraps a
-workbench SQL query as a `@sql_transform`, auto-detecting input datasets by
+`^[a-z][a-z0-9_]*$` (no paths/dots — no traversal). `from-query` wraps an
+ad-hoc SQL query as a `@sql_transform`, auto-detecting input datasets by
 name. Executed transform code is **not** sandboxed (a roadmap item).
 
 ### `laurelin/ui` — single-page app
@@ -1560,17 +1573,18 @@ configured" from an empty field and retypes the credential.
 `main()` = entry point that invokes the typer app.
 
 ```
-laurelin init PATH [--name] [--description]
+laurelin init PATH [--name] [--description] [--force]
 laurelin serve [--workspace PATH | --root DIR] [--host 127.0.0.1] [--port 8787]
                [--no-auth] [--secure-cookies] [--lock-pipelines] [--lock-flows]
                [--control-db URL]
 laurelin build [TARGETS...] [--workspace PATH]
 laurelin datasets list|show NAME [--workspace PATH]
 laurelin upload NAME FILE [--workspace PATH]
-laurelin demo [PATH=demo-workspace] [--build/--no-build]   # default: build
+laurelin demo [PATH=demo-workspace] [--build/--no-build] [--force]  # default: build
 laurelin mcp --url URL --token TOKEN                       # stdio MCP server
 laurelin export ARCHIVE|- [--fingerprint] [--metadata-only] [-w PATH]
 laurelin import ARCHIVE|- [-w PATH] [--merge --confirm SHA] [--rename-prefix P]
+                          [--expect-sha256 SHA]
 laurelin verify-governance --baseline ARCHIVE [-w PATH]
 laurelin users create|list|passwd|role|disable|enable|delete ...
 laurelin tokens create|list|revoke ...
@@ -1578,9 +1592,20 @@ laurelin tokens create|list|revoke ...
 
 `--workspace` defaults to `Workspace.find()` discovery.
 
+`Workspace.init` is idempotent and stays that way (two concurrent callers must
+both succeed), but the CLI no longer inherits its silence. `init` on a
+directory that already holds a workspace **refuses with exit 2** when the run
+would discard a `--name` or `--description` you typed, and otherwise says
+"already exists, nothing to do" rather than claiming it initialized anything.
+`demo` refuses unconditionally, because regenerating overwrites
+`pipelines/aviation.py` and `ontology/aviation.yml` and adds a version to every
+demo dataset. `--force` proceeds in both. `demo` also reports the targets that
+actually built — it used to print three names from a string literal.
+
 ### `laurelin/demo.py`
 
-`create_demo(path: Path, build: bool = True) -> Workspace` — deterministic
+`create_demo(path: Path, build: bool = True) -> DemoResult(workspace, build)`
+— deterministic
 in-code aviation dataset (no downloads): `raw_aircraft` (~12 rows: tail_number,
 model, operator, status, year_built), `raw_flights` (~60 rows: flight_id,
 tail_number, origin, destination, scheduled_departure, delay_minutes, status —

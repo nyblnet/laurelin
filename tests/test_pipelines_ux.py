@@ -25,6 +25,7 @@ node_modules are absent (a Python-only checkout).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,6 +35,19 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 WEBAPP = REPO / "laurelin" / "ui" / "webapp"
 SRC = WEBAPP / "src"
+
+
+def _code(*parts: str) -> str:
+    """Source with comments removed.
+
+    Several contracts here are about the ABSENCE of a phrase, and the comment
+    that records why the phrase was removed necessarily contains it. Scanning
+    raw bytes made those assertions unwritable; test_ui_consistency.py solved
+    this the same way.
+    """
+    text = (SRC.joinpath(*parts)).read_text(encoding="utf-8")
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"(?m)(?:^|(?<=\s))//.*$", " ", text)
 ESBUILD = WEBAPP / "node_modules" / ".bin" / "esbuild"
 HARNESS = REPO / "tests" / "webapp_harness" / "pipelines_mount.tsx"
 
@@ -113,9 +127,44 @@ def test_the_collision_banner_offers_a_rename_not_the_workspace_broken_sentence(
 def test_the_naming_dialog_refuses_a_dataset_owned_name_before_the_server_has_to():
     # A pipeline's name is the name of the dataset it builds; a name a dataset
     # already owns is a guaranteed 409, so the dialog refuses it with the rule.
-    src = (SRC / "views" / "Flows.tsx").read_text(encoding="utf-8")
-    assert "takenDatasets" in src
-    assert "There is already a dataset called" in src
+    #
+    # DELIBERATE edit: the dialog moved from inside Flows.tsx to
+    # views/flow/NameDialog.tsx so the Python tab could reuse it instead of
+    # calling window.prompt. The invariant is unchanged and now covers both
+    # tabs; the Visual tab must still be the one that PASSES the dataset names,
+    # because only it names a dataset.
+    dlg = (SRC / "views" / "flow" / "NameDialog.tsx").read_text(encoding="utf-8")
+    assert "takenDatasets" in dlg
+    assert "There is already a dataset called" in dlg
+    assert "takenDatasets=" in (SRC / "views" / "Flows.tsx").read_text(encoding="utf-8")
+
+
+def test_neither_pipelines_tab_asks_for_a_name_with_a_native_browser_dialog():
+    # One screen, two tabs, two dialog systems: the Visual tab shipped a styled
+    # NameDialog carrying a comment about why window.prompt is wrong for this
+    # job, and the Python tab called window.prompt anyway — so whether you were
+    # told the naming rule, or that the name was taken, before you committed to
+    # it depended on which tab you happened to be standing on. A prompt cannot
+    # show a rule, cannot validate as you type, and cannot be announced.
+    for name in ("Flows.tsx", "Transforms.tsx"):
+        src = _code("views", name)
+        assert "window.prompt" not in src, f"{name} still collects a name with window.prompt"
+        assert "window.alert" not in src, f"{name} still reports a refusal with window.alert"
+    assert "NameDialog" in _code("views", "Transforms.tsx")
+
+
+def test_the_python_tab_names_a_file_and_the_visual_tab_names_a_pipeline():
+    # A .py file declares SEVERAL pipelines — which is exactly why the Python
+    # tab's delete confirm says "the datasets" in the plural. Calling the file
+    # a "pipeline" would be false, so the two tabs use two nouns on purpose and
+    # the shared header no longer flattens them into "two ways to write it".
+    tf = _code("views", "Transforms.tsx")
+    assert "+ New pipeline file" in tf
+    assert 'noun="pipeline file"' in tf
+    subtitle = _code("views", "Pipelines.tsx")
+    assert "One kind of thing; written one at a time, " in subtitle
+    assert "or several to a file" in subtitle
+    assert "two ways to write it" not in subtitle
 
 
 # ------------------------------------------------------------ first-run hero
@@ -141,7 +190,7 @@ def test_the_flow_builder_follows_its_build_to_an_outcome():
     # "Build started" was a static sentence; the builder now polls the build
     # it started (the Builds page's refetchInterval pattern) and converges the
     # note to succeeded/failed, linking the build it is talking about.
-    src = (SRC / "views" / "Flows.tsx").read_text(encoding="utf-8")
+    src = _code("views", "Flows.tsx")
     assert "refetchInterval" in src
     assert "/builds?build=" in src
     # DELIBERATE edit: the outcome copy joined the one sentence family every
@@ -149,9 +198,15 @@ def test_the_flow_builder_follows_its_build_to_an_outcome():
     # "See the build" — the Builds page's own phrasing, which Schedules
     # already copies). The invariant here is unchanged: the note converges to
     # a terminal outcome and links the build it is talking about.
-    assert "Build finished: failed." in src
-    assert "Build finished: succeeded" in src
+    # DELIBERATE edit (second): the terminal fact converged completely across
+    # the three build-kicking screens — "Build <id> finished: <outcome>." then
+    # "See the build." and nothing after it. The trailing clauses each screen
+    # had invented ("— <dataset> has N rows", "for what went wrong") are what
+    # let three voices grow, so their ABSENCE is now part of the contract.
+    assert "finished: {buildQ.data.status}." in src
     assert "See the build" in src
+    assert "for what went wrong" not in src
+    assert "Build finished:" not in src
     # The outcome is announced to screen readers, not just repainted.
     assert "LiveStatus" in src
 

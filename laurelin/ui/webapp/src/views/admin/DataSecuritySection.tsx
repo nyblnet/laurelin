@@ -101,7 +101,25 @@ function SubjectPicker({
             ))}
           </select>
         ) : (
-          <span className="faint">no groups defined</span>
+          <span className="faint">
+              {/* Was inert text at a dead end: the door to create the thing it
+                  says is missing sits on this same page. NOT an `#groups`
+                  anchor — this app routes on the hash, so that would navigate
+                  away instead of scrolling. */}
+              No groups yet —{" "}
+              <button
+                type="button"
+                className="linklike"
+                onClick={() =>
+                  document
+                    .getElementById("groups")
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                }
+              >
+                create one under Groups
+              </button>
+              .
+            </span>
         )
       ) : (
         // user

@@ -273,6 +273,12 @@ export function ShapingCards({
                   <option value="">Pick a column…</option>
                   <ColumnOptions columns={columns.filter((c) => c === g.column || !usedPlain.has(c))} />
                 </select>
+                {/* A text column may hold dates written as text, which is why
+                    the option exists at all — but offered bare beside a plain
+                    string column like `region` it read as six meaningless
+                    choices, while the summarise picker one card over correctly
+                    refuses non-numeric columns. The option stays; what it
+                    costs is now stated. */}
                 {(kind === "time" || kind === "text") && (
                   <select
                     aria-label="Date bucket"
@@ -288,6 +294,12 @@ export function ShapingCards({
                       </option>
                     ))}
                   </select>
+                )}
+                {kind === "text" && g.bucket && (
+                  <span className="hint">
+                    Read as dates: values that are not dates group together as
+                    empty.
+                  </span>
                 )}
                 {kind === "number" && (
                   <>

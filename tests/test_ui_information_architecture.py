@@ -263,3 +263,55 @@ def test_the_command_palette_offers_exactly_the_nav_items_the_callers_role_can_s
             f"{role}: the palette and the sidebar disagree — the palette must "
             "consume the same filtered nav, never its own list"
         )
+
+
+def test_every_empty_state_names_a_next_step_or_says_there_is_none():
+    """The settled empty-state contract, applied to the FIRST-RUN shape.
+
+    An empty state is the only guidance a first-run reader gets, so it owes a
+    DOOR — a link or a control that makes the missing thing, or a pointer to
+    where it is authored — or an explicit statement that there is no in-app
+    door (Ontology and Apps say so honestly: those artifacts live in
+    ``ontology/*.yml`` on disk). The Builds page owed one and gave none:
+    "No transforms defined.", full stop, under a header reading "Pipelines",
+    in a noun the product had retired.
+
+    Scoped to the first-run sentence ("No <things> yet…") on a ROUTED view.
+    Filtered sub-tables, per-panel placeholders and "pick something on the
+    left" prompts are not first runs and are not in scope: the door they would
+    name is the control directly above them.
+    """
+    src = REPO / "laurelin" / "ui" / "webapp" / "src"
+    views = sorted(p for p in (src / "views").glob("*.tsx")
+                   if p.name != "Admin.tsx")
+    assert len(views) >= 14, "the views directory moved — update this test"
+
+    # What counts as naming a next step: a route link, an in-page control, a
+    # pointer at the panel that makes the thing, or the on-disk location of an
+    # artifact this app deliberately does not author.
+    doors = ("<link", "<a ", "<button", " above", " below", " on disk",
+             "*.yml", "<code>")
+
+    offenders = []
+    for path in views:
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"<EmptyState>(.*?)</EmptyState>", text, re.S):
+            raw = m.group(1)
+            # The explicit escape hatch, written deliberately as a comment in
+            # the source rather than as jargon in the reader's copy: some
+            # things (a dataset version, a health transition, an Iceberg
+            # snapshot) are recorded BY the system and no control anywhere
+            # creates one. Those say so in prose and carry this marker.
+            if "no in-app door:" in raw:
+                continue
+            body = re.sub(r"/\*.*?\*/", " ", raw, flags=re.S)
+            low = re.sub(r"\s+", " ", body).lower().strip()
+            if not re.match(r"^\{?\s*[\"\'`]?\s*no [a-z ]+ yet", low):
+                continue  # not the first-run sentence
+            if any(d in low for d in doors):
+                continue
+            offenders.append(f"{path.name}: {low[:120]}")
+    assert not offenders, (
+        "first-run empty states with neither a next-step door nor a statement "
+        "that there is none:\n" + "\n".join(offenders)
+    )

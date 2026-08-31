@@ -208,6 +208,11 @@ class Builder:
 
         failed_outputs: set[str] = set()
         any_failed = False
+        # The codes of the tasks that RAN and failed. Blocked tasks are
+        # excluded deliberately: their TRANSFORM_FAILED is a placeholder for
+        # "a named upstream failed", not a diagnosis, and letting it into the
+        # set would make every chain look mixed and re-hardcode the bug below.
+        failed_codes: set[FailureCode] = set()
 
         for spec in specs:
             blocked_by = sorted(
@@ -341,6 +346,7 @@ class Builder:
                 # no redactor anywhere on this path — `grep -rn redact
                 # laurelin/transforms/` returned nothing.
                 task.failure = _task_failure(exc, spec)
+                failed_codes.add(task.failure.code)
             task.finished_at = utcnow_iso()
             self.store.upsert_build_task(build.id, task)
 
@@ -357,7 +363,22 @@ class Builder:
             status=final_status,
             finished_at=utcnow_iso(),
             failure=Failure(
-                code=FailureCode.TRANSFORM_FAILED, phase=Phase.execute,
+                # NOT hard-coded. Measured: a build whose only failed task
+                # recorded `expectation_failed` reported `transform_failed` at
+                # build level, so the Builds row read "The pipeline's code
+                # raised — fix the code" directly above the task row reading
+                # "A data expectation failed". The data was wrong, not the
+                # code, and the louder sentence was the wrong one.
+                #
+                # One code only when the failed tasks agree. When they differ
+                # there is no true single cause, so the generic code is the
+                # honest answer — inventing a MIXED member would put a word on
+                # the row that no task ever recorded.
+                code=(
+                    next(iter(failed_codes)) if len(failed_codes) == 1
+                    else FailureCode.TRANSFORM_FAILED
+                ),
+                phase=Phase.execute,
                 subject=f"build:{build.id}",
                 counters={"failed_tasks": len(failed_outputs)},
             ) if any_failed else None,

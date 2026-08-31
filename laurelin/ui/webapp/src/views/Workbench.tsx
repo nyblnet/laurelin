@@ -417,19 +417,34 @@ export function WorkbenchView() {
             </div>
           ) : (
             <ul className="wb-ds-list">
-              {datasets.map((d) => (
+              {/* A dataset that has been declared but never built has no
+                  version, so there is no view to select from and the query
+                  fails on a name the picker itself handed the reader. The
+                  picker knew; it just did not say. Offer it, greyed, with the
+                  reason — hiding it would be worse, because the reader can see
+                  the name on Datasets and would wonder why SQL denies it. */}
+              {datasets.map((d) => {
+                const noVersion = d.latest_version == null;
+                return (
                 <li key={d.name}>
                   <button
                     type="button"
                     className="wb-ds-item mono"
-                    title={`SELECT * FROM ${d.name} LIMIT 100`}
-                    disabled={!ready}
+                    title={
+                      noVersion
+                        ? "No versions yet — build or import into this dataset before querying it."
+                        : `SELECT * FROM ${d.name} LIMIT 100`
+                    }
+                    aria-disabled={noVersion ? true : undefined}
+                    disabled={!ready || noVersion}
                     onClick={() => setDoc(`SELECT * FROM ${d.name} LIMIT 100`)}
                   >
                     {d.name}
+                    {noVersion && <span className="faint"> (no versions yet)</span>}
                   </button>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </aside>

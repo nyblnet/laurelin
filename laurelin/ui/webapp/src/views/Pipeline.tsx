@@ -140,15 +140,93 @@ function layout(graph: LineageGraph): {
   return { placed, byId, width, height };
 }
 
-function LineageGraphView({ graph }: { graph: LineageGraph }) {
+// #75. The one bit a node may carry about a neighbour it may not see, drawn as
+// a MARK and not a node: a short stub edge to a dashed terminal with no name,
+// nothing to click, and no contribution to any node total the page shows. It
+// is the `RedactedValue` treatment moved onto the canvas — dashed border, faint
+// stroke — so a reader who has met it elsewhere already knows what it means.
+//
+// Deliberately not a placeholder node: a placeholder is countable, and a graph
+// with two anonymous boxes between two visible ones has told you there are
+// exactly two hidden datasets and how they fan in and out.
+const STUB_LEN = 26;
+
+function HiddenMark({
+  x,
+  y,
+  direction,
+}: {
+  x: number;
+  y: number;
+  direction: "upstream" | "downstream";
+}) {
+  const sign = direction === "upstream" ? -1 : 1;
+  const tipX = x + sign * STUB_LEN;
+  const label =
+    direction === "upstream"
+      ? "Upstream you cannot see."
+      : "Downstream you cannot see.";
+  return (
+    <g aria-hidden="false" role="img" aria-label={label}>
+      <title>{label}</title>
+      <line
+        x1={x}
+        y1={y}
+        x2={tipX}
+        y2={y}
+        stroke="var(--border-2)"
+        strokeDasharray="3 3"
+      />
+      <rect
+        x={sign > 0 ? tipX : tipX - 10}
+        y={y - 7}
+        width={10}
+        height={14}
+        rx={3}
+        fill="none"
+        stroke="var(--border-2)"
+        strokeDasharray="3 2"
+      />
+    </g>
+  );
+}
+
+function LineageGraphView({
+  graph,
+  buildsRan,
+}: {
+  graph: LineageGraph;
+  buildsRan: boolean;
+}) {
   const { placed, byId, width, height } = useMemo(() => layout(graph), [graph]);
+  const anyHidden = graph.nodes.some(
+    (n) => n.has_hidden_upstream || n.has_hidden_downstream,
+  );
 
   if (graph.nodes.length === 0) {
-    return <EmptyState>No lineage yet — start a build.</EmptyState>;
+    // Lineage rows are written only by a build that produces a VERSION, so
+    // "start a build" read as "you have not tried yet" to someone who had just
+    // started four and watched one fail on this very screen. Two different
+    // facts, two sentences.
+    return (
+      <EmptyState>
+        {buildsRan
+          ? "No lineage yet — builds have run, but none has produced a dataset version. The build history below says why."
+          : "No lineage yet — start a build."}
+      </EmptyState>
+    );
   }
 
   return (
     <div className="lineage">
+      {/* One sentence, no numbers. It appears only when a mark does, so an
+          editor who legitimately sees the whole graph never reads it — the
+          marks are absent, not role-gated away. */}
+      {anyHidden && (
+        <p className="dim" style={{ fontSize: 12.5, margin: "10px 14px 0" }}>
+          Parts of this lineage are not shared with your role and are not shown.
+        </p>
+      )}
       <svg
         viewBox={`0 0 ${width} ${height}`}
         width={width}
@@ -211,6 +289,20 @@ function LineageGraphView({ graph }: { graph: LineageGraph }) {
               >
                 {truncate(p.node.id, 18)}
               </text>
+              {p.node.has_hidden_upstream && (
+                <HiddenMark
+                  x={p.x}
+                  y={p.y + NODE_H / 2}
+                  direction="upstream"
+                />
+              )}
+              {p.node.has_hidden_downstream && (
+                <HiddenMark
+                  x={p.x + NODE_W}
+                  y={p.y + NODE_H / 2}
+                  direction="downstream"
+                />
+              )}
             </g>
           );
         })}
@@ -385,6 +477,15 @@ function BuildCard({
         </span>
       </button>
 
+      {/* #75. The badge above still carries the TRUE status. This sentence
+          says the projection is partial; it never softens the outcome, so the
+          row cannot read green over a red build. */}
+      {build.hidden_tasks && (
+        <p className="dim" style={{ fontSize: 12.5, margin: "8px 0 0 24px" }}>
+          Some of this build's steps are not shared with your role.
+        </p>
+      )}
+
       {build.failure && <FailureNote failure={build.failure} role={auth.role} />}
 
       {open && (
@@ -474,14 +575,26 @@ export function BuildsView() {
     ? buildsQ.data?.find((b) => b.id === runBuild.data.id) ?? runBuild.data
     : undefined;
 
+  // M8. A workspace with no pipelines has nothing to build, and the button
+  // used to answer with a green "succeeded" over "all targets" — on the same
+  // page that simultaneously read "No pipelines yet". The server now refuses
+  // it (400); the button says why before it is pressed rather than after.
+  const nothingToBuild = (transformsQ.data?.length ?? 0) === 0 && !transformsQ.isLoading;
+  const noPipelinesSentence =
+    "There are no pipelines in this workspace yet, so there is nothing to build.";
   const actions = canEdit ? (
-    <button
-      className="primary"
-      disabled={buildInFlight}
-      onClick={() => runBuild.mutate(undefined)}
-    >
-      {buildInFlight ? "Building…" : "Build now"}
-    </button>
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+      {nothingToBuild && <span className="dim">{noPipelinesSentence}</span>}
+      <button
+        className="primary"
+        disabled={buildInFlight || nothingToBuild}
+        aria-disabled={buildInFlight || nothingToBuild}
+        title={nothingToBuild ? noPipelinesSentence : undefined}
+        onClick={() => runBuild.mutate(undefined)}
+      >
+        {buildInFlight ? "Building…" : "Build now"}
+      </button>
+    </span>
   ) : (
     <span className="dim">Viewer — builds are read-only.</span>
   );
@@ -507,7 +620,19 @@ export function BuildsView() {
     {
       label: "Inputs",
       className: "dim",
-      render: (t) => (t.inputs.length > 0 ? t.inputs.join(", ") : "—"),
+      // #75. An input the reader may not view is dropped from the list, and
+      // the cell says so rather than reading as a shorter true list. Same
+      // one-bit rule as the lineage marks: no count, no name.
+      render: (t) => (
+        <>
+          {t.inputs.length > 0 ? t.inputs.join(", ") : t.hidden_inputs ? "" : "—"}
+          {t.hidden_inputs && (
+            <span className="withheld" title="Not shared with your role.">
+              {t.inputs.length > 0 ? " + not shared with you" : "not shared with you"}
+            </span>
+          )}
+        </>
+      ),
     },
     { label: "Output", className: "mono", render: (t) => t.output },
   ];
@@ -558,10 +683,28 @@ export function BuildsView() {
         // A live region, so the outcome of the click is announced when it
         // lands — the polling below is what moves it from running to done.
         <LiveStatus className="dim" style={{ fontSize: 13, marginTop: 8 }}>
-          Build <span className="mono">{shortId(startedBuild.id)}</span>{" "}
-          {startedBuild.status === "pending" || startedBuild.status === "running"
-            ? `${startedBuild.status} — the history below follows it.`
-            : `finished: ${startedBuild.status}.`}
+          {/* The converged build-kick sentence — see the long note at the
+              matching site in Flows.tsx. Terminal: "Build <id> finished:
+              <outcome>." then "See the build." and nothing after it. Pending
+              shares the subject and keeps this page's tail, because the reader
+              is standing on the history that follows it. */}
+          {startedBuild.status === "pending" || startedBuild.status === "running" ? (
+            <>
+              Build <span className="mono">{shortId(startedBuild.id)}</span> is
+              running… the history below follows it.
+            </>
+          ) : (
+            <>
+              <strong>
+                Build <span className="mono">{shortId(startedBuild.id)}</span>{" "}
+                finished: {startedBuild.status}.
+              </strong>{" "}
+              <Link to={`/builds?build=${encodeURIComponent(startedBuild.id)}`}>
+                See the build
+              </Link>
+              .
+            </>
+          )}
         </LiveStatus>
       )}
 
@@ -573,7 +716,10 @@ export function BuildsView() {
         ) : lineageQ.isError ? (
           <ErrorBox error={lineageQ.error} />
         ) : (
-          <LineageGraphView graph={lineageQ.data!} />
+          <LineageGraphView
+            graph={lineageQ.data!}
+            buildsRan={(buildsQ.data?.length ?? 0) > 0}
+          />
         )}
       </section>
 
@@ -585,7 +731,9 @@ export function BuildsView() {
         ) : transformsQ.isError ? (
           <ErrorBox error={transformsQ.error} />
         ) : transformsQ.data!.length === 0 ? (
-          <EmptyState>No transforms defined.</EmptyState>
+          <EmptyState>
+            No pipelines yet — write one on <Link to="/pipelines">Pipelines</Link>.
+          </EmptyState>
         ) : (
           <DataTable
             columns={transformColumns}
@@ -603,7 +751,9 @@ export function BuildsView() {
         ) : buildsQ.isError ? (
           <ErrorBox error={buildsQ.error} />
         ) : buildsQ.data!.length === 0 ? (
-          <EmptyState>No builds yet.</EmptyState>
+          <EmptyState>
+            No builds yet — start one with <strong>Build now</strong> above.
+          </EmptyState>
         ) : (
           <div style={{ display: "grid", gap: 10, marginTop: 8 }}>
             {/* The API returns builds newest-first (ORDER BY rowid DESC). */}

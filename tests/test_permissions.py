@@ -175,12 +175,21 @@ def test_http_default_and_locked_enforcement(app):
                   json={"grants": [{"subject_kind": "user", "subject": "vic", "can_view": True}]})
     assert r.status_code == 200
 
-    # Now the editor is locked out of aircraft entirely (403), viewer still views.
-    assert editor.get("/api/v1/ontology/objects/aircraft").status_code == 403
+    # Now the editor is locked out of aircraft entirely, viewer still views.
+    # DELIBERATE CHANGE (was 403): a withheld object type answers exactly like
+    # an unknown one. The listing already omits it, so a 403 naming it one URL
+    # over handed its existence straight back — and, because
+    # `object_type_permission` composes the BACKING DATASET's view right, that
+    # was a second-order oracle on a hidden dataset. 404 discloses strictly
+    # less than 403; see tests/test_lineage_disclosure.py.
+    locked = editor.get("/api/v1/ontology/objects/aircraft")
+    assert locked.status_code == 404
+    assert locked.json()["detail"] == "Unknown object type: 'aircraft'"
     assert viewer.get("/api/v1/ontology/objects/aircraft").status_code == 200
-    # Editor can no longer apply the aircraft action either.
+    # Editor can no longer apply the aircraft action either — and, since they
+    # may not VIEW the type, the refusal is the unknown-type one.
     assert editor.post("/api/v1/ontology/actions/set_status/apply",
-                       json={"pk": "a1", "parameters": {"status": "y"}}).status_code == 403
+                       json={"pk": "a1", "parameters": {"status": "y"}}).status_code == 404
     # object-types listing hides aircraft from the editor, keeps flight
     editor_types = {t["api_name"] for t in editor.get("/api/v1/ontology/object-types").json()}
     assert editor_types == {"flight"}

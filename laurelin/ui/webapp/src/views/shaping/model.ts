@@ -27,6 +27,7 @@ import type {
   FlowKind,
   FlowNode,
 } from "../../types";
+import { NAME_RULE_LABEL } from "../../ui";
 
 // ------------------------------------------------------------------- state
 
@@ -219,7 +220,9 @@ export function filterExpr(f: ExploreFilter, kinds: Record<string, FlowKind>): F
 /** The server's rule for names an author invents (`_NEW_IDENT_RE`), copied so
  *  the refusal can be a sentence on the card *before* preview, in the card's
  *  own words — the server's version arrives as "Invalid new column name ...
- *  on step 's2'", about a step the analyst has never seen. */
+ *  on step 's2'", about a step the analyst has never seen. The SENTENCE is
+ *  NAME_RULE_LABEL, shared with the flow builder's rename hint, so the same
+ *  rule stops being worded two ways one screen apart. */
 const NEW_NAME_RE = /^[A-Za-z_][A-Za-z0-9_ ]{0,127}$/;
 
 /** Why these shaping fields cannot preview yet, as sentences for the cards.
@@ -277,10 +280,7 @@ export function shapingFieldIssues(
     if (!alias) {
       issues.push("Give every summary a name.");
     } else if (!NEW_NAME_RE.test(m.alias)) {
-      issues.push(
-        `Summary names can use letters, digits, underscores and spaces — ` +
-          `rename “${m.alias}”.`,
-      );
+      issues.push(`${NAME_RULE_LABEL} Rename “${m.alias}”.`);
     } else if (seenAliases.has(alias)) {
       issues.push(`Two summaries are both called “${alias}” — give one a different name.`);
     } else if (seenGroupNames.has(alias)) {

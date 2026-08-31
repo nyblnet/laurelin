@@ -10,6 +10,141 @@ minor releases may break things.
 Nothing here has shipped: there is no git tag in this repository and nothing has
 been uploaded to PyPI. Everything below is in `main`.
 
+### Task #75 closed, and the five surfaces the first pass did not enumerate
+
+The withholding boundary is only real if every surface honours it. `GET
+/transforms`, `GET /builds`, `GET /builds/{id}` and `GET /lineage` named every
+dataset in the workspace to any viewer, because `serialize.dump` enforces R2 at
+*field* level and has no concept of a row. All four now project by dataset
+visibility before serializing.
+
+The rule, in one sentence: **a route may name a dataset, or a transform whose
+name is a dataset name, only to a principal who may view that dataset; where a
+name is withheld the response withholds the whole node and edge and marks the
+surviving endpoint with a single unquantified boolean, and no status, count or
+shape is falsified to make the projection look complete.**
+
+The lineage decision, recorded because it is why #75 sat open: a withheld node
+is dropped **with both its edges**, and each surviving neighbour carries one
+boolean (`has_hidden_upstream` / `has_hidden_downstream`). Not a silent drop
+(the graph would *look* complete and be wrong — the schedule-row bug again),
+and not an anonymised placeholder (which preserves topology and cardinality,
+and counts are the thing #75 is about). A failed build whose failing task is
+withheld still reads `failed`, with `hidden_tasks: true`; the
+`counters.failed_tasks` count is recomputed over visible tasks and **dropped**
+rather than emitted as `0`. `GET /builds/{id}` answers a withheld id with the
+byte-identical 404 an unknown id gets.
+
+Then the same rule, applied to the five surfaces the first audit list missed —
+each reproduced live against a real server before it was fixed:
+
+- **`GET /datasets/{n}/iceberg/schema/impact` handed a viewer the full
+  downstream closure.** It checked the *subject* dataset and returned
+  `catalog.downstream_of(name)` unfiltered: the names *and* the cardinality of
+  the hidden topology, byte-identical to the admin's answer. Now row-filtered,
+  with one `hidden_downstream` boolean.
+- **The Iceberg dataset routes were a clean enumeration oracle.** A withheld
+  name answered 404 and an *absent* one 500 (an uncaught `NoSuchTableError`) or
+  200 — so any name in the namespace could be classified in one request.
+  `_require_dataset_view` alone is not enough on a route that then touches
+  storage; a new `_require_existing_dataset_view` answers 404 in the same words
+  for both.
+- **`POST /builds` minted and disclosed what the read door withheld.** An
+  editor with no view grant got 200 with the hidden name echoed through
+  `targets` and every task — and 404 on `GET /builds/{id}` for the build he had
+  just created. A hidden target now answers exactly like an absent one, and
+  every build response is projected like every other build body.
+- **`GET /pipelines` named withheld datasets in the same structured shape
+  `/transforms` had just been filtered on.** The list is filtered
+  (`hidden_transforms: true`); a file whose outputs are not all viewable is
+  refused whole — read, write and delete — because its *content* is arbitrary
+  authored Python and cannot be row-filtered. Fail-closed: if you may not see
+  what a file produces, you may not read the file that produces it.
+- **`GET /schedules` handed an editor a `targets` list the same principal was
+  denied on four other surfaces.** Projected like builds, with one
+  `hidden_targets` bit; a schedule whose every named dataset is withheld
+  answers 404 like an unknown name. A target the author may not view is
+  reported at save time *exactly* as one no pipeline produces — silence would
+  have confirmed the name.
+
+Two second-order oracles closed with them:
+
+- **A withheld object type answered `403 "You do not have access to object type
+  'x'"` while an unknown one answered 404** — and because
+  `object_type_permission` composes the *backing dataset's* view right, that
+  403 was an oracle on a hidden dataset one indirection away. Both answer 404
+  now, on read and on write, and object apps over a hidden type follow.
+- **A dataset whose first build failed could not be ACL'd at all.** No version
+  means no `datasets` row, so `PUT /datasets/{n}/permissions` answered 404:
+  an intended-secret output was unprotectable for the whole window before its
+  first *successful* build, and permanently if the build never succeeded. The
+  ACL door now addresses declared-but-unbuilt outputs, and
+  `GET /dataset-permissions` lists them with `built: false`.
+
+### Builds, schedules and the shell: what the surfaces were still saying wrong
+
+- **A build no longer reports a cause no task recorded.** The build-level
+  `Failure.code` was hard-coded `TRANSFORM_FAILED`, so a failed data
+  expectation was diagnosed on the Builds page as "The pipeline's code raised —
+  fix the code", stacked directly above the task row reading "A data
+  expectation failed". The build now carries the code its failed tasks agree
+  on, and the generic code when they disagree — no new `MIXED` member, because
+  a word no task recorded has no business on the row.
+- **"Build now" on a workspace with no pipelines refuses instead of
+  manufacturing a green success.** `POST /builds` with no targets over an empty
+  registry answered `{"status": "succeeded", "targets": [], "tasks": []}` — a
+  green history row reading "all targets" on a page that simultaneously read
+  "No pipelines yet". It is 400 now, with the sentence the disabled button
+  carries; the refusal is raised *after* the import acknowledgement check, so an
+  imported workspace still gets the 409 that names the door that helps.
+- **A failing `/auth/status` is no longer a sign-in wall.** The bootstrap catch
+  collapsed every failure into `auth_required`, so a `--no-auth` server whose
+  probe failed rendered a credential form that could never succeed, with no
+  Retry. 401 is the only status that means signed out; everything else gets one
+  honest sentence — "Cannot reach the Laurelin server… This is not a sign-in
+  problem." — and a Retry. Deliberately one message: when the probe fails the
+  client does not know the server's auth mode, so claiming to would be a guess.
+- **A failing schedule is explained in its own domain.** `definition_stale`
+  advice read "A panel or an app still names a property that has been renamed
+  or removed" on a schedule with no panel, no app and no property. Advice is now
+  selected on `(code, subjectKind)`, parsed from `Failure.subject`'s already
+  validated namespace.
+- **One not-found treatment.** Six shipped at once: two bare `Error 404:` dead
+  ends with no links at all, two offering a Retry for a 404 that can never be
+  transient, and two silently rewriting the hash to `#/datasets`. One
+  `NotFound` primitive now, in prose, with a back link, **no Retry and no
+  status code** — the body must be identical for a resource that is absent and
+  one that is withheld.
+- **The Audit page stopped blaming governance for its own filter.** "No events
+  you can read. Events above your read level are not shown here." rendered
+  immediately above "5 sign-in events hidden" and a button that revealed five
+  readable rows.
+- **Health tells emptiness apart from withholding.** The rollup carries
+  `others_exist` — one boolean, never a count — so a sole administrator on a
+  brand-new workspace is no longer told data is being kept from them. The
+  response is now `{"datasets": [...], "others_exist": bool}`.
+- **A viewer is no longer offered "+ New pipeline"** behind a 403 with a futile
+  Retry; the Pipelines list answers a viewer in the prose Schedules already
+  used.
+- **Orientation stopped living only in empty states.** The `laurelin demo`
+  workspace — the documented first-run experience — landed on a bare table with
+  no statement of what to try, because the three next-step doors were emitted
+  only when there was no data to act on.
+- **`laurelin init <existing>` stopped blaming a flag nobody typed.** The
+  refusal diffed an *invented* `--name` (the directory basename) against the
+  stored one, so a bare re-init exited 2 for any workspace whose name differed
+  from its directory.
+
+Guards, all strengthened rather than relaxed: the truncation check normalises
+whitespace (a JSX line break inside the phrase had defeated it) and now covers
+`charts.tsx`; the name-rule guard keys on six shared constants instead of prose
+(which `MarkingsSection` had evaded by not using the words); the pipeline-delete
+guard covers all three confirms and both halves of the promise; and four new
+guards pin the bootstrap branch, the absence of HTTP status prefixes, the
+converged build-kick sentence, the ban on `window.prompt`/`window.alert`, and
+the empty-state contract ("a next-step door, or an explicit statement that
+there is none").
+
 ### The audit pass after the merge: 19 confirmed findings, fixed
 
 A consistency-and-honesty sweep drove the merged product across four

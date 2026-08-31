@@ -53,7 +53,13 @@ It does not carry everything, and [docs/PORTABILITY.md](docs/PORTABILITY.md)
 says what: federated, ClickHouse and StarRocks datasets are pointers whose rows
 live elsewhere, Iceberg tables must be re-registered against a reachable
 warehouse, object-store data planes are unverified, and there is no incremental
-or resumable export.
+or resumable export. The archive is **not signed** — the trailer's per-member
+digests catch corruption and truncation, not tampering. `laurelin export`
+prints the whole-archive sha256 on stderr and `laurelin import
+--expect-sha256 <digest>` refuses anything else before a row is read, which is
+an operator-supplied control that travels by a different route than the
+archive; it is deliberately not described as a signature, because there is no
+trust root between two workspaces to verify one against.
 
 ## Concepts
 

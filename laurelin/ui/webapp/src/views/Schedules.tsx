@@ -67,7 +67,12 @@ function triggerSummary(s: Schedule): string {
 
 function actionSummary(s: Schedule): string {
   if (s.action === "sync") return `sync ${s.source || "?"}`;
-  return s.targets.length ? `build ${s.targets.join(", ")}` : "build all";
+  // #75 on the schedules surface: a target this reader may not view is
+  // dropped by the server and the row says so with one unquantified bit
+  // rather than reading as a shorter true list.
+  const hidden = s.hidden_targets ? " + not shared with you" : "";
+  if (!s.targets.length) return s.hidden_targets ? `build${hidden}` : "build all";
+  return `build ${s.targets.join(", ")}${hidden}`;
 }
 
 export function SchedulesView() {
@@ -271,15 +276,28 @@ export function SchedulesView() {
       )}
       {outcome && !watching && (
         <LiveStatus className="dim" style={{ fontSize: 13, margin: "8px 0" }}>
-          Run of <span className="mono">{outcome.name}</span> finished:{" "}
-          {outcome.last_status ?? "unknown"}.
-          {outcome.last_build_id && (
+          {/* When the firing produced a build, this is a BUILD outcome and it
+              says so in the one converged sentence family (see the note at the
+              matching site in Flows.tsx): "Build <id> finished: <outcome>."
+              then "See the build." and nothing after. A sync firing produces
+              no build, so it keeps its own subject — that is a different fact,
+              not a second phrasing of the same one. */}
+          {outcome.last_build_id ? (
             <>
-              {" "}
+              <strong>
+                Build{" "}
+                <span className="mono">{outcome.last_build_id}</span> finished:{" "}
+                {outcome.last_status ?? "unknown"}.
+              </strong>{" "}
               <Link to={`/builds?build=${encodeURIComponent(outcome.last_build_id)}`}>
                 See the build
               </Link>
               .
+            </>
+          ) : (
+            <>
+              Run of <span className="mono">{outcome.name}</span> finished:{" "}
+              {outcome.last_status ?? "unknown"}.
             </>
           )}
         </LiveStatus>
@@ -288,7 +306,8 @@ export function SchedulesView() {
       {q.data &&
         (q.data.length === 0 ? (
           <EmptyState>
-            No schedules yet.{canEdit ? " Create one to build a pipeline on its own." : ""}
+            No schedules yet.
+            {canEdit ? " Create one with the button above to build a pipeline on its own." : ""}
           </EmptyState>
         ) : (
           <>

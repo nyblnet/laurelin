@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { API, api } from "../api";
 import { useAuth } from "../auth";
 import type { ObjectTypeDef, ObjectTypeDetail } from "../types";
-import { Badge, EmptyState, ErrorBox, PageHeader, Spinner } from "../ui";
+import { Badge, EmptyState, ErrorBox, NotFound, PageHeader, Spinner, isNotFound } from "../ui";
 import { ObjectBrowser } from "./ontology/ObjectBrowser";
 import { EditLogPanel } from "./ontology/EditLogPanel";
 import { WritebackPanel } from "./ontology/WritebackPanel";
@@ -110,7 +110,11 @@ function ObjectTypePage() {
         actions={<Link to="/ontology">← All types</Link>}
       />
       {q.isLoading && <Spinner />}
-      {q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />}
+      {isNotFound(q.error) ? (
+        <NotFound what="object type" name={type} backTo="/ontology" backLabel="Back to Ontology" />
+      ) : (
+        q.isError && <ErrorBox error={q.error} onRetry={() => q.refetch()} />
+      )}
       {q.data && (
         <>
           {/* The order is the story of the page: what the store knows, then how

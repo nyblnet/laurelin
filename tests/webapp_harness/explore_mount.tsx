@@ -191,7 +191,12 @@ store.set(
   }),
 );
 mount("lists_resolved", "/analyses", (qc) => {
-  qc.setQueryData(["datasets"], [{ name: "orders" }, { name: "flights" }]);
+  // `latest_version` is on every DatasetInfo the server sends; a fixture
+  // that omitted it made every dataset look unbuilt to the pickers.
+  qc.setQueryData(["datasets"], [
+    { name: "orders", latest_version: 3 },
+    { name: "flights", latest_version: 1 },
+  ]);
   qc.setQueryData(
     ["object-types"],
     [{ api_name: "flight", display_name: "Flight", properties: { delay: { type: "double" } } }],

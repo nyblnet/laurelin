@@ -255,7 +255,14 @@ function EventsFeed() {
   if (q.error) return <ErrorBox error={q.error} onRetry={() => q.refetch()} />;
   const events = q.data ?? [];
   if (events.length === 0) {
-    return <EmptyState>No health transitions recorded yet.</EmptyState>;
+    return (
+      <EmptyState>
+        {/* no in-app door: transitions are RECORDED by the system, never
+            created by a reader. */}
+        No health transitions recorded yet — one is recorded when a dataset
+        changes state, after a build or a scheduled sync runs.
+      </EmptyState>
+    );
   }
   return (
     <div className="table-wrap">
@@ -310,18 +317,54 @@ function WebhookNote() {
 
 // ------------------------------------------------------------- view
 
+/**
+ * The rollup is a list of the datasets this reader may view. It may also
+ * arrive wrapped, carrying one extra bit — `others_exist` — that says whether
+ * the workspace holds datasets withheld from this reader.
+ *
+ * Why the bit is needed: an empty rollup has two causes that read identically
+ * and mean opposite things. "You cannot see anything here" is a governance
+ * fact; "there is nothing here yet" is a first-run fact with a next step. The
+ * page used to state the first unconditionally, so an administrator standing
+ * on a brand-new workspace was told they were being withheld from — the exact
+ * inverse of the empty-vs-withheld rule the Datasets page already keeps.
+ *
+ * Why a boolean and nothing more: a count or a name would turn a health page
+ * into an enumeration oracle for hidden datasets. One bit is what a 404 for a
+ * withheld dataset already concedes, so it discloses nothing new.
+ */
+type HealthRollupBody =
+  | DatasetHealth[]
+  | { datasets: DatasetHealth[]; others_exist?: boolean };
+
+function rollupRows(body: HealthRollupBody | undefined): DatasetHealth[] {
+  if (body == null) return [];
+  return Array.isArray(body) ? body : (body.datasets ?? []);
+}
+
+function rollupOthersExist(body: HealthRollupBody | undefined): boolean | undefined {
+  if (body == null || Array.isArray(body)) return undefined;
+  return body.others_exist;
+}
+
 export function HealthView() {
   const auth = useAuth();
   const canEdit = auth.can("editor");
   const rollup = useQuery({
     queryKey: ["health", "datasets"],
-    queryFn: () => api.get<DatasetHealth[]>(`${API}/health/datasets`),
+    queryFn: () => api.get<HealthRollupBody>(`${API}/health/datasets`),
     refetchInterval: 30_000, // a health page that goes stale is its own joke
   });
+  const rows = rollupRows(rollup.data);
+  // The one unquantified bit: does the workspace hold datasets this reader
+  // cannot view? Never a count, never a name — the same bit a 404 for a
+  // withheld dataset already concedes. Absent (an older server) means we do
+  // not know, and a surface that does not know must not guess.
+  const othersExist = rollupOthersExist(rollup.data);
 
   const sections = useMemo(() => {
     const by: Partial<Record<HealthStatus, DatasetHealth[]>> = {};
-    for (const h of rollup.data ?? []) (by[h.status] ??= []).push(h);
+    for (const h of rows) (by[h.status] ??= []).push(h);
     return by;
   }, [rollup.data]);
 
@@ -343,11 +386,24 @@ export function HealthView() {
         <ErrorBox error={rollup.error} onRetry={() => rollup.refetch()} />
       )}
 
-      {rollup.data && rollup.data.length === 0 && (
-        <EmptyState>No datasets visible to you.</EmptyState>
+      {rollup.data && rows.length === 0 && (
+        <EmptyState>
+          {othersExist === false ? (
+            <>
+              No datasets yet — import a file on{" "}
+              <Link to="/datasets">Datasets</Link> to make one.
+            </>
+          ) : (
+            // Either the server told us other datasets exist, or it is old
+            // enough not to say. Both cases keep the withholding sentence:
+            // claiming emptiness we have not established would be the same
+            // false-green class of bug pointed the other way.
+            <>No datasets you can read.</>
+          )}
+        </EmptyState>
       )}
 
-      {rollup.data && rollup.data.length > 0 && redCount === 0 && (
+      {rollup.data && rows.length > 0 && redCount === 0 && (
         <div className="card" style={{ marginBottom: 16 }}>
           <Badge tone="green">all clear</Badge>{" "}
           <span className="dim" style={{ fontSize: 13 }}>

@@ -19,6 +19,7 @@ import { SourcesSection } from "../../laurelin/ui/webapp/src/views/Sources";
 import { DashboardsView } from "../../laurelin/ui/webapp/src/views/Dashboards";
 import { AnalysesView } from "../../laurelin/ui/webapp/src/views/Analyses";
 import { FlowsView } from "../../laurelin/ui/webapp/src/views/Flows";
+import { HealthView } from "../../laurelin/ui/webapp/src/views/Health";
 
 const out: Record<string, unknown> = {};
 
@@ -135,7 +136,13 @@ const analysesApp = (
 store.clear();
 out.quick_chart_preset = mount(
   analysesApp, "editor", "/analyses?mode=chart&dataset=flights",
-  (qc) => qc.setQueryData(["datasets"], [{ name: "orders" }, { name: "flights" }]),
+  (qc) =>
+    // `latest_version` is on every DatasetInfo the server sends; a fixture
+    // that omitted it made every dataset look unbuilt to the pickers.
+    qc.setQueryData(["datasets"], [
+      { name: "orders", latest_version: 3 },
+      { name: "flights", latest_version: 1 },
+    ]),
 );
 
 // The landing page is the disambiguation: both entries, each naming its job.
@@ -211,6 +218,34 @@ out.datasets_list_empty_editor = mount(
 out.datasets_list_empty_viewer = mount(
   datasetsApp, "viewer", "/datasets",
   (qc) => qc.setQueryData(["datasets"], []),
+);
+
+// A dataset that exists but has never been built has no version, so there is
+// nothing for a chart or a query to read. It is still offered by every source
+// picker in the product, which is right — the reader can see the name on
+// Datasets — but the picker must say why it cannot be used, or picking it just
+// prints a 404 for a name the product itself suggested.
+store.clear();
+out.quick_chart_unbuilt_source = mount(
+  analysesApp, "editor", "/analyses?mode=chart",
+  (qc) =>
+    qc.setQueryData(["datasets"], [
+      { name: "orders", latest_version: 3 },
+      { name: "newborn", latest_version: null },
+    ]),
+);
+
+// The Health rollup's empty answer has two causes that mean opposite things.
+// `others_exist: false` is emptiness with a next step; anything else keeps the
+// withholding sentence, because a surface that does not know must not guess.
+const healthApp = <HealthView />;
+out.health_empty_nothing_exists = mount(
+  healthApp, "admin", "/health",
+  (qc) => qc.setQueryData(["health", "datasets"], { datasets: [], others_exist: false }),
+);
+out.health_empty_others_withheld = mount(
+  healthApp, "viewer", "/health",
+  (qc) => qc.setQueryData(["health", "datasets"], { datasets: [], others_exist: true }),
 );
 
 process.stdout.write(JSON.stringify(out));

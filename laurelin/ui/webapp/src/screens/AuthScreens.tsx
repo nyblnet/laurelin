@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { ApiError } from "../api";
 import { useAuth } from "../auth";
 import { TreeGlyph } from "../brand";
+import { NAME_RULE_USERNAME } from "../ui";
 
 const USERNAME_RE = /^[a-z0-9_.-]{2,32}$/;
 
@@ -146,7 +147,7 @@ export function SetupScreen() {
             onChange={(e) => setUsername(e.target.value)}
           />
           <div className={`hint ${username && !userValid ? "bad" : ""}`}>
-            2–32 chars: lowercase letters, digits, . _ -
+            {NAME_RULE_USERNAME}
           </div>
         </div>
         <div className="field">

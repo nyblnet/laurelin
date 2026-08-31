@@ -15,6 +15,7 @@ import {
   Badge,
   EmptyState,
   ErrorBox,
+  NAME_RULE_WORKSPACE,
   PageHeader,
   Spinner,
   fmtNum,
@@ -76,9 +77,7 @@ function CreateWorkspacePanel() {
           }}
         />
         <div className={`hint${showBad ? " bad" : ""}`}>
-          Lowercase letters, digits, <span className="mono">_ -</span>; 2–48
-          characters; must start with a letter or digit. This is the workspace's
-          permanent identifier.
+          {NAME_RULE_WORKSPACE} This is the workspace's permanent identifier.
         </div>
       </div>
       <div className="field">

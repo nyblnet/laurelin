@@ -18,6 +18,7 @@
 
 import { useMemo } from "react";
 import type { ChartKind } from "./types";
+import { truncationNote } from "./ui";
 
 export type { ChartKind };
 
@@ -1074,7 +1075,10 @@ function StatChart({ data, yCols }: { data: ChartData; yCols: string[] }) {
       {col && <div className="faint" style={{ fontSize: 11.5, marginTop: 4 }}>{col}</div>}
       {n > 1 && (
         <FootNote>
-          first of {n} rows — filter to one row, or use a chart
+          {/* One voice for truncation honesty. This mark hand-rolled "first of
+              {n} rows", a fifth phrasing of the fact `truncationNote` exists
+              to state once. */}
+          {truncationNote(n)} — filter to one row, or use a chart
         </FootNote>
       )}
     </div>
